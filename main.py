@@ -344,9 +344,11 @@ async def fetch_bulk_ohlc(session: aiohttp.ClientSession, instrument_keys: list)
         "interval": "1d"
     }
     try:
-        async with session.get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=30)) as r:
+        async with session.get(url, headers=headers, params=params,
+                               timeout=aiohttp.ClientTimeout(total=30)) as r:
             if r.status != 200:
-                log.warning(f"OHLC fetch failed: {r.status}")
+                text = await r.text()
+                log.warning(f"OHLC fetch failed: {r.status} — {text[:200]}")
                 return {}
             data = await r.json()
             return data.get('data', {})
@@ -354,25 +356,31 @@ async def fetch_bulk_ohlc(session: aiohttp.ClientSession, instrument_keys: list)
         log.error(f"OHLC fetch error: {e}")
         return {}
 
-async def fetch_historical(session: aiohttp.ClientSession, sym: str) -> dict:
+async def fetch_historical(session: aiohttp.ClientSession, sym: str,
+                           instrument_key: str = None) -> dict:
     """Fetch 15 months of daily historical data for one stock."""
     to   = datetime.now(IST).strftime('%Y-%m-%d')
     from_= (datetime.now(IST) - timedelta(days=400)).strftime('%Y-%m-%d')
-    key  = f"NSE_EQ%7C{sym}"
-    url  = f"https://api.upstox.com/v2/historical-candle/{key}/day/{to}/{from_}"
+
+    # Use provided instrument_key or build from symbol
+    key = instrument_key if instrument_key else f"NSE_EQ|{sym}"
+    encoded_key = key.replace('|', '%7C')
+    url = f"https://api.upstox.com/v2/historical-candle/{encoded_key}/day/{to}/{from_}"
+
     headers = {
         "Authorization": f"Bearer {ANALYTICS_TOKEN}",
         "Accept": "application/json"
     }
     try:
-        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as r:
+        async with session.get(url, headers=headers,
+                               timeout=aiohttp.ClientTimeout(total=15)) as r:
             if r.status != 200:
                 return {}
             data = await r.json()
             candles = list(reversed(data.get('data', {}).get('candles', [])))
             return {
-                'prices':  [c[4] for c in candles],   # close
-                'volumes': [c[5] for c in candles],   # volume
+                'prices':  [c[4] for c in candles],  # close
+                'volumes': [c[5] for c in candles],  # volume
                 'highs':   [c[2] for c in candles],
                 'lows':    [c[3] for c in candles],
             }
@@ -435,8 +443,71 @@ def is_scan_time() -> bool:
     close_time = now.replace(hour=MARKET_CLOSE_H, minute=MARKET_CLOSE_M, second=0, microsecond=0) + timedelta(minutes=30)
     return open_time <= now <= close_time
 
-# ── Historical data cache (loaded once at startup, updated in batch) ──
-historical_cache: dict = {}  # sym -> {prices, volumes}
+# ── Historical data cache + instrument key map ────────────────────────
+historical_cache: dict = {}   # sym -> {prices, volumes}
+instrument_key_map: dict = {} # sym -> full instrument key (e.g. NSE_EQ|INE002A01018)
+
+async def load_instrument_master(session: aiohttp.ClientSession):
+    """Fetch Upstox instrument master to get correct instrument keys."""
+    global instrument_key_map, ALL_STOCKS
+    log.info("Fetching instrument master from Upstox…")
+    try:
+        # Use the publicly available JSON master file
+        url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as r:
+            if r.status == 200:
+                import gzip, io
+                content = await r.read()
+                try:
+                    data = json.loads(gzip.decompress(content))
+                except Exception:
+                    data = json.loads(content)
+
+                # Build sym -> instrument_key map for EQ stocks
+                for item in data:
+                    sym = item.get('trading_symbol', '').replace('-EQ', '').replace('EQ', '')
+                    itype = item.get('instrument_type', '')
+                    exch = item.get('exchange', '')
+                    key = item.get('instrument_key', '')
+                    if exch == 'NSE' and itype == 'EQ' and sym and key:
+                        instrument_key_map[sym] = key
+
+                log.info(f"✅ Instrument master loaded: {len(instrument_key_map)} EQ stocks")
+
+                # Update ALL_STOCKS to only include stocks we have keys for
+                if len(instrument_key_map) > 100:
+                    ALL_STOCKS = list(instrument_key_map.keys())
+                    log.info(f"📊 Updated stock list: {len(ALL_STOCKS)} stocks")
+                return True
+    except Exception as e:
+        log.warning(f"Instrument master fetch failed: {e} — trying alternative…")
+
+    # Fallback: try the CSV format
+    try:
+        url2 = "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz"
+        async with session.get(url2, timeout=aiohttp.ClientTimeout(total=60)) as r:
+            if r.status == 200:
+                import gzip, csv, io
+                content = gzip.decompress(await r.read()).decode('utf-8')
+                reader = csv.DictReader(io.StringIO(content))
+                for row in reader:
+                    if row.get('exchange') == 'NSE' and row.get('instrument_type') == 'EQ':
+                        sym = row.get('trading_symbol', '').replace('-EQ', '')
+                        key = row.get('instrument_key', '')
+                        if sym and key:
+                            instrument_key_map[sym] = key
+                log.info(f"✅ CSV master loaded: {len(instrument_key_map)} EQ stocks")
+                if len(instrument_key_map) > 100:
+                    ALL_STOCKS = list(instrument_key_map.keys())
+                return True
+    except Exception as e:
+        log.warning(f"CSV master also failed: {e} — using symbol-based keys")
+
+    # Last resort: build keys from symbol names (may not always work)
+    log.warning("Using symbol-based instrument keys as fallback")
+    for sym in ALL_STOCKS:
+        instrument_key_map[sym] = f"NSE_EQ|{sym}"
+    return False
 
 async def load_historical_cache(session: aiohttp.ClientSession):
     """Load historical data for all stocks at startup."""
@@ -445,7 +516,10 @@ async def load_historical_cache(session: aiohttp.ClientSession):
     loaded = 0
     for i in range(0, len(ALL_STOCKS), BATCH):
         batch = ALL_STOCKS[i:i+BATCH]
-        results = await asyncio.gather(*[fetch_historical(session, sym) for sym in batch])
+        results = await asyncio.gather(*[
+            fetch_historical(session, sym, instrument_key_map.get(sym))
+            for sym in batch
+        ])
         for sym, data in zip(batch, results):
             if data:
                 historical_cache[sym] = data
@@ -687,7 +761,10 @@ async def main():
 
         log.info(f"📊 Total stocks to scan: {len(ALL_STOCKS)}")
 
-        # Step 2: Load historical data cache at startup
+        # Step 2: Load instrument master to get correct API keys
+        await load_instrument_master(session)
+
+        # Step 3: Load historical data cache at startup
         log.info("Loading historical data cache at startup…")
         await load_historical_cache(session)
 
