@@ -536,12 +536,31 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
     log.info(f"🔄 Starting {scan_type} scan at {now_ist.strftime('%H:%M:%S IST')}")
 
     # Step 1: Fetch live prices for all stocks (bulk OHLC — 500 per call)
-    instrument_keys = [f"NSE_EQ|{sym}" for sym in ALL_STOCKS]
+    # Use correct instrument keys from master map
+    instrument_keys = [
+        instrument_key_map.get(sym, f"NSE_EQ|{sym}")
+        for sym in ALL_STOCKS
+        if sym in historical_cache  # only fetch stocks we have history for
+    ]
+    stocks_for_ohlc = [
+        sym for sym in ALL_STOCKS
+        if sym in historical_cache
+    ]
+
     live_data = {}
     for i in range(0, len(instrument_keys), BATCH_SIZE):
-        batch = instrument_keys[i:i+BATCH_SIZE]
-        data  = await fetch_bulk_ohlc(session, batch)
-        live_data.update(data)
+        batch_keys  = instrument_keys[i:i+BATCH_SIZE]
+        batch_syms  = stocks_for_ohlc[i:i+BATCH_SIZE]
+        data = await fetch_bulk_ohlc(session, batch_keys)
+        # Map response back to symbol names
+        for sym, ikey in zip(batch_syms, batch_keys):
+            # Upstox returns data keyed by instrument_key
+            if ikey in data:
+                live_data[sym] = data[ikey]
+            # Also try NSE_EQ:SYM format
+            alt_key = ikey.replace('|', ':')
+            if alt_key in data:
+                live_data[sym] = data[alt_key]
         if len(instrument_keys) > BATCH_SIZE:
             await asyncio.sleep(0.5)
 
@@ -553,13 +572,11 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
 
     # Step 3: Update historical cache with today's live price
     for sym in ALL_STOCKS:
-        key = f"NSE_EQ:{sym}"
-        if key not in live_data or sym not in historical_cache:
+        if sym not in live_data or sym not in historical_cache:
             continue
-        live = live_data[key]
+        live = live_data[sym]
         last_price = live.get('last_price', 0)
         if last_price and last_price > 0:
-            # Update last price in cache (today's close = live price)
             if historical_cache[sym]['prices']:
                 historical_cache[sym]['prices'][-1] = last_price
                 historical_cache[sym]['volumes'][-1] = live.get('volume', historical_cache[sym]['volumes'][-1])
@@ -600,9 +617,8 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         hist = rs_history.get(sym, [])
         trend_data = rs_slope(hist)
 
-        # Live price
-        live_key = f"NSE_EQ:{sym}"
-        live = live_data.get(live_key, {})
+        # Live price — use sym-based lookup
+        live = live_data.get(sym, {})
         last  = prices[n-1]
         prev  = prices[n-2] if n > 1 else last
         chg   = round((last - prev) / prev * 100, 2) if prev else 0
