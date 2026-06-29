@@ -201,18 +201,28 @@ def detect_weak_rs(prices: list, volumes: list, rs: int, threshold: float = 8.0)
 
 def build_rs_history(all_stocks: list, days: int = 15) -> dict:
     """Build 15-day RS history for all stocks."""
-    n = len(all_stocks[0]['prices'])
+    if not all_stocks:
+        return {}
+    # Only use stocks with enough price history
+    valid = [s for s in all_stocks if s.get('prices') and len(s['prices']) >= 60]
+    if not valid:
+        log.warning("No stocks with sufficient history — skipping RS history")
+        return {s['sym']: [None]*days for s in all_stocks}
+    n = len(valid[0]['prices'])
     history = {s['sym']: [] for s in all_stocks}
     for d in range(days-1, -1, -1):
         end_idx = n - 1 - d
         raw_map = {}
-        for s in all_stocks:
-            raw = calc_rs_raw(s['prices'], end_idx)
-            if raw is not None:
-                raw_map[s['sym']] = raw
+        for s in valid:
+            try:
+                raw = calc_rs_raw(s['prices'], end_idx)
+                if raw is not None:
+                    raw_map[s['sym']] = raw
+            except Exception:
+                pass
         raw_vals = list(raw_map.values())
         for s in all_stocks:
-            if s['sym'] in raw_map:
+            if s['sym'] in raw_map and raw_vals:
                 history[s['sym']].append(percentile_rank(raw_vals, raw_map[s['sym']]))
             else:
                 history[s['sym']].append(None)
@@ -487,6 +497,10 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         if sym in historical_cache and len(historical_cache[sym].get('prices', [])) >= 60
     ]
 
+    if not stocks_with_hist:
+        log.warning("⚠️ No stocks with historical data yet — skipping scan, will retry next cycle")
+        return 0
+
     # Raw RS scores
     raw_scores = []
     for s in stocks_with_hist:
@@ -627,20 +641,57 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
 
 # ── Main loop ─────────────────────────────────────────────────────────
 async def main():
+    global ALL_STOCKS, NIFTY50, MIDCAP, SMALLCAP, MICROCAP
+
     log.info("=" * 60)
     log.info("  PocketRS Pro — Live Update Server")
     log.info(f"  Update interval: {UPDATE_INTERVAL} seconds")
     log.info(f"  Market hours: {MARKET_OPEN_H}:{MARKET_OPEN_M:02d} - {MARKET_CLOSE_H}:{MARKET_CLOSE_M:02d} IST")
     log.info("=" * 60)
 
-    connector = aiohttp.TCPConnector(limit=20)
+    connector = aiohttp.TCPConnector(limit=20, ssl=False)
     async with aiohttp.ClientSession(connector=connector) as session:
 
-        # Load historical data cache at startup
+        # Step 1: Fetch ALL NSE instruments from Upstox
+        log.info("Fetching all NSE instruments from Upstox…")
+        try:
+            url = "https://api.upstox.com/v2/instruments"
+            headers = {
+                "Authorization": f"Bearer {ANALYTICS_TOKEN}",
+                "Accept": "application/json"
+            }
+            async with session.get(url, headers=headers,
+                                   timeout=aiohttp.ClientTimeout(total=60)) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    instruments = data.get('data', [])
+                    # Filter NSE equity stocks only
+                    nse_eq = [
+                        i['trading_symbol'] for i in instruments
+                        if i.get('exchange') == 'NSE'
+                        and i.get('instrument_type') == 'EQ'
+                        and i.get('trading_symbol')
+                        and '-' not in i.get('trading_symbol','')[-3:]
+                    ]
+                    # Remove duplicates and sort
+                    nse_eq = list(dict.fromkeys(nse_eq))
+                    log.info(f"✅ Fetched {len(nse_eq)} NSE equity stocks from Upstox")
+                    if len(nse_eq) > 100:
+                        ALL_STOCKS = nse_eq
+                    else:
+                        log.warning("Too few instruments fetched — using hardcoded list")
+                else:
+                    log.warning(f"Instrument fetch failed: {r.status} — using hardcoded list")
+        except Exception as e:
+            log.warning(f"Could not fetch instruments: {e} — using hardcoded list")
+
+        log.info(f"📊 Total stocks to scan: {len(ALL_STOCKS)}")
+
+        # Step 2: Load historical data cache at startup
         log.info("Loading historical data cache at startup…")
         await load_historical_cache(session)
 
-        # Run initial scan
+        # Step 3: Run initial scan
         await run_scan(session, 'batch_morning')
 
         last_scan = time.time()
