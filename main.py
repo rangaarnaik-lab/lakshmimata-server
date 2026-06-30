@@ -70,6 +70,195 @@ def sma(prices: list, n: int) -> Optional[float]:
         return None
     return sum(prices[-n:]) / n
 
+def std_dev(prices: list, n: int) -> Optional[float]:
+    if len(prices) < n:
+        return None
+    vals = prices[-n:]
+    mean = sum(vals) / n
+    variance = sum((p - mean) ** 2 for p in vals) / n
+    return variance ** 0.5
+
+def true_range_series(highs: list, lows: list, closes: list) -> list:
+    tr = []
+    for i in range(len(closes)):
+        if i == 0:
+            tr.append(highs[i] - lows[i])
+        else:
+            tr.append(max(
+                highs[i] - lows[i],
+                abs(highs[i] - closes[i-1]),
+                abs(lows[i] - closes[i-1])
+            ))
+    return tr
+
+def atr(highs: list, lows: list, closes: list, n: int = 20) -> Optional[float]:
+    if len(closes) < n + 1:
+        return None
+    tr = true_range_series(highs, lows, closes)
+    return sum(tr[-n:]) / n
+
+def detect_bb_squeeze(prices: list, highs: list, lows: list, n: int = 20) -> dict:
+    """
+    Bollinger Band Squeeze: BB width at multi-month low, BB inside Keltner Channel.
+    Classic TTM Squeeze indicator logic.
+    """
+    empty = {'in_squeeze': False, 'squeeze_fired': False, 'bb_width_pct': None, 'squeeze_days': 0}
+    if len(prices) < n + 60:
+        return empty
+
+    closes = prices
+    ma20 = sma(closes, n)
+    sd20 = std_dev(closes, n)
+    if not ma20 or not sd20:
+        return empty
+
+    upper_bb = ma20 + 2 * sd20
+    lower_bb = ma20 - 2 * sd20
+    bb_width = upper_bb - lower_bb
+    bb_width_pct = round((bb_width / ma20) * 100, 2) if ma20 else None
+
+    # Keltner Channel using ATR
+    atr_val = atr(highs, lows, closes, n)
+    if not atr_val:
+        return empty
+    upper_kc = ma20 + 1.5 * atr_val
+    lower_kc = ma20 - 1.5 * atr_val
+
+    # Squeeze ON when BB is inside KC
+    in_squeeze = (upper_bb < upper_kc) and (lower_bb > lower_kc)
+
+    # Check how many consecutive days squeeze has been on
+    squeeze_days = 0
+    for d in range(0, min(20, len(closes) - n - 20)):
+        end = len(closes) - 1 - d
+        if end < n + 20:
+            break
+        sub_closes = closes[:end+1]
+        sub_highs  = highs[:end+1]
+        sub_lows   = lows[:end+1]
+        m = sma(sub_closes, n)
+        s = std_dev(sub_closes, n)
+        a = atr(sub_highs, sub_lows, sub_closes, n)
+        if not m or not s or not a:
+            break
+        ub, lb = m + 2*s, m - 2*s
+        uk, lk = m + 1.5*a, m - 1.5*a
+        if ub < uk and lb > lk:
+            squeeze_days += 1
+        else:
+            break
+
+    # Squeeze fired = was in squeeze yesterday, not in squeeze today (breakout)
+    squeeze_fired = squeeze_days == 0 and was_in_squeeze_yesterday(closes, highs, lows, n)
+
+    return {
+        'in_squeeze': in_squeeze,
+        'squeeze_fired': squeeze_fired,
+        'bb_width_pct': bb_width_pct,
+        'squeeze_days': squeeze_days,
+    }
+
+def was_in_squeeze_yesterday(closes, highs, lows, n=20) -> bool:
+    if len(closes) < n + 21:
+        return False
+    sub_closes = closes[:-1]
+    sub_highs  = highs[:-1]
+    sub_lows   = lows[:-1]
+    m = sma(sub_closes, n)
+    s = std_dev(sub_closes, n)
+    a = atr(sub_highs, sub_lows, sub_closes, n)
+    if not m or not s or not a:
+        return False
+    ub, lb = m + 2*s, m - 2*s
+    uk, lk = m + 1.5*a, m - 1.5*a
+    return ub < uk and lb > lk
+
+def detect_vcp(prices: list, volumes: list, highs: list, lows: list) -> dict:
+    """
+    VCP (Volatility Contraction Pattern) - Minervini style.
+    Looks for 2-4 contracting pullbacks, each shallower than the last,
+    with declining volume on each pullback, price near top of range.
+    """
+    empty = {'is_vcp': False, 'vcp_stage': 0, 'contractions': [], 'vcp_fired': False}
+    n = len(prices)
+    if n < 60:
+        return empty
+
+    # Find swing highs and lows in last 60 days using simple pivot detection
+    window = 60
+    sub_p = prices[-window:]
+    sub_v = volumes[-window:]
+    sub_h = highs[-window:]
+    sub_l = lows[-window:]
+
+    pivots = []  # list of (idx, price, type) type: 'H' or 'L'
+    for i in range(3, len(sub_p) - 3):
+        if sub_h[i] == max(sub_h[i-3:i+4]):
+            pivots.append((i, sub_h[i], 'H'))
+        elif sub_l[i] == min(sub_l[i-3:i+4]):
+            pivots.append((i, sub_l[i], 'L'))
+
+    # Build alternating H-L sequence
+    contractions = []
+    last_type = None
+    sequence = []
+    for idx, price, typ in pivots:
+        if typ != last_type:
+            sequence.append((idx, price, typ))
+            last_type = typ
+
+    # Find H-L-H-L patterns and measure pullback %
+    i = 0
+    while i < len(sequence) - 1:
+        if sequence[i][2] == 'H' and i+1 < len(sequence) and sequence[i+1][2] == 'L':
+            high_price = sequence[i][1]
+            low_price  = sequence[i+1][1]
+            pullback_pct = round((high_price - low_price) / high_price * 100, 1)
+            contractions.append(pullback_pct)
+        i += 1
+
+    # Keep only the most recent 2-4 contractions
+    recent_contractions = contractions[-4:] if len(contractions) >= 2 else []
+
+    # VCP valid if each contraction is smaller than the previous (contracting)
+    is_contracting = False
+    if len(recent_contractions) >= 2:
+        is_contracting = all(
+            recent_contractions[i] > recent_contractions[i+1] * 0.95  # allow small tolerance
+            for i in range(len(recent_contractions)-1)
+        )
+
+    # Price should be within 15% of 52-week high (tight area)
+    high_252 = max(prices[-252:]) if len(prices) >= 252 else max(prices)
+    last_price = prices[-1]
+    pct_from_high = (last_price - high_252) / high_252 * 100
+
+    # Volume should be drying up (last 5 days avg < 20 day avg)
+    vol_5d  = sum(volumes[-5:]) / 5 if len(volumes) >= 5 else 0
+    vol_20d = sum(volumes[-20:]) / 20 if len(volumes) >= 20 else 1
+    vol_drying = vol_5d < vol_20d * 0.8
+
+    is_vcp = (
+        is_contracting and
+        len(recent_contractions) >= 2 and
+        pct_from_high >= -20 and
+        vol_drying
+    )
+
+    # VCP fired = was VCP, now breaking out with volume (today vol > 20d avg * 1.5)
+    today_vol_ratio = volumes[-1] / vol_20d if vol_20d > 0 else 0
+    price_breaking = prices[-1] > prices[-2] if len(prices) > 1 else False
+    vcp_fired = is_vcp and today_vol_ratio >= 1.5 and price_breaking
+
+    return {
+        'is_vcp': is_vcp,
+        'vcp_stage': len(recent_contractions),
+        'contractions': recent_contractions,
+        'vcp_fired': vcp_fired,
+        'vol_drying': vol_drying,
+        'pct_from_high': round(pct_from_high, 1),
+    }
+
 def calc_rs_raw(prices: list, end_idx: int = None) -> Optional[float]:
     end = end_idx if end_idx is not None else len(prices) - 1
     if end < 60:
@@ -333,7 +522,7 @@ async def fetch_instruments(session: aiohttp.ClientSession) -> list:
         return instruments
 
 async def fetch_bulk_ohlc(session: aiohttp.ClientSession, instrument_keys: list) -> dict:
-    """Fetch OHLC for up to 500 instruments in one call."""
+    """Fetch OHLC for instruments in one call. Keep batch small — GET URL length limits apply."""
     url = "https://api.upstox.com/v2/market-quote/ohlc"
     headers = {
         "Authorization": f"Bearer {ANALYTICS_TOKEN}",
@@ -346,12 +535,19 @@ async def fetch_bulk_ohlc(session: aiohttp.ClientSession, instrument_keys: list)
     try:
         async with session.get(url, headers=headers, params=params,
                                timeout=aiohttp.ClientTimeout(total=30)) as r:
+            text = await r.text()
             if r.status != 200:
-                text = await r.text()
-                log.warning(f"OHLC fetch failed: {r.status} — {text[:200]}")
+                log.warning(f"OHLC fetch failed: {r.status} — {text[:300]}")
                 return {}
-            data = await r.json()
-            return data.get('data', {})
+            try:
+                data = json.loads(text)
+            except Exception:
+                log.warning(f"OHLC response not JSON: {text[:200]}")
+                return {}
+            result = data.get('data', {})
+            if not result:
+                log.warning(f"OHLC empty data field. Full response keys: {list(data.keys())} status={data.get('status')}")
+            return result
     except Exception as e:
         log.error(f"OHLC fetch error: {e}")
         return {}
@@ -548,21 +744,24 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
     ]
 
     live_data = {}
-    for i in range(0, len(instrument_keys), BATCH_SIZE):
-        batch_keys  = instrument_keys[i:i+BATCH_SIZE]
-        batch_syms  = stocks_for_ohlc[i:i+BATCH_SIZE]
+    OHLC_BATCH = 200  # keep GET URL length safe (ISIN keys are long)
+    first_batch_logged = False
+    for i in range(0, len(instrument_keys), OHLC_BATCH):
+        batch_keys  = instrument_keys[i:i+OHLC_BATCH]
+        batch_syms  = stocks_for_ohlc[i:i+OHLC_BATCH]
         data = await fetch_bulk_ohlc(session, batch_keys)
-        # Map response back to symbol names
-        for sym, ikey in zip(batch_syms, batch_keys):
-            # Upstox returns data keyed by instrument_key
-            if ikey in data:
-                live_data[sym] = data[ikey]
-            # Also try NSE_EQ:SYM format
-            alt_key = ikey.replace('|', ':')
-            if alt_key in data:
-                live_data[sym] = data[alt_key]
-        if len(instrument_keys) > BATCH_SIZE:
-            await asyncio.sleep(0.5)
+        if not first_batch_logged and data:
+            sample_keys = list(data.keys())[:3]
+            log.info(f"  Sample OHLC response keys: {sample_keys}")
+            first_batch_logged = True
+        # Upstox returns data keyed by "EXCHANGE:TRADINGSYMBOL" (e.g. "NSE_EQ:RELIANCE"),
+        # not by the ISIN-based instrument_key we sent in the request.
+        for sym in batch_syms:
+            resp_key = f"NSE_EQ:{sym}"
+            if resp_key in data:
+                live_data[sym] = data[resp_key]
+        if len(instrument_keys) > OHLC_BATCH:
+            await asyncio.sleep(0.3)
 
     log.info(f"  Live prices: {len(live_data)} stocks")
 
@@ -600,6 +799,21 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             raw_scores.append({'sym': s['sym'], 'raw': raw})
     raw_vals = [r['raw'] for r in raw_scores]
 
+    # Per-index raw score pools for index-relative RS
+    raw_by_sym = {r['sym']: r['raw'] for r in raw_scores}
+    nifty50_raws  = [raw_by_sym[s] for s in NIFTY50   if s in raw_by_sym]
+    midcap_raws   = [raw_by_sym[s] for s in MIDCAP    if s in raw_by_sym]
+    smallcap_raws = [raw_by_sym[s] for s in SMALLCAP  if s in raw_by_sym]
+    microcap_raws = [raw_by_sym[s] for s in MICROCAP  if s in raw_by_sym]
+
+    # Per-sector raw score pools for sector-relative RS
+    sector_raws = {}  # sector_name -> [raw scores of its members]
+    sym_to_sector = {}
+    for sym in raw_by_sym:
+        sec = get_sector(sym)
+        sym_to_sector[sym] = sec
+        sector_raws.setdefault(sec, []).append(raw_by_sym[sym])
+
     # RS history (15 days)
     rs_history = build_rs_history(stocks_with_hist, days=15)
 
@@ -612,10 +826,22 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         n = len(prices)
 
         # RS
-        raw_entry = next((r for r in raw_scores if r['sym'] == sym), None)
-        rs = percentile_rank(raw_vals, raw_entry['raw']) if raw_entry else 0
+        my_raw_val = raw_by_sym.get(sym)
+        rs = percentile_rank(raw_vals, my_raw_val) if my_raw_val is not None else 0
         hist = rs_history.get(sym, [])
         trend_data = rs_slope(hist)
+
+        # Index-relative RS — rank within each index peer group only
+        my_raw = my_raw_val
+        rs_nifty50  = percentile_rank(nifty50_raws,  my_raw) if my_raw is not None and sym in NIFTY50  and len(nifty50_raws)  >= 5 else None
+        rs_midcap   = percentile_rank(midcap_raws,   my_raw) if my_raw is not None and sym in MIDCAP   and len(midcap_raws)   >= 5 else None
+        rs_smallcap = percentile_rank(smallcap_raws, my_raw) if my_raw is not None and sym in SMALLCAP and len(smallcap_raws) >= 5 else None
+        rs_microcap = percentile_rank(microcap_raws, my_raw) if my_raw is not None and sym in MICROCAP and len(microcap_raws) >= 5 else None
+
+        # Sector-relative RS — rank within stock's own sector only
+        my_sector = sym_to_sector.get(sym, 'Other')
+        sec_pool  = sector_raws.get(my_sector, [])
+        rs_sector = percentile_rank(sec_pool, my_raw) if my_raw is not None and len(sec_pool) >= 5 else None
 
         # Live price — use sym-based lookup
         live = live_data.get(sym, {})
@@ -648,6 +874,12 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         # Weak RS
         weak = detect_weak_rs(prices, volumes, rs)
 
+        # Squeeze (BB + Keltner) and VCP
+        highs_arr = s.get('highs', prices)
+        lows_arr  = s.get('lows', prices)
+        squeeze = detect_bb_squeeze(prices, highs_arr, lows_arr)
+        vcp     = detect_vcp(prices, volumes, highs_arr, lows_arr)
+
         # 52W high/low
         p252  = prices[-252:] if len(prices) >= 252 else prices
         h52   = max(p252)
@@ -664,7 +896,12 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'chg_pct':        chg,
             'volume':         int(vol),
             'rs':             rs,
-            'rs_raw':         round(raw_entry['raw'], 6) if raw_entry else None,
+            'rs_nifty50':     rs_nifty50,
+            'rs_midcap':      rs_midcap,
+            'rs_smallcap':    rs_smallcap,
+            'rs_microcap':    rs_microcap,
+            'rs_sector':      rs_sector,
+            'rs_raw':         round(my_raw_val, 6) if my_raw_val is not None else None,
             'rs_trend':       trend_data['trend'],
             'rs_slope':       trend_data['slope'],
             'rs_hist':        hist,
@@ -693,6 +930,14 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'weak_chg_1d':    weak['chg_1d'],
             'weak_chg_5d':    weak['chg_5d'],
             'weak_vol_spike': weak['vol_spike'],
+            'in_squeeze':     squeeze['in_squeeze'],
+            'squeeze_fired':  squeeze['squeeze_fired'],
+            'bb_width_pct':   squeeze['bb_width_pct'],
+            'squeeze_days':   squeeze['squeeze_days'],
+            'is_vcp':         vcp['is_vcp'],
+            'vcp_stage':      vcp['vcp_stage'],
+            'vcp_fired':      vcp['vcp_fired'],
+            'vcp_contractions': json.dumps(vcp['contractions']),
             'sector':         get_sector(sym),
             'in_nifty50':     sym in NIFTY50,
             'in_midcap':      sym in MIDCAP,
