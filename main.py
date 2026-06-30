@@ -127,26 +127,38 @@ def detect_bb_squeeze(prices: list, highs: list, lows: list, n: int = 20) -> dic
     # Squeeze ON when BB is inside KC
     in_squeeze = (upper_bb < upper_kc) and (lower_bb > lower_kc)
 
-    # Check how many consecutive days squeeze has been on
+    # Check how many consecutive days squeeze has been on.
+    # PERFORMANCE: avoid re-slicing/re-scanning the full price history on every
+    # iteration (was O(n) work x 20 iterations x 3 functions x 2400 stocks,
+    # which froze the event loop for minutes). Instead, precompute a short
+    # window of closes/highs/lows once and reuse it.
     squeeze_days = 0
-    for d in range(0, min(20, len(closes) - n - 20)):
-        end = len(closes) - 1 - d
-        if end < n + 20:
-            break
-        sub_closes = closes[:end+1]
-        sub_highs  = highs[:end+1]
-        sub_lows   = lows[:end+1]
-        m = sma(sub_closes, n)
-        s = std_dev(sub_closes, n)
-        a = atr(sub_highs, sub_lows, sub_closes, n)
-        if not m or not s or not a:
-            break
-        ub, lb = m + 2*s, m - 2*s
-        uk, lk = m + 1.5*a, m - 1.5*a
-        if ub < uk and lb > lk:
-            squeeze_days += 1
-        else:
-            break
+    max_lookback = min(20, len(closes) - n - 20)
+    if max_lookback > 0:
+        # Only need the last (n + max_lookback + 20) closes for this whole check
+        window_size = n + max_lookback + 21
+        wc = closes[-window_size:] if len(closes) > window_size else closes
+        wh = highs[-window_size:]  if len(highs)  > window_size else highs
+        wl = lows[-window_size:]   if len(lows)   > window_size else lows
+
+        for d in range(0, max_lookback):
+            end = len(wc) - 1 - d
+            if end < n + 20:
+                break
+            sub_closes = wc[:end+1]
+            sub_highs  = wh[:end+1]
+            sub_lows   = wl[:end+1]
+            m = sma(sub_closes, n)
+            s = std_dev(sub_closes, n)
+            a = atr(sub_highs, sub_lows, sub_closes, n)
+            if not m or not s or not a:
+                break
+            ub, lb = m + 2*s, m - 2*s
+            uk, lk = m + 1.5*a, m - 1.5*a
+            if ub < uk and lb > lk:
+                squeeze_days += 1
+            else:
+                break
 
     # Squeeze fired = was in squeeze yesterday, not in squeeze today (breakout)
     squeeze_fired = squeeze_days == 0 and was_in_squeeze_yesterday(closes, highs, lows, n)
@@ -388,8 +400,10 @@ def detect_weak_rs(prices: list, volumes: list, rs: int, threshold: float = 8.0)
         'vol_spike':   spike,
     }
 
-def build_rs_history(all_stocks: list, days: int = 15) -> dict:
-    """Build 15-day RS history for all stocks."""
+async def build_rs_history(all_stocks: list, days: int = 15) -> dict:
+    """Build 15-day RS history for all stocks. Async so it can yield to the
+    event loop periodically — without this, 15 days x 2400 stocks of
+    synchronous work can stall the process for a noticeable stretch."""
     if not all_stocks:
         return {}
     # Only use stocks with enough price history
@@ -415,6 +429,7 @@ def build_rs_history(all_stocks: list, days: int = 15) -> dict:
                 history[s['sym']].append(percentile_rank(raw_vals, raw_map[s['sym']]))
             else:
                 history[s['sym']].append(None)
+        await asyncio.sleep(0)  # yield to event loop after each of the 15 days
     return history
 
 def build_sector_rs(processed: list, sector_map: dict) -> list:
@@ -500,6 +515,102 @@ MICROCAP = [
 ]
 
 ALL_STOCKS = list(dict.fromkeys(NIFTY50 + MIDCAP + SMALLCAP + MICROCAP))
+
+# ── Official index constituent lists (fetched live at startup) ────────
+# The hardcoded NIFTY50/MIDCAP/SMALLCAP/MICROCAP arrays above are small
+# fallback samples. At startup we replace them with the real, current
+# official lists published by niftyindices.com. If that fetch fails for
+# any reason, we silently keep using the hardcoded fallback so the app
+# never breaks.
+NIFTY_INDEX_CSV_URLS = {
+    'NIFTY50':   'https://niftyindices.com/IndexConstituent/ind_nifty50list.csv',
+    'MIDCAP150': 'https://niftyindices.com/IndexConstituent/ind_niftymidcap150list.csv',
+    'SMALLCAP250': 'https://niftyindices.com/IndexConstituent/ind_niftysmallcap250list.csv',
+    'MICROCAP250': 'https://niftyindices.com/IndexConstituent/ind_niftymicrocap250_list.csv',
+}
+
+async def fetch_index_csv(session: aiohttp.ClientSession, url: str) -> list:
+    """Download an NSE index constituent CSV and return list of trading symbols."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+        "Accept": "text/csv,*/*",
+    }
+    try:
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as r:
+            if r.status != 200:
+                log.warning(f"Index CSV fetch failed ({url}): HTTP {r.status}")
+                return []
+            raw = await r.read()
+            text = raw.decode('utf-8', errors='ignore')
+
+            import csv, io
+            reader = csv.DictReader(io.StringIO(text))
+            symbols = []
+            for row in reader:
+                # NSE CSVs use a "Symbol" column (case can vary slightly)
+                sym = None
+                for key in row:
+                    if key and key.strip().lower() == 'symbol':
+                        sym = row[key]
+                        break
+                if sym:
+                    sym = sym.strip().upper()
+                    if sym:
+                        symbols.append(sym)
+            return symbols
+    except Exception as e:
+        log.warning(f"Index CSV fetch error ({url}): {e}")
+        return []
+
+async def load_official_index_lists(session: aiohttp.ClientSession):
+    """
+    Replace hardcoded NIFTY50/MIDCAP/SMALLCAP/MICROCAP with the real,
+    current official lists from niftyindices.com. Falls back silently
+    to the existing hardcoded lists on any failure.
+    """
+    global NIFTY50, MIDCAP, SMALLCAP, MICROCAP, ALL_STOCKS
+
+    log.info("Fetching official NSE index constituent lists…")
+    results = await asyncio.gather(
+        fetch_index_csv(session, NIFTY_INDEX_CSV_URLS['NIFTY50']),
+        fetch_index_csv(session, NIFTY_INDEX_CSV_URLS['MIDCAP150']),
+        fetch_index_csv(session, NIFTY_INDEX_CSV_URLS['SMALLCAP250']),
+        fetch_index_csv(session, NIFTY_INDEX_CSV_URLS['MICROCAP250']),
+        return_exceptions=True,
+    )
+    fresh_nifty50, fresh_midcap, fresh_smallcap, fresh_microcap = [
+        r if isinstance(r, list) else [] for r in results
+    ]
+
+    if len(fresh_nifty50) >= 40:
+        NIFTY50 = fresh_nifty50
+        log.info(f"✅ Nifty 50: {len(NIFTY50)} stocks (official)")
+    else:
+        log.warning(f"⚠️ Nifty 50 fetch returned {len(fresh_nifty50)} — keeping {len(NIFTY50)} hardcoded fallback")
+
+    if len(fresh_midcap) >= 100:
+        MIDCAP = fresh_midcap
+        log.info(f"✅ Midcap 150: {len(MIDCAP)} stocks (official)")
+    else:
+        log.warning(f"⚠️ Midcap fetch returned {len(fresh_midcap)} — keeping {len(MIDCAP)} hardcoded fallback")
+
+    if len(fresh_smallcap) >= 150:
+        SMALLCAP = fresh_smallcap
+        log.info(f"✅ Smallcap 250: {len(SMALLCAP)} stocks (official)")
+    else:
+        log.warning(f"⚠️ Smallcap fetch returned {len(fresh_smallcap)} — keeping {len(SMALLCAP)} hardcoded fallback")
+
+    if len(fresh_microcap) >= 150:
+        MICROCAP = fresh_microcap
+        log.info(f"✅ Microcap 250: {len(MICROCAP)} stocks (official)")
+    else:
+        log.warning(f"⚠️ Microcap fetch returned {len(fresh_microcap)} — keeping {len(MICROCAP)} hardcoded fallback")
+
+    # Rebuild ALL_STOCKS to include any official-list stocks not already covered
+    # (ALL_STOCKS itself is later overwritten by the Upstox instrument master in
+    # main(), so this just ensures the index membership flags stay consistent)
+    ALL_STOCKS = list(dict.fromkeys(NIFTY50 + MIDCAP + SMALLCAP + MICROCAP))
 
 async def fetch_instruments(session: aiohttp.ClientSession) -> list:
     """Fetch all NSE instrument keys from Upstox."""
@@ -765,20 +876,23 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
 
     log.info(f"  Live prices: {len(live_data)} stocks")
 
-    # Step 2: For batch scans, refresh historical cache
-    if scan_type in ('batch_morning', 'batch_eod'):
+    # Step 2: Only reload full 15-month history once per day, after market
+    # close (batch_eod) — this bakes in today's now-final candle as the new
+    # baseline for tomorrow. During the day, 'live' scans reuse the cache
+    # as-is and just overlay live_data for display, so no re-fetch needed.
+    # 'batch_morning' does NOT reload here — the startup sequence already
+    # loaded history once before any scan runs, re-loading again on every
+    # batch_morning-tagged cycle was wasted API calls and the root cause of
+    # repeated multi-minute "stalls" that looked like the live data was
+    # not updating.
+    if scan_type == 'batch_eod':
+        log.info("  End-of-day scan — reloading full historical cache to bake in today's final close…")
         await load_historical_cache(session)
 
-    # Step 3: Update historical cache with today's live price
-    for sym in ALL_STOCKS:
-        if sym not in live_data or sym not in historical_cache:
-            continue
-        live = live_data[sym]
-        last_price = live.get('last_price', 0)
-        if last_price and last_price > 0:
-            if historical_cache[sym]['prices']:
-                historical_cache[sym]['prices'][-1] = last_price
-                historical_cache[sym]['volumes'][-1] = live.get('volume', historical_cache[sym]['volumes'][-1])
+    # Step 3: DO NOT mutate historical_cache prices in place (was causing chg% drift).
+    # Instead, keep historical close as the immutable baseline and use live price
+    # only for today's last/chg calculation downstream.
+    # (No-op here intentionally — see Step 5 for safe chg calculation.)
 
     # Step 4: Calculate RS ratings for all stocks
     stocks_with_hist = [
@@ -798,6 +912,7 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         if raw is not None:
             raw_scores.append({'sym': s['sym'], 'raw': raw})
     raw_vals = [r['raw'] for r in raw_scores]
+    log.info(f"  Computed raw RS scores for {len(raw_scores)} stocks, building 15-day history…")
 
     # Per-index raw score pools for index-relative RS
     raw_by_sym = {r['sym']: r['raw'] for r in raw_scores}
@@ -815,15 +930,23 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         sector_raws.setdefault(sec, []).append(raw_by_sym[sym])
 
     # RS history (15 days)
-    rs_history = build_rs_history(stocks_with_hist, days=15)
+    rs_history = await build_rs_history(stocks_with_hist, days=15)
 
     # Step 5: Build full stock records
+    log.info(f"  Building per-stock records (RS/PP/squeeze/VCP) for {len(stocks_with_hist)} stocks…")
     processed = []
-    for s in stocks_with_hist:
+    for loop_idx, s in enumerate(stocks_with_hist):
         sym = s['sym']
         prices  = s['prices']
         volumes = s['volumes']
         n = len(prices)
+
+        # Yield control back to the event loop periodically. Without this,
+        # the synchronous CPU-bound work below (especially squeeze/VCP math)
+        # across ~2400 stocks can block the event loop for minutes straight,
+        # freezing heartbeats, timeouts, and Railway health checks.
+        if loop_idx % 100 == 0:
+            await asyncio.sleep(0)
 
         # RS
         my_raw_val = raw_by_sym.get(sym)
@@ -844,11 +967,26 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         rs_sector = percentile_rank(sec_pool, my_raw) if my_raw is not None and len(sec_pool) >= 5 else None
 
         # Live price — use sym-based lookup
+        # IMPORTANT: historical_cache prices are NEVER mutated. The last element of
+        # `prices` is the most recent COMPLETED daily close (yesterday's close during
+        # market hours, or today's close after EOD batch). We use that as the
+        # baseline "prev" and overlay live_data's last_price as "today" ONLY for
+        # display (last/chg) — RS/PP/etc continue to use the immutable closes.
         live = live_data.get(sym, {})
-        last  = prices[n-1]
-        prev  = prices[n-2] if n > 1 else last
-        chg   = round((last - prev) / prev * 100, 2) if prev else 0
-        vol   = volumes[n-1] if volumes else 0
+        true_prev_close = prices[n-1]               # most recent completed close
+        live_price = live.get('last_price', 0)
+
+        if live_price and live_price > 0:
+            last = live_price
+            prev = true_prev_close
+        else:
+            # No live data (market closed / fetch failed) — show last completed
+            # close vs the one before it, exactly like EOD.
+            last = prices[n-1]
+            prev = prices[n-2] if n > 1 else last
+
+        chg = round((last - prev) / prev * 100, 2) if prev else 0
+        vol = live.get('volume') if live.get('volume') else (volumes[n-1] if volumes else 0)
 
         # PP
         pp = detect_pp(prices, volumes)
@@ -987,6 +1125,11 @@ async def main():
     connector = aiohttp.TCPConnector(limit=20, ssl=False)
     async with aiohttp.ClientSession(connector=connector) as session:
 
+        # Step 0: Fetch real official Nifty index constituent lists
+        # (replaces the small hardcoded MIDCAP/SMALLCAP/MICROCAP samples
+        #  with the actual current 150/250/250 stock lists)
+        await load_official_index_lists(session)
+
         # Step 1: Fetch ALL NSE instruments from Upstox
         log.info("Fetching all NSE instruments from Upstox…")
         try:
@@ -1028,9 +1171,28 @@ async def main():
         # Step 3: Load historical data cache at startup
         log.info("Loading historical data cache at startup…")
         await load_historical_cache(session)
+        log.info("✅ Proceeding to initial scan…")
 
-        # Step 3: Run initial scan
-        await run_scan(session, 'batch_morning')
+        # Step 4: Run initial scan (hard timeout so a stall can't hang the process forever)
+        # Detect the correct scan type based on actual time, rather than always
+        # forcing 'batch_morning' — if Railway restarts mid-afternoon or after
+        # close, the first scan should reflect that correctly.
+        SCAN_TIMEOUT = 600  # 10 minutes max for a single scan cycle
+        ist_now_initial = datetime.now(IST)
+        if is_market_open():
+            initial_scan_type = 'live'
+        elif ist_now_initial.hour >= MARKET_CLOSE_H:
+            initial_scan_type = 'batch_eod'
+        else:
+            initial_scan_type = 'batch_morning'
+        log.info(f"Initial scan type detected: {initial_scan_type} (current time {ist_now_initial.strftime('%H:%M IST')})")
+
+        try:
+            await asyncio.wait_for(run_scan(session, initial_scan_type), timeout=SCAN_TIMEOUT)
+        except asyncio.TimeoutError:
+            log.error(f"⏱ Initial scan exceeded {SCAN_TIMEOUT}s timeout — aborting and continuing to main loop")
+        except Exception as e:
+            log.error(f"❌ Initial scan failed: {e}")
 
         last_scan = time.time()
         scan_count = 0
@@ -1043,8 +1205,11 @@ async def main():
                 if elapsed >= UPDATE_INTERVAL:
                     if is_scan_time():
                         scan_type = 'live' if is_market_open() else 'batch_eod'
-                        await run_scan(session, scan_type)
-                        scan_count += 1
+                        try:
+                            await asyncio.wait_for(run_scan(session, scan_type), timeout=SCAN_TIMEOUT)
+                            scan_count += 1
+                        except asyncio.TimeoutError:
+                            log.error(f"⏱ Scan exceeded {SCAN_TIMEOUT}s timeout — skipping this cycle")
                         last_scan = time.time()
                     else:
                         ist_now = datetime.now(IST)
