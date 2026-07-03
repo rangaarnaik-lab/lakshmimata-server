@@ -272,6 +272,7 @@ def detect_vcp(prices: list, volumes: list, highs: list, lows: list) -> dict:
     }
 
 def calc_rs_raw(prices: list, end_idx: int = None) -> Optional[float]:
+    """Original IBD-style raw RS score — kept for RS history sparkline trend calc."""
     end = end_idx if end_idx is not None else len(prices) - 1
     if end < 60:
         return None
@@ -286,6 +287,101 @@ def calc_rs_raw(prices: list, end_idx: int = None) -> Optional[float]:
         0.2 * ((p126 - p189) / p189) +
         0.2 * ((p189 - p252) / p252)
     )
+
+def calc_rs_tv_raw(prices: list, bench_prices: list, end_idx: int = None) -> Optional[float]:
+    """
+    TradingView / Lakshmi Mata Pine Script RS formula.
+    Matches exactly:
+        perf(src, len) => (src - src[len]) / src[len] * 100
+        r3m  = perf(close, 63)  - perf(benchClose, 63)
+        r6m  = perf(close, 126) - perf(benchClose, 126)
+        r9m  = perf(close, 189) - perf(benchClose, 189)
+        r12m = perf(close, 252) - perf(benchClose, 252)
+        rawRS = r3m*0.4 + r6m*0.2 + r9m*0.2 + r12m*0.2
+    Returns the raw weighted relative-to-benchmark score (not yet normalized).
+    """
+    end   = end_idx if end_idx is not None else len(prices) - 1
+    bend  = end_idx if end_idx is not None else len(bench_prices) - 1
+
+    # Need at least 252 bars for both stock and benchmark
+    if end < 252 or bend < 252:
+        return None
+    if len(bench_prices) <= bend:
+        return None
+
+    def perf(arr, idx, lag):
+        i = idx - lag
+        if i < 0 or arr[i] == 0:
+            return None
+        return (arr[idx] - arr[i]) / arr[i] * 100
+
+    sp63  = perf(prices,       end,  63)
+    bp63  = perf(bench_prices, bend, 63)
+    sp126 = perf(prices,       end,  126)
+    bp126 = perf(bench_prices, bend, 126)
+    sp189 = perf(prices,       end,  189)
+    bp189 = perf(bench_prices, bend, 189)
+    sp252 = perf(prices,       end,  252)
+    bp252 = perf(bench_prices, bend, 252)
+
+    if any(v is None for v in [sp63,bp63,sp126,bp126,sp189,bp189,sp252,bp252]):
+        return None
+
+    r3m  = sp63  - bp63
+    r6m  = sp126 - bp126
+    r9m  = sp189 - bp189
+    r12m = sp252 - bp252
+
+    return r3m * 0.4 + r6m * 0.2 + r9m * 0.2 + r12m * 0.2
+
+def calc_rs_tv_normalized(prices: list, bench_prices: list, end_idx: int = None) -> Optional[int]:
+    """
+    Full TradingView RS Rating — raw score normalized via the stock's OWN
+    252-day min/max rawRS range, exactly matching the Pine Script:
+        rsHigh = ta.highest(rawRS, 252)
+        rsLow  = ta.lowest(rawRS,  252)
+        rsRating = round(((rawRS - rsLow) / (rsHigh - rsLow)) * 98 + 1)
+    Returns an integer 1-99, or None if insufficient data.
+    """
+    end = end_idx if end_idx is not None else len(prices) - 1
+
+    # calc_rs_tv_raw needs 252 bars minimum — check we have enough
+    if end < 252 or len(bench_prices) < 252:
+        return None
+
+    # Compute today's rawRS
+    current_raw = calc_rs_tv_raw(prices, bench_prices, end_idx=end)
+    if current_raw is None:
+        return None
+
+    # Build rawRS history for the normalization window
+    # Pine Script uses ta.highest/lowest over last 252 bars of rawRS
+    # We compute rawRS at each available day going back up to 252 days
+    # Each rawRS call only needs 252 bars from that point
+    raw_history = []
+    lookback_days = min(252, end - 252)  # how far back we can compute rawRS
+    for d in range(lookback_days, -1, -1):
+        idx = end - d
+        if idx < 252:
+            continue
+        raw = calc_rs_tv_raw(prices, bench_prices, end_idx=idx)
+        if raw is not None:
+            raw_history.append(raw)
+
+    # Need at least a few points to normalize meaningfully
+    if len(raw_history) < 5:
+        # If we can't get history, just use current raw vs a simple scale
+        # This handles stocks with exactly 252 days - return a basic score
+        return 50
+
+    rs_high = max(raw_history)
+    rs_low  = min(raw_history)
+
+    if rs_high == rs_low:
+        return 50  # Pine Script returns 50 when range is zero (flat stock)
+
+    rating = round(((current_raw - rs_low) / (rs_high - rs_low)) * 98 + 1)
+    return max(1, min(99, rating))
 
 def percentile_rank(values: list, val: float) -> int:
     below = sum(1 for v in values if v < val)
@@ -695,9 +791,15 @@ async def fetch_historical(session: aiohttp.ClientSession, sym: str,
         return {}
 
 # ── Supabase client ───────────────────────────────────────────────────
-async def supabase_upsert(session: aiohttp.ClientSession, table: str, rows: list):
-    """Upsert rows into Supabase table."""
+async def supabase_upsert(session: aiohttp.ClientSession, table: str, rows: list, on_conflict: str = None):
+    """Upsert rows into Supabase table. Pass on_conflict for tables whose
+    unique constraint isn't the primary key PostgREST would infer by default
+    (e.g. stock_history uses (snapshot_date, sym), not its surrogate id)."""
+    if not rows:
+        return
     url = f"{SUPABASE_URL}/rest/v1/{table}"
+    if on_conflict:
+        url += f"?on_conflict={on_conflict}"
     headers = {
         "apikey":        SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
@@ -752,6 +854,97 @@ def is_scan_time() -> bool:
 
 # ── Historical data cache + instrument key map ────────────────────────
 historical_cache: dict = {}   # sym -> {prices, volumes}
+nifty_cache: dict = {}        # {'prices': [...]} — Nifty index daily closes for TV RS calc
+
+NIFTY_INSTRUMENT_KEY = "NSE_INDEX|Nifty 50"  # Upstox key for Nifty 50 index
+
+# All indices to track on the Index Dashboard page
+# Key = display name, value = Upstox instrument key
+INDEX_TRACKER = {
+    "Nifty 50":       "NSE_INDEX|Nifty 50",
+    "Nifty Next 50":  "NSE_INDEX|Nifty Next 50",
+    "Nifty 500":      "NSE_INDEX|Nifty 500",
+    "Midcap 150":     "NSE_INDEX|Nifty Midcap 150",
+    "Smallcap 250":   "NSE_INDEX|Nifty Smallcap 250",
+    "Microcap 250":   "NSE_INDEX|Nifty Microcap 250",
+    "Bank Nifty":     "NSE_INDEX|Nifty Bank",
+    "IT":             "NSE_INDEX|Nifty IT",
+    "Pharma":         "NSE_INDEX|Nifty Pharma",
+    "Auto":           "NSE_INDEX|Nifty Auto",
+    "FMCG":           "NSE_INDEX|Nifty FMCG",
+    "Metal":          "NSE_INDEX|Nifty Metal",
+    "Realty":         "NSE_INDEX|Nifty Realty",
+    "Energy":         "NSE_INDEX|Nifty Energy",
+}
+
+# Cache for all index historical data
+index_history_cache: dict = {}  # name -> {prices, volumes}
+
+async def load_index_cache(session: aiohttp.ClientSession):
+    """Fetch historical data for all tracked indices."""
+    global index_history_cache
+    log.info(f"Loading historical data for {len(INDEX_TRACKER)} indices…")
+    to   = datetime.now(IST).strftime('%Y-%m-%d')
+    from_= (datetime.now(IST) - timedelta(days=420)).strftime('%Y-%m-%d')
+    headers = {
+        "Authorization": f"Bearer {ANALYTICS_TOKEN}",
+        "Accept": "application/json"
+    }
+    loaded = 0
+    for name, ikey in INDEX_TRACKER.items():
+        encoded = ikey.replace('|', '%7C').replace(' ', '%20')
+        url = f"https://api.upstox.com/v2/historical-candle/{encoded}/day/{to}/{from_}"
+        try:
+            async with session.get(url, headers=headers,
+                                   timeout=aiohttp.ClientTimeout(total=15)) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    candles = list(reversed(data.get('data', {}).get('candles', [])))
+                    if candles:
+                        index_history_cache[name] = {
+                            'prices':  [c[4] for c in candles],
+                            'volumes': [c[5] for c in candles],
+                            'highs':   [c[2] for c in candles],
+                            'lows':    [c[3] for c in candles],
+                        }
+                        loaded += 1
+                else:
+                    log.warning(f"Index {name} fetch failed: {r.status}")
+        except Exception as e:
+            log.warning(f"Index {name} error: {e}")
+        await asyncio.sleep(0.2)
+    log.info(f"✅ Index cache loaded: {loaded}/{len(INDEX_TRACKER)} indices")
+
+
+async def load_nifty_cache(session: aiohttp.ClientSession):
+    """Fetch Nifty 50 daily close history needed for TradingView-style RS calculation."""
+    global nifty_cache
+    log.info("Fetching Nifty 50 historical data for TV-style RS calc…")
+    to   = datetime.now(IST).strftime('%Y-%m-%d')
+    from_= (datetime.now(IST) - timedelta(days=420)).strftime('%Y-%m-%d')
+    encoded = NIFTY_INSTRUMENT_KEY.replace('|', '%7C').replace(' ', '%20')
+    url  = f"https://api.upstox.com/v2/historical-candle/{encoded}/day/{to}/{from_}"
+    headers = {
+        "Authorization": f"Bearer {ANALYTICS_TOKEN}",
+        "Accept": "application/json"
+    }
+    try:
+        async with session.get(url, headers=headers,
+                               timeout=aiohttp.ClientTimeout(total=30)) as r:
+            if r.status != 200:
+                text = await r.text()
+                log.warning(f"Nifty fetch failed: {r.status} {text[:200]}")
+                return
+            data = await r.json()
+            candles = list(reversed(data.get('data', {}).get('candles', [])))
+            nifty_cache = {
+                'prices':  [c[4] for c in candles],  # close
+                'volumes': [c[5] for c in candles],
+            }
+            log.info(f"✅ Nifty 50 history: {len(nifty_cache['prices'])} days")
+    except Exception as e:
+        log.warning(f"Nifty cache load failed: {e}")
+
 instrument_key_map: dict = {} # sym -> full instrument key (e.g. NSE_EQ|INE002A01018)
 
 async def load_instrument_master(session: aiohttp.ClientSession):
@@ -888,6 +1081,8 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
     if scan_type == 'batch_eod':
         log.info("  End-of-day scan — reloading full historical cache to bake in today's final close…")
         await load_historical_cache(session)
+        await load_nifty_cache(session)
+        await load_index_cache(session)
 
     # Step 3: DO NOT mutate historical_cache prices in place (was causing chg% drift).
     # Instead, keep historical close as the immutable baseline and use live price
@@ -948,11 +1143,17 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         if loop_idx % 100 == 0:
             await asyncio.sleep(0)
 
-        # RS
+        # RS (IBD percentile — kept for trend/history sparkline)
         my_raw_val = raw_by_sym.get(sym)
         rs = percentile_rank(raw_vals, my_raw_val) if my_raw_val is not None else 0
         hist = rs_history.get(sym, [])
         trend_data = rs_slope(hist)
+
+        # RS — TradingView / Lakshmi Mata Pine Script formula
+        # Benchmark-relative, normalized by stock's own 252-day rawRS range
+        rs_tv = None
+        if nifty_cache.get('prices'):
+            rs_tv = calc_rs_tv_normalized(prices, nifty_cache['prices'])
 
         # Index-relative RS — rank within each index peer group only
         my_raw = my_raw_val
@@ -1034,6 +1235,7 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'chg_pct':        chg,
             'volume':         int(vol),
             'rs':             rs,
+            'rs_tv':          rs_tv,       # TradingView / Lakshmi Mata Pine Script RS
             'rs_nifty50':     rs_nifty50,
             'rs_midcap':      rs_midcap,
             'rs_smallcap':    rs_smallcap,
@@ -1088,6 +1290,107 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
     # Step 6: Build sector RS
     sector_rows = build_sector_rs(processed, SECTOR_MAP)
 
+    # Step 6.5: Build index dashboard data
+    # For each tracked index: live price + daily/weekly/monthly chg + RS-TV + Stage
+    index_rows = []
+    nifty_prices = nifty_cache.get('prices', [])
+
+    for idx_name, idx_data in index_history_cache.items():
+        prices  = idx_data['prices']
+        n       = len(prices)
+        if n < 5:
+            continue
+
+        last    = prices[-1]
+        prev    = prices[-2]  if n >= 2   else last
+        week    = prices[-6]  if n >= 6   else prices[0]
+        month   = prices[-22] if n >= 22  else prices[0]
+        qtr     = prices[-66] if n >= 66  else prices[0]
+        yr      = prices[-252] if n >= 252 else prices[0]
+
+        chg_d = round((last - prev) / prev * 100, 2) if prev else 0
+        chg_w = round((last - week) / week * 100, 2) if week else 0
+        chg_m = round((last - month) / month * 100, 2) if month else 0
+        chg_q = round((last - qtr)  / qtr  * 100, 2) if qtr  else 0
+        chg_y = round((last - yr)   / yr   * 100, 2) if yr   else 0
+
+        # RS-TV using Nifty as benchmark (skip for Nifty itself)
+        if idx_name == 'Nifty 50':
+            rs_tv_idx = 50  # Nifty vs itself is always median
+        elif nifty_prices and len(nifty_prices) >= 252:
+            rs_tv_idx = calc_rs_tv_normalized(prices, nifty_prices)
+        else:
+            rs_tv_idx = None
+
+        # Weinstein Stage for the index
+        highs = idx_data.get('highs', prices)
+        lows  = idx_data.get('lows', prices)
+        ma30  = sma(prices, min(30, n))
+        ma10  = sma(prices, min(10, n))
+        h52   = max(prices[-252:]) if n >= 252 else max(prices)
+        l52   = min(prices[-252:]) if n >= 252 else min(prices)
+        pct_from_high = round((last - h52) / h52 * 100, 1) if h52 else 0
+
+        # Stage logic for index
+        if ma30 and last > ma30 and chg_d >= 0:
+            if pct_from_high >= -5:
+                stage = 3
+            else:
+                stage = 2
+        elif ma30 and last < ma30 and chg_d <= 0:
+            stage = 4
+        else:
+            stage = 1
+
+        stage_labels = {1:'S1 Base', 2:'S2 Up', 3:'S3 Top', 4:'S4 Down'}
+        stage_label  = stage_labels.get(stage, 'S1 Base')
+
+        # Above/below key MAs
+        above_ma10 = last > ma10 if ma10 else None
+        above_ma30 = last > ma30 if ma30 else None
+
+        # Top 3 stocks in this index from our scan (only for constituent indices)
+        top_stocks = []
+        constituent_map = {
+            'Nifty 50':    [s for s in processed if s.get('in_nifty50')],
+            'Midcap 150':  [s for s in processed if s.get('in_midcap')],
+            'Smallcap 250':[s for s in processed if s.get('in_smallcap')],
+            'Microcap 250':[s for s in processed if s.get('in_microcap')],
+        }
+        if idx_name in constituent_map:
+            members = constituent_map[idx_name]
+            top3    = sorted(members, key=lambda x: x.get('rs_tv') or x.get('rs') or 0, reverse=True)[:3]
+            bot3    = sorted(members, key=lambda x: x.get('rs_tv') or x.get('rs') or 0)[:3]
+            top_stocks = [{'sym':s['sym'],'rs':s.get('rs_tv') or s.get('rs')} for s in top3]
+            bot_stocks = [{'sym':s['sym'],'rs':s.get('rs_tv') or s.get('rs')} for s in bot3]
+        else:
+            bot_stocks = []
+
+        index_rows.append({
+            'name':          idx_name,
+            'last_price':    round(last, 2),
+            'chg_d':         chg_d,
+            'chg_w':         chg_w,
+            'chg_m':         chg_m,
+            'chg_q':         chg_q,
+            'chg_y':         chg_y,
+            'rs_tv':         rs_tv_idx,
+            'stage':         stage,
+            'stage_label':   stage_label,
+            'above_ma10':    above_ma10,
+            'above_ma30':    above_ma30,
+            'high_52w':      round(h52, 2),
+            'low_52w':       round(l52, 2),
+            'pct_from_high': pct_from_high,
+            'top_stocks':    json.dumps(top_stocks),
+            'bot_stocks':    json.dumps(bot_stocks),
+            'last_updated':  now_ist.isoformat(),
+        })
+
+    if index_rows:
+        await supabase_upsert(session, 'index_dashboard', index_rows, on_conflict='name')
+        log.info(f"  📊 Index dashboard: {len(index_rows)} indices saved")
+
     # Step 7: Save to Supabase
     log.info(f"  Saving {len(processed)} stocks to Supabase…")
     await supabase_upsert(session, 'stocks', processed)
@@ -1095,6 +1398,36 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         {**s, 'last_updated': now_ist.isoformat(), 'top_stocks': json.dumps(s['top_stocks'])}
         for s in sector_rows
     ])
+
+    # Step 7.5: At end-of-day, also archive a permanent daily snapshot.
+    # This is what powers the "view any past date" history feature —
+    # without this, only today's live state is ever available.
+    if scan_type == 'batch_eod':
+        snapshot_date = now_ist.strftime('%Y-%m-%d')
+        log.info(f"  📸 Archiving EOD snapshot for {snapshot_date}…")
+
+        history_rows = []
+        for p in processed:
+            row = {k: v for k, v in p.items() if k not in ('last_updated', 'scan_type')}
+            row['snapshot_date'] = snapshot_date
+            history_rows.append(row)
+        await supabase_upsert(session, 'stock_history', history_rows, on_conflict='snapshot_date,sym')
+
+        sector_history_rows = [
+            {
+                'snapshot_date': snapshot_date,
+                'sector':        s['sector'],
+                'avg_rs':        s['avg_rs'],
+                'rank':          s['rank'],
+                'count':         s['count'],
+                'pp_count':      s['pp_count'],
+                'improving':     s['improving'],
+                'top_stocks':    json.dumps(s['top_stocks']),
+            }
+            for s in sector_rows
+        ]
+        await supabase_upsert(session, 'sector_history', sector_history_rows, on_conflict='snapshot_date,sector')
+        log.info(f"  ✅ Snapshot archived: {len(history_rows)} stocks for {snapshot_date}")
 
     # Step 8: Update scan metadata
     duration = round(time.time() - start, 1)
@@ -1167,6 +1500,10 @@ async def main():
 
         # Step 2: Load instrument master to get correct API keys
         await load_instrument_master(session)
+
+        # Step 2b: Load Nifty 50 + all index histories for TV RS calc and index dashboard
+        await load_nifty_cache(session)
+        await load_index_cache(session)
 
         # Step 3: Load historical data cache at startup
         log.info("Loading historical data cache at startup…")
