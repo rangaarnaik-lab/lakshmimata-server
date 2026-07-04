@@ -1659,8 +1659,12 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         # RS — TradingView / Lakshmi Mata Pine Script formula
         # Benchmark-relative, normalized by stock's own 252-day rawRS range
         rs_tv = None
-        if nifty_cache.get('prices'):
+        if nifty_cache.get('prices') and len(nifty_cache['prices']) >= 60:
             rs_tv = calc_rs_tv_normalized(prices, nifty_cache['prices'])
+        # Fallback: if RS-TV can't be calculated, use IBD percentile rank
+        # This ensures EVERY stock always has a number shown
+        if rs_tv is None:
+            rs_tv = rs  # IBD percentile rank as fallback
 
         # Index-relative RS — rank within each index peer group only
         my_raw = my_raw_val
