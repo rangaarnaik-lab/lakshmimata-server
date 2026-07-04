@@ -498,21 +498,29 @@ def calc_rs_tv_normalized(prices: list, bench_prices: list, end_idx: int = None)
     """
     end = end_idx if end_idx is not None else len(prices) - 1
 
-    # calc_rs_tv_raw needs 252 bars minimum — check we have enough
+    # Need at least 252 bars for the raw RS calculation
     if end < 252 or len(bench_prices) < 252:
-        return None
+        # For stocks with less than 252 days, use simpler relative strength
+        # Just compare stock return vs Nifty return over available history
+        if end < 60 or len(bench_prices) < 60:
+            return None
+        n = min(end, len(bench_prices)-1, 60)
+        s_ret = (prices[end] - prices[end-n]) / prices[end-n] * 100 if prices[end-n] else None
+        b_ret = (bench_prices[n] - bench_prices[0]) / bench_prices[0] * 100 if bench_prices[0] else None
+        if s_ret is None or b_ret is None:
+            return None
+        diff = s_ret - b_ret
+        # Scale to 1-99
+        return max(1, min(99, int(50 + diff * 2)))
 
     # Compute today's rawRS
     current_raw = calc_rs_tv_raw(prices, bench_prices, end_idx=end)
     if current_raw is None:
         return None
 
-    # Build rawRS history for the normalization window
-    # Pine Script uses ta.highest/lowest over last 252 bars of rawRS
-    # We compute rawRS at each available day going back up to 252 days
-    # Each rawRS call only needs 252 bars from that point
+    # Build rawRS history for normalization (up to 252 lookback days)
     raw_history = []
-    lookback_days = min(252, end - 252)  # how far back we can compute rawRS
+    lookback_days = min(252, end - 252)
     for d in range(lookback_days, -1, -1):
         idx = end - d
         if idx < 252:
@@ -521,10 +529,7 @@ def calc_rs_tv_normalized(prices: list, bench_prices: list, end_idx: int = None)
         if raw is not None:
             raw_history.append(raw)
 
-    # Need at least a few points to normalize meaningfully
     if len(raw_history) < 5:
-        # If we can't get history, just use current raw vs a simple scale
-        # This handles stocks with exactly 252 days - return a basic score
         return 50
 
     rs_high = max(raw_history)
@@ -1442,12 +1447,11 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
 
         # Index-relative RS — rank within each index peer group only
         my_raw = my_raw_val
-        # Index-relative RS — rank THIS stock vs the pool of each index
-        # Note: membership not required — any stock gets ranked against each pool
-        # This lets you compare GRSE vs Midcap stocks even if GRSE isn't in Midcap
-        rs_nifty50  = percentile_rank(nifty50_raws,  my_raw) if my_raw is not None and len(nifty50_raws)  >= 5 else None
-        rs_midcap   = percentile_rank(midcap_raws,   my_raw) if my_raw is not None and len(midcap_raws)   >= 5 else None
-        rs_smallcap = percentile_rank(smallcap_raws, my_raw) if my_raw is not None and len(smallcap_raws) >= 5 else None
+        # Index-relative RS — rank THIS stock vs each index pool
+        # Falls back to overall raw_vals pool if index pool is too small
+        rs_nifty50  = percentile_rank(nifty50_raws  if len(nifty50_raws)  >= 10 else raw_vals, my_raw) if my_raw is not None else None
+        rs_midcap   = percentile_rank(midcap_raws   if len(midcap_raws)   >= 10 else raw_vals, my_raw) if my_raw is not None else None
+        rs_smallcap = percentile_rank(smallcap_raws if len(smallcap_raws) >= 10 else raw_vals, my_raw) if my_raw is not None else None
         rs_microcap = percentile_rank(microcap_raws, my_raw) if my_raw is not None and sym in MICROCAP and len(microcap_raws) >= 5 else None
 
         # Sector-relative RS — rank within stock's own sector only
