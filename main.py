@@ -711,25 +711,76 @@ def build_sector_rs(processed: list, sector_map: dict) -> list:
 
 # ── Sector map ────────────────────────────────────────────────────────
 SECTOR_MAP = {
-    "IT":            ["TCS","INFOSYS","WIPRO","HCLTECH","TECHM","MPHASIS","PERSISTENT","COFORGE","LTTS","KPITTECH","TATAELXSI"],
-    "Banking":       ["HDFCBANK","ICICIBANK","SBIN","KOTAKBANK","AXISBANK","INDUSINDBK","BANDHANBNK","FEDERALBNK","IDFCFIRSTB","RBLBANK","YESBANK","PNB","CANBK","BANKBARODA","AUBANK"],
-    "NBFC":          ["BAJFINANCE","BAJAJFINSV","CHOLAFIN","MUTHOOTFIN","MANAPPURAM","AAVAS","HOMEFIRST","LICHSGFIN","PNBHOUSING","CANFINHOME"],
-    "Auto":          ["MARUTI","TATAMOTORS","M&M","BAJAJ-AUTO","HEROMOTOCO","TVSMOTOR","EICHERMOT","BOSCHLTD","MOTHERSON","ESCORTS"],
-    "Pharma":        ["SUNPHARMA","DRREDDY","CIPLA","DIVISLAB","LUPIN","AUROPHARMA","BIOCON","ALKEM","GLENMARK","IPCALAB","MANKIND","JUBLPHARMA"],
-    "FMCG":          ["HINDUNILVR","ITC","NESTLEIND","DABUR","MARICO","COLPAL","EMAMILTD","GODREJCP","TATACONSUM"],
-    "Energy":        ["RELIANCE","ONGC","BPCL","IOC","HINDPETRO","GAIL","PETRONET","IGL","MGL","ATGL"],
-    "Metals":        ["JSWSTEEL","TATASTEEL","HINDALCO","COALINDIA","VEDL","NMDC","MOIL"],
-    "Infra/Capital": ["LT","SIEMENS","ABB","BHEL","BEL","HAL","CUMMINSIND","THERMAX","HAVELLS"],
-    "Cement":        ["ULTRACEMCO","GRASIM","SHREECEM","AMBUJACEM","ACC","JKCEMENT","RAMCOCEM"],
-    "Consumer":      ["TITAN","ASIANPAINT","BERGEPAINT","PIDILITIND","VOLTAS","CROMPTON"],
-    "Telecom":       ["BHARTIARTL","IDEA","TATACOMM","RAILTEL","HFCL","STLTECH"],
-    "Realty":        ["DLF","GODREJPROP","OBEROIRLTY","PRESTIGE","BRIGADE","PHOENIXLTD","SOBHA","LODHA"],
-    "Healthcare":    ["APOLLOHOSP","FORTIS","MAXHEALTH","METROPOLIS","THYROCARE","LALPATHLAB","NARAYANA","ASTER"],
-    "Insurance":     ["SBILIFE","HDFCLIFE","ICICIPRULI","LICI","GICRE","STARHEALTH"],
-    "Internet":      ["ZOMATO","NYKAA","PAYTM","POLICYBZR","INDIAMART","JUSTDIAL","RATEGAIN","IXIGO"],
-    "Travel":        ["IRCTC","EASEMYTRIP","THOMASCOOK"],
-    "Exchange":      ["BSE","CDSL","CAMS","MCX","ANGELONE"],
+    "IT": ["TCS","INFY","WIPRO","HCLTECH","TECHM","MPHASIS","PERSISTENT","COFORGE",
+           "LTTS","KPITTECH","TATAELXSI","OFSS","LTIM","NIITTECH","HEXAWARE","MASTEK",
+           "ZENSAR","NIIT","ECLERX","BIRLASOFT","RATEGAIN","NEWGEN","TANLA","INTELLECT"],
+    "Banking": ["HDFCBANK","ICICIBANK","SBIN","KOTAKBANK","AXISBANK","INDUSINDBK",
+                "BANDHANBNK","FEDERALBNK","IDFCFIRSTB","RBLBANK","YESBANK","CANARABANK",
+                "BANKBARODA","PNB","UNIONBANK","MAHABANK","UCOBANK","CENTRALBK","IOB",
+                "INDIANB","BANKINDIA","DCBBANK","SOUTHBANK","KARURVYSYA","CSBBANK"],
+    "NBFC": ["BAJFINANCE","BAJAJFINSV","CHOLAFIN","MUTHOOTFIN","MANAPPURAM","M&MFIN",
+             "SHRIRAMFIN","LICHSGFIN","PNBHOUSING","CANFINHOME","AAVAS","HOMEFIRST",
+             "APTUS","CREDITACC","SPANDANA","UGROCAP","SATIN"],
+    "Insurance": ["HDFCLIFE","SBILIFE","ICICIPRULI","LICI","STARHEALTH","NIACL","GICRE",
+                  "ICICIGI","BAJAJHLDNG","MAXFINSERV"],
+    "Pharma": ["SUNPHARMA","DRREDDY","CIPLA","DIVISLAB","BIOCON","AUROPHARMA","LUPIN",
+               "TORNTPHARM","ALKEM","IPCALAB","PFIZER","GLAXO","ABBOTINDIA","SANOFI",
+               "GLAND","LAURUSLABS","GRANULES","NATCOPHARM","AJANTPHARM","JBCHEPHARM",
+               "ERIS","SHILPAMED","SUVEN","NEULANDLAB","SEQUENT"],
+    "Auto": ["MARUTI","TATAMOTORS","M&M","BAJAJ-AUTO","HEROMOTOCO","EICHERMOT",
+             "TVSMOTORS","ASHOKLEY","TVSMOTOR","ATUL","ESCORTS","FORCE","SML"],
+    "Auto Ancil": ["MOTHERSON","BOSCHLTD","BHARATFORG","SUNDRMFAST","EXIDEIND","AMARARAJA",
+                   "MRF","APOLLOTYRE","CEATLTD","BALKRISIND","TIINDIA","FIEM","SUPRAJIT",
+                   "MINDA","LUMAX","ENDURANCE","GABRIEL","SUBROS","JAMNA","RACL"],
+    "FMCG": ["HINDUNILVR","ITC","NESTLEIND","BRITANNIA","DABUR","MARICO","GODREJCP",
+              "COLPAL","EMAMILTD","TATACONSUM","VBL","RADICO","MCDOWELL-N","UNITEDSPIRITS",
+              "PGHH","GILLETTE","HONASA","BIKAJI","DOMS","DEVYANI","SAPPHIRE","JUBLFOOD",
+              "WESTLIFE","BARBEQUE","THANGAMALY","VAIBHAVGBL"],
+    "Cement": ["ULTRACEMCO","SHREECEM","AMBUJACEMENT","ACC","DALMIACEM","JKCEMENT",
+               "RAMCOCEM","HEIDELBERG","PRISMJOINTS","STARCEMENT","NUVOCO","BIRLACORPN",
+               "ORIENTCEM","SAGCEM","MANGCEM"],
+    "Steel & Metal": ["TATASTEEL","JSWSTEEL","SAIL","HINDALCO","NATIONALUM","NMDC","MOIL",
+                      "VEDL","HINDCOPPER","COALINDIA","APLAPOLLO","JSPL","RATNAMANI",
+                      "WELSPUNLIVING","KALYANKJIL","MSTCLTD"],
+    "Energy & Oil": ["RELIANCE","ONGC","BPCL","IOC","HPCL","GAIL","PETRONET","OIL",
+                     "HINDPETRO","MGL","IGL","GSPL","GUJGASLTD","ATGL","AEGISCHEM"],
+    "Power": ["NTPC","POWERGRID","ADANIGREEN","TATAPOWER","CESC","TORNTPOWER","JPPOWER",
+              "RPOWER","SJVN","NHPC","RVNL","IRCON","POWERMECH","KEC","KALPATPOWR",
+              "RITES","ENGINERSIN","BHEL"],
+    "Realty": ["DLF","GODREJPROP","OBEROIRLTY","PHOENIXLTD","PRESTIGE","BRIGADE","SOBHA",
+               "MAHINDRALIFESC","KOLTEPATIL","SUNTECK","ANANTRAJ","HEMISPHEREP","KEYSTONE"],
+    "Engineering": ["LTIM","LT","SIEMENS","ABB","HONAUT","CUMMINSIND","THERMAX","BFUTILITIE",
+                    "KIRLOSENG","KIRLOSKARIND","ELGIEQUIP","GRINDWELL","GREAVESCOT",
+                    "LLOYDSME","LLOYDSENGG","GMRINFRA","AIAENG","RAMKRISHNA","JYOTHYLAB"],
+    "Defence": ["HAL","BEL","MAZDOCK","GRSE","COCHINSHIP","BEML","MIDHANI","DCXSYS",
+                "IDEAFORGE","PARAS","ZEN","SOLARINDS","DYNAMATECH","NEWSPACE"],
+    "Capital Goods": ["BHEL","TITAGARH","TEXRAIL","RAILTEL","IRFC","IRCTC","CONCOR",
+                      "MAHINDCIE","SCHAEFFLER","SKFINDIA","TIMKEN","NRB","IGARASHI"],
+    "Chemicals": ["PIDILITIND","ATUL","DEEPAKNTR","NAVINFLUOR","CLEAN","FINEORG","NOCIL",
+                  "VINATI","ROSSARI","TATACHEM","GNFC","GSFC","DFMFOODS","BALRAMCHIN",
+                  "DHANUKA","RALLIS","SUMITCHEM","BAYER","BASF","INSECTICID"],
+    "Textile": ["PAGEIND","DOLLAR","RAYMOND","ARVIND","VARDHMAN","TRIDENT","WELSPUNIND",
+                "GOKEX","KITEX","NITIN","NAHARSPG","FILATEX","SPANDEX"],
+    "Telecom": ["BHARTIARTL","IDEA","TATACOMM","HFCL","STLTECH","RAILTEL","TEJAS"],
+    "Media": ["ZEEL","SUNTV","PVRINOX","INOXWIND","SAREGAMA","TIPS","BALAJITELE"],
+    "Retail": ["TRENT","ABFRL","SHOPERSTOP","VMART","SPENCERS","NYKAA","MEESHO"],
+    "Hospital & Health": ["APOLLOHOSP","FORTIS","ASTER","MEDANTA","RAINBOW","VIJAYAHOSP",
+                          "KIMS","METROPOLIS","THYROCARE","LALPATHLAB","KRSNAA"],
+    "Hotel & Travel": ["INDHOTEL","LEMONTREE","MAHINDRAHOLIDAYS","EIH","CHALET","THOMASCOOK",
+                       "IRCTC","EASEMYTRIP"],
+    "Agriculture": ["UPL","COROMANDEL","KSCL","KAVERI","NUZIVEEDU","GODREJAGRO","JAINIRRIG",
+                    "TATACHEM","CHAMBAL","IFFCO"],
+    "Logistics": ["BLUEDART","DELHIVERY","MAHLOG","VRL","TCI","ALLCARGO","GATI","XPRO"],
+    "IT Services": ["WIPRO","NIIT","APTECH","CAMS","CDSL","BSE","MCX","ANGELONE",
+                    "FINCABLES","POLICYBAZAAR","PAYTM","NSDL"],
 }
+
+def get_sector(sym: str) -> str:
+    for sector, stocks in SECTOR_MAP.items():
+        if sym in stocks:
+            return sector
+    return 'Other'
+
 
 def get_sector(sym: str) -> str:
     for sector, stocks in SECTOR_MAP.items():
@@ -1352,6 +1403,7 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         log.info(f"  Sample OHLC keys: {[f'NSE_EQ:{s}' for s in sample]}")
 
     log.info(f"  Live prices: {len(live_data)} stocks")
+    log.info(f"  OHLC keys sample: {list(live_data.keys())[:3] if live_data else 'EMPTY'}")
 
     # Step 2: Only reload full 15-month history once per day, after market
     # close (batch_eod) — this bakes in today's now-final candle as the new
