@@ -1659,9 +1659,12 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         # RS — TradingView / Lakshmi Mata Pine Script formula
         # Benchmark-relative, normalized by stock's own 252-day rawRS range
         rs_tv = None
-        if nifty_cache.get('prices') and len(nifty_cache['prices']) >= 60:
-            rs_tv = calc_rs_tv_normalized(prices, nifty_cache['prices'])
-        # No fallback - RS-TV must be the real Pine Script value or None
+        nifty_prices = nifty_cache.get('prices', [])
+        if len(nifty_prices) >= 252:
+            rs_tv = calc_rs_tv_normalized(prices, nifty_prices)
+        elif len(nifty_prices) >= 60:
+            rs_tv = calc_rs_tv_normalized(prices, nifty_prices)
+        # else: nifty_cache is empty - RS-TV stays None
         # Showing wrong RS would mislead trading decisions
 
         # Index-relative RS — rank within each index peer group only
@@ -2146,6 +2149,33 @@ async def main():
         # Step 3: Load historical data cache at startup
         log.info("Loading historical data cache at startup…")
         await load_historical_cache(session)
+        # Fallback: if Nifty cache empty (Upstox rejected outside hours),
+        # build it from RELIANCE/HDFCBANK price history as Nifty proxy
+        # OR better: use the Nifty index historical candle with a different key
+        if not nifty_cache.get('prices'):
+            log.warning("⚠️ Nifty cache empty — retrying with alternate key...")
+            # Try alternate Nifty key format
+            for nifty_key in ["NSE_INDEX|Nifty 50", "NSE_INDEX|NIFTY 50", "NSE_EQ|NIFTY"]:
+                encoded = nifty_key.replace('|','%7C').replace(' ','%20')
+                url = f"https://api.upstox.com/v2/historical-candle/{encoded}/day/{datetime.now(IST).strftime('%Y-%m-%d')}/{(datetime.now(IST)-timedelta(days=420)).strftime('%Y-%m-%d')}"
+                try:
+                    async with session.get(url, headers={"Authorization":f"Bearer {ANALYTICS_TOKEN}","Accept":"application/json"},
+                                          timeout=aiohttp.ClientTimeout(total=30)) as r:
+                        if r.status == 200:
+                            data = await r.json()
+                            candles = list(reversed(data.get('data',{}).get('candles',[])))
+                            if candles:
+                                nifty_cache = {'prices':[c[4] for c in candles],'volumes':[c[5] for c in candles]}
+                                log.info(f"✅ Nifty loaded with key {nifty_key}: {len(nifty_cache['prices'])} days")
+                                break
+                except Exception as e:
+                    log.warning(f"Nifty retry {nifty_key} failed: {e}")
+
+        if not nifty_cache.get('prices'):
+            log.error("❌ Nifty cache still empty after retries — RS-TV will be None for all stocks")
+        else:
+            log.info(f"✅ Nifty cache ready: {len(nifty_cache['prices'])} days — RS-TV will be calculated")
+
         log.info("✅ Proceeding to initial scan…")
 
         # Step 4: Run initial scan (hard timeout so a stall can't hang the process forever)
