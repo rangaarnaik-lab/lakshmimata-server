@@ -2154,9 +2154,9 @@ async def main():
         ist_now_initial = datetime.now(IST)
         if is_market_open():
             initial_scan_type = 'live'
-        elif ist_now_initial.hour >= MARKET_CLOSE_H:
-            initial_scan_type = 'batch_eod'
         else:
+            # Always run batch_morning outside market hours
+            # RS-TV and all signals calculate from historical data — no live prices needed
             initial_scan_type = 'batch_morning'
         log.info(f"Initial scan type detected: {initial_scan_type} (current time {ist_now_initial.strftime('%H:%M IST')})")
 
