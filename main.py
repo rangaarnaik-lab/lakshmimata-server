@@ -1735,7 +1735,13 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         # Squeeze (BB + Keltner) and VCP
         highs_arr = s.get('highs', prices)
         lows_arr  = s.get('lows', prices)
-        squeeze = detect_bb_squeeze(prices, highs_arr, lows_arr)
+        # ── Multi-timeframe TTM Squeeze ──────────────────────────
+        squeeze_daily  = calc_ttm_squeeze(prices, highs_arr, lows_arr)
+        _w = weekly_cache.get(sym, {})
+        squeeze_weekly = calc_ttm_squeeze(_w.get('prices',[]),_w.get('highs',[]),_w.get('lows',[])) if _w else {'in_squeeze':False,'squeeze_fired':False,'momentum':0,'momentum_dir':'flat','squeeze_days':0,'strength_score':0,'fired_bullish':False,'fired_bearish':False,'bb_width_pct':None,'dots':[],'hist':[]}
+        _h = hourly_cache.get(sym, {})
+        squeeze_hourly = calc_ttm_squeeze(_h.get('prices',[]),_h.get('highs',[]),_h.get('lows',[])) if _h else {'in_squeeze':False,'squeeze_fired':False,'momentum':0,'momentum_dir':'flat','squeeze_days':0,'strength_score':0,'fired_bullish':False,'fired_bearish':False,'bb_width_pct':None,'dots':[],'hist':[]}
+        squeeze = squeeze_daily  # backward compat
         vcp     = detect_vcp(prices, volumes, highs_arr, lows_arr)
 
         # 52W high/low
