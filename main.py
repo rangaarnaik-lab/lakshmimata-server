@@ -1021,13 +1021,55 @@ async def fetch_index_csv(session: aiohttp.ClientSession, url: str) -> list:
 
 async def load_official_index_lists(session: aiohttp.ClientSession):
     """
-    Replace hardcoded NIFTY50/MIDCAP/SMALLCAP/MICROCAP with the real,
-    current official lists from niftyindices.com. Falls back silently
-    to the existing hardcoded lists on any failure.
+    Load index constituents:
+    1. Try to load from Supabase (fast, works offline)
+    2. If stale/empty, fetch from niftyindices.com CSV
+    3. Save fresh data back to Supabase
+    Falls back to hardcoded lists only if everything fails.
     """
     global NIFTY50, MIDCAP, SMALLCAP, MICROCAP, ALL_STOCKS
 
-    log.info("Fetching official NSE index constituent lists…")
+    SUPABASE_REFRESH_DAYS = 7  # refresh weekly
+
+    # ── Step 1: Try loading from Supabase ──────────────────────────
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/index_constituents?select=index_name,symbols,updated_at&order=updated_at.desc"
+        headers = {
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+        }
+        async with session.get(url, headers=headers,
+                               timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status == 200:
+                rows = await r.json()
+                if rows:
+                    # Check if data is fresh enough
+                    from datetime import timezone
+                    latest = rows[0].get('updated_at','')
+                    if latest:
+                        updated = datetime.fromisoformat(latest.replace('Z','+00:00'))
+                        age_days = (datetime.now(timezone.utc) - updated).days
+                        if age_days <= SUPABASE_REFRESH_DAYS:
+                            # Use cached data
+                            for row in rows:
+                                syms = row.get('symbols', [])
+                                if isinstance(syms, str):
+                                    import json as _json
+                                    syms = _json.loads(syms)
+                                name = row.get('index_name','')
+                                if name == 'NIFTY50'   and len(syms) >= 40:  NIFTY50   = syms
+                                if name == 'MIDCAP150' and len(syms) >= 100: MIDCAP    = syms
+                                if name == 'SMALLCAP250' and len(syms) >= 150: SMALLCAP = syms
+                                if name == 'MICROCAP250' and len(syms) >= 150: MICROCAP = syms
+                            log.info(f"✅ Loaded from Supabase: N50={len(NIFTY50)} MID={len(MIDCAP)} SML={len(SMALLCAP)}")
+                            return
+                        else:
+                            log.info(f"Index data is {age_days}d old — refreshing from niftyindices.com")
+    except Exception as e:
+        log.warning(f"Supabase index load failed: {e}")
+
+    # ── Step 2: Fetch fresh from niftyindices.com ──────────────────
+    log.info("Fetching official NSE index constituent lists from niftyindices.com…")
     results = await asyncio.gather(
         fetch_index_csv(session, NIFTY_INDEX_CSV_URLS['NIFTY50']),
         fetch_index_csv(session, NIFTY_INDEX_CSV_URLS['MIDCAP150']),
@@ -1035,38 +1077,67 @@ async def load_official_index_lists(session: aiohttp.ClientSession):
         fetch_index_csv(session, NIFTY_INDEX_CSV_URLS['MICROCAP250']),
         return_exceptions=True,
     )
-    fresh_nifty50, fresh_midcap, fresh_smallcap, fresh_microcap = [
+    fresh_n50, fresh_mid, fresh_sml, fresh_mic = [
         r if isinstance(r, list) else [] for r in results
     ]
 
-    if len(fresh_nifty50) >= 40:
-        NIFTY50 = fresh_nifty50
-        log.info(f"✅ Nifty 50: {len(NIFTY50)} stocks (official)")
-    else:
-        log.warning(f"⚠️ Nifty 50 fetch returned {len(fresh_nifty50)} — keeping {len(NIFTY50)} hardcoded fallback")
+    updated_any = False
 
-    if len(fresh_midcap) >= 100:
-        MIDCAP = fresh_midcap
-        log.info(f"✅ Midcap 150: {len(MIDCAP)} stocks (official)")
+    if len(fresh_n50) >= 40:
+        NIFTY50 = fresh_n50
+        log.info(f"✅ Nifty 50: {len(NIFTY50)} stocks")
+        updated_any = True
     else:
-        log.warning(f"⚠️ Midcap fetch returned {len(fresh_midcap)} — keeping {len(MIDCAP)} hardcoded fallback")
+        log.warning(f"⚠️ Nifty 50 fetch returned {len(fresh_n50)} — keeping existing {len(NIFTY50)}")
 
-    if len(fresh_smallcap) >= 150:
-        SMALLCAP = fresh_smallcap
-        log.info(f"✅ Smallcap 250: {len(SMALLCAP)} stocks (official)")
+    if len(fresh_mid) >= 100:
+        MIDCAP = fresh_mid
+        log.info(f"✅ Midcap 150: {len(MIDCAP)} stocks")
+        updated_any = True
     else:
-        log.warning(f"⚠️ Smallcap fetch returned {len(fresh_smallcap)} — keeping {len(SMALLCAP)} hardcoded fallback")
+        log.warning(f"⚠️ Midcap fetch returned {len(fresh_mid)} — keeping existing {len(MIDCAP)}")
 
-    if len(fresh_microcap) >= 150:
-        MICROCAP = fresh_microcap
-        log.info(f"✅ Microcap 250: {len(MICROCAP)} stocks (official)")
+    if len(fresh_sml) >= 150:
+        SMALLCAP = fresh_sml
+        log.info(f"✅ Smallcap 250: {len(SMALLCAP)} stocks")
+        updated_any = True
     else:
-        log.warning(f"⚠️ Microcap fetch returned {len(fresh_microcap)} — keeping {len(MICROCAP)} hardcoded fallback")
+        log.warning(f"⚠️ Smallcap fetch returned {len(fresh_sml)} — keeping existing {len(SMALLCAP)}")
 
-    # Rebuild ALL_STOCKS to include any official-list stocks not already covered
-    # (ALL_STOCKS itself is later overwritten by the Upstox instrument master in
-    # main(), so this just ensures the index membership flags stay consistent)
-    ALL_STOCKS = list(dict.fromkeys(NIFTY50 + MIDCAP + SMALLCAP + MICROCAP))
+    if len(fresh_mic) >= 150:
+        MICROCAP = fresh_mic
+        log.info(f"✅ Microcap 250: {len(MICROCAP)} stocks")
+        updated_any = True
+    else:
+        log.warning(f"⚠️ Microcap fetch returned {len(fresh_mic)} — keeping existing {len(MICROCAP)}")
+
+    # ── Step 3: Save fresh data to Supabase ────────────────────────
+    if updated_any:
+        try:
+            import json as _json
+            now_iso = datetime.now(IST).isoformat()
+            rows = [
+                {"index_name": "NIFTY50",    "symbols": _json.dumps(NIFTY50),   "updated_at": now_iso},
+                {"index_name": "MIDCAP150",  "symbols": _json.dumps(MIDCAP),    "updated_at": now_iso},
+                {"index_name": "SMALLCAP250","symbols": _json.dumps(SMALLCAP),  "updated_at": now_iso},
+                {"index_name": "MICROCAP250","symbols": _json.dumps(MICROCAP),  "updated_at": now_iso},
+            ]
+            url = f"{SUPABASE_URL}/rest/v1/index_constituents?on_conflict=index_name"
+            headers = {
+                "apikey": SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+                "Content-Type": "application/json",
+                "Prefer": "resolution=merge-duplicates",
+            }
+            async with session.post(url, headers=headers, json=rows,
+                                    timeout=aiohttp.ClientTimeout(total=15)) as r:
+                if r.status in (200,201,204):
+                    log.info(f"✅ Index constituents saved to Supabase (refreshes weekly)")
+                else:
+                    log.warning(f"⚠️ Failed to save to Supabase: {r.status}")
+        except Exception as e:
+            log.warning(f"Could not save index constituents: {e}")
+
 
 async def fetch_instruments(session: aiohttp.ClientSession) -> list:
     """Fetch all NSE instrument keys from Upstox."""
