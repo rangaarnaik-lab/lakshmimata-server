@@ -1495,8 +1495,41 @@ async def load_weekly_hourly_cache(session):
     log.info(f"✅ Weekly/hourly cache: {len(weekly_cache)} weekly, {len(hourly_cache)} hourly")
 
 async def load_index_cache(session: aiohttp.ClientSession):
-    """Fetch historical data for all tracked indices."""
+    """Fetch historical data for all tracked indices.
+    First tries Supabase (fast), falls back to Upstox API if stale/empty."""
     global index_history_cache
+    import json as _json
+
+    # Try loading from Supabase first (instant restart)
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/index_price_history?select=index_name,prices,highs,lows,volumes,updated_at"
+        headers_sb = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+        async with session.get(url, headers=headers_sb,
+                               timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status == 200:
+                rows = await r.json()
+                if rows:
+                    from datetime import timezone
+                    # Check freshness - use if less than 2 days old
+                    latest = rows[0].get('updated_at','')
+                    if latest:
+                        updated = datetime.fromisoformat(latest.replace('Z','+00:00'))
+                        age_days = (datetime.now(timezone.utc) - updated).days
+                        if age_days <= 2:
+                            for row in rows:
+                                name = row['index_name']
+                                index_history_cache[name] = {
+                                    'prices':  _json.loads(row.get('prices','[]')),
+                                    'highs':   _json.loads(row.get('highs','[]')),
+                                    'lows':    _json.loads(row.get('lows','[]')),
+                                    'volumes': _json.loads(row.get('volumes','[]')),
+                                }
+                            log.info(f"✅ Index price history loaded from Supabase: {len(index_history_cache)} indices (age: {age_days}d)")
+                            return
+                        else:
+                            log.info(f"Index price history is {age_days}d old — refreshing from Upstox")
+    except Exception as e:
+        log.warning(f"Could not load index prices from Supabase: {e}")
     log.info(f"Loading historical data for {len(INDEX_TRACKER)} indices…")
     to   = datetime.now(IST).strftime('%Y-%m-%d')
     from_= (datetime.now(IST) - timedelta(days=420)).strftime('%Y-%m-%d')
@@ -1528,6 +1561,37 @@ async def load_index_cache(session: aiohttp.ClientSession):
             log.warning(f"Index {name} error: {e}")
         await asyncio.sleep(0.2)
     log.info(f"✅ Index cache loaded: {loaded}/{len(INDEX_TRACKER)} indices")
+
+    # Save index price history to Supabase for persistence across restarts
+    import json as _json
+    rows = []
+    for name, data in index_history_cache.items():
+        rows.append({
+            "index_name": name,
+            "prices":     _json.dumps(data.get('prices',[])),
+            "highs":      _json.dumps(data.get('highs',[])),
+            "lows":       _json.dumps(data.get('lows',[])),
+            "volumes":    _json.dumps(data.get('volumes',[])),
+            "updated_at": datetime.now(IST).isoformat(),
+        })
+    if rows:
+        url = f"{SUPABASE_URL}/rest/v1/index_price_history?on_conflict=index_name"
+        headers_sb = {
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json",
+            "Prefer": "resolution=merge-duplicates",
+        }
+        try:
+            async with session.post(url, headers=headers_sb, json=rows,
+                                    timeout=aiohttp.ClientTimeout(total=30)) as r:
+                if r.status in (200,201,204):
+                    log.info(f"✅ Index price history saved to Supabase ({len(rows)} indices)")
+                else:
+                    txt = await r.text()
+                    log.warning(f"⚠️ Index price save failed: {r.status} {txt[:100]}")
+        except Exception as e:
+            log.warning(f"Could not save index prices: {e}")
 
 
 async def load_nifty_cache(session: aiohttp.ClientSession):
@@ -1797,11 +1861,17 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
 
         # Index-relative RS — rank within each index peer group only
         my_raw = my_raw_val
-        # Index-relative RS — rank THIS stock vs each index pool
-        # Falls back to overall raw_vals pool if index pool is too small
-        rs_nifty50  = percentile_rank(nifty50_raws  if len(nifty50_raws)  >= 10 else raw_vals, my_raw) if my_raw is not None else None
-        rs_midcap   = percentile_rank(midcap_raws   if len(midcap_raws)   >= 10 else raw_vals, my_raw) if my_raw is not None else None
-        rs_smallcap = percentile_rank(smallcap_raws if len(smallcap_raws) >= 10 else raw_vals, my_raw) if my_raw is not None else None
+        # Index-relative RS using actual index price history (Pine Script formula)
+        # RS-MID = how stock performs vs Midcap150 index (not vs constituent stocks)
+        # RS-SML = how stock performs vs Smallcap250 index
+        # This is correct: same formula as RS-TV but benchmark changes
+        mid_prices = index_history_cache.get('Midcap 150', {}).get('prices', [])
+        sml_prices = index_history_cache.get('Smallcap 250', {}).get('prices', [])
+        n50_prices = nifty_cache.get('prices', [])
+
+        rs_nifty50  = calc_rs_tv_normalized(prices, n50_prices)  if len(n50_prices)  >= 60 else None
+        rs_midcap   = calc_rs_tv_normalized(prices, mid_prices)  if len(mid_prices)  >= 60 else None
+        rs_smallcap = calc_rs_tv_normalized(prices, sml_prices)  if len(sml_prices)  >= 60 else None
         rs_microcap = percentile_rank(microcap_raws, my_raw) if my_raw is not None and sym in MICROCAP and len(microcap_raws) >= 5 else None
 
         # Sector-relative RS — rank within stock's own sector only
