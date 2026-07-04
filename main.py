@@ -1661,10 +1661,11 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         rs_tv = None
         if nifty_cache.get('prices') and len(nifty_cache['prices']) >= 60:
             rs_tv = calc_rs_tv_normalized(prices, nifty_cache['prices'])
-        # Fallback: if RS-TV can't be calculated, use IBD percentile rank
-        # This ensures EVERY stock always has a number shown
+        # Absolute fallback chain - always show a number
+        if rs_tv is None and rs is not None:
+            rs_tv = rs  # use IBD percentile rank
         if rs_tv is None:
-            rs_tv = rs  # IBD percentile rank as fallback
+            rs_tv = 50  # default midpoint if everything fails
 
         # Index-relative RS — rank within each index peer group only
         my_raw = my_raw_val
