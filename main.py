@@ -2306,6 +2306,8 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
 # ── Main loop ─────────────────────────────────────────────────────────
 async def main():
     global ALL_STOCKS, NIFTY50, MIDCAP, SMALLCAP, MICROCAP
+    global nifty_cache, index_history_cache, historical_cache
+    global instrument_key_map, weekly_cache, hourly_cache
 
     log.info("=" * 60)
     log.info("  PocketRS Pro — Live Update Server")
