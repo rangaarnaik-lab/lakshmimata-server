@@ -35,9 +35,78 @@ log = logging.getLogger('pocketrs')
 ANALYTICS_TOKEN  = os.environ['UPSTOX_ANALYTICS_TOKEN']
 SUPABASE_URL     = os.environ['SUPABASE_URL']
 SUPABASE_KEY     = os.environ['SUPABASE_SERVICE_KEY']
+TELEGRAM_TOKEN   = os.getenv('TELEGRAM_BOT_TOKEN', '')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 UPDATE_INTERVAL  = 60          # seconds between updates
 BATCH_SIZE       = 500         # Upstox supports 500 per bulk call
 IST              = timezone(timedelta(hours=5, minutes=30))
+
+# ── Telegram Bot ─────────────────────────────────────────────────────
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
+TELEGRAM_CHAT_ID   = os.getenv('TELEGRAM_CHAT_ID', '')
+
+async def send_telegram(session, message: str):
+    """Send a message via Telegram bot."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        async with session.post(url, json={
+            'chat_id': TELEGRAM_CHAT_ID,
+            'text': message,
+            'parse_mode': 'HTML',
+            'disable_web_page_preview': True,
+        }, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status != 200:
+                log.warning(f"Telegram send failed: {r.status}")
+    except Exception as e:
+        log.warning(f"Telegram error: {e}")
+
+async def send_daily_digest(session, processed: list, breadth: dict):
+    """Send EOD digest to Telegram."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    improvers = sorted(
+        [s for s in processed if s.get('rs_trend') == 'improving' and (s.get('rs_tv') or 0) >= 70],
+        key=lambda x: x.get('rs_tv') or x.get('rs', 0), reverse=True
+    )[:5]
+    s2_new   = [s for s in processed if s.get('is_s2_new_entry')][:5]
+    pp_today = [s for s in processed if s.get('is_pp')][:10]
+    rs_highs = [s for s in processed if s.get('rs_line_new_high')][:5]
+
+    date_str = datetime.now(IST).strftime('%d %b %Y')
+    adv = breadth.get('advances', 0)
+    dec = breadth.get('declines', 0)
+    s2c = breadth.get('stage2_count', 0)
+    s4c = breadth.get('stage4_count', 0)
+    imp = breadth.get('rs_improving', 0)
+    dcl = breadth.get('rs_declining', 0)
+    h52 = breadth.get('new_52w_high', 0)
+    l52 = breadth.get('new_52w_low', 0)
+    ppc = breadth.get('pp_count', 0)
+    vol = breadth.get('rvol_surge', 0)
+
+    s2_lines  = '\n'.join(f"  {s['sym']} RS:{s.get('rs_tv') or s.get('rs','?')}" for s in s2_new) or '  None'
+    rsl_lines = '\n'.join(f"  {s['sym']} RS:{s.get('rs_tv') or s.get('rs','?')}" for s in rs_highs) or '  None'
+    pp_syms   = ', '.join(s['sym'] for s in pp_today) or 'None'
+    top_syms  = '\n'.join(f"  {s['sym']} {s.get('rs_tv') or s.get('rs','?')}" for s in improvers) or '  None'
+
+    msg = (
+        f"<b>Lakshmimata EOD Digest — {date_str}</b>\n\n"
+        f"<b>Market Breadth</b>\n"
+        f"Up: {adv}  Down: {dec}\n"
+        f"Stage2: {s2c}  Stage4: {s4c}\n"
+        f"RS Improving: {imp}  Declining: {dcl}\n"
+        f"52W High: {h52}  52W Low: {l52}\n"
+        f"PP Signals: {ppc}  Vol Surge: {vol}\n\n"
+        f"<b>New Stage 2 Entries ({len(s2_new)})</b>\n{s2_lines}\n\n"
+        f"<b>RS Line New Highs ({len(rs_highs)})</b>\n{rsl_lines}\n\n"
+        f"<b>PP Signals Today</b>\n{pp_syms}\n\n"
+        f"<b>Top RS Improvers</b>\n{top_syms}"
+    )
+    await send_telegram(session, msg)
+    log.info("Daily digest sent to Telegram")
+
 
 # Market hours IST
 MARKET_OPEN_H, MARKET_OPEN_M   = 9, 15
@@ -96,6 +165,90 @@ def atr(highs: list, lows: list, closes: list, n: int = 20) -> Optional[float]:
         return None
     tr = true_range_series(highs, lows, closes)
     return sum(tr[-n:]) / n
+
+def calc_rvol(volumes: list, today_vol: int = None) -> dict:
+    """
+    Relative Volume — today's volume vs average volume at same time.
+    Without intraday data, we compare today's vol vs 20d avg.
+    RVOL > 2.0 = very high, > 1.5 = high, < 0.5 = drying up.
+    """
+    if len(volumes) < 20:
+        return {'rvol': None, 'avg_vol_20d': None}
+    avg_20d = sum(volumes[-21:-1]) / 20  # exclude today
+    today = today_vol if today_vol else volumes[-1]
+    rvol = round(today / avg_20d, 2) if avg_20d > 0 else None
+    return {
+        'rvol': rvol,
+        'avg_vol_20d': round(avg_20d),
+        'vol_signal': 'surge' if rvol and rvol >= 2.0 else
+                      'high'   if rvol and rvol >= 1.5 else
+                      'avg'    if rvol and rvol >= 0.8 else
+                      'dry'    if rvol else 'unknown'
+    }
+
+def calc_rs_line(prices: list, bench_prices: list) -> dict:
+    """
+    RS Line = stock price / Nifty price * 100.
+    RS Line New High = RS line at all-time high in last 252 days BEFORE price.
+    This is the IBD 'RS Line in Blue Sky' signal — early leader detection.
+    """
+    if len(prices) < 60 or len(bench_prices) < 60:
+        return {'rs_line_new_high': False, 'rs_line_trend': 'flat'}
+    n = min(len(prices), len(bench_prices))
+    rs_line = [prices[i] / bench_prices[i] * 100 for i in range(n) if bench_prices[i] > 0]
+    if len(rs_line) < 30:
+        return {'rs_line_new_high': False, 'rs_line_trend': 'flat'}
+    current = rs_line[-1]
+    high_252 = max(rs_line[-min(252,len(rs_line)):])
+    price_high_252 = max(prices[-min(252,len(prices)):])
+    # RS Line New High = RS line at high but price NOT at high yet
+    rs_line_new_high = (current >= high_252 * 0.99 and prices[-1] < price_high_252 * 0.98)
+    # RS Line trend (5d vs 20d slope)
+    if len(rs_line) >= 20:
+        slope = (rs_line[-1] - rs_line[-20]) / rs_line[-20] * 100
+        trend = 'rising' if slope > 1 else 'falling' if slope < -1 else 'flat'
+    else:
+        trend = 'flat'
+    return {
+        'rs_line_new_high': rs_line_new_high,
+        'rs_line_trend': trend,
+        'rs_line_value': round(current, 2),
+    }
+
+def calc_stage2_new_entry(prices: list, prev_stage: int = None) -> bool:
+    """
+    Stage 2 New Entry = stock just entered Stage 2 this scan
+    (was Stage 1 previously, now above 30W MA with rising momentum).
+    prev_stage comes from previous scan data — not available in stateless calc,
+    so we approximate: price crossed above MA30 in last 3 days.
+    """
+    if len(prices) < 30:
+        return False
+    ma30_now   = sum(prices[-30:]) / 30
+    ma30_3d    = sum(prices[-33:-3]) / 30 if len(prices) >= 33 else None
+    last_price = prices[-1]
+    # Crossed above MA30 in last 3 days
+    recently_crossed = (ma30_3d and prices[-4] < ma30_3d and last_price > ma30_now)
+    return bool(recently_crossed and last_price > ma30_now)
+
+def calc_earnings_momentum(screener_html: str) -> dict:
+    """Parse quarterly EPS growth from Screener.in HTML."""
+    import re
+    result = {'eps_growth_3q': None, 'consecutive_growth': 0, 'eps_quarters': []}
+    if not screener_html:
+        return result
+    # Look for quarterly EPS data in the financial tables
+    # Screener shows TTM EPS and quarterly Net Profit
+    pat = re.findall(r'<td[^>]*>([\d,.-]+)</td>', screener_html)
+    # Basic parse — extract numbers from profit rows
+    nums = []
+    for p in pat:
+        try:
+            nums.append(float(p.replace(',','')))
+        except:
+            pass
+    # We'll use the pe and eps we already parse as a proxy
+    return result
 
 def detect_bb_squeeze(prices: list, highs: list, lows: list, n: int = 20) -> dict:
     """
@@ -728,7 +881,109 @@ async def fetch_instruments(session: aiohttp.ClientSession) -> list:
         log.info(f"Fetched {len(instruments)} NSE equity instruments")
         return instruments
 
-async def fetch_bulk_ohlc(session: aiohttp.ClientSession, instrument_keys: list) -> dict:
+async def fetch_fundamentals_screener(session: aiohttp.ClientSession, sym: str) -> dict:
+    """
+    Scrape fundamental data from Screener.in company page.
+    Free, no auth needed. Returns: market_cap, pe, roe, eps, debt_eq, promoter.
+    """
+    url = f"https://www.screener.in/company/{sym}/consolidated/"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "text/html,application/xhtml+xml",
+    }
+    result = {
+        'market_cap': None, 'pe': None, 'roe': None,
+        'eps': None, 'debt_eq': None, 'promoter': None,
+    }
+    try:
+        async with session.get(url, headers=headers,
+                               timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status == 404:
+                # Try standalone (non-consolidated)
+                url2 = f"https://www.screener.in/company/{sym}/"
+                async with session.get(url2, headers=headers,
+                                       timeout=aiohttp.ClientTimeout(total=10)) as r2:
+                    if r2.status != 200:
+                        return result
+                    html = await r2.text()
+            elif r.status != 200:
+                return result
+            else:
+                html = await r.text()
+
+        # Parse key ratios from the #top-ratios list
+        import re
+
+        def extract_ratio(label: str, html: str) -> str:
+            # Screener renders ratios like: <li>...<span class="name">Market Cap</span><span class="nowrap">₹ 1,234 Cr.</span>
+            pattern = rf'{re.escape(label)}.*?<span[^>]*nowrap[^>]*>(.*?)</span>'
+            m = re.search(pattern, html, re.DOTALL | re.IGNORECASE)
+            if m:
+                return re.sub(r'<[^>]+>', '', m.group(1)).strip()
+            return None
+
+        def parse_number(s: str):
+            if not s:
+                return None
+            s = s.replace('₹', '').replace('%', '').replace(',', '').replace('Cr.','').replace('Cr','').strip()
+            try:
+                return float(s)
+            except Exception:
+                return None
+
+        result['market_cap'] = parse_number(extract_ratio('Market Cap', html))
+        result['pe']         = parse_number(extract_ratio('Stock P/E', html))
+        result['roe']        = parse_number(extract_ratio('ROE', html))
+        result['eps']        = parse_number(extract_ratio('EPS', html))
+        result['debt_eq']    = parse_number(extract_ratio('Debt to equity', html))
+
+        # Promoter holding — from shareholding section
+        prom_m = re.search(r'Promoters?\s*</td>\s*<td[^>]*>([\d.]+)%?</td>', html, re.IGNORECASE)
+        if prom_m:
+            result['promoter'] = float(prom_m.group(1))
+        else:
+            # Alternative pattern
+            prom_m2 = re.search(r'"promoters":\s*([\d.]+)', html, re.IGNORECASE)
+            if prom_m2:
+                result['promoter'] = float(prom_m2.group(1))
+
+    except Exception as e:
+        pass
+    return result
+
+# Cache fundamentals to avoid re-fetching every minute
+fundamentals_cache: dict = {}  # sym -> {market_cap, pe, roe, eps, debt_eq, promoter, fetched_at}
+FUNDAMENTALS_TTL = 7 * 24 * 3600  # refresh weekly (data changes quarterly)
+
+async def load_fundamentals_batch(session: aiohttp.ClientSession, symbols: list):
+    """Fetch fundamentals for a batch of symbols, respecting TTL cache."""
+    now = time.time()
+    to_fetch = [
+        sym for sym in symbols
+        if sym not in fundamentals_cache
+        or (now - fundamentals_cache[sym].get('fetched_at', 0)) > FUNDAMENTALS_TTL
+    ]
+    if not to_fetch:
+        return
+
+    log.info(f"  Fetching fundamentals for {len(to_fetch)} stocks from Screener.in…")
+    BATCH = 5  # small batches to be respectful
+    fetched = 0
+    for i in range(0, len(to_fetch), BATCH):
+        batch = to_fetch[i:i+BATCH]
+        results = await asyncio.gather(*[
+            fetch_fundamentals_screener(session, sym) for sym in batch
+        ])
+        for sym, data in zip(batch, results):
+            data['fetched_at'] = now
+            fundamentals_cache[sym] = data
+            if any(v is not None for k, v in data.items() if k != 'fetched_at'):
+                fetched += 1
+        await asyncio.sleep(1)  # be gentle with Screener.in
+
+    log.info(f"  Fundamentals loaded: {fetched}/{len(to_fetch)} stocks")
+
+
     """Fetch OHLC for instruments in one call. Keep batch small — GET URL length limits apply."""
     url = "https://api.upstox.com/v2/market-quote/ohlc"
     headers = {
@@ -792,9 +1047,7 @@ async def fetch_historical(session: aiohttp.ClientSession, sym: str,
 
 # ── Supabase client ───────────────────────────────────────────────────
 async def supabase_upsert(session: aiohttp.ClientSession, table: str, rows: list, on_conflict: str = None):
-    """Upsert rows into Supabase table. Pass on_conflict for tables whose
-    unique constraint isn't the primary key PostgREST would infer by default
-    (e.g. stock_history uses (snapshot_date, sym), not its surrogate id)."""
+    """Upsert rows into Supabase table in parallel chunks for speed."""
     if not rows:
         return
     url = f"{SUPABASE_URL}/rest/v1/{table}"
@@ -806,9 +1059,9 @@ async def supabase_upsert(session: aiohttp.ClientSession, table: str, rows: list
         "Content-Type":  "application/json",
         "Prefer":        "resolution=merge-duplicates",
     }
-    # Upsert in chunks of 100
-    for i in range(0, len(rows), 100):
-        chunk = rows[i:i+100]
+    CHUNK = 500  # larger chunks = fewer round trips
+
+    async def upsert_chunk(chunk):
         try:
             async with session.post(url, headers=headers, json=chunk,
                                     timeout=aiohttp.ClientTimeout(total=30)) as r:
@@ -816,7 +1069,15 @@ async def supabase_upsert(session: aiohttp.ClientSession, table: str, rows: list
                     text = await r.text()
                     log.warning(f"Supabase upsert {table} failed: {r.status} {text[:100]}")
         except Exception as e:
-            log.error(f"Supabase error: {e}")
+            log.error(f"Supabase error ({table}): {e}")
+
+    # Fire all chunks concurrently (max 4 at a time)
+    chunks = [rows[i:i+CHUNK] for i in range(0, len(rows), CHUNK)]
+    sem = asyncio.Semaphore(4)
+    async def upsert_with_sem(chunk):
+        async with sem:
+            await upsert_chunk(chunk)
+    await asyncio.gather(*[upsert_with_sem(c) for c in chunks])
 
 async def supabase_update_meta(session: aiohttp.ClientSession, meta: dict):
     """Update scan metadata."""
@@ -852,7 +1113,12 @@ def is_scan_time() -> bool:
     close_time = now.replace(hour=MARKET_CLOSE_H, minute=MARKET_CLOSE_M, second=0, microsecond=0) + timedelta(minutes=30)
     return open_time <= now <= close_time
 
-# ── Historical data cache + instrument key map ────────────────────────
+# ── Squeeze fire state tracking ──────────────────────────────────────
+# Track which stocks were firing last scan — only alert on NEW fires
+# Format: {sym: {'bb': bool, 'vcp': bool}}
+prev_squeeze_state: dict = {}
+
+
 historical_cache: dict = {}   # sym -> {prices, volumes}
 nifty_cache: dict = {}        # {'prices': [...]} — Nifty index daily closes for TV RS calc
 
@@ -1048,24 +1314,37 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
     ]
 
     live_data = {}
-    OHLC_BATCH = 200  # keep GET URL length safe (ISIN keys are long)
+    OHLC_BATCH = 500  # Upstox supports 500 per call — use max to reduce round trips
     first_batch_logged = False
-    for i in range(0, len(instrument_keys), OHLC_BATCH):
-        batch_keys  = instrument_keys[i:i+OHLC_BATCH]
-        batch_syms  = stocks_for_ohlc[i:i+OHLC_BATCH]
+
+    # Fetch all OHLC batches concurrently for maximum speed
+    async def fetch_ohlc_batch(batch_keys, batch_syms):
         data = await fetch_bulk_ohlc(session, batch_keys)
-        if not first_batch_logged and data:
-            sample_keys = list(data.keys())[:3]
-            log.info(f"  Sample OHLC response keys: {sample_keys}")
-            first_batch_logged = True
-        # Upstox returns data keyed by "EXCHANGE:TRADINGSYMBOL" (e.g. "NSE_EQ:RELIANCE"),
-        # not by the ISIN-based instrument_key we sent in the request.
+        result = {}
         for sym in batch_syms:
             resp_key = f"NSE_EQ:{sym}"
             if resp_key in data:
-                live_data[sym] = data[resp_key]
-        if len(instrument_keys) > OHLC_BATCH:
-            await asyncio.sleep(0.3)
+                result[sym] = data[resp_key]
+        return result
+
+    # Split into batches and fire all concurrently (with small concurrency limit)
+    batches = [
+        (instrument_keys[i:i+OHLC_BATCH], stocks_for_ohlc[i:i+OHLC_BATCH])
+        for i in range(0, len(instrument_keys), OHLC_BATCH)
+    ]
+    # Run up to 5 concurrent OHLC fetches
+    sem = asyncio.Semaphore(5)
+    async def fetch_with_sem(bkeys, bsyms):
+        async with sem:
+            return await fetch_ohlc_batch(bkeys, bsyms)
+
+    results = await asyncio.gather(*[fetch_with_sem(bk, bs) for bk, bs in batches])
+    for r in results:
+        live_data.update(r)
+
+    if live_data:
+        sample = list(live_data.keys())[:3]
+        log.info(f"  Sample OHLC keys: {[f'NSE_EQ:{s}' for s in sample]}")
 
     log.info(f"  Live prices: {len(live_data)} stocks")
 
@@ -1129,6 +1408,12 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
 
     # Step 5: Build full stock records
     log.info(f"  Building per-stock records (RS/PP/squeeze/VCP) for {len(stocks_with_hist)} stocks…")
+
+    # Fetch fundamentals only at EOD — they change quarterly, no point fetching more often
+    if scan_type == 'batch_eod':
+        all_syms = [s['sym'] for s in stocks_with_hist]
+        await load_fundamentals_batch(session, all_syms)
+
     processed = []
     for loop_idx, s in enumerate(stocks_with_hist):
         sym = s['sym']
@@ -1157,15 +1442,27 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
 
         # Index-relative RS — rank within each index peer group only
         my_raw = my_raw_val
-        rs_nifty50  = percentile_rank(nifty50_raws,  my_raw) if my_raw is not None and sym in NIFTY50  and len(nifty50_raws)  >= 5 else None
-        rs_midcap   = percentile_rank(midcap_raws,   my_raw) if my_raw is not None and sym in MIDCAP   and len(midcap_raws)   >= 5 else None
-        rs_smallcap = percentile_rank(smallcap_raws, my_raw) if my_raw is not None and sym in SMALLCAP and len(smallcap_raws) >= 5 else None
+        # Index-relative RS — rank THIS stock vs the pool of each index
+        # Note: membership not required — any stock gets ranked against each pool
+        # This lets you compare GRSE vs Midcap stocks even if GRSE isn't in Midcap
+        rs_nifty50  = percentile_rank(nifty50_raws,  my_raw) if my_raw is not None and len(nifty50_raws)  >= 5 else None
+        rs_midcap   = percentile_rank(midcap_raws,   my_raw) if my_raw is not None and len(midcap_raws)   >= 5 else None
+        rs_smallcap = percentile_rank(smallcap_raws, my_raw) if my_raw is not None and len(smallcap_raws) >= 5 else None
         rs_microcap = percentile_rank(microcap_raws, my_raw) if my_raw is not None and sym in MICROCAP and len(microcap_raws) >= 5 else None
 
         # Sector-relative RS — rank within stock's own sector only
         my_sector = sym_to_sector.get(sym, 'Other')
         sec_pool  = sector_raws.get(my_sector, [])
         rs_sector = percentile_rank(sec_pool, my_raw) if my_raw is not None and len(sec_pool) >= 5 else None
+
+        # RVOL — relative volume
+        rvol_data = calc_rvol(volumes)
+
+        # RS Line vs Nifty
+        rs_line_data = calc_rs_line(prices, nifty_cache.get('prices', []))
+
+        # Stage 2 New Entry
+        is_s2_new = calc_stage2_new_entry(prices)
 
         # Live price — use sym-based lookup
         # IMPORTANT: historical_cache prices are NEVER mutated. The last element of
@@ -1235,7 +1532,13 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'chg_pct':        chg,
             'volume':         int(vol),
             'rs':             rs,
-            'rs_tv':          rs_tv,       # TradingView / Lakshmi Mata Pine Script RS
+            'rs_tv':          rs_tv,
+            'rvol':           rvol_data.get('rvol'),
+            'vol_signal':     rvol_data.get('vol_signal'),
+            'rs_line_new_high': rs_line_data.get('rs_line_new_high', False),
+            'rs_line_trend':  rs_line_data.get('rs_line_trend', 'flat'),
+            'rs_line_value':  rs_line_data.get('rs_line_value'),
+            'is_s2_new_entry': is_s2_new,       # TradingView / Lakshmi Mata Pine Script RS
             'rs_nifty50':     rs_nifty50,
             'rs_midcap':      rs_midcap,
             'rs_smallcap':    rs_smallcap,
@@ -1283,9 +1586,85 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'in_midcap':      sym in MIDCAP,
             'in_smallcap':    sym in SMALLCAP,
             'in_microcap':    sym in MICROCAP,
+            # Fundamentals from Screener.in (cached, refreshed every 6h)
+            'market_cap':     fundamentals_cache.get(sym, {}).get('market_cap'),
+            'pe':             fundamentals_cache.get(sym, {}).get('pe'),
+            'roe':            fundamentals_cache.get(sym, {}).get('roe'),
+            'eps':            fundamentals_cache.get(sym, {}).get('eps'),
+            'debt_eq':        fundamentals_cache.get(sym, {}).get('debt_eq'),
+            'promoter':       fundamentals_cache.get(sym, {}).get('promoter'),
             'last_updated':   now_ist.isoformat(),
             'scan_type':      scan_type,
         })
+
+    # Step 5.4: Detect NEW squeeze/VCP fires (state change from last scan)
+    global prev_squeeze_state
+    new_fires = []
+    for s in processed:
+        sym = s['sym']
+        bb_fired  = s.get('squeeze_fired', False)
+        vcp_fired = s.get('vcp_fired', False)
+        prev = prev_squeeze_state.get(sym, {'bb': False, 'vcp': False})
+
+        new_bb  = bb_fired  and not prev['bb']
+        new_vcp = vcp_fired and not prev['vcp']
+
+        if new_bb or new_vcp:
+            fire_type = []
+            if new_bb:  fire_type.append('BB Squeeze')
+            if new_vcp: fire_type.append('VCP')
+            new_fires.append({
+                'sym':        sym,
+                'fire_type':  ', '.join(fire_type),
+                'rs_tv':      s.get('rs_tv'),
+                'rs':         s.get('rs'),
+                'last_price': s.get('last_price'),
+                'chg_pct':    s.get('chg_pct'),
+                'sector':     s.get('sector'),
+                'fired_at':   now_ist.isoformat(),
+            })
+
+    # Update state for next scan
+    prev_squeeze_state = {
+        s['sym']: {
+            'bb':  s.get('squeeze_fired', False),
+            'vcp': s.get('vcp_fired', False),
+        }
+        for s in processed
+    }
+
+    if new_fires:
+        log.info(f"  🔥 {len(new_fires)} NEW squeeze fires: {[f['sym'] for f in new_fires]}")
+        # Save to Supabase so frontend can poll and show notifications
+        await supabase_upsert(session, 'squeeze_alerts', new_fires, on_conflict='sym,fired_at')
+
+    # Step 5.5: Market Breadth metrics
+    # These give a pulse on overall market health
+    total = len(processed)
+    if total > 0:
+        breadth = {
+            'total_stocks':       total,
+            'above_ma10':         sum(1 for s in processed if s.get('ma10') and s.get('last_price',0) > s.get('ma10',0)),
+            'above_ma50':         sum(1 for s in processed if s.get('ma50') and s.get('last_price',0) > s.get('ma50',0)),
+            'rs_above_70':        sum(1 for s in processed if (s.get('rs_tv') or s.get('rs',0)) >= 70),
+            'rs_above_50':        sum(1 for s in processed if (s.get('rs_tv') or s.get('rs',0)) >= 50),
+            'rs_improving':       sum(1 for s in processed if s.get('rs_trend') == 'improving'),
+            'rs_declining':       sum(1 for s in processed if s.get('rs_trend') == 'declining'),
+            'stage2_count':       sum(1 for s in processed if s.get('weinstein_stage') == 2),
+            'stage4_count':       sum(1 for s in processed if s.get('weinstein_stage') == 4),
+            'new_52w_high':       sum(1 for s in processed if s.get('pct_from_52wh', -100) >= -2),
+            'new_52w_low':        sum(1 for s in processed if s.get('pct_from_52wl', 100) <= 2),
+            'pp_count':           sum(1 for s in processed if s.get('is_pp')),
+            'rvol_surge':         sum(1 for s in processed if s.get('vol_signal') == 'surge'),
+            's2_new_entry':       sum(1 for s in processed if s.get('is_s2_new_entry')),
+            'rs_line_new_high':   sum(1 for s in processed if s.get('rs_line_new_high')),
+            'advances':           sum(1 for s in processed if s.get('chg_pct', 0) > 0),
+            'declines':           sum(1 for s in processed if s.get('chg_pct', 0) < 0),
+            'last_updated':       now_ist.isoformat(),
+            'scan_date':          now_ist.strftime('%Y-%m-%d'),
+        }
+        await supabase_upsert(session, 'market_breadth', [breadth], on_conflict='scan_date')
+        log.info(f"  📈 Market breadth saved: {breadth['advances']}↑ {breadth['declines']}↓ Stage2:{breadth['stage2_count']}")
 
     # Step 6: Build sector RS
     sector_rows = build_sector_rs(processed, SECTOR_MAP)
@@ -1428,6 +1807,9 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         ]
         await supabase_upsert(session, 'sector_history', sector_history_rows, on_conflict='snapshot_date,sector')
         log.info(f"  ✅ Snapshot archived: {len(history_rows)} stocks for {snapshot_date}")
+        # Send daily Telegram digest at EOD
+        if breadth:
+            await send_daily_digest(session, processed, breadth)
 
     # Step 8: Update scan metadata
     duration = round(time.time() - start, 1)
@@ -1455,7 +1837,7 @@ async def main():
     log.info(f"  Market hours: {MARKET_OPEN_H}:{MARKET_OPEN_M:02d} - {MARKET_CLOSE_H}:{MARKET_CLOSE_M:02d} IST")
     log.info("=" * 60)
 
-    connector = aiohttp.TCPConnector(limit=20, ssl=False)
+    connector = aiohttp.TCPConnector(limit=50, ssl=False)  # higher limit for parallel OHLC fetches
     async with aiohttp.ClientSession(connector=connector) as session:
 
         # Step 0: Fetch real official Nifty index constituent lists
