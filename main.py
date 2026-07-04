@@ -2186,8 +2186,17 @@ async def main():
                             log.error(f"⏱ Scan exceeded {SCAN_TIMEOUT}s timeout — skipping this cycle")
                         last_scan = time.time()
                     else:
+                        # Market closed — still run scan using historical data
+                        # This ensures RS-TV is always calculated and saved
                         ist_now = datetime.now(IST)
-                        log.info(f"⏸ Market closed ({ist_now.strftime('%H:%M IST')}) — next check in {UPDATE_INTERVAL}s")
+                        log.info(f"📊 Market closed ({ist_now.strftime('%H:%M IST')}) — running historical scan for RS-TV...")
+                        try:
+                            await asyncio.wait_for(run_scan(session, 'batch_morning'), timeout=SCAN_TIMEOUT)
+                            log.info("✅ Historical scan done — RS-TV updated")
+                            # After hours: scan every 30 mins not every minute
+                            await asyncio.sleep(1800)
+                        except Exception as e:
+                            log.error(f"Historical scan failed: {e}")
                         last_scan = time.time()
 
                 await asyncio.sleep(5)  # check every 5 seconds
