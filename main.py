@@ -1661,11 +1661,8 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         rs_tv = None
         if nifty_cache.get('prices') and len(nifty_cache['prices']) >= 60:
             rs_tv = calc_rs_tv_normalized(prices, nifty_cache['prices'])
-        # Absolute fallback chain - always show a number
-        if rs_tv is None and rs is not None:
-            rs_tv = rs  # use IBD percentile rank
-        if rs_tv is None:
-            rs_tv = 50  # default midpoint if everything fails
+        # No fallback - RS-TV must be the real Pine Script value or None
+        # Showing wrong RS would mislead trading decisions
 
         # Index-relative RS — rank within each index peer group only
         my_raw = my_raw_val
@@ -2157,12 +2154,11 @@ async def main():
         # close, the first scan should reflect that correctly.
         SCAN_TIMEOUT = 600  # 10 minutes max for a single scan cycle
         ist_now_initial = datetime.now(IST)
-        if is_market_open():
-            initial_scan_type = 'live'
-        else:
-            # Always run batch_morning outside market hours
-            # RS-TV and all signals calculate from historical data — no live prices needed
-            initial_scan_type = 'batch_morning'
+        # Always run batch_morning first — calculates RS-TV from historical data
+        # This ensures RS-TV is populated immediately even outside market hours
+        # If market is open, we'll also get live prices in this scan
+        initial_scan_type = 'batch_morning'
+        log.info(f"Starting with batch_morning scan to populate RS-TV from history...")
         log.info(f"Initial scan type detected: {initial_scan_type} (current time {ist_now_initial.strftime('%H:%M IST')})")
 
         try:
