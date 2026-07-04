@@ -1541,24 +1541,43 @@ async def load_index_cache(session: aiohttp.ClientSession):
     for name, ikey in INDEX_TRACKER.items():
         encoded = ikey.replace('|', '%7C').replace(' ', '%20')
         url = f"https://api.upstox.com/v2/historical-candle/{encoded}/day/{to}/{from_}"
-        try:
-            async with session.get(url, headers=headers,
-                                   timeout=aiohttp.ClientTimeout(total=15)) as r:
-                if r.status == 200:
-                    data = await r.json()
-                    candles = list(reversed(data.get('data', {}).get('candles', [])))
-                    if candles:
-                        index_history_cache[name] = {
-                            'prices':  [c[4] for c in candles],
-                            'volumes': [c[5] for c in candles],
-                            'highs':   [c[2] for c in candles],
-                            'lows':    [c[3] for c in candles],
-                        }
-                        loaded += 1
-                else:
-                    log.warning(f"Index {name} fetch failed: {r.status}")
-        except Exception as e:
-            log.warning(f"Index {name} error: {e}")
+        # Try multiple key formats - Upstox is inconsistent with index names
+        alt_keys = [
+            ikey,
+            ikey.replace("Nifty Midcap 150", "NIFTY MIDCAP 150"),
+            ikey.replace("Nifty Smallcap 250", "NIFTY SMALLCAP 250"),
+            ikey.replace("Nifty Microcap 250", "NIFTY MICROCAP 250"),
+            ikey.replace("Nifty Next 50", "NIFTY NEXT 50"),
+            ikey.replace("Nifty 500", "NIFTY 500"),
+        ]
+        fetched = False
+        for try_key in alt_keys:
+            if fetched: break
+            try_encoded = try_key.replace('|', '%7C').replace(' ', '%20')
+            try_url = f"https://api.upstox.com/v2/historical-candle/{try_encoded}/day/{to}/{from_}"
+            try:
+                async with session.get(try_url, headers=headers,
+                                       timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        candles = list(reversed(data.get('data', {}).get('candles', [])))
+                        if candles:
+                            index_history_cache[name] = {
+                                'prices':  [c[4] for c in candles],
+                                'volumes': [c[5] for c in candles],
+                                'highs':   [c[2] for c in candles],
+                                'lows':    [c[3] for c in candles],
+                            }
+                            loaded += 1
+                            fetched = True
+                    elif r.status != 400:
+                        log.warning(f"Index {name} fetch failed: {r.status}")
+                        break
+            except Exception as e:
+                log.warning(f"Index {name} error: {e}")
+                break
+        if not fetched:
+            log.warning(f"Index {name} could not be fetched with any key format")
         await asyncio.sleep(0.2)
     log.info(f"✅ Index cache loaded: {loaded}/{len(INDEX_TRACKER)} indices")
 
