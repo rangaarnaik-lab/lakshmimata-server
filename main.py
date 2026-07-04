@@ -1711,12 +1711,20 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         # PP
         pp = detect_pp(prices, volumes)
 
-        # Volume signals
+        # Volume signals — IBD style
+        # HY (High Year) = today volume ranks in top 5% of last 252 trading days
+        # HT (High Time) = today volume ranks in top 5% of all available history
         yr_vols  = volumes[-252:] if len(volumes) >= 252 else volumes
-        max_yr   = max(yr_vols) if yr_vols else 1
-        max_all  = max(volumes) if volumes else 1
-        hy_pct   = round(vol / max_yr * 100, 1) if max_yr > 0 else 0
-        ht_pct   = round(vol / max_all * 100, 1) if max_all > 0 else 0
+        all_vols = volumes  # all available history
+
+        # Percentile rank: what % of past volumes is today's volume greater than?
+        def vol_pct_rank(today_v, hist_vols):
+            if not hist_vols or today_v is None: return 0
+            rank = sum(1 for v in hist_vols if today_v > v)
+            return round(rank / len(hist_vols) * 100, 1)
+
+        hy_pct = vol_pct_rank(vol, yr_vols)   # percentile rank in last 1 year
+        ht_pct = vol_pct_rank(vol, all_vols)  # percentile rank in all history
 
         # EMA9
         e9 = ema(prices, 9)
