@@ -250,93 +250,188 @@ def calc_earnings_momentum(screener_html: str) -> dict:
     # We'll use the pe and eps we already parse as a proxy
     return result
 
-def detect_bb_squeeze(prices: list, highs: list, lows: list, n: int = 20) -> dict:
+# ── John Carter TTM Squeeze — Full Implementation ─────────────────────
+# Based on John Carter's "Mastering the Trade" TTM Squeeze indicator
+# 
+# Logic:
+# 1. Bollinger Bands (20, 2.0) 
+# 2. Keltner Channels (20, 1.5 ATR)
+# 3. Squeeze ON  = BB inside KC (red dot) — stock coiling
+# 4. Squeeze OFF = BB outside KC (green dot) — stock fired
+# 5. Momentum = Donchian midline vs EMA midline (histogram)
+# 6. Fire signal = squeeze was ON, now OFF + momentum turning up
+
+def __sma(data, n):
+    if len(data) < n: return None
+    return sum(data[-n:]) / n
+
+def ema(data, n):
+    if len(data) < n: return None
+    k = 2 / (n + 1)
+    e = sum(data[:n]) / n
+    for p in data[n:]:
+        e = p * k + e * (1 - k)
+    return e
+
+def stdev(data, n):
+    if len(data) < n: return None
+    m = sum(data[-n:]) / n
+    variance = sum((x - m) ** 2 for x in data[-n:]) / n
+    return variance ** 0.5
+
+def true_range(closes, highs, lows):
+    """Compute True Range series."""
+    tr = []
+    for i in range(1, len(closes)):
+        h, l, pc = highs[i], lows[i], closes[i-1]
+        tr.append(max(h - l, abs(h - pc), abs(l - pc)))
+    return tr
+
+def calc_ttm_squeeze(closes, highs, lows, bb_len=20, bb_mult=2.0, kc_len=20, kc_mult=1.5):
     """
-    Bollinger Band Squeeze: BB width at multi-month low, BB inside Keltner Channel.
-    Classic TTM Squeeze indicator logic.
+    Full John Carter TTM Squeeze calculation.
+    
+    Returns dict with:
+    - in_squeeze: bool (BB inside KC = squeeze ON = red dot)
+    - squeeze_fired: bool (just transitioned from ON to OFF = green dot)
+    - momentum: float (histogram value, positive=bullish, negative=bearish)
+    - momentum_dir: 'up'|'down'|'flat' (is histogram rising or falling)
+    - squeeze_days: int (consecutive days in squeeze)
+    - strength_score: float (squeeze_days * abs(momentum) = overall strength)
+    - dots: list of last 20 dots ('red'|'green'|'black') for UI histogram
+    - hist: list of last 20 momentum values for histogram bars
+    - fired_bullish: bool (fired + momentum positive + rising)
+    - fired_bearish: bool (fired + momentum negative + falling)
     """
-    empty = {'in_squeeze': False, 'squeeze_fired': False, 'bb_width_pct': None, 'squeeze_days': 0}
-    if len(prices) < n + 60:
+    n = max(bb_len, kc_len)
+    empty = {
+        'in_squeeze': False, 'squeeze_fired': False,
+        'momentum': 0, 'momentum_dir': 'flat',
+        'squeeze_days': 0, 'strength_score': 0,
+        'dots': [], 'hist': [],
+        'fired_bullish': False, 'fired_bearish': False,
+        'bb_width_pct': None,
+    }
+    if len(closes) < n + 30:
         return empty
 
-    closes = prices
-    ma20 = sma(closes, n)
-    sd20 = std_dev(closes, n)
-    if not ma20 or not sd20:
-        return empty
+    # Bollinger Bands
+    bb_basis = [_sma(closes[:i+1], bb_len) for i in range(len(closes))]
+    bb_std   = [stdev(closes[:i+1], bb_len) for i in range(len(closes))]
 
-    upper_bb = ma20 + 2 * sd20
-    lower_bb = ma20 - 2 * sd20
-    bb_width = upper_bb - lower_bb
-    bb_width_pct = round((bb_width / ma20) * 100, 2) if ma20 else None
+    # Keltner Channels using ATR
+    tr = true_range(closes, highs, lows)
+    tr_full = [0] + tr  # align with closes
+    atr_series = []
+    for i in range(len(closes)):
+        if i < kc_len:
+            atr_series.append(None)
+        else:
+            atr_series.append(sum(tr_full[i-kc_len+1:i+1]) / kc_len)
 
-    # Keltner Channel using ATR
-    atr_val = atr(highs, lows, closes, n)
-    if not atr_val:
-        return empty
-    upper_kc = ma20 + 1.5 * atr_val
-    lower_kc = ma20 - 1.5 * atr_val
+    kc_basis = [_sma(closes[:i+1], kc_len) for i in range(len(closes))]
 
-    # Squeeze ON when BB is inside KC
-    in_squeeze = (upper_bb < upper_kc) and (lower_bb > lower_kc)
+    # Momentum = price position relative to midpoint of high/low range and EMA
+    # John Carter's exact formula: 
+    # val = close - avg(avg(highest_high(len), lowest_low(len)), _sma(close, len))
+    mom_series = []
+    for i in range(len(closes)):
+        if i < n:
+            mom_series.append(None)
+            continue
+        window_h = max(highs[max(0,i-kc_len+1):i+1])
+        window_l = min(lows[max(0,i-kc_len+1):i+1])
+        delta = closes[i] - (((window_h + window_l) / 2 + (_sma(closes[:i+1], kc_len) or closes[i])) / 2)
+        mom_series.append(delta)
 
-    # Check how many consecutive days squeeze has been on.
-    # PERFORMANCE: avoid re-slicing/re-scanning the full price history on every
-    # iteration (was O(n) work x 20 iterations x 3 functions x 2400 stocks,
-    # which froze the event loop for minutes). Instead, precompute a short
-    # window of closes/highs/lows once and reuse it.
-    squeeze_days = 0
-    max_lookback = min(20, len(closes) - n - 20)
-    if max_lookback > 0:
-        # Only need the last (n + max_lookback + 20) closes for this whole check
-        window_size = n + max_lookback + 21
-        wc = closes[-window_size:] if len(closes) > window_size else closes
-        wh = highs[-window_size:]  if len(highs)  > window_size else highs
-        wl = lows[-window_size:]   if len(lows)   > window_size else lows
+    # Linear regression of momentum (smooth it)
+    def linreg(data, length):
+        if len(data) < length: return data[-1] if data else 0
+        xs = list(range(length))
+        ys = data[-length:]
+        mx = sum(xs)/length
+        my = sum(ys)/length
+        num = sum((xs[i]-mx)*(ys[i]-my) for i in range(length))
+        den = sum((xs[i]-mx)**2 for i in range(length))
+        if den == 0: return my
+        slope = num/den
+        return my + slope*(length-1-mx)
 
-        for d in range(0, max_lookback):
-            end = len(wc) - 1 - d
-            if end < n + 20:
-                break
-            sub_closes = wc[:end+1]
-            sub_highs  = wh[:end+1]
-            sub_lows   = wl[:end+1]
-            m = sma(sub_closes, n)
-            s = std_dev(sub_closes, n)
-            a = atr(sub_highs, sub_lows, sub_closes, n)
-            if not m or not s or not a:
-                break
-            ub, lb = m + 2*s, m - 2*s
-            uk, lk = m + 1.5*a, m - 1.5*a
-            if ub < uk and lb > lk:
-                squeeze_days += 1
-            else:
-                break
+    # Build dot and histogram series for last 30 bars
+    history_dots = []
+    history_hist = []
+    prev_in_sq = False
 
-    # Squeeze fired = was in squeeze yesterday, not in squeeze today (breakout)
-    squeeze_fired = squeeze_days == 0 and was_in_squeeze_yesterday(closes, highs, lows, n)
+    for i in range(max(0, len(closes)-30), len(closes)):
+        bb_b = bb_basis[i]
+        bb_s = bb_std[i]
+        kc_b = kc_basis[i]
+        atr  = atr_series[i]
+        if bb_b is None or bb_s is None or kc_b is None or atr is None:
+            history_dots.append('black')
+            history_hist.append(0)
+            continue
+
+        bb_upper = bb_b + bb_mult * bb_s
+        bb_lower = bb_b - bb_mult * bb_s
+        kc_upper = kc_b + kc_mult * atr
+        kc_lower = kc_b - kc_mult * atr
+
+        in_sq = (bb_upper < kc_upper) and (bb_lower > kc_lower)
+        history_dots.append('red' if in_sq else 'green')
+
+        # Momentum histogram
+        mom_vals = [m for m in mom_series[max(0,i-kc_len+1):i+1] if m is not None]
+        if mom_vals:
+            val = linreg(mom_vals, min(len(mom_vals), kc_len))
+            history_hist.append(round(val, 4))
+        else:
+            history_hist.append(0)
+
+    # Current state
+    curr_in_sq  = history_dots[-1] == 'red'   if history_dots else False
+    prev_in_sq  = history_dots[-2] == 'red'   if len(history_dots) >= 2 else False
+    fired       = prev_in_sq and not curr_in_sq  # was red, now green
+
+    # Squeeze days — how many consecutive red dots
+    sq_days = 0
+    for dot in reversed(history_dots):
+        if dot == 'red': sq_days += 1
+        else: break
+
+    # Momentum direction
+    curr_mom = history_hist[-1] if history_hist else 0
+    prev_mom = history_hist[-2] if len(history_hist) >= 2 else 0
+    if curr_mom > prev_mom: mom_dir = 'up'
+    elif curr_mom < prev_mom: mom_dir = 'down'
+    else: mom_dir = 'flat'
+
+    # BB width % (how tight the bands are)
+    if bb_basis[-1] and bb_std[-1] and bb_basis[-1] != 0:
+        bb_w = (bb_std[-1] * 4) / bb_basis[-1] * 100
+    else:
+        bb_w = None
+
+    strength = round(sq_days * abs(curr_mom) * 100, 2) if sq_days > 0 else 0
 
     return {
-        'in_squeeze': in_squeeze,
-        'squeeze_fired': squeeze_fired,
-        'bb_width_pct': bb_width_pct,
-        'squeeze_days': squeeze_days,
+        'in_squeeze':    curr_in_sq,
+        'squeeze_fired': fired,
+        'momentum':      round(curr_mom, 4),
+        'momentum_dir':  mom_dir,
+        'squeeze_days':  sq_days,
+        'strength_score': strength,
+        'fired_bullish': fired and curr_mom > 0 and mom_dir == 'up',
+        'fired_bearish': fired and curr_mom < 0 and mom_dir == 'down',
+        'bb_width_pct':  round(bb_w, 2) if bb_w else None,
+        'dots':          history_dots[-20:],
+        'hist':          history_hist[-20:],
     }
 
-def was_in_squeeze_yesterday(closes, highs, lows, n=20) -> bool:
-    if len(closes) < n + 21:
-        return False
-    sub_closes = closes[:-1]
-    sub_highs  = highs[:-1]
-    sub_lows   = lows[:-1]
-    m = sma(sub_closes, n)
-    s = std_dev(sub_closes, n)
-    a = atr(sub_highs, sub_lows, sub_closes, n)
-    if not m or not s or not a:
-        return False
-    ub, lb = m + 2*s, m - 2*s
-    uk, lk = m + 1.5*a, m - 1.5*a
-    return ub < uk and lb > lk
+
+def detect_bb_squeeze(prices, highs, lows, n=20):
+    """Backward-compatible wrapper — uses full TTM Squeeze now."""
+    return calc_ttm_squeeze(prices, highs, lows)
 
 def detect_vcp(prices: list, volumes: list, highs: list, lows: list) -> dict:
     """
@@ -1199,8 +1294,78 @@ INDEX_TRACKER = {
     "Energy":         "NSE_INDEX|Nifty Energy",
 }
 
+# Weekly and hourly historical data caches for multi-timeframe squeeze
+weekly_cache:  dict = {}   # sym -> {prices, highs, lows, volumes}
+hourly_cache:  dict = {}   # sym -> {prices, highs, lows, volumes}
+
 # Cache for all index historical data
 index_history_cache: dict = {}  # name -> {prices, volumes}
+
+async def fetch_weekly_hourly(session, sym, instrument_key, n_stocks):
+    """Fetch weekly (1Y) and hourly (5 days) candles for TTM Squeeze."""
+    headers = {"Authorization": f"Bearer {ANALYTICS_TOKEN}", "Accept": "application/json"}
+    key_enc = instrument_key.replace('|','%7C') if instrument_key else f"NSE_EQ%7C{sym}"
+    to   = datetime.now(IST).strftime('%Y-%m-%d')
+    fr1y = (datetime.now(IST) - timedelta(days=400)).strftime('%Y-%m-%d')
+    fr5d = (datetime.now(IST) - timedelta(days=7)).strftime('%Y-%m-%d')
+
+    result = {}
+    # Weekly candles
+    try:
+        url = f"https://api.upstox.com/v2/historical-candle/{key_enc}/week/{to}/{fr1y}"
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status == 200:
+                d = await r.json()
+                candles = list(reversed(d.get('data',{}).get('candles',[])))
+                if candles:
+                    result['weekly'] = {
+                        'prices': [c[4] for c in candles],
+                        'highs':  [c[2] for c in candles],
+                        'lows':   [c[3] for c in candles],
+                    }
+    except Exception: pass
+
+    # Hourly candles
+    try:
+        url2 = f"https://api.upstox.com/v2/historical-candle/{key_enc}/60minute/{to}/{fr5d}"
+        async with session.get(url2, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as r2:
+            if r2.status == 200:
+                d2 = await r2.json()
+                candles2 = list(reversed(d2.get('data',{}).get('candles',[])))
+                if candles2:
+                    result['hourly'] = {
+                        'prices': [c[4] for c in candles2],
+                        'highs':  [c[2] for c in candles2],
+                        'lows':   [c[3] for c in candles2],
+                    }
+    except Exception: pass
+    return result
+
+async def load_weekly_hourly_cache(session):
+    """Load weekly + hourly data for all stocks — for TTM multi-timeframe squeeze."""
+    global weekly_cache, hourly_cache
+    log.info(f"Loading weekly + hourly data for TTM Squeeze ({len(ALL_STOCKS)} stocks)…")
+    sem = asyncio.Semaphore(10)
+    loaded = 0
+
+    async def fetch_one(sym):
+        async with sem:
+            ikey = instrument_key_map.get(sym, f"NSE_EQ|{sym}")
+            result = await fetch_weekly_hourly(session, sym, ikey, len(ALL_STOCKS))
+            if 'weekly' in result: weekly_cache[sym] = result['weekly']
+            if 'hourly' in result: hourly_cache[sym] = result['hourly']
+            return sym
+
+    # Batch in groups of 50 to avoid overwhelming API
+    for i in range(0, len(ALL_STOCKS), 50):
+        batch = ALL_STOCKS[i:i+50]
+        await asyncio.gather(*[fetch_one(s) for s in batch])
+        loaded += len(batch)
+        if i % 500 == 0 and i > 0:
+            log.info(f"  Weekly/hourly cache: {loaded}/{len(ALL_STOCKS)} stocks")
+        await asyncio.sleep(0.1)
+
+    log.info(f"✅ Weekly/hourly cache: {len(weekly_cache)} weekly, {len(hourly_cache)} hourly")
 
 async def load_index_cache(session: aiohttp.ClientSession):
     """Fetch historical data for all tracked indices."""
@@ -1419,6 +1584,7 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         await load_historical_cache(session)
         await load_nifty_cache(session)
         await load_index_cache(session)
+        await load_weekly_hourly_cache(session)
 
     # Step 3: DO NOT mutate historical_cache prices in place (was causing chg% drift).
     # Instead, keep historical close as the immutable baseline and use live price
