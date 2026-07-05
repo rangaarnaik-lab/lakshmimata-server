@@ -1927,6 +1927,23 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             prev = prices[n-2] if n > 1 else last
 
         chg = round((last - prev) / prev * 100, 2) if prev else 0
+
+        # Weekly/Monthly % change from historical prices
+        chg_w = None
+        chg_m = None
+        if len(prices) >= 5:
+            p5  = prices[-6] if len(prices) > 5 else prices[0]
+            chg_w = round((last - p5) / p5 * 100, 2) if p5 else None
+        if len(prices) >= 21:
+            p21 = prices[-22] if len(prices) > 21 else prices[0]
+            chg_m = round((last - p21) / p21 * 100, 2) if p21 else None
+
+        # Hourly % change from hourly cache
+        chg_h = None
+        h_data = hourly_cache.get(sym, {})
+        h_prices = h_data.get('prices', [])
+        if len(h_prices) >= 2:
+            chg_h = round((h_prices[-1] - h_prices[-2]) / h_prices[-2] * 100, 2) if h_prices[-2] else None
         vol = live.get('volume') if live.get('volume') else (volumes[n-1] if volumes else 0)
 
         # PP
