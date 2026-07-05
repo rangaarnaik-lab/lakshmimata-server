@@ -261,7 +261,7 @@ def calc_earnings_momentum(screener_html: str) -> dict:
 # 5. Momentum = Donchian midline vs EMA midline (histogram)
 # 6. Fire signal = squeeze was ON, now OFF + momentum turning up
 
-def _sma(data, n):
+def sma(data, n):
     if len(data) < n: return None
     return sum(data[-n:]) / n
 
