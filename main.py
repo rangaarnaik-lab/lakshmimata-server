@@ -1259,6 +1259,62 @@ async def ensure_db_columns(session: aiohttp.ClientSession):
         log.info(f"✅ DB column check skipped: {e}")
 
 
+
+async def fetch_stooq_history(session: aiohttp.ClientSession, symbol: str, is_index: bool = False) -> list:
+    """
+    Fetch 2+ years of daily closes from stooq.com.
+    Free, no auth, supports NSE stocks (GRSE.NS) and indices (^NSEI).
+    Returns list of closing prices oldest-first.
+    """
+    ticker = symbol.lower() + ".ns" if not is_index else symbol.lower()
+    url = f"https://stooq.com/q/d/l/?s={ticker}&i=d"
+    try:
+        async with session.get(url,
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status != 200:
+                return []
+            text = await r.text()
+            lines = text.strip().split("\n")
+            prices = []
+            for line in lines[1:]:  # skip header
+                parts = line.split(",")
+                if len(parts) >= 5 and parts[4] != "N/D":
+                    try:
+                        prices.append(float(parts[4]))  # Close price
+                    except:
+                        pass
+            return list(reversed(prices))  # oldest first
+    except Exception as e:
+        return []
+
+
+async def load_stooq_index_cache(session: aiohttp.ClientSession):
+    """Load Nifty/Midcap/Smallcap index history from stooq for accurate RS calc."""
+    global nifty_cache, midcap_cache, smallcap_cache
+
+    stooq_indices = {
+        "nifty":    "^NSEI",
+        "midcap":   "^CNXMC",   # Nifty Midcap 100 on stooq
+        "smallcap": "^CNXSC",   # Nifty Smallcap on stooq
+    }
+
+    for name, ticker in stooq_indices.items():
+        prices = await fetch_stooq_history(session, ticker, is_index=True)
+        if len(prices) >= 252:
+            if name == "nifty" and len(prices) > len(nifty_cache.get("prices", [])):
+                nifty_cache = {"prices": prices}
+                log.info(f"✅ Stooq Nifty 50: {len(prices)} days (extended from Upstox)")
+            elif name == "midcap" and len(prices) >= 252:
+                midcap_cache = {"prices": prices}
+                log.info(f"✅ Stooq Midcap: {len(prices)} days")
+            elif name == "smallcap" and len(prices) >= 252:
+                smallcap_cache = {"prices": prices}
+                log.info(f"✅ Stooq Smallcap: {len(prices)} days")
+        else:
+            log.warning(f"Stooq {name} ({ticker}): only {len(prices)} days")
+        await asyncio.sleep(0.5)
+
 async def load_nifty_cache(session: aiohttp.ClientSession):
     """Fetch Nifty 50 daily close history needed for TradingView-style RS calculation."""
     global nifty_cache
@@ -1982,6 +2038,8 @@ async def main():
         # Step 2b: Load Nifty 50 + all index histories
         await load_nifty_cache(session)
         await load_index_cache(session)
+        # Step 2c: Extend with stooq 2yr history for accurate RS normalization
+        await load_stooq_index_cache(session)
 
         # Step 3: Load historical data cache at startup
         log.info("Loading historical data cache at startup…")
