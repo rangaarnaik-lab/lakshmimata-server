@@ -1085,6 +1085,36 @@ prev_squeeze_state: dict = {}
 
 historical_cache: dict = {}   # sym -> {prices, volumes}
 nifty_cache: dict = {}        # {'prices': [...]} — Nifty index daily closes for TV RS calc
+midcap_cache: dict = {}       # {'prices': [...]} — synthetic Midcap 150 index
+smallcap_cache: dict = {}     # {'prices': [...]} — synthetic Smallcap 250 index
+
+def build_synthetic_index(symbols: list, cache: dict, min_stocks: int = 20) -> dict:
+    """
+    Build a synthetic index price series from constituent stocks.
+    Uses equal-weight average of daily closes — approximates the index well enough
+    for RS benchmark calculation. NSE uses free-float market cap weighting but
+    equal-weight is directionally identical for RS purposes.
+    Returns {'prices': [...]} aligned to the shortest common history.
+    """
+    series = []
+    for sym in symbols:
+        data = cache.get(sym)
+        if data and len(data.get('prices', [])) >= 60:
+            series.append(data['prices'])
+
+    if len(series) < min_stocks:
+        return {}
+
+    # Align to shortest series length
+    min_len = min(len(s) for s in series)
+    series  = [s[-min_len:] for s in series]
+
+    # Equal-weight average at each day
+    prices = [
+        sum(s[i] for s in series) / len(series)
+        for i in range(min_len)
+    ]
+    return {'prices': prices}
 
 NIFTY_INSTRUMENT_KEY = "NSE_INDEX|Nifty 50"  # Upstox key for Nifty 50 index
 
@@ -1374,6 +1404,10 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         await load_historical_cache(session)
         await load_nifty_cache(session)
         await load_index_cache(session)
+        # Rebuild synthetic indices with fresh EOD data
+        midcap_cache   = build_synthetic_index(list(MIDCAP),   historical_cache, min_stocks=50)
+        smallcap_cache = build_synthetic_index(list(SMALLCAP), historical_cache, min_stocks=80)
+        log.info(f"  Synthetic indices rebuilt: Mid={len(midcap_cache.get('prices',[]))}d Sml={len(smallcap_cache.get('prices',[]))}d")
 
     # Step 3: DO NOT mutate historical_cache prices in place (was causing chg% drift).
     # Instead, keep historical close as the immutable baseline and use live price
@@ -1450,13 +1484,12 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         # Compute raw scores vs each benchmark index
         # Cross-sectional percentile rank happens AFTER all stocks are computed
         nifty_prices    = nifty_cache.get('prices', [])
-        midcap_prices   = nifty_prices   # Upstox doesn't support Midcap index history
-        smallcap_prices = nifty_prices   # Use Nifty as benchmark for all — rank vs peer group
+        midcap_prices   = midcap_cache.get('prices', [])   or nifty_prices
+        smallcap_prices = smallcap_cache.get('prices', []) or nifty_prices
 
         raw_tv       = calc_rs_tv_normalized(prices, nifty_prices)    if nifty_prices    else None
         raw_mid      = calc_rs_tv_normalized(prices, midcap_prices)   if midcap_prices   else None
         raw_sml      = calc_rs_tv_normalized(prices, smallcap_prices) if smallcap_prices else None
-
         # Sector-relative RS — percentile rank vs same sector peers
         my_raw    = my_raw_val
         my_sector = sym_to_sector.get(sym, 'Other')
@@ -1540,7 +1573,9 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'chg_pct':        chg,
             'volume':         int(vol),
             'rs':             rs,
-            'rs_tv':          raw_tv,      # raw for now — ranked cross-sectionally below
+            'rs_tv':          raw_tv,      # raw vs Nifty — cross-ranked below
+            'rs_mid_raw':     raw_mid,     # raw vs synthetic Midcap — cross-ranked below
+            'rs_sml_raw':     raw_sml,     # raw vs synthetic Smallcap — cross-ranked below
             'rvol':           rvol_data.get('rvol'),
             'vol_signal':     rvol_data.get('vol_signal'),
             'rs_line_new_high': rs_line_data.get('rs_line_new_high', False),
@@ -1674,40 +1709,26 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         await supabase_upsert(session, 'market_breadth', [breadth], on_conflict='scan_date')
         log.info(f"  📈 Market breadth saved: {breadth['advances']}↑ {breadth['declines']}↓ Stage2:{breadth['stage2_count']}")
 
-    # ── Cross-sectional RS ranking (matches Pine Script exactly) ──────────
-    # All stocks use rawRS vs Nifty as benchmark
-    # Then rank cross-sectionally within each peer pool
-    all_pairs = [(s, s['rs_tv']) for s in processed if s['rs_tv'] is not None]
-    all_raws  = [v for _, v in all_pairs]
+    # ── Cross-sectional RS ranking ─────────────────────────────────────────
+    # Each stock has raw scores vs 3 benchmarks: Nifty, synthetic Midcap, synthetic Smallcap
+    # Cross-rank each raw score against all stocks to get 1-99 percentile
+
+    all_tv_raws  = [s['rs_tv']      for s in processed if s['rs_tv']      is not None]
+    all_mid_raws = [s['rs_mid_raw'] for s in processed if s['rs_mid_raw'] is not None]
+    all_sml_raws = [s['rs_sml_raw'] for s in processed if s['rs_sml_raw'] is not None]
 
     def cross_pct(raw, pool_raws):
         if not pool_raws or raw is None: return None
         return min(99, max(1, round((sum(1 for x in pool_raws if x < raw) / len(pool_raws)) * 98) + 1))
 
-    # Build pool raw values for each group
-    mid_syms  = set(MIDCAP)
-    sml_syms  = set(SMALLCAP)
-    n50_syms  = set(NIFTY50)
-
-    mid_raws  = [s['rs_tv'] for s in processed if s['sym'] in mid_syms  and s['rs_tv'] is not None]
-    sml_raws  = [s['rs_tv'] for s in processed if s['sym'] in sml_syms  and s['rs_tv'] is not None]
-    n50_raws  = [s['rs_tv'] for s in processed if s['sym'] in n50_syms  and s['rs_tv'] is not None]
-
     for s in processed:
-        raw = s['rs_tv']
-        # rs_tv = rank vs ALL stocks (primary — matches Pine Script Main RS)
-        s['rs_tv']       = cross_pct(raw, all_raws)
-        # rs_midcap = where this stock ranks vs Midcap 150 peer group
-        s['rs_midcap']   = cross_pct(raw, mid_raws)  if mid_raws  else None
-        # rs_smallcap = where this stock ranks vs Smallcap 250 peer group
-        s['rs_smallcap'] = cross_pct(raw, sml_raws)  if sml_raws  else None
-
-    # Clean up temp raw fields
-    for s in processed:
+        s['rs_tv']       = cross_pct(s['rs_tv'],      all_tv_raws)
+        s['rs_midcap']   = cross_pct(s['rs_mid_raw'], all_mid_raws)
+        s['rs_smallcap'] = cross_pct(s['rs_sml_raw'], all_sml_raws)
         s.pop('rs_mid_raw', None)
         s.pop('rs_sml_raw', None)
 
-    log.info(f"  RS-TV ranked: {len(all_pairs)} stocks | Mid pool: {len(mid_raws)} | Sml pool: {len(sml_raws)}")
+    log.info(f"  RS ranked: TV={len(all_tv_raws)} Mid={len(all_mid_raws)} Sml={len(all_sml_raws)} stocks")
 
     # Step 6: Build sector RS
     sector_rows = build_sector_rs(processed, SECTOR_MAP)
@@ -1931,6 +1952,13 @@ async def main():
         # Step 2b: Load Nifty 50 + all index histories for TV RS calc and index dashboard
         await load_nifty_cache(session)
         await load_index_cache(session)
+
+        # Step 2c: Build synthetic Midcap/Smallcap indices from constituent stock prices
+        global midcap_cache, smallcap_cache
+        midcap_cache   = build_synthetic_index(list(MIDCAP),   historical_cache, min_stocks=50)
+        smallcap_cache = build_synthetic_index(list(SMALLCAP), historical_cache, min_stocks=80)
+        log.info(f"✅ Synthetic Midcap index: {len(midcap_cache.get('prices',[]))} days from {len([s for s in MIDCAP if s in historical_cache])} stocks")
+        log.info(f"✅ Synthetic Smallcap index: {len(smallcap_cache.get('prices',[]))} days from {len([s for s in SMALLCAP if s in historical_cache])} stocks")
 
         # Step 3: Load historical data cache at startup
         log.info("Loading historical data cache at startup…")
