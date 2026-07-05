@@ -489,49 +489,51 @@ def calc_rs_tv_raw(prices: list, bench_prices: list, end_idx: int = None) -> Opt
 
 def calc_rs_tv_normalized(prices: list, bench_prices: list, end_idx: int = None) -> Optional[int]:
     """
-    TradingView RS Rating — matches Lakshmi Mata Pine Script exactly:
-        perf(src,len) = (src - src[len]) / src[len] * 100
-        r3m  = perf(stock,63)  - perf(bench,63)   * 0.40
-        r6m  = perf(stock,126) - perf(bench,126)  * 0.20
-        r9m  = perf(stock,189) - perf(bench,189)  * 0.20
-        r12m = perf(stock,252) - perf(bench,252)  * 0.20
-        rawRS = r3m*0.4 + r6m*0.2 + r9m*0.2 + r12m*0.2
-        rsHigh = ta.highest(rawRS, 252)
-        rsLow  = ta.lowest(rawRS,  252)
-        rsRating = round(((rawRS - rsLow)/(rsHigh - rsLow))*98 + 1)
-    Self-normalized — each stock rated vs its OWN 252-day rawRS range.
-    Returns 1-99 integer.
+    Fast vectorized TV RS Rating matching Pine Script exactly.
+    Uses single-pass computation instead of 252 individual calls.
     """
     end = end_idx if end_idx is not None else len(prices) - 1
-    if end < 252 or len(bench_prices) <= end:
+    n   = min(end + 1, len(bench_prices))
+    if n < 253:
         return None
 
+    p = prices[:n]
+    b = bench_prices[:n]
+
+    def perf(arr, length, i):
+        if i < length: return None
+        prev = arr[i - length]
+        return (arr[i] - prev) / prev * 100 if prev else None
+
+    def raw_at(i):
+        r3  = perf(p,63,i);  br3  = perf(b,63,i)
+        r6  = perf(p,126,i); br6  = perf(b,126,i)
+        r9  = perf(p,189,i); br9  = perf(b,189,i)
+        r12 = perf(p,252,i); br12 = perf(b,252,i)
+        if None in (r3,br3,r6,br6,r9,br9,r12,br12): return None
+        return (r3-br3)*0.4 + (r6-br6)*0.2 + (r9-br9)*0.2 + (r12-br12)*0.2
+
     # Today's rawRS
-    current_raw = calc_rs_tv_raw(prices, bench_prices, end_idx=end)
+    current_raw = raw_at(end)
     if current_raw is None:
         return None
 
-    # Build 252-day history of rawRS for this stock (Pine Script: ta.highest/lowest over 252)
-    raw_history = []
-    for d in range(min(252, end - 252), -1, -1):
-        idx = end - d
-        if idx < 252:
-            continue
-        raw = calc_rs_tv_raw(prices, bench_prices, end_idx=idx)
-        if raw is not None:
-            raw_history.append(raw)
+    # Build history window (up to 252 days back) in one pass
+    hist = []
+    for i in range(max(252, end-251), end+1):
+        v = raw_at(i)
+        if v is not None:
+            hist.append(v)
 
-    if len(raw_history) < 2:
-        return 50  # not enough history
+    if len(hist) < 2:
+        return 50
 
-    rs_high = max(raw_history)
-    rs_low  = min(raw_history)
-
+    rs_high = max(hist)
+    rs_low  = min(hist)
     if rs_high == rs_low:
         return 50
 
-    rating = round(((current_raw - rs_low) / (rs_high - rs_low)) * 98 + 1)
-    return max(1, min(99, rating))
+    return max(1, min(99, round(((current_raw - rs_low) / (rs_high - rs_low)) * 98 + 1)))
 
 def percentile_rank(values: list, val: float) -> int:
     below = sum(1 for v in values if v < val)
@@ -1124,29 +1126,33 @@ smallcap_cache: dict = {}     # {'prices': [...]} — synthetic Smallcap 250 ind
 
 def build_synthetic_index(symbols: list, cache: dict, min_stocks: int = 20) -> dict:
     """
-    Build a synthetic index price series from constituent stocks.
-    Uses equal-weight average of daily closes — approximates the index well enough
-    for RS benchmark calculation. NSE uses free-float market cap weighting but
-    equal-weight is directionally identical for RS purposes.
-    Returns {'prices': [...]} aligned to the shortest common history.
+    Build synthetic index from constituent stocks.
+    Uses the LONGEST common window (most stocks have 285 days).
+    Stocks with shorter history are excluded rather than truncating all.
     """
-    series = []
+    # Get all series, find the most common length (mode)
+    all_series = []
     for sym in symbols:
         data = cache.get(sym)
-        if data and len(data.get('prices', [])) >= 60:
-            series.append(data['prices'])
+        if data and len(data.get('prices', [])) >= 252:
+            all_series.append(data['prices'])
+
+    if len(all_series) < min_stocks:
+        return {}
+
+    # Use the max length that at least 80% of stocks share
+    lengths = sorted([len(s) for s in all_series], reverse=True)
+    target_len = lengths[int(len(lengths) * 0.2)]  # 80th percentile length
+
+    # Keep only stocks with enough history, truncate to target_len
+    series = [s[-target_len:] for s in all_series if len(s) >= target_len]
 
     if len(series) < min_stocks:
         return {}
 
-    # Align to shortest series length
-    min_len = min(len(s) for s in series)
-    series  = [s[-min_len:] for s in series]
-
-    # Equal-weight average at each day
     prices = [
         sum(s[i] for s in series) / len(series)
-        for i in range(min_len)
+        for i in range(target_len)
     ]
     return {'prices': prices}
 
@@ -1983,7 +1989,7 @@ async def main():
         # Detect the correct scan type based on actual time, rather than always
         # forcing 'batch_morning' — if Railway restarts mid-afternoon or after
         # close, the first scan should reflect that correctly.
-        SCAN_TIMEOUT = 600  # 10 minutes max for a single scan cycle
+        SCAN_TIMEOUT = 900  # 15 minutes max — RS self-normalization adds compute time
         ist_now_initial = datetime.now(IST)
         if is_market_open():
             initial_scan_type = 'live'
