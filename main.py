@@ -1094,9 +1094,6 @@ INDEX_TRACKER = {
     "Nifty 50":       "NSE_INDEX|Nifty 50",
     "Nifty Next 50":  "NSE_INDEX|Nifty Next 50",
     "Nifty 500":      "NSE_INDEX|Nifty 500",
-    "Midcap 150":     "NSE_INDEX|Nifty Midcap 150",
-    "Smallcap 250":   "NSE_INDEX|Nifty Smallcap 250",
-    "Microcap 250":   "NSE_INDEX|Nifty Microcap 250",
     "Bank Nifty":     "NSE_INDEX|Nifty Bank",
     "IT":             "NSE_INDEX|Nifty IT",
     "Pharma":         "NSE_INDEX|Nifty Pharma",
@@ -1453,8 +1450,8 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         # Compute raw scores vs each benchmark index
         # Cross-sectional percentile rank happens AFTER all stocks are computed
         nifty_prices    = nifty_cache.get('prices', [])
-        midcap_prices   = index_history_cache.get('Midcap 150',   {}).get('prices', []) or nifty_prices
-        smallcap_prices = index_history_cache.get('Smallcap 250', {}).get('prices', []) or nifty_prices
+        midcap_prices   = nifty_prices   # Upstox doesn't support Midcap index history
+        smallcap_prices = nifty_prices   # Use Nifty as benchmark for all — rank vs peer group
 
         raw_tv       = calc_rs_tv_normalized(prices, nifty_prices)    if nifty_prices    else None
         raw_mid      = calc_rs_tv_normalized(prices, midcap_prices)   if midcap_prices   else None
@@ -1544,8 +1541,6 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'volume':         int(vol),
             'rs':             rs,
             'rs_tv':          raw_tv,      # raw for now — ranked cross-sectionally below
-            'rs_mid_raw':     raw_mid,     # raw — ranked below
-            'rs_sml_raw':     raw_sml,     # raw — ranked below
             'rvol':           rvol_data.get('rvol'),
             'vol_signal':     rvol_data.get('vol_signal'),
             'rs_line_new_high': rs_line_data.get('rs_line_new_high', False),
@@ -1680,32 +1675,39 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         log.info(f"  📈 Market breadth saved: {breadth['advances']}↑ {breadth['declines']}↓ Stage2:{breadth['stage2_count']}")
 
     # ── Cross-sectional RS ranking (matches Pine Script exactly) ──────────
-    # Pine Script ranks each stock's rawRS against ALL other stocks' rawRS
-    # to produce the final 1-99 rating. We do the same here.
-    tv_raws  = [(s, s['rs_tv'])       for s in processed if s['rs_tv']      is not None]
-    mid_raws = [(s, s['rs_mid_raw'])  for s in processed if s['rs_mid_raw'] is not None]
-    sml_raws = [(s, s['rs_sml_raw'])  for s in processed if s['rs_sml_raw'] is not None]
+    # All stocks use rawRS vs Nifty as benchmark
+    # Then rank cross-sectionally within each peer pool
+    all_pairs = [(s, s['rs_tv']) for s in processed if s['rs_tv'] is not None]
+    all_raws  = [v for _, v in all_pairs]
 
-    def cross_rank(pairs):
-        vals = [v for _, v in pairs]
-        for s, v in pairs:
-            s_key = id(s)
-            rank = min(99, max(1, round((sum(1 for x in vals if x < v) / len(vals)) * 98) + 1))
-            yield s, rank
+    def cross_pct(raw, pool_raws):
+        if not pool_raws or raw is None: return None
+        return min(99, max(1, round((sum(1 for x in pool_raws if x < raw) / len(pool_raws)) * 98) + 1))
 
-    for s, rank in cross_rank(tv_raws):
-        s['rs_tv'] = rank
-    for s, rank in cross_rank(mid_raws):
-        s['rs_midcap'] = rank
-    for s, rank in cross_rank(sml_raws):
-        s['rs_smallcap'] = rank
+    # Build pool raw values for each group
+    mid_syms  = set(MIDCAP)
+    sml_syms  = set(SMALLCAP)
+    n50_syms  = set(NIFTY50)
+
+    mid_raws  = [s['rs_tv'] for s in processed if s['sym'] in mid_syms  and s['rs_tv'] is not None]
+    sml_raws  = [s['rs_tv'] for s in processed if s['sym'] in sml_syms  and s['rs_tv'] is not None]
+    n50_raws  = [s['rs_tv'] for s in processed if s['sym'] in n50_syms  and s['rs_tv'] is not None]
+
+    for s in processed:
+        raw = s['rs_tv']
+        # rs_tv = rank vs ALL stocks (primary — matches Pine Script Main RS)
+        s['rs_tv']       = cross_pct(raw, all_raws)
+        # rs_midcap = where this stock ranks vs Midcap 150 peer group
+        s['rs_midcap']   = cross_pct(raw, mid_raws)  if mid_raws  else None
+        # rs_smallcap = where this stock ranks vs Smallcap 250 peer group
+        s['rs_smallcap'] = cross_pct(raw, sml_raws)  if sml_raws  else None
 
     # Clean up temp raw fields
     for s in processed:
         s.pop('rs_mid_raw', None)
         s.pop('rs_sml_raw', None)
 
-    log.info(f"  RS-TV cross-ranked: {len(tv_raws)} stocks | Mid: {len(mid_raws)} | Sml: {len(sml_raws)}")
+    log.info(f"  RS-TV ranked: {len(all_pairs)} stocks | Mid pool: {len(mid_raws)} | Sml pool: {len(sml_raws)}")
 
     # Step 6: Build sector RS
     sector_rows = build_sector_rs(processed, SECTOR_MAP)
