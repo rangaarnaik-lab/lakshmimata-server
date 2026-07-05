@@ -1026,7 +1026,7 @@ async def fetch_historical(session: aiohttp.ClientSession, sym: str,
                            instrument_key: str = None) -> dict:
     """Fetch 15 months of daily historical data for one stock."""
     to   = datetime.now(IST).strftime('%Y-%m-%d')
-    from_= (datetime.now(IST) - timedelta(days=400)).strftime('%Y-%m-%d')
+    from_= (datetime.now(IST) - timedelta(days=550)).strftime('%Y-%m-%d')
 
     # Use provided instrument_key or build from symbol
     key = instrument_key if instrument_key else f"NSE_EQ|{sym}"
@@ -1190,7 +1190,7 @@ async def load_index_cache(session: aiohttp.ClientSession):
     global index_history_cache
     log.info(f"Loading historical data for {len(INDEX_TRACKER)} indices…")
     to   = datetime.now(IST).strftime('%Y-%m-%d')
-    from_= (datetime.now(IST) - timedelta(days=420)).strftime('%Y-%m-%d')
+    from_= (datetime.now(IST) - timedelta(days=550)).strftime('%Y-%m-%d')
     headers = {
         "Authorization": f"Bearer {ANALYTICS_TOKEN}",
         "Accept": "application/json"
@@ -1277,7 +1277,7 @@ async def load_nifty_cache(session: aiohttp.ClientSession):
     global nifty_cache
     log.info("Fetching Nifty 50 historical data for TV-style RS calc…")
     to   = datetime.now(IST).strftime('%Y-%m-%d')
-    from_= (datetime.now(IST) - timedelta(days=420)).strftime('%Y-%m-%d')
+    from_= (datetime.now(IST) - timedelta(days=550)).strftime('%Y-%m-%d')
     encoded = NIFTY_INSTRUMENT_KEY.replace('|', '%7C').replace(' ', '%20')
     url  = f"https://api.upstox.com/v2/historical-candle/{encoded}/day/{to}/{from_}"
     headers = {
