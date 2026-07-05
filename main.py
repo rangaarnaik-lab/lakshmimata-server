@@ -1727,6 +1727,44 @@ async def load_historical_cache(session: aiohttp.ClientSession):
     log.info(f"✅ Historical cache loaded: {loaded} stocks")
 
 # ── Main scan function ────────────────────────────────────────────────
+async def fetch_bulk_ohlc(session: aiohttp.ClientSession, instrument_keys: list) -> dict:
+    """
+    Fetch live OHLC quotes for up to 500 instruments from Upstox market quotes API.
+    Returns dict: { "NSE_EQ:SYM": {last_price, open, high, low, volume, ...} }
+    """
+    if not instrument_keys:
+        return {}
+    headers = {
+        "Authorization": f"Bearer {ANALYTICS_TOKEN}",
+        "Accept": "application/json",
+    }
+    # Upstox full market quotes endpoint
+    keys_param = ",".join(instrument_keys)
+    url = f"https://api.upstox.com/v2/market-quote/quotes?instrument_key={keys_param}"
+    try:
+        async with session.get(url, headers=headers,
+                               timeout=aiohttp.ClientTimeout(total=30)) as r:
+            if r.status == 200:
+                data = await r.json()
+                result = {}
+                for key, quote in data.get("data", {}).items():
+                    result[key] = {
+                        "last_price": quote.get("last_price") or quote.get("ltp"),
+                        "open":       quote.get("ohlc", {}).get("open"),
+                        "high":       quote.get("ohlc", {}).get("high"),
+                        "low":        quote.get("ohlc", {}).get("low"),
+                        "volume":     quote.get("volume"),
+                        "prev_close": quote.get("ohlc", {}).get("close"),
+                    }
+                return result
+            else:
+                body = await r.text()
+                log.warning(f"Bulk OHLC fetch failed: {r.status} {body[:100]}")
+                return {}
+    except Exception as e:
+        log.warning(f"Bulk OHLC error: {e}")
+        return {}
+
 async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> int:
     start = time.time()
     now_ist = datetime.now(IST)
