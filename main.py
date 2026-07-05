@@ -487,17 +487,51 @@ def calc_rs_tv_raw(prices: list, bench_prices: list, end_idx: int = None) -> Opt
 
     return r3m * 0.4 + r6m * 0.2 + r9m * 0.2 + r12m * 0.2
 
-def calc_rs_tv_normalized(prices: list, bench_prices: list, end_idx: int = None) -> Optional[float]:
+def calc_rs_tv_normalized(prices: list, bench_prices: list, end_idx: int = None) -> Optional[int]:
     """
-    Returns the RAW (unnormalized) TV RS score for cross-sectional ranking.
-    Pine Script normalizes across ALL stocks — so we compute raw here,
-    then percentile_rank across all stocks in run_scan().
-    rawRS = r3m*0.4 + r6m*0.2 + r9m*0.2 + r12m*0.2  (relative to benchmark)
+    TradingView RS Rating — matches Lakshmi Mata Pine Script exactly:
+        perf(src,len) = (src - src[len]) / src[len] * 100
+        r3m  = perf(stock,63)  - perf(bench,63)   * 0.40
+        r6m  = perf(stock,126) - perf(bench,126)  * 0.20
+        r9m  = perf(stock,189) - perf(bench,189)  * 0.20
+        r12m = perf(stock,252) - perf(bench,252)  * 0.20
+        rawRS = r3m*0.4 + r6m*0.2 + r9m*0.2 + r12m*0.2
+        rsHigh = ta.highest(rawRS, 252)
+        rsLow  = ta.lowest(rawRS,  252)
+        rsRating = round(((rawRS - rsLow)/(rsHigh - rsLow))*98 + 1)
+    Self-normalized — each stock rated vs its OWN 252-day rawRS range.
+    Returns 1-99 integer.
     """
     end = end_idx if end_idx is not None else len(prices) - 1
-    if end < 252 or len(bench_prices) < 252:
+    if end < 252 or len(bench_prices) <= end:
         return None
-    return calc_rs_tv_raw(prices, bench_prices, end_idx=end)
+
+    # Today's rawRS
+    current_raw = calc_rs_tv_raw(prices, bench_prices, end_idx=end)
+    if current_raw is None:
+        return None
+
+    # Build 252-day history of rawRS for this stock (Pine Script: ta.highest/lowest over 252)
+    raw_history = []
+    for d in range(min(252, end - 252), -1, -1):
+        idx = end - d
+        if idx < 252:
+            continue
+        raw = calc_rs_tv_raw(prices, bench_prices, end_idx=idx)
+        if raw is not None:
+            raw_history.append(raw)
+
+    if len(raw_history) < 2:
+        return 50  # not enough history
+
+    rs_high = max(raw_history)
+    rs_low  = min(raw_history)
+
+    if rs_high == rs_low:
+        return 50
+
+    rating = round(((current_raw - rs_low) / (rs_high - rs_low)) * 98 + 1)
+    return max(1, min(99, rating))
 
 def percentile_rank(values: list, val: float) -> int:
     below = sum(1 for v in values if v < val)
@@ -1573,9 +1607,9 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'chg_pct':        chg,
             'volume':         int(vol),
             'rs':             rs,
-            'rs_tv':          raw_tv,      # raw vs Nifty — cross-ranked below
-            'rs_mid_raw':     raw_mid,     # raw vs synthetic Midcap — cross-ranked below
-            'rs_sml_raw':     raw_sml,     # raw vs synthetic Smallcap — cross-ranked below
+            'rs_tv':          raw_tv,      # self-normalized vs Nifty (matches Pine Script)
+            'rs_midcap':      raw_mid,     # self-normalized vs synthetic Midcap index
+            'rs_smallcap':    raw_sml,     # self-normalized vs synthetic Smallcap index
             'rvol':           rvol_data.get('rvol'),
             'vol_signal':     rvol_data.get('vol_signal'),
             'rs_line_new_high': rs_line_data.get('rs_line_new_high', False),
@@ -1583,8 +1617,6 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'rs_line_value':  rs_line_data.get('rs_line_value'),
             'is_s2_new_entry': is_s2_new,       # TradingView / Lakshmi Mata Pine Script RS
             'rs_nifty50':     None,        # deprecated — use rs_tv
-            'rs_midcap':      None,        # filled cross-sectionally below
-            'rs_smallcap':    None,        # filled cross-sectionally below
             'rs_microcap':    None,
             'rs_sector':      rs_sector,
             'rs_raw':         round(my_raw_val, 6) if my_raw_val is not None else None,
@@ -1709,26 +1741,7 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         await supabase_upsert(session, 'market_breadth', [breadth], on_conflict='scan_date')
         log.info(f"  📈 Market breadth saved: {breadth['advances']}↑ {breadth['declines']}↓ Stage2:{breadth['stage2_count']}")
 
-    # ── Cross-sectional RS ranking ─────────────────────────────────────────
-    # Each stock has raw scores vs 3 benchmarks: Nifty, synthetic Midcap, synthetic Smallcap
-    # Cross-rank each raw score against all stocks to get 1-99 percentile
 
-    all_tv_raws  = [s['rs_tv']      for s in processed if s['rs_tv']      is not None]
-    all_mid_raws = [s['rs_mid_raw'] for s in processed if s['rs_mid_raw'] is not None]
-    all_sml_raws = [s['rs_sml_raw'] for s in processed if s['rs_sml_raw'] is not None]
-
-    def cross_pct(raw, pool_raws):
-        if not pool_raws or raw is None: return None
-        return min(99, max(1, round((sum(1 for x in pool_raws if x < raw) / len(pool_raws)) * 98) + 1))
-
-    for s in processed:
-        s['rs_tv']       = cross_pct(s['rs_tv'],      all_tv_raws)
-        s['rs_midcap']   = cross_pct(s['rs_mid_raw'], all_mid_raws)
-        s['rs_smallcap'] = cross_pct(s['rs_sml_raw'], all_sml_raws)
-        s.pop('rs_mid_raw', None)
-        s.pop('rs_sml_raw', None)
-
-    log.info(f"  RS ranked: TV={len(all_tv_raws)} Mid={len(all_mid_raws)} Sml={len(all_sml_raws)} stocks")
 
     # Step 6: Build sector RS
     sector_rows = build_sector_rs(processed, SECTOR_MAP)
