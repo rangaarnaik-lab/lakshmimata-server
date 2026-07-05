@@ -487,53 +487,61 @@ def calc_rs_tv_raw(prices: list, bench_prices: list, end_idx: int = None) -> Opt
 
     return r3m * 0.4 + r6m * 0.2 + r9m * 0.2 + r12m * 0.2
 
+def calc_raw_rs_series(prices: list, bench_prices: list) -> list:
+    """
+    Compute full rawRS series for a stock vs benchmark in ONE pass.
+    Returns list of rawRS values (one per day, None where not computable).
+    This is called ONCE per stock — result is cached and used for normalization.
+    """
+    n = min(len(prices), len(bench_prices))
+    result = []
+    for i in range(n):
+        if i < 252:
+            result.append(None)
+            continue
+        def pct(arr, length):
+            prev = arr[i - length]
+            return (arr[i] - prev) / prev * 100 if prev else None
+        r3  = pct(prices, 63);  br3  = pct(bench_prices, 63)
+        r6  = pct(prices, 126); br6  = pct(bench_prices, 126)
+        r9  = pct(prices, 189); br9  = pct(bench_prices, 189)
+        r12 = pct(prices, 252); br12 = pct(bench_prices, 252)
+        if None in (r3,br3,r6,br6,r9,br9,r12,br12):
+            result.append(None)
+        else:
+            result.append((r3-br3)*0.4 + (r6-br6)*0.2 + (r9-br9)*0.2 + (r12-br12)*0.2)
+    return result
+
+
+def normalize_rs(raw_series: list) -> Optional[int]:
+    """
+    Normalize today's rawRS using 252-day min/max window — matches Pine Script:
+        rsHigh = ta.highest(rawRS, 252)
+        rsLow  = ta.lowest(rawRS,  252)
+        rsRating = round(((rawRS - rsLow)/(rsHigh - rsLow))*98 + 1)
+    """
+    if not raw_series:
+        return None
+    # Get last 252 valid values
+    valid = [v for v in raw_series[-252:] if v is not None]
+    if len(valid) < 2:
+        return 50
+    current = raw_series[-1]
+    if current is None:
+        return None
+    hi = max(valid)
+    lo = min(valid)
+    if hi == lo:
+        return 50
+    return max(1, min(99, round(((current - lo) / (hi - lo)) * 98 + 1)))
+
+
 def calc_rs_tv_normalized(prices: list, bench_prices: list, end_idx: int = None) -> Optional[int]:
-    """
-    Fast vectorized TV RS Rating matching Pine Script exactly.
-    Uses single-pass computation instead of 252 individual calls.
-    """
-    end = end_idx if end_idx is not None else len(prices) - 1
-    n   = min(end + 1, len(bench_prices))
-    if n < 253:
-        return None
-
-    p = prices[:n]
-    b = bench_prices[:n]
-
-    def perf(arr, length, i):
-        if i < length: return None
-        prev = arr[i - length]
-        return (arr[i] - prev) / prev * 100 if prev else None
-
-    def raw_at(i):
-        r3  = perf(p,63,i);  br3  = perf(b,63,i)
-        r6  = perf(p,126,i); br6  = perf(b,126,i)
-        r9  = perf(p,189,i); br9  = perf(b,189,i)
-        r12 = perf(p,252,i); br12 = perf(b,252,i)
-        if None in (r3,br3,r6,br6,r9,br9,r12,br12): return None
-        return (r3-br3)*0.4 + (r6-br6)*0.2 + (r9-br9)*0.2 + (r12-br12)*0.2
-
-    # Today's rawRS
-    current_raw = raw_at(end)
-    if current_raw is None:
-        return None
-
-    # Build history window (up to 252 days back) in one pass
-    hist = []
-    for i in range(max(252, end-251), end+1):
-        v = raw_at(i)
-        if v is not None:
-            hist.append(v)
-
-    if len(hist) < 2:
-        return 50
-
-    rs_high = max(hist)
-    rs_low  = min(hist)
-    if rs_high == rs_low:
-        return 50
-
-    return max(1, min(99, round(((current_raw - rs_low) / (rs_high - rs_low)) * 98 + 1)))
+    """Convenience wrapper — computes full series then normalizes."""
+    raw = calc_raw_rs_series(prices, bench_prices)
+    if end_idx is not None:
+        raw = raw[:end_idx+1]
+    return normalize_rs(raw)
 
 def percentile_rank(values: list, val: float) -> int:
     below = sum(1 for v in values if v < val)
