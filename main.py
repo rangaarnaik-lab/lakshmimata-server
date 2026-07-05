@@ -584,54 +584,53 @@ def calc_rs_tv_raw(prices: list, bench_prices: list, end_idx: int = None) -> Opt
 
 def calc_rs_tv_normalized(prices: list, bench_prices: list, end_idx: int = None) -> Optional[int]:
     """
-    Full TradingView RS Rating — raw score normalized via the stock's OWN
-    252-day min/max rawRS range, exactly matching the Pine Script:
+    Full TradingView RS Rating matching Pine Script exactly:
         rsHigh = ta.highest(rawRS, 252)
         rsLow  = ta.lowest(rawRS,  252)
         rsRating = round(((rawRS - rsLow) / (rsHigh - rsLow)) * 98 + 1)
-    Returns an integer 1-99, or None if insufficient data.
+
+    KEY FIX: When building rawRS history, BOTH stock AND bench arrays
+    are trimmed to the same bar — matching Pine Script bar-by-bar calculation.
     """
     end = end_idx if end_idx is not None else len(prices) - 1
 
-    # Need at least 252 bars for the raw RS calculation
-    if end < 252 or len(bench_prices) < 252:
-        # For stocks with less than 252 days, use simpler relative strength
-        # Just compare stock return vs Nifty return over available history
-        if end < 60 or len(bench_prices) < 60:
-            return None
-        n = min(end, len(bench_prices)-1, 60)
-        s_ret = (prices[end] - prices[end-n]) / prices[end-n] * 100 if prices[end-n] else None
-        b_ret = (bench_prices[n] - bench_prices[0]) / bench_prices[0] * 100 if bench_prices[0] else None
-        if s_ret is None or b_ret is None:
-            return None
-        diff = s_ret - b_ret
-        # Scale to 1-99
-        return max(1, min(99, int(50 + diff * 2)))
+    # Align arrays — both end at same date (today)
+    n = min(len(prices), len(bench_prices))
+    prices      = prices[-n:]
+    bench_prices = bench_prices[-n:]
+    end         = len(prices) - 1
 
-    # Compute today's rawRS
+    if end < 252:
+        # Fewer than 252 bars: use simple relative return
+        if end < 60: return None
+        s_ret = (prices[-1] - prices[0]) / prices[0] * 100 if prices[0] else None
+        b_ret = (bench_prices[-1] - bench_prices[0]) / bench_prices[0] * 100 if bench_prices[0] else None
+        if s_ret is None or b_ret is None: return None
+        return max(1, min(99, int(50 + (s_ret - b_ret) * 1.5)))
+
+    # Today's rawRS
     current_raw = calc_rs_tv_raw(prices, bench_prices, end_idx=end)
     if current_raw is None:
         return None
 
-    # Build rawRS history for normalization (up to 252 lookback days)
-    raw_history = []
-    lookback_days = min(252, end - 252)
-    for d in range(lookback_days, -1, -1):
-        idx = end - d
-        if idx < 252:
-            continue
-        raw = calc_rs_tv_raw(prices, bench_prices, end_idx=idx)
-        if raw is not None:
-            raw_history.append(raw)
+    # Build rawRS history — trim BOTH arrays to bar ei (same date)
+    # This matches Pine Script: at each past bar, rawRS uses data up to that bar
+    raw_history = [current_raw]
+    lookback = min(252, end - 252)
+    for d in range(1, lookback + 1):
+        ei = end - d
+        if ei < 252: continue
+        # Both arrays trimmed to same historical date
+        r = calc_rs_tv_raw(prices[:ei+1], bench_prices[:ei+1], end_idx=ei)
+        if r is not None:
+            raw_history.append(r)
 
     if len(raw_history) < 5:
         return 50
 
     rs_high = max(raw_history)
     rs_low  = min(raw_history)
-
-    if rs_high == rs_low:
-        return 50  # Pine Script returns 50 when range is zero (flat stock)
+    if rs_high == rs_low: return 50
 
     rating = round(((current_raw - rs_low) / (rs_high - rs_low)) * 98 + 1)
     return max(1, min(99, rating))
