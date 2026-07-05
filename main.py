@@ -1949,20 +1949,21 @@ async def main():
 
         # Step 2a: Ensure all required DB columns exist
         await ensure_db_columns(session)
-        # Step 2b: Load Nifty 50 + all index histories for TV RS calc and index dashboard
+        # Step 2b: Load Nifty 50 + all index histories
         await load_nifty_cache(session)
         await load_index_cache(session)
 
-        # Step 2c: Build synthetic Midcap/Smallcap indices from constituent stock prices
+        # Step 3: Load historical data cache at startup
+        log.info("Loading historical data cache at startup…")
+        await load_historical_cache(session)
+
+        # Step 3b: Build synthetic Midcap/Smallcap indices AFTER history is loaded
         global midcap_cache, smallcap_cache
         midcap_cache   = build_synthetic_index(list(MIDCAP),   historical_cache, min_stocks=50)
         smallcap_cache = build_synthetic_index(list(SMALLCAP), historical_cache, min_stocks=80)
         log.info(f"✅ Synthetic Midcap index: {len(midcap_cache.get('prices',[]))} days from {len([s for s in MIDCAP if s in historical_cache])} stocks")
         log.info(f"✅ Synthetic Smallcap index: {len(smallcap_cache.get('prices',[]))} days from {len([s for s in SMALLCAP if s in historical_cache])} stocks")
 
-        # Step 3: Load historical data cache at startup
-        log.info("Loading historical data cache at startup…")
-        await load_historical_cache(session)
         log.info("✅ Proceeding to initial scan…")
 
         # Step 4: Run initial scan (hard timeout so a stall can't hang the process forever)
