@@ -947,6 +947,7 @@ async def load_fundamentals_batch(session: aiohttp.ClientSession, symbols: list)
     log.info(f"  Fundamentals loaded: {fetched}/{len(to_fetch)} stocks")
 
 
+async def fetch_bulk_ohlc(session: aiohttp.ClientSession, instrument_keys: list) -> dict:
     """Fetch OHLC for instruments in one call. Keep batch small — GET URL length limits apply."""
     url = "https://api.upstox.com/v2/market-quote/ohlc"
     headers = {
@@ -1401,8 +1402,8 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         # Compute raw scores vs each benchmark index
         # Cross-sectional percentile rank happens AFTER all stocks are computed
         nifty_prices    = nifty_cache.get('prices', [])
-        midcap_prices   = index_history_cache.get('Midcap 150',   {}).get('prices', [])
-        smallcap_prices = index_history_cache.get('Smallcap 250', {}).get('prices', [])
+        midcap_prices   = index_history_cache.get('Midcap 150',   {}).get('prices', []) or nifty_prices
+        smallcap_prices = index_history_cache.get('Smallcap 250', {}).get('prices', []) or nifty_prices
 
         raw_tv       = calc_rs_tv_normalized(prices, nifty_prices)    if nifty_prices    else None
         raw_mid      = calc_rs_tv_normalized(prices, midcap_prices)   if midcap_prices   else None
