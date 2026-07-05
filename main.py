@@ -261,7 +261,7 @@ def calc_earnings_momentum(screener_html: str) -> dict:
 # 5. Momentum = Donchian midline vs EMA midline (histogram)
 # 6. Fire signal = squeeze was ON, now OFF + momentum turning up
 
-def __sma(data, n):
+def _sma(data, n):
     if len(data) < n: return None
     return sum(data[-n:]) / n
 
@@ -316,7 +316,7 @@ def calc_ttm_squeeze(closes, highs, lows, bb_len=20, bb_mult=2.0, kc_len=20, kc_
         return empty
 
     # Bollinger Bands
-    bb_basis = [_sma(closes[:i+1], bb_len) for i in range(len(closes))]
+    bb_basis = [sma(closes[:i+1], bb_len) for i in range(len(closes))]
     bb_std   = [stdev(closes[:i+1], bb_len) for i in range(len(closes))]
 
     # Keltner Channels using ATR
@@ -329,11 +329,11 @@ def calc_ttm_squeeze(closes, highs, lows, bb_len=20, bb_mult=2.0, kc_len=20, kc_
         else:
             atr_series.append(sum(tr_full[i-kc_len+1:i+1]) / kc_len)
 
-    kc_basis = [_sma(closes[:i+1], kc_len) for i in range(len(closes))]
+    kc_basis = [sma(closes[:i+1], kc_len) for i in range(len(closes))]
 
     # Momentum = price position relative to midpoint of high/low range and EMA
     # John Carter's exact formula: 
-    # val = close - avg(avg(highest_high(len), lowest_low(len)), _sma(close, len))
+    # val = close - avg(avg(highest_high(len), lowest_low(len)), sma(close, len))
     mom_series = []
     for i in range(len(closes)):
         if i < n:
@@ -341,7 +341,7 @@ def calc_ttm_squeeze(closes, highs, lows, bb_len=20, bb_mult=2.0, kc_len=20, kc_
             continue
         window_h = max(highs[max(0,i-kc_len+1):i+1])
         window_l = min(lows[max(0,i-kc_len+1):i+1])
-        delta = closes[i] - (((window_h + window_l) / 2 + (_sma(closes[:i+1], kc_len) or closes[i])) / 2)
+        delta = closes[i] - (((window_h + window_l) / 2 + (sma(closes[:i+1], kc_len) or closes[i])) / 2)
         mom_series.append(delta)
 
     # Linear regression of momentum (smooth it)
