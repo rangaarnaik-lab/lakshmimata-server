@@ -250,188 +250,93 @@ def calc_earnings_momentum(screener_html: str) -> dict:
     # We'll use the pe and eps we already parse as a proxy
     return result
 
-# ── John Carter TTM Squeeze — Full Implementation ─────────────────────
-# Based on John Carter's "Mastering the Trade" TTM Squeeze indicator
-# 
-# Logic:
-# 1. Bollinger Bands (20, 2.0) 
-# 2. Keltner Channels (20, 1.5 ATR)
-# 3. Squeeze ON  = BB inside KC (red dot) — stock coiling
-# 4. Squeeze OFF = BB outside KC (green dot) — stock fired
-# 5. Momentum = Donchian midline vs EMA midline (histogram)
-# 6. Fire signal = squeeze was ON, now OFF + momentum turning up
-
-def sma(data, n):
-    if len(data) < n: return None
-    return sum(data[-n:]) / n
-
-def ema(data, n):
-    if len(data) < n: return None
-    k = 2 / (n + 1)
-    e = sum(data[:n]) / n
-    for p in data[n:]:
-        e = p * k + e * (1 - k)
-    return e
-
-def stdev(data, n):
-    if len(data) < n: return None
-    m = sum(data[-n:]) / n
-    variance = sum((x - m) ** 2 for x in data[-n:]) / n
-    return variance ** 0.5
-
-def true_range(closes, highs, lows):
-    """Compute True Range series."""
-    tr = []
-    for i in range(1, len(closes)):
-        h, l, pc = highs[i], lows[i], closes[i-1]
-        tr.append(max(h - l, abs(h - pc), abs(l - pc)))
-    return tr
-
-def calc_ttm_squeeze(closes, highs, lows, bb_len=20, bb_mult=2.0, kc_len=20, kc_mult=1.5):
+def detect_bb_squeeze(prices: list, highs: list, lows: list, n: int = 20) -> dict:
     """
-    Full John Carter TTM Squeeze calculation.
-    
-    Returns dict with:
-    - in_squeeze: bool (BB inside KC = squeeze ON = red dot)
-    - squeeze_fired: bool (just transitioned from ON to OFF = green dot)
-    - momentum: float (histogram value, positive=bullish, negative=bearish)
-    - momentum_dir: 'up'|'down'|'flat' (is histogram rising or falling)
-    - squeeze_days: int (consecutive days in squeeze)
-    - strength_score: float (squeeze_days * abs(momentum) = overall strength)
-    - dots: list of last 20 dots ('red'|'green'|'black') for UI histogram
-    - hist: list of last 20 momentum values for histogram bars
-    - fired_bullish: bool (fired + momentum positive + rising)
-    - fired_bearish: bool (fired + momentum negative + falling)
+    Bollinger Band Squeeze: BB width at multi-month low, BB inside Keltner Channel.
+    Classic TTM Squeeze indicator logic.
     """
-    n = max(bb_len, kc_len)
-    empty = {
-        'in_squeeze': False, 'squeeze_fired': False,
-        'momentum': 0, 'momentum_dir': 'flat',
-        'squeeze_days': 0, 'strength_score': 0,
-        'dots': [], 'hist': [],
-        'fired_bullish': False, 'fired_bearish': False,
-        'bb_width_pct': None,
-    }
-    if len(closes) < n + 30:
+    empty = {'in_squeeze': False, 'squeeze_fired': False, 'bb_width_pct': None, 'squeeze_days': 0}
+    if len(prices) < n + 60:
         return empty
 
-    # Bollinger Bands
-    bb_basis = [sma(closes[:i+1], bb_len) for i in range(len(closes))]
-    bb_std   = [stdev(closes[:i+1], bb_len) for i in range(len(closes))]
+    closes = prices
+    ma20 = sma(closes, n)
+    sd20 = std_dev(closes, n)
+    if not ma20 or not sd20:
+        return empty
 
-    # Keltner Channels using ATR
-    tr = true_range(closes, highs, lows)
-    tr_full = [0] + tr  # align with closes
-    atr_series = []
-    for i in range(len(closes)):
-        if i < kc_len:
-            atr_series.append(None)
-        else:
-            atr_series.append(sum(tr_full[i-kc_len+1:i+1]) / kc_len)
+    upper_bb = ma20 + 2 * sd20
+    lower_bb = ma20 - 2 * sd20
+    bb_width = upper_bb - lower_bb
+    bb_width_pct = round((bb_width / ma20) * 100, 2) if ma20 else None
 
-    kc_basis = [sma(closes[:i+1], kc_len) for i in range(len(closes))]
+    # Keltner Channel using ATR
+    atr_val = atr(highs, lows, closes, n)
+    if not atr_val:
+        return empty
+    upper_kc = ma20 + 1.5 * atr_val
+    lower_kc = ma20 - 1.5 * atr_val
 
-    # Momentum = price position relative to midpoint of high/low range and EMA
-    # John Carter's exact formula: 
-    # val = close - avg(avg(highest_high(len), lowest_low(len)), sma(close, len))
-    mom_series = []
-    for i in range(len(closes)):
-        if i < n:
-            mom_series.append(None)
-            continue
-        window_h = max(highs[max(0,i-kc_len+1):i+1])
-        window_l = min(lows[max(0,i-kc_len+1):i+1])
-        delta = closes[i] - (((window_h + window_l) / 2 + (sma(closes[:i+1], kc_len) or closes[i])) / 2)
-        mom_series.append(delta)
+    # Squeeze ON when BB is inside KC
+    in_squeeze = (upper_bb < upper_kc) and (lower_bb > lower_kc)
 
-    # Linear regression of momentum (smooth it)
-    def linreg(data, length):
-        if len(data) < length: return data[-1] if data else 0
-        xs = list(range(length))
-        ys = data[-length:]
-        mx = sum(xs)/length
-        my = sum(ys)/length
-        num = sum((xs[i]-mx)*(ys[i]-my) for i in range(length))
-        den = sum((xs[i]-mx)**2 for i in range(length))
-        if den == 0: return my
-        slope = num/den
-        return my + slope*(length-1-mx)
+    # Check how many consecutive days squeeze has been on.
+    # PERFORMANCE: avoid re-slicing/re-scanning the full price history on every
+    # iteration (was O(n) work x 20 iterations x 3 functions x 2400 stocks,
+    # which froze the event loop for minutes). Instead, precompute a short
+    # window of closes/highs/lows once and reuse it.
+    squeeze_days = 0
+    max_lookback = min(20, len(closes) - n - 20)
+    if max_lookback > 0:
+        # Only need the last (n + max_lookback + 20) closes for this whole check
+        window_size = n + max_lookback + 21
+        wc = closes[-window_size:] if len(closes) > window_size else closes
+        wh = highs[-window_size:]  if len(highs)  > window_size else highs
+        wl = lows[-window_size:]   if len(lows)   > window_size else lows
 
-    # Build dot and histogram series for last 30 bars
-    history_dots = []
-    history_hist = []
-    prev_in_sq = False
+        for d in range(0, max_lookback):
+            end = len(wc) - 1 - d
+            if end < n + 20:
+                break
+            sub_closes = wc[:end+1]
+            sub_highs  = wh[:end+1]
+            sub_lows   = wl[:end+1]
+            m = sma(sub_closes, n)
+            s = std_dev(sub_closes, n)
+            a = atr(sub_highs, sub_lows, sub_closes, n)
+            if not m or not s or not a:
+                break
+            ub, lb = m + 2*s, m - 2*s
+            uk, lk = m + 1.5*a, m - 1.5*a
+            if ub < uk and lb > lk:
+                squeeze_days += 1
+            else:
+                break
 
-    for i in range(max(0, len(closes)-30), len(closes)):
-        bb_b = bb_basis[i]
-        bb_s = bb_std[i]
-        kc_b = kc_basis[i]
-        atr  = atr_series[i]
-        if bb_b is None or bb_s is None or kc_b is None or atr is None:
-            history_dots.append('black')
-            history_hist.append(0)
-            continue
-
-        bb_upper = bb_b + bb_mult * bb_s
-        bb_lower = bb_b - bb_mult * bb_s
-        kc_upper = kc_b + kc_mult * atr
-        kc_lower = kc_b - kc_mult * atr
-
-        in_sq = (bb_upper < kc_upper) and (bb_lower > kc_lower)
-        history_dots.append('red' if in_sq else 'green')
-
-        # Momentum histogram
-        mom_vals = [m for m in mom_series[max(0,i-kc_len+1):i+1] if m is not None]
-        if mom_vals:
-            val = linreg(mom_vals, min(len(mom_vals), kc_len))
-            history_hist.append(round(val, 4))
-        else:
-            history_hist.append(0)
-
-    # Current state
-    curr_in_sq  = history_dots[-1] == 'red'   if history_dots else False
-    prev_in_sq  = history_dots[-2] == 'red'   if len(history_dots) >= 2 else False
-    fired       = prev_in_sq and not curr_in_sq  # was red, now green
-
-    # Squeeze days — how many consecutive red dots
-    sq_days = 0
-    for dot in reversed(history_dots):
-        if dot == 'red': sq_days += 1
-        else: break
-
-    # Momentum direction
-    curr_mom = history_hist[-1] if history_hist else 0
-    prev_mom = history_hist[-2] if len(history_hist) >= 2 else 0
-    if curr_mom > prev_mom: mom_dir = 'up'
-    elif curr_mom < prev_mom: mom_dir = 'down'
-    else: mom_dir = 'flat'
-
-    # BB width % (how tight the bands are)
-    if bb_basis[-1] and bb_std[-1] and bb_basis[-1] != 0:
-        bb_w = (bb_std[-1] * 4) / bb_basis[-1] * 100
-    else:
-        bb_w = None
-
-    strength = round(sq_days * abs(curr_mom) * 100, 2) if sq_days > 0 else 0
+    # Squeeze fired = was in squeeze yesterday, not in squeeze today (breakout)
+    squeeze_fired = squeeze_days == 0 and was_in_squeeze_yesterday(closes, highs, lows, n)
 
     return {
-        'in_squeeze':    curr_in_sq,
-        'squeeze_fired': fired,
-        'momentum':      round(curr_mom, 4),
-        'momentum_dir':  mom_dir,
-        'squeeze_days':  sq_days,
-        'strength_score': strength,
-        'fired_bullish': fired and curr_mom > 0 and mom_dir == 'up',
-        'fired_bearish': fired and curr_mom < 0 and mom_dir == 'down',
-        'bb_width_pct':  round(bb_w, 2) if bb_w else None,
-        'dots':          history_dots[-20:],
-        'hist':          history_hist[-20:],
+        'in_squeeze': in_squeeze,
+        'squeeze_fired': squeeze_fired,
+        'bb_width_pct': bb_width_pct,
+        'squeeze_days': squeeze_days,
     }
 
-
-def detect_bb_squeeze(prices, highs, lows, n=20):
-    """Backward-compatible wrapper — uses full TTM Squeeze now."""
-    return calc_ttm_squeeze(prices, highs, lows)
+def was_in_squeeze_yesterday(closes, highs, lows, n=20) -> bool:
+    if len(closes) < n + 21:
+        return False
+    sub_closes = closes[:-1]
+    sub_highs  = highs[:-1]
+    sub_lows   = lows[:-1]
+    m = sma(sub_closes, n)
+    s = std_dev(sub_closes, n)
+    a = atr(sub_highs, sub_lows, sub_closes, n)
+    if not m or not s or not a:
+        return False
+    ub, lb = m + 2*s, m - 2*s
+    uk, lk = m + 1.5*a, m - 1.5*a
+    return ub < uk and lb > lk
 
 def detect_vcp(prices: list, volumes: list, highs: list, lows: list) -> dict:
     """
@@ -582,58 +487,17 @@ def calc_rs_tv_raw(prices: list, bench_prices: list, end_idx: int = None) -> Opt
 
     return r3m * 0.4 + r6m * 0.2 + r9m * 0.2 + r12m * 0.2
 
-def calc_rs_tv_normalized(prices: list, bench_prices: list, end_idx: int = None) -> Optional[int]:
+def calc_rs_tv_normalized(prices: list, bench_prices: list, end_idx: int = None) -> Optional[float]:
     """
-    Full TradingView RS Rating matching Pine Script exactly:
-        rsHigh = ta.highest(rawRS, 252)
-        rsLow  = ta.lowest(rawRS,  252)
-        rsRating = round(((rawRS - rsLow) / (rsHigh - rsLow)) * 98 + 1)
-
-    KEY FIX: When building rawRS history, BOTH stock AND bench arrays
-    are trimmed to the same bar — matching Pine Script bar-by-bar calculation.
+    Returns the RAW (unnormalized) TV RS score for cross-sectional ranking.
+    Pine Script normalizes across ALL stocks — so we compute raw here,
+    then percentile_rank across all stocks in run_scan().
+    rawRS = r3m*0.4 + r6m*0.2 + r9m*0.2 + r12m*0.2  (relative to benchmark)
     """
     end = end_idx if end_idx is not None else len(prices) - 1
-
-    # Align arrays — both end at same date (today)
-    n = min(len(prices), len(bench_prices))
-    prices      = prices[-n:]
-    bench_prices = bench_prices[-n:]
-    end         = len(prices) - 1
-
-    if end < 252:
-        # Fewer than 252 bars: use simple relative return
-        if end < 60: return None
-        s_ret = (prices[-1] - prices[0]) / prices[0] * 100 if prices[0] else None
-        b_ret = (bench_prices[-1] - bench_prices[0]) / bench_prices[0] * 100 if bench_prices[0] else None
-        if s_ret is None or b_ret is None: return None
-        return max(1, min(99, int(50 + (s_ret - b_ret) * 1.5)))
-
-    # Today's rawRS
-    current_raw = calc_rs_tv_raw(prices, bench_prices, end_idx=end)
-    if current_raw is None:
+    if end < 252 or len(bench_prices) < 252:
         return None
-
-    # Build rawRS history — trim BOTH arrays to bar ei (same date)
-    # This matches Pine Script: at each past bar, rawRS uses data up to that bar
-    raw_history = [current_raw]
-    lookback = min(252, end - 252)
-    for d in range(1, lookback + 1):
-        ei = end - d
-        if ei < 252: continue
-        # Both arrays trimmed to same historical date
-        r = calc_rs_tv_raw(prices[:ei+1], bench_prices[:ei+1], end_idx=ei)
-        if r is not None:
-            raw_history.append(r)
-
-    if len(raw_history) < 5:
-        return 50
-
-    rs_high = max(raw_history)
-    rs_low  = min(raw_history)
-    if rs_high == rs_low: return 50
-
-    rating = round(((current_raw - rs_low) / (rs_high - rs_low)) * 98 + 1)
-    return max(1, min(99, rating))
+    return calc_rs_tv_raw(prices, bench_prices, end_idx=end)
 
 def percentile_rank(values: list, val: float) -> int:
     below = sum(1 for v in values if v < val)
@@ -805,75 +669,25 @@ def build_sector_rs(processed: list, sector_map: dict) -> list:
 
 # ── Sector map ────────────────────────────────────────────────────────
 SECTOR_MAP = {
-    "IT": ["TCS","INFY","WIPRO","HCLTECH","TECHM","MPHASIS","PERSISTENT","COFORGE",
-           "LTTS","KPITTECH","TATAELXSI","OFSS","LTIM","NIITTECH","HEXAWARE","MASTEK",
-           "ZENSAR","NIIT","ECLERX","BIRLASOFT","RATEGAIN","NEWGEN","TANLA","INTELLECT"],
-    "Banking": ["HDFCBANK","ICICIBANK","SBIN","KOTAKBANK","AXISBANK","INDUSINDBK",
-                "BANDHANBNK","FEDERALBNK","IDFCFIRSTB","RBLBANK","YESBANK","CANARABANK",
-                "BANKBARODA","PNB","UNIONBANK","MAHABANK","UCOBANK","CENTRALBK","IOB",
-                "INDIANB","BANKINDIA","DCBBANK","SOUTHBANK","KARURVYSYA","CSBBANK"],
-    "NBFC": ["BAJFINANCE","BAJAJFINSV","CHOLAFIN","MUTHOOTFIN","MANAPPURAM","M&MFIN",
-             "SHRIRAMFIN","LICHSGFIN","PNBHOUSING","CANFINHOME","AAVAS","HOMEFIRST",
-             "APTUS","CREDITACC","SPANDANA","UGROCAP","SATIN"],
-    "Insurance": ["HDFCLIFE","SBILIFE","ICICIPRULI","LICI","STARHEALTH","NIACL","GICRE",
-                  "ICICIGI","BAJAJHLDNG","MAXFINSERV"],
-    "Pharma": ["SUNPHARMA","DRREDDY","CIPLA","DIVISLAB","BIOCON","AUROPHARMA","LUPIN",
-               "TORNTPHARM","ALKEM","IPCALAB","PFIZER","GLAXO","ABBOTINDIA","SANOFI",
-               "GLAND","LAURUSLABS","GRANULES","NATCOPHARM","AJANTPHARM","JBCHEPHARM",
-               "ERIS","SHILPAMED","SUVEN","NEULANDLAB","SEQUENT"],
-    "Auto": ["MARUTI","TATAMOTORS","M&M","BAJAJ-AUTO","HEROMOTOCO","EICHERMOT",
-             "TVSMOTORS","ASHOKLEY","TVSMOTOR","ATUL","ESCORTS","FORCE","SML"],
-    "Auto Ancil": ["MOTHERSON","BOSCHLTD","BHARATFORG","SUNDRMFAST","EXIDEIND","AMARARAJA",
-                   "MRF","APOLLOTYRE","CEATLTD","BALKRISIND","TIINDIA","FIEM","SUPRAJIT",
-                   "MINDA","LUMAX","ENDURANCE","GABRIEL","SUBROS","JAMNA","RACL"],
-    "FMCG": ["HINDUNILVR","ITC","NESTLEIND","BRITANNIA","DABUR","MARICO","GODREJCP",
-              "COLPAL","EMAMILTD","TATACONSUM","VBL","RADICO","MCDOWELL-N","UNITEDSPIRITS",
-              "PGHH","GILLETTE","HONASA","BIKAJI","DOMS","DEVYANI","SAPPHIRE","JUBLFOOD",
-              "WESTLIFE","BARBEQUE","THANGAMALY","VAIBHAVGBL"],
-    "Cement": ["ULTRACEMCO","SHREECEM","AMBUJACEMENT","ACC","DALMIACEM","JKCEMENT",
-               "RAMCOCEM","HEIDELBERG","PRISMJOINTS","STARCEMENT","NUVOCO","BIRLACORPN",
-               "ORIENTCEM","SAGCEM","MANGCEM"],
-    "Steel & Metal": ["TATASTEEL","JSWSTEEL","SAIL","HINDALCO","NATIONALUM","NMDC","MOIL",
-                      "VEDL","HINDCOPPER","COALINDIA","APLAPOLLO","JSPL","RATNAMANI",
-                      "WELSPUNLIVING","KALYANKJIL","MSTCLTD"],
-    "Energy & Oil": ["RELIANCE","ONGC","BPCL","IOC","HPCL","GAIL","PETRONET","OIL",
-                     "HINDPETRO","MGL","IGL","GSPL","GUJGASLTD","ATGL","AEGISCHEM"],
-    "Power": ["NTPC","POWERGRID","ADANIGREEN","TATAPOWER","CESC","TORNTPOWER","JPPOWER",
-              "RPOWER","SJVN","NHPC","RVNL","IRCON","POWERMECH","KEC","KALPATPOWR",
-              "RITES","ENGINERSIN","BHEL"],
-    "Realty": ["DLF","GODREJPROP","OBEROIRLTY","PHOENIXLTD","PRESTIGE","BRIGADE","SOBHA",
-               "MAHINDRALIFESC","KOLTEPATIL","SUNTECK","ANANTRAJ","HEMISPHEREP","KEYSTONE"],
-    "Engineering": ["LTIM","LT","SIEMENS","ABB","HONAUT","CUMMINSIND","THERMAX","BFUTILITIE",
-                    "KIRLOSENG","KIRLOSKARIND","ELGIEQUIP","GRINDWELL","GREAVESCOT",
-                    "LLOYDSME","LLOYDSENGG","GMRINFRA","AIAENG","RAMKRISHNA","JYOTHYLAB"],
-    "Defence": ["HAL","BEL","MAZDOCK","GRSE","COCHINSHIP","BEML","MIDHANI","DCXSYS","KERNEX","MTAR","DATAPATTNS","CENTUM","ASTRAMICRO","IDEAFORGE","PARAS","ZEN","SOLARINDS","DYNAMATECH","NEWSPACE","AVANTEL","ELCOM","RTNPOWER"],
-    "Capital Goods": ["BHEL","TITAGARH","TEXRAIL","RAILTEL","IRFC","IRCTC","CONCOR",
-                      "MAHINDCIE","SCHAEFFLER","SKFINDIA","TIMKEN","NRB","IGARASHI"],
-    "Chemicals": ["PIDILITIND","ATUL","DEEPAKNTR","NAVINFLUOR","CLEAN","FINEORG","NOCIL",
-                  "VINATI","ROSSARI","TATACHEM","GNFC","GSFC","DFMFOODS","BALRAMCHIN",
-                  "DHANUKA","RALLIS","SUMITCHEM","BAYER","BASF","INSECTICID"],
-    "Textile": ["PAGEIND","DOLLAR","RAYMOND","ARVIND","VARDHMAN","TRIDENT","WELSPUNIND",
-                "GOKEX","KITEX","NITIN","NAHARSPG","FILATEX","SPANDEX"],
-    "Telecom": ["BHARTIARTL","IDEA","TATACOMM","HFCL","STLTECH","RAILTEL","TEJAS"],
-    "Media": ["ZEEL","SUNTV","PVRINOX","INOXWIND","SAREGAMA","TIPS","BALAJITELE"],
-    "Retail": ["TRENT","ABFRL","SHOPERSTOP","VMART","SPENCERS","NYKAA","MEESHO"],
-    "Hospital & Health": ["APOLLOHOSP","FORTIS","ASTER","MEDANTA","RAINBOW","VIJAYAHOSP",
-                          "KIMS","METROPOLIS","THYROCARE","LALPATHLAB","KRSNAA"],
-    "Hotel & Travel": ["INDHOTEL","LEMONTREE","MAHINDRAHOLIDAYS","EIH","CHALET","THOMASCOOK",
-                       "IRCTC","EASEMYTRIP"],
-    "Agriculture": ["UPL","COROMANDEL","KSCL","KAVERI","NUZIVEEDU","GODREJAGRO","JAINIRRIG",
-                    "TATACHEM","CHAMBAL","IFFCO"],
-    "Logistics": ["BLUEDART","DELHIVERY","MAHLOG","VRL","TCI","ALLCARGO","GATI","XPRO"],
-    "IT Services": ["WIPRO","NIIT","APTECH","CAMS","CDSL","BSE","MCX","ANGELONE",
-                    "FINCABLES","POLICYBAZAAR","PAYTM","NSDL"],
+    "IT":            ["TCS","INFOSYS","WIPRO","HCLTECH","TECHM","MPHASIS","PERSISTENT","COFORGE","LTTS","KPITTECH","TATAELXSI"],
+    "Banking":       ["HDFCBANK","ICICIBANK","SBIN","KOTAKBANK","AXISBANK","INDUSINDBK","BANDHANBNK","FEDERALBNK","IDFCFIRSTB","RBLBANK","YESBANK","PNB","CANBK","BANKBARODA","AUBANK"],
+    "NBFC":          ["BAJFINANCE","BAJAJFINSV","CHOLAFIN","MUTHOOTFIN","MANAPPURAM","AAVAS","HOMEFIRST","LICHSGFIN","PNBHOUSING","CANFINHOME"],
+    "Auto":          ["MARUTI","TATAMOTORS","M&M","BAJAJ-AUTO","HEROMOTOCO","TVSMOTOR","EICHERMOT","BOSCHLTD","MOTHERSON","ESCORTS"],
+    "Pharma":        ["SUNPHARMA","DRREDDY","CIPLA","DIVISLAB","LUPIN","AUROPHARMA","BIOCON","ALKEM","GLENMARK","IPCALAB","MANKIND","JUBLPHARMA"],
+    "FMCG":          ["HINDUNILVR","ITC","NESTLEIND","DABUR","MARICO","COLPAL","EMAMILTD","GODREJCP","TATACONSUM"],
+    "Energy":        ["RELIANCE","ONGC","BPCL","IOC","HINDPETRO","GAIL","PETRONET","IGL","MGL","ATGL"],
+    "Metals":        ["JSWSTEEL","TATASTEEL","HINDALCO","COALINDIA","VEDL","NMDC","MOIL"],
+    "Infra/Capital": ["LT","SIEMENS","ABB","BHEL","BEL","HAL","CUMMINSIND","THERMAX","HAVELLS"],
+    "Cement":        ["ULTRACEMCO","GRASIM","SHREECEM","AMBUJACEM","ACC","JKCEMENT","RAMCOCEM"],
+    "Consumer":      ["TITAN","ASIANPAINT","BERGEPAINT","PIDILITIND","VOLTAS","CROMPTON"],
+    "Telecom":       ["BHARTIARTL","IDEA","TATACOMM","RAILTEL","HFCL","STLTECH"],
+    "Realty":        ["DLF","GODREJPROP","OBEROIRLTY","PRESTIGE","BRIGADE","PHOENIXLTD","SOBHA","LODHA"],
+    "Healthcare":    ["APOLLOHOSP","FORTIS","MAXHEALTH","METROPOLIS","THYROCARE","LALPATHLAB","NARAYANA","ASTER"],
+    "Insurance":     ["SBILIFE","HDFCLIFE","ICICIPRULI","LICI","GICRE","STARHEALTH"],
+    "Internet":      ["ZOMATO","NYKAA","PAYTM","POLICYBZR","INDIAMART","JUSTDIAL","RATEGAIN","IXIGO"],
+    "Travel":        ["IRCTC","EASEMYTRIP","THOMASCOOK"],
+    "Exchange":      ["BSE","CDSL","CAMS","MCX","ANGELONE"],
 }
-
-def get_sector(sym: str) -> str:
-    for sector, stocks in SECTOR_MAP.items():
-        if sym in stocks:
-            return sector
-    return 'Other'
-
 
 def get_sector(sym: str) -> str:
     for sector, stocks in SECTOR_MAP.items():
@@ -883,65 +697,8 @@ def get_sector(sym: str) -> str:
 
 # ── Upstox API ────────────────────────────────────────────────────────
 NIFTY50   = ["RELIANCE","TCS","HDFCBANK","BHARTIARTL","ICICIBANK","INFOSYS","SBIN","HINDUNILVR","ITC","LT","KOTAKBANK","HCLTECH","AXISBANK","BAJFINANCE","MARUTI","ASIANPAINT","SUNPHARMA","TITAN","ULTRACEMCO","NESTLEIND","WIPRO","NTPC","POWERGRID","TECHM","TATAMOTORS","ADANIENT","ADANIPORTS","ONGC","BAJAJFINSV","JSWSTEEL","TATASTEEL","COALINDIA","HINDALCO","M&M","DRREDDY","CIPLA","EICHERMOT","DIVISLAB","BPCL","GRASIM","INDUSINDBK","APOLLOHOSP","BAJAJ-AUTO","HEROMOTOCO","TVSMOTOR","SHREECEM","BRITANNIA","VEDL","BEL","NTPC"]
-MIDCAP = [
-    # Nifty Midcap 150 — full list
-    "MPHASIS","PERSISTENT","COFORGE","LTTS","TATAELXSI","BANDHANBNK","FEDERALBNK",
-    "IDFCFIRSTB","RBLBANK","CHOLAFIN","MUTHOOTFIN","MANAPPURAM","SHRIRAMFIN",
-    "PIIND","ALKEM","TORNTPHARM","IPCALAB","AUROPHARMA","LUPIN","GLAND","LAURUSLABS",
-    "GRANULES","AJANTPHARM","JBCHEPHARM","ERIS","SUNDRMFAST","BHARATFORG","EXIDEIND",
-    "AMARARAJA","MRF","APOLLOTYRE","CEATLTD","BALKRISIND","TIINDIA","FIEM","SUPRAJIT",
-    "MINDA","LUMAX","ENDURANCE","GABRIEL","ESCORTS","MAZDOCK","GRSE","COCHINSHIP",
-    "BEML","MIDHANI","DCXSYS","KERNEX","MTAR","DATAPATTNS","CENTUM","ASTRAMICRO",
-    "TITAGARH","RAILTEL","IRFC","CONCOR","MAHINDCIE","SCHAEFFLER","SKFINDIA","TIMKEN",
-    "AIAENG","RAMKRISHNA","ELGIEQUIP","GRINDWELL","THERMAX","CUMMINSIND","SIEMENS",
-    "ABB","HONAUT","BHEL","KEC","KALPATPOWR","RITES","ENGINERSIN","POWERMECH",
-    "SJVN","NHPC","JPPOWER","RPOWER","CESC","TORNTPOWER","TATAPOWER","ADANIGREEN",
-    "PIDILITIND","ATUL","DEEPAKNTR","NAVINFLUOR","CLEAN","FINEORG","NOCIL","VINATI",
-    "ROSSARI","TATACHEM","GNFC","GSFC","DHANUKA","RALLIS","SUMITCHEM","BAYER",
-    "UPL","COROMANDEL","KSCL","KAVERI","JAINIRRIG","CHAMBAL","IFFCO",
-    "PAGEIND","DOLLAR","RAYMOND","ARVIND","VARDHMAN","TRIDENT","WELSPUNIND",
-    "GOKEX","KITEX","NITIN","NAHARSPG","DLF","GODREJPROP","OBEROIRLTY","PHOENIXLTD",
-    "PRESTIGE","BRIGADE","SOBHA","KOLTEPATIL","SUNTECK","ANANTRAJ","KEYSTONE",
-    "APOLLOHOSP","FORTIS","ASTER","MEDANTA","RAINBOW","METROPOLIS","THYROCARE",
-    "LALPATHLAB","INDHOTEL","LEMONTREE","EIH","CHALET","IRCTC","EASEMYTRIP",
-    "BLUEDART","DELHIVERY","VRL","TCI","ALLCARGO","TRENT","ABFRL","SHOPERSTOP",
-    "VMART","NYKAA","ZEEL","SUNTV","PVRINOX","SAREGAMA","TIPS","BALAJITELE",
-    "ANGELONE","CDSL","BSE","MCX","CAMS","POLICYBAZAAR","PAYTM",
-    "RELAXO","LLOYDSENGG","THANGAMALY","VAIBHAVGBL","DEVYANI","SAPPHIRE",
-    "JUBLFOOD","WESTLIFE","BARBEQUE","BIKAJI","DOMS","HONASA",
-]
-SMALLCAP = [
-    # Nifty Smallcap 250 — representative list
-    "DELTACORP","GMRINFRA","IDEA","SUZLON","UNITECH","DISHTV","JPASSOCIAT",
-    "PVRLTD","NATIONALUM","HINDALCO","VEDL","HINDCOPPER","COALINDIA","NMDC","MOIL",
-    "APLAPOLLO","JSPL","RATNAMANI","WELSPUNLIVING","KALYANKJIL","MSTCLTD",
-    "HFCL","STLTECH","TEJAS","RATEGAIN","NEWGEN","TANLA","INTELLECT","ECLERX",
-    "BIRLASOFT","MASTEK","ZENSAR","NIIT","APTECH","HEXAWARE","OFSS",
-    "TATACONSUMER","RADICO","MCDOWELL","UNITEDSPIRITS","PGHH","GILLETTE",
-    "VARUN","KRBL","LT","LTIM","PERSISTENT","COFORGE","TATAELXSI",
-    "ASHOKLEY","TVSMOTOR","FORCE","SML","MOTHERSON","GABRIEL","SUBROS","JAMNA",
-    "RACL","SUPRAJIT","FIEM","MINDA","LUMAX","ENDURANCE","BALKRISIND",
-    "APOLLOTYRE","CEATLTD","EXIDEIND","AMARARAJA","MRF",
-    "IDEAFORGE","PARAS","ZEN","SOLARINDS","DYNAMATECH","NEWSPACE","AVANTEL",
-    "ELCOM","RTNPOWER","CENTUM","ASTRAMICRO","KERNEX","MTAR","DATAPATTNS",
-    "RAILTEL","RITES","ENGINERSIN","TITAGARH","KEC","KALPATPOWR","POWERMECH",
-    "SJVN","NHPC","JPPOWER","CESC","TORNTPOWER",
-    "ROSSARI","NOCIL","FINEORG","VINATI","CLEAN","DEEPAKNTR","NAVINFLUOR",
-    "GNFC","GSFC","DHANUKA","RALLIS","SUMITCHEM","BAYER","INSECTICID",
-    "PAGEIND","DOLLAR","RAYMOND","ARVIND","VARDHMAN","TRIDENT","WELSPUNIND",
-    "GOKEX","KITEX","NITIN","NAHARSPG","FILATEX","SPANDEX",
-    "KOLTEPATIL","SUNTECK","ANANTRAJ","KEYSTONE","SOBHA","BRIGADE","PRESTIGE",
-    "METROPOLIS","THYROCARE","LALPATHLAB","KRSNAA","VIJAYAHOSP","KIMS",
-    "LEMONTREE","MAHINDRAHOLIDAYS","EIH","CHALET","THOMASCOOK","EASEMYTRIP",
-    "BLUEDART","DELHIVERY","VRL","TCI","ALLCARGO","GATI","XPRO",
-    "VMART","SPENCERS","NYKAA","MEESHO","SHOPERSTOP",
-    "SAREGAMA","TIPS","BALAJITELE","ANGELONE","CDSL","BSE","MCX","CAMS",
-    "RELAXO","BIKAJI","DOMS","HONASA","DEVYANI","SAPPHIRE","WESTLIFE","BARBEQUE",
-    "AAVAS","HOMEFIRST","APTUS","CREDITACC","SPANDANA","UGROCAP","SATIN",
-    "STARHEALTH","NIACL","GICRE","ICICIGI","BAJAJHLDNG","MAXFINSERV",
-    "HDFCLIFE","SBILIFE","ICICIPRULI","LICI",
-    "KARURVYSYA","CSBBANK","DCBBANK","SOUTHBANK","YESBANK","RBLBANK",
-]
+MIDCAP    = ["MPHASIS","PERSISTENT","COFORGE","LTTS","TATAELXSI","BANDHANBNK","FEDERALBNK","IDFCFIRSTB","RBLBANK","AUBANK","CHOLAFIN","MUTHOOTFIN","MANAPPURAM","AAVAS","ESCORTS","AUROPHARMA","LUPIN","BIOCON","ALKEM","GLENMARK","IPCALAB","EMAMILTD","GODREJCP","NMDC","MOIL","PRESTIGE","BRIGADE","PHOENIXLTD","SOBHA","LODHA","METROPOLIS","THYROCARE","LALPATHLAB","NARAYANA","ASTER","STARHEALTH","MCX","ANGELONE","EASEMYTRIP","RATEGAIN"]
+SMALLCAP  = ["DELTACORP","GMRINFRA","IDEA","SUZLON","UNITECH","DISHTV","JPASSOCIAT","PVR","INDIABULL","KOLTEPATIL","LEMONTREE","THOMASCOOK","JUSTDIAL","IXIGO","ALOKTEXT","RADICO","HEIDELBERG","BIRLACORPN","JKCEMENT","RAMCOCEM","HFCL","STLTECH","TEJAS","ROUTE","RAILTEL","NSDL","CANFINHOME","APTUS","HOMEFIRST","REPCO","SPANDANA","CREDITACC","SATIN"]
 
 MICROCAP = [
   "MTAR","TDPOWERSYS","STLTECH","SANSERA","ASTRAMICRO","SOUTHBANK","UJJIVANSFB",
@@ -1020,55 +777,13 @@ async def fetch_index_csv(session: aiohttp.ClientSession, url: str) -> list:
 
 async def load_official_index_lists(session: aiohttp.ClientSession):
     """
-    Load index constituents:
-    1. Try to load from Supabase (fast, works offline)
-    2. If stale/empty, fetch from niftyindices.com CSV
-    3. Save fresh data back to Supabase
-    Falls back to hardcoded lists only if everything fails.
+    Replace hardcoded NIFTY50/MIDCAP/SMALLCAP/MICROCAP with the real,
+    current official lists from niftyindices.com. Falls back silently
+    to the existing hardcoded lists on any failure.
     """
     global NIFTY50, MIDCAP, SMALLCAP, MICROCAP, ALL_STOCKS
 
-    SUPABASE_REFRESH_DAYS = 7  # refresh weekly
-
-    # ── Step 1: Try loading from Supabase ──────────────────────────
-    try:
-        url = f"{SUPABASE_URL}/rest/v1/index_constituents?select=index_name,symbols,updated_at&order=updated_at.desc"
-        headers = {
-            "apikey": SUPABASE_KEY,
-            "Authorization": f"Bearer {SUPABASE_KEY}",
-        }
-        async with session.get(url, headers=headers,
-                               timeout=aiohttp.ClientTimeout(total=10)) as r:
-            if r.status == 200:
-                rows = await r.json()
-                if rows:
-                    # Check if data is fresh enough
-                    from datetime import timezone
-                    latest = rows[0].get('updated_at','')
-                    if latest:
-                        updated = datetime.fromisoformat(latest.replace('Z','+00:00'))
-                        age_days = (datetime.now(timezone.utc) - updated).days
-                        if age_days <= SUPABASE_REFRESH_DAYS:
-                            # Use cached data
-                            for row in rows:
-                                syms = row.get('symbols', [])
-                                if isinstance(syms, str):
-                                    import json as _json
-                                    syms = _json.loads(syms)
-                                name = row.get('index_name','')
-                                if name == 'NIFTY50'   and len(syms) >= 40:  NIFTY50   = syms
-                                if name == 'MIDCAP150' and len(syms) >= 100: MIDCAP    = syms
-                                if name == 'SMALLCAP250' and len(syms) >= 150: SMALLCAP = syms
-                                if name == 'MICROCAP250' and len(syms) >= 150: MICROCAP = syms
-                            log.info(f"✅ Loaded from Supabase: N50={len(NIFTY50)} MID={len(MIDCAP)} SML={len(SMALLCAP)}")
-                            return
-                        else:
-                            log.info(f"Index data is {age_days}d old — refreshing from niftyindices.com")
-    except Exception as e:
-        log.warning(f"Supabase index load failed: {e}")
-
-    # ── Step 2: Fetch fresh from niftyindices.com ──────────────────
-    log.info("Fetching official NSE index constituent lists from niftyindices.com…")
+    log.info("Fetching official NSE index constituent lists…")
     results = await asyncio.gather(
         fetch_index_csv(session, NIFTY_INDEX_CSV_URLS['NIFTY50']),
         fetch_index_csv(session, NIFTY_INDEX_CSV_URLS['MIDCAP150']),
@@ -1076,67 +791,38 @@ async def load_official_index_lists(session: aiohttp.ClientSession):
         fetch_index_csv(session, NIFTY_INDEX_CSV_URLS['MICROCAP250']),
         return_exceptions=True,
     )
-    fresh_n50, fresh_mid, fresh_sml, fresh_mic = [
+    fresh_nifty50, fresh_midcap, fresh_smallcap, fresh_microcap = [
         r if isinstance(r, list) else [] for r in results
     ]
 
-    updated_any = False
-
-    if len(fresh_n50) >= 40:
-        NIFTY50 = fresh_n50
-        log.info(f"✅ Nifty 50: {len(NIFTY50)} stocks")
-        updated_any = True
+    if len(fresh_nifty50) >= 40:
+        NIFTY50 = fresh_nifty50
+        log.info(f"✅ Nifty 50: {len(NIFTY50)} stocks (official)")
     else:
-        log.warning(f"⚠️ Nifty 50 fetch returned {len(fresh_n50)} — keeping existing {len(NIFTY50)}")
+        log.warning(f"⚠️ Nifty 50 fetch returned {len(fresh_nifty50)} — keeping {len(NIFTY50)} hardcoded fallback")
 
-    if len(fresh_mid) >= 100:
-        MIDCAP = fresh_mid
-        log.info(f"✅ Midcap 150: {len(MIDCAP)} stocks")
-        updated_any = True
+    if len(fresh_midcap) >= 100:
+        MIDCAP = fresh_midcap
+        log.info(f"✅ Midcap 150: {len(MIDCAP)} stocks (official)")
     else:
-        log.warning(f"⚠️ Midcap fetch returned {len(fresh_mid)} — keeping existing {len(MIDCAP)}")
+        log.warning(f"⚠️ Midcap fetch returned {len(fresh_midcap)} — keeping {len(MIDCAP)} hardcoded fallback")
 
-    if len(fresh_sml) >= 150:
-        SMALLCAP = fresh_sml
-        log.info(f"✅ Smallcap 250: {len(SMALLCAP)} stocks")
-        updated_any = True
+    if len(fresh_smallcap) >= 150:
+        SMALLCAP = fresh_smallcap
+        log.info(f"✅ Smallcap 250: {len(SMALLCAP)} stocks (official)")
     else:
-        log.warning(f"⚠️ Smallcap fetch returned {len(fresh_sml)} — keeping existing {len(SMALLCAP)}")
+        log.warning(f"⚠️ Smallcap fetch returned {len(fresh_smallcap)} — keeping {len(SMALLCAP)} hardcoded fallback")
 
-    if len(fresh_mic) >= 150:
-        MICROCAP = fresh_mic
-        log.info(f"✅ Microcap 250: {len(MICROCAP)} stocks")
-        updated_any = True
+    if len(fresh_microcap) >= 150:
+        MICROCAP = fresh_microcap
+        log.info(f"✅ Microcap 250: {len(MICROCAP)} stocks (official)")
     else:
-        log.warning(f"⚠️ Microcap fetch returned {len(fresh_mic)} — keeping existing {len(MICROCAP)}")
+        log.warning(f"⚠️ Microcap fetch returned {len(fresh_microcap)} — keeping {len(MICROCAP)} hardcoded fallback")
 
-    # ── Step 3: Save fresh data to Supabase ────────────────────────
-    if updated_any:
-        try:
-            import json as _json
-            now_iso = datetime.now(IST).isoformat()
-            rows = [
-                {"index_name": "NIFTY50",    "symbols": _json.dumps(NIFTY50),   "updated_at": now_iso},
-                {"index_name": "MIDCAP150",  "symbols": _json.dumps(MIDCAP),    "updated_at": now_iso},
-                {"index_name": "SMALLCAP250","symbols": _json.dumps(SMALLCAP),  "updated_at": now_iso},
-                {"index_name": "MICROCAP250","symbols": _json.dumps(MICROCAP),  "updated_at": now_iso},
-            ]
-            url = f"{SUPABASE_URL}/rest/v1/index_constituents?on_conflict=index_name"
-            headers = {
-                "apikey": SUPABASE_KEY,
-                "Authorization": f"Bearer {SUPABASE_KEY}",
-                "Content-Type": "application/json",
-                "Prefer": "resolution=merge-duplicates",
-            }
-            async with session.post(url, headers=headers, json=rows,
-                                    timeout=aiohttp.ClientTimeout(total=15)) as r:
-                if r.status in (200,201,204):
-                    log.info(f"✅ Index constituents saved to Supabase (refreshes weekly)")
-                else:
-                    log.warning(f"⚠️ Failed to save to Supabase: {r.status}")
-        except Exception as e:
-            log.warning(f"Could not save index constituents: {e}")
-
+    # Rebuild ALL_STOCKS to include any official-list stocks not already covered
+    # (ALL_STOCKS itself is later overwritten by the Upstox instrument master in
+    # main(), so this just ensures the index membership flags stay consistent)
+    ALL_STOCKS = list(dict.fromkeys(NIFTY50 + MIDCAP + SMALLCAP + MICROCAP))
 
 async def fetch_instruments(session: aiohttp.ClientSession) -> list:
     """Fetch all NSE instrument keys from Upstox."""
@@ -1420,115 +1106,12 @@ INDEX_TRACKER = {
     "Energy":         "NSE_INDEX|Nifty Energy",
 }
 
-# Weekly and hourly historical data caches for multi-timeframe squeeze
-weekly_cache:  dict = {}   # sym -> {prices, highs, lows, volumes}
-hourly_cache:  dict = {}   # sym -> {prices, highs, lows, volumes}
-
 # Cache for all index historical data
 index_history_cache: dict = {}  # name -> {prices, volumes}
 
-async def fetch_weekly_hourly(session, sym, instrument_key, n_stocks):
-    """Fetch weekly (1Y) and hourly (5 days) candles for TTM Squeeze."""
-    headers = {"Authorization": f"Bearer {ANALYTICS_TOKEN}", "Accept": "application/json"}
-    key_enc = instrument_key.replace('|','%7C') if instrument_key else f"NSE_EQ%7C{sym}"
-    to   = datetime.now(IST).strftime('%Y-%m-%d')
-    fr1y = (datetime.now(IST) - timedelta(days=400)).strftime('%Y-%m-%d')
-    fr5d = (datetime.now(IST) - timedelta(days=7)).strftime('%Y-%m-%d')
-
-    result = {}
-    # Weekly candles
-    try:
-        url = f"https://api.upstox.com/v2/historical-candle/{key_enc}/week/{to}/{fr1y}"
-        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as r:
-            if r.status == 200:
-                d = await r.json()
-                candles = list(reversed(d.get('data',{}).get('candles',[])))
-                if candles:
-                    result['weekly'] = {
-                        'prices': [c[4] for c in candles],
-                        'highs':  [c[2] for c in candles],
-                        'lows':   [c[3] for c in candles],
-                    }
-    except Exception: pass
-
-    # Hourly candles
-    try:
-        url2 = f"https://api.upstox.com/v2/historical-candle/{key_enc}/60minute/{to}/{fr5d}"
-        async with session.get(url2, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as r2:
-            if r2.status == 200:
-                d2 = await r2.json()
-                candles2 = list(reversed(d2.get('data',{}).get('candles',[])))
-                if candles2:
-                    result['hourly'] = {
-                        'prices': [c[4] for c in candles2],
-                        'highs':  [c[2] for c in candles2],
-                        'lows':   [c[3] for c in candles2],
-                    }
-    except Exception: pass
-    return result
-
-async def load_weekly_hourly_cache(session):
-    """Load weekly + hourly data for all stocks — for TTM multi-timeframe squeeze."""
-    global weekly_cache, hourly_cache
-    log.info(f"Loading weekly + hourly data for TTM Squeeze ({len(ALL_STOCKS)} stocks)…")
-    sem = asyncio.Semaphore(10)
-    loaded = 0
-
-    async def fetch_one(sym):
-        async with sem:
-            ikey = instrument_key_map.get(sym, f"NSE_EQ|{sym}")
-            result = await fetch_weekly_hourly(session, sym, ikey, len(ALL_STOCKS))
-            if 'weekly' in result: weekly_cache[sym] = result['weekly']
-            if 'hourly' in result: hourly_cache[sym] = result['hourly']
-            return sym
-
-    # Batch in groups of 50 to avoid overwhelming API
-    for i in range(0, len(ALL_STOCKS), 50):
-        batch = ALL_STOCKS[i:i+50]
-        await asyncio.gather(*[fetch_one(s) for s in batch])
-        loaded += len(batch)
-        if i % 500 == 0 and i > 0:
-            log.info(f"  Weekly/hourly cache: {loaded}/{len(ALL_STOCKS)} stocks")
-        await asyncio.sleep(0.1)
-
-    log.info(f"✅ Weekly/hourly cache: {len(weekly_cache)} weekly, {len(hourly_cache)} hourly")
-
 async def load_index_cache(session: aiohttp.ClientSession):
-    """Fetch historical data for all tracked indices.
-    First tries Supabase (fast), falls back to Upstox API if stale/empty."""
+    """Fetch historical data for all tracked indices."""
     global index_history_cache
-    import json as _json
-
-    # Try loading from Supabase first (instant restart)
-    try:
-        url = f"{SUPABASE_URL}/rest/v1/index_price_history?select=index_name,prices,highs,lows,volumes,updated_at"
-        headers_sb = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
-        async with session.get(url, headers=headers_sb,
-                               timeout=aiohttp.ClientTimeout(total=10)) as r:
-            if r.status == 200:
-                rows = await r.json()
-                if rows:
-                    from datetime import timezone
-                    # Check freshness - use if less than 2 days old
-                    latest = rows[0].get('updated_at','')
-                    if latest:
-                        updated = datetime.fromisoformat(latest.replace('Z','+00:00'))
-                        age_days = (datetime.now(timezone.utc) - updated).days
-                        if age_days <= 2:
-                            for row in rows:
-                                name = row['index_name']
-                                index_history_cache[name] = {
-                                    'prices':  _json.loads(row.get('prices','[]')),
-                                    'highs':   _json.loads(row.get('highs','[]')),
-                                    'lows':    _json.loads(row.get('lows','[]')),
-                                    'volumes': _json.loads(row.get('volumes','[]')),
-                                }
-                            log.info(f"✅ Index price history loaded from Supabase: {len(index_history_cache)} indices (age: {age_days}d)")
-                            return
-                        else:
-                            log.info(f"Index price history is {age_days}d old — refreshing from Upstox")
-    except Exception as e:
-        log.warning(f"Could not load index prices from Supabase: {e}")
     log.info(f"Loading historical data for {len(INDEX_TRACKER)} indices…")
     to   = datetime.now(IST).strftime('%Y-%m-%d')
     from_= (datetime.now(IST) - timedelta(days=420)).strftime('%Y-%m-%d')
@@ -1540,76 +1123,26 @@ async def load_index_cache(session: aiohttp.ClientSession):
     for name, ikey in INDEX_TRACKER.items():
         encoded = ikey.replace('|', '%7C').replace(' ', '%20')
         url = f"https://api.upstox.com/v2/historical-candle/{encoded}/day/{to}/{from_}"
-        # Try multiple key formats - Upstox is inconsistent with index names
-        alt_keys = [
-            ikey,
-            ikey.replace("Nifty Midcap 150", "NIFTY MIDCAP 150"),
-            ikey.replace("Nifty Smallcap 250", "NIFTY SMALLCAP 250"),
-            ikey.replace("Nifty Microcap 250", "NIFTY MICROCAP 250"),
-            ikey.replace("Nifty Next 50", "NIFTY NEXT 50"),
-            ikey.replace("Nifty 500", "NIFTY 500"),
-        ]
-        fetched = False
-        for try_key in alt_keys:
-            if fetched: break
-            try_encoded = try_key.replace('|', '%7C').replace(' ', '%20')
-            try_url = f"https://api.upstox.com/v2/historical-candle/{try_encoded}/day/{to}/{from_}"
-            try:
-                async with session.get(try_url, headers=headers,
-                                       timeout=aiohttp.ClientTimeout(total=15)) as r:
-                    if r.status == 200:
-                        data = await r.json()
-                        candles = list(reversed(data.get('data', {}).get('candles', [])))
-                        if candles:
-                            index_history_cache[name] = {
-                                'prices':  [c[4] for c in candles],
-                                'volumes': [c[5] for c in candles],
-                                'highs':   [c[2] for c in candles],
-                                'lows':    [c[3] for c in candles],
-                            }
-                            loaded += 1
-                            fetched = True
-                    elif r.status != 400:
-                        log.warning(f"Index {name} fetch failed: {r.status}")
-                        break
-            except Exception as e:
-                log.warning(f"Index {name} error: {e}")
-                break
-        if not fetched:
-            log.warning(f"Index {name} could not be fetched with any key format")
+        try:
+            async with session.get(url, headers=headers,
+                                   timeout=aiohttp.ClientTimeout(total=15)) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    candles = list(reversed(data.get('data', {}).get('candles', [])))
+                    if candles:
+                        index_history_cache[name] = {
+                            'prices':  [c[4] for c in candles],
+                            'volumes': [c[5] for c in candles],
+                            'highs':   [c[2] for c in candles],
+                            'lows':    [c[3] for c in candles],
+                        }
+                        loaded += 1
+                else:
+                    log.warning(f"Index {name} fetch failed: {r.status}")
+        except Exception as e:
+            log.warning(f"Index {name} error: {e}")
         await asyncio.sleep(0.2)
     log.info(f"✅ Index cache loaded: {loaded}/{len(INDEX_TRACKER)} indices")
-
-    # Save index price history to Supabase for persistence across restarts
-    import json as _json
-    rows = []
-    for name, data in index_history_cache.items():
-        rows.append({
-            "index_name": name,
-            "prices":     _json.dumps(data.get('prices',[])),
-            "highs":      _json.dumps(data.get('highs',[])),
-            "lows":       _json.dumps(data.get('lows',[])),
-            "volumes":    _json.dumps(data.get('volumes',[])),
-            "updated_at": datetime.now(IST).isoformat(),
-        })
-    if rows:
-        url = f"{SUPABASE_URL}/rest/v1/index_price_history?on_conflict=index_name"
-        headers_sb = {
-            "apikey": SUPABASE_KEY,
-            "Authorization": f"Bearer {SUPABASE_KEY}",
-            "Content-Type": "application/json",
-            "Prefer": "resolution=merge-duplicates",
-        }
-        try:
-            async with session.post(url, headers=headers_sb, json=rows,
-                                    timeout=aiohttp.ClientTimeout(total=30)) as r:
-                if r.status in (200,201,204):
-                    log.info(f"✅ Index price history saved to Supabase ({len(rows)} indices)")
-                else:
-                    txt = await r.text()
-                    log.warning(f"⚠️ Index price save failed: {r.status} {txt[:100]}")
-        except Exception as e:
-            log.warning(f"Could not save index prices: {e}")
 
 
 async def load_nifty_cache(session: aiohttp.ClientSession):
@@ -1726,44 +1259,6 @@ async def load_historical_cache(session: aiohttp.ClientSession):
     log.info(f"✅ Historical cache loaded: {loaded} stocks")
 
 # ── Main scan function ────────────────────────────────────────────────
-async def fetch_bulk_ohlc(session: aiohttp.ClientSession, instrument_keys: list) -> dict:
-    """
-    Fetch live OHLC quotes for up to 500 instruments from Upstox market quotes API.
-    Returns dict: { "NSE_EQ:SYM": {last_price, open, high, low, volume, ...} }
-    """
-    if not instrument_keys:
-        return {}
-    headers = {
-        "Authorization": f"Bearer {ANALYTICS_TOKEN}",
-        "Accept": "application/json",
-    }
-    # Upstox full market quotes endpoint
-    keys_param = ",".join(instrument_keys)
-    url = f"https://api.upstox.com/v2/market-quote/quotes?instrument_key={keys_param}"
-    try:
-        async with session.get(url, headers=headers,
-                               timeout=aiohttp.ClientTimeout(total=30)) as r:
-            if r.status == 200:
-                data = await r.json()
-                result = {}
-                for key, quote in data.get("data", {}).items():
-                    result[key] = {
-                        "last_price": quote.get("last_price") or quote.get("ltp"),
-                        "open":       quote.get("ohlc", {}).get("open"),
-                        "high":       quote.get("ohlc", {}).get("high"),
-                        "low":        quote.get("ohlc", {}).get("low"),
-                        "volume":     quote.get("volume"),
-                        "prev_close": quote.get("ohlc", {}).get("close"),
-                    }
-                return result
-            else:
-                body = await r.text()
-                log.warning(f"Bulk OHLC fetch failed: {r.status} {body[:100]}")
-                return {}
-    except Exception as e:
-        log.warning(f"Bulk OHLC error: {e}")
-        return {}
-
 async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> int:
     start = time.time()
     now_ist = datetime.now(IST)
@@ -1815,7 +1310,6 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         log.info(f"  Sample OHLC keys: {[f'NSE_EQ:{s}' for s in sample]}")
 
     log.info(f"  Live prices: {len(live_data)} stocks")
-    log.info(f"  OHLC keys sample: {list(live_data.keys())[:3] if live_data else 'EMPTY'}")
 
     # Step 2: Only reload full 15-month history once per day, after market
     # close (batch_eod) — this bakes in today's now-final candle as the new
@@ -1831,7 +1325,6 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         await load_historical_cache(session)
         await load_nifty_cache(session)
         await load_index_cache(session)
-        await load_weekly_hourly_cache(session)
 
     # Step 3: DO NOT mutate historical_cache prices in place (was causing chg% drift).
     # Instead, keep historical close as the immutable baseline and use live price
@@ -1905,32 +1398,18 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         trend_data = rs_slope(hist)
 
         # RS — TradingView / Lakshmi Mata Pine Script formula
-        # Benchmark-relative, normalized by stock's own 252-day rawRS range
-        rs_tv = None
-        nifty_prices = nifty_cache.get('prices', [])
-        if len(nifty_prices) >= 252:
-            rs_tv = calc_rs_tv_normalized(prices, nifty_prices)
-        elif len(nifty_prices) >= 60:
-            rs_tv = calc_rs_tv_normalized(prices, nifty_prices)
-        # else: nifty_cache is empty - RS-TV stays None
-        # Showing wrong RS would mislead trading decisions
+        # Compute raw scores vs each benchmark index
+        # Cross-sectional percentile rank happens AFTER all stocks are computed
+        nifty_prices    = nifty_cache.get('prices', [])
+        midcap_prices   = index_history_cache.get('Midcap 150',   {}).get('prices', [])
+        smallcap_prices = index_history_cache.get('Smallcap 250', {}).get('prices', [])
 
-        # Index-relative RS — rank within each index peer group only
-        my_raw = my_raw_val
-        # Index-relative RS using actual index price history (Pine Script formula)
-        # RS-MID = how stock performs vs Midcap150 index (not vs constituent stocks)
-        # RS-SML = how stock performs vs Smallcap250 index
-        # This is correct: same formula as RS-TV but benchmark changes
-        mid_prices = index_history_cache.get('Midcap 150', {}).get('prices', [])
-        sml_prices = index_history_cache.get('Smallcap 250', {}).get('prices', [])
-        n50_prices = nifty_cache.get('prices', [])
+        raw_tv       = calc_rs_tv_normalized(prices, nifty_prices)    if nifty_prices    else None
+        raw_mid      = calc_rs_tv_normalized(prices, midcap_prices)   if midcap_prices   else None
+        raw_sml      = calc_rs_tv_normalized(prices, smallcap_prices) if smallcap_prices else None
 
-        rs_nifty50  = calc_rs_tv_normalized(prices, n50_prices)  if len(n50_prices)  >= 60 else None
-        rs_midcap   = calc_rs_tv_normalized(prices, mid_prices)  if len(mid_prices)  >= 60 else None
-        rs_smallcap = calc_rs_tv_normalized(prices, sml_prices)  if len(sml_prices)  >= 60 else None
-        rs_microcap = percentile_rank(microcap_raws, my_raw) if my_raw is not None and sym in MICROCAP and len(microcap_raws) >= 5 else None
-
-        # Sector-relative RS — rank within stock's own sector only
+        # Sector-relative RS — percentile rank vs same sector peers
+        my_raw    = my_raw_val
         my_sector = sym_to_sector.get(sym, 'Other')
         sec_pool  = sector_raws.get(my_sector, [])
         rs_sector = percentile_rank(sec_pool, my_raw) if my_raw is not None and len(sec_pool) >= 5 else None
@@ -1964,42 +1443,17 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             prev = prices[n-2] if n > 1 else last
 
         chg = round((last - prev) / prev * 100, 2) if prev else 0
-
-        # Weekly/Monthly % change from historical prices
-        chg_w = None
-        chg_m = None
-        if len(prices) >= 5:
-            p5  = prices[-6] if len(prices) > 5 else prices[0]
-            chg_w = round((last - p5) / p5 * 100, 2) if p5 else None
-        if len(prices) >= 21:
-            p21 = prices[-22] if len(prices) > 21 else prices[0]
-            chg_m = round((last - p21) / p21 * 100, 2) if p21 else None
-
-        # Hourly % change from hourly cache
-        chg_h = None
-        h_data = hourly_cache.get(sym, {})
-        h_prices = h_data.get('prices', [])
-        if len(h_prices) >= 2:
-            chg_h = round((h_prices[-1] - h_prices[-2]) / h_prices[-2] * 100, 2) if h_prices[-2] else None
         vol = live.get('volume') if live.get('volume') else (volumes[n-1] if volumes else 0)
 
         # PP
         pp = detect_pp(prices, volumes)
 
-        # Volume signals — IBD style
-        # HY (High Year) = today volume ranks in top 5% of last 252 trading days
-        # HT (High Time) = today volume ranks in top 5% of all available history
+        # Volume signals
         yr_vols  = volumes[-252:] if len(volumes) >= 252 else volumes
-        all_vols = volumes  # all available history
-
-        # Percentile rank: what % of past volumes is today's volume greater than?
-        def vol_pct_rank(today_v, hist_vols):
-            if not hist_vols or today_v is None: return 0
-            rank = sum(1 for v in hist_vols if today_v > v)
-            return round(rank / len(hist_vols) * 100, 1)
-
-        hy_pct = vol_pct_rank(vol, yr_vols)   # percentile rank in last 1 year
-        ht_pct = vol_pct_rank(vol, all_vols)  # percentile rank in all history
+        max_yr   = max(yr_vols) if yr_vols else 1
+        max_all  = max(volumes) if volumes else 1
+        hy_pct   = round(vol / max_yr * 100, 1) if max_yr > 0 else 0
+        ht_pct   = round(vol / max_all * 100, 1) if max_all > 0 else 0
 
         # EMA9
         e9 = ema(prices, 9)
@@ -2018,13 +1472,7 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         # Squeeze (BB + Keltner) and VCP
         highs_arr = s.get('highs', prices)
         lows_arr  = s.get('lows', prices)
-        # ── Multi-timeframe TTM Squeeze ──────────────────────────
-        squeeze_daily  = calc_ttm_squeeze(prices, highs_arr, lows_arr)
-        _w = weekly_cache.get(sym, {})
-        squeeze_weekly = calc_ttm_squeeze(_w.get('prices',[]),_w.get('highs',[]),_w.get('lows',[])) if _w else {'in_squeeze':False,'squeeze_fired':False,'momentum':0,'momentum_dir':'flat','squeeze_days':0,'strength_score':0,'fired_bullish':False,'fired_bearish':False,'bb_width_pct':None,'dots':[],'hist':[]}
-        _h = hourly_cache.get(sym, {})
-        squeeze_hourly = calc_ttm_squeeze(_h.get('prices',[]),_h.get('highs',[]),_h.get('lows',[])) if _h else {'in_squeeze':False,'squeeze_fired':False,'momentum':0,'momentum_dir':'flat','squeeze_days':0,'strength_score':0,'fired_bullish':False,'fired_bearish':False,'bb_width_pct':None,'dots':[],'hist':[]}
-        squeeze = squeeze_daily  # backward compat
+        squeeze = detect_bb_squeeze(prices, highs_arr, lows_arr)
         vcp     = detect_vcp(prices, volumes, highs_arr, lows_arr)
 
         # 52W high/low
@@ -2041,22 +1489,21 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'close':          round(last, 2),
             'prev_close':     round(prev, 2),
             'chg_pct':        chg,
-            'chg_w':          chg_w,
-            'chg_m':          chg_m,
-            'chg_h':          chg_h,
             'volume':         int(vol),
             'rs':             rs,
-            'rs_tv':          rs_tv,
+            'rs_tv':          raw_tv,      # raw for now — ranked cross-sectionally below
+            'rs_mid_raw':     raw_mid,     # raw — ranked below
+            'rs_sml_raw':     raw_sml,     # raw — ranked below
             'rvol':           rvol_data.get('rvol'),
             'vol_signal':     rvol_data.get('vol_signal'),
             'rs_line_new_high': rs_line_data.get('rs_line_new_high', False),
             'rs_line_trend':  rs_line_data.get('rs_line_trend', 'flat'),
             'rs_line_value':  rs_line_data.get('rs_line_value'),
             'is_s2_new_entry': is_s2_new,       # TradingView / Lakshmi Mata Pine Script RS
-            'rs_nifty50':     rs_nifty50,
-            'rs_midcap':      rs_midcap,
-            'rs_smallcap':    rs_smallcap,
-            'rs_microcap':    rs_microcap,
+            'rs_nifty50':     None,        # deprecated — use rs_tv
+            'rs_midcap':      None,        # filled cross-sectionally below
+            'rs_smallcap':    None,        # filled cross-sectionally below
+            'rs_microcap':    None,
             'rs_sector':      rs_sector,
             'rs_raw':         round(my_raw_val, 6) if my_raw_val is not None else None,
             'rs_trend':       trend_data['trend'],
@@ -2087,29 +1534,10 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'weak_chg_1d':    weak['chg_1d'],
             'weak_chg_5d':    weak['chg_5d'],
             'weak_vol_spike': weak['vol_spike'],
-            'in_squeeze':        squeeze_daily['in_squeeze'],
-            'squeeze_fired':     squeeze_daily['squeeze_fired'],
-            'bb_width_pct':      squeeze_daily.get('bb_width_pct'),
-            'squeeze_days':      squeeze_daily.get('squeeze_days',0),
-            'sq_momentum':       squeeze_daily.get('momentum',0),
-            'sq_momentum_dir':   squeeze_daily.get('momentum_dir','flat'),
-            'sq_strength':       squeeze_daily.get('strength_score',0),
-            'sq_fired_bullish':  squeeze_daily.get('fired_bullish',False),
-            'sq_fired_bearish':  squeeze_daily.get('fired_bearish',False),
-            'sq_dots_d':         json.dumps(squeeze_daily.get('dots',[])),
-            'sq_hist_d':         json.dumps(squeeze_daily.get('hist',[])),
-            'sq_weekly_in':      squeeze_weekly['in_squeeze'],
-            'sq_weekly_fired':   squeeze_weekly['squeeze_fired'],
-            'sq_weekly_days':    squeeze_weekly.get('squeeze_days',0),
-            'sq_weekly_mom':     squeeze_weekly.get('momentum',0),
-            'sq_weekly_mom_dir': squeeze_weekly.get('momentum_dir','flat'),
-            'sq_weekly_bullish': squeeze_weekly.get('fired_bullish',False),
-            'sq_hourly_in':      squeeze_hourly['in_squeeze'],
-            'sq_hourly_fired':   squeeze_hourly['squeeze_fired'],
-            'sq_hourly_days':    squeeze_hourly.get('squeeze_days',0),
-            'sq_hourly_mom':     squeeze_hourly.get('momentum',0),
-            'sq_hourly_mom_dir': squeeze_hourly.get('momentum_dir','flat'),
-            'sq_hourly_bullish': squeeze_hourly.get('fired_bullish',False),
+            'in_squeeze':     squeeze['in_squeeze'],
+            'squeeze_fired':  squeeze['squeeze_fired'],
+            'bb_width_pct':   squeeze['bb_width_pct'],
+            'squeeze_days':   squeeze['squeeze_days'],
             'is_vcp':         vcp['is_vcp'],
             'vcp_stage':      vcp['vcp_stage'],
             'vcp_fired':      vcp['vcp_fired'],
@@ -2198,6 +1626,34 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         }
         await supabase_upsert(session, 'market_breadth', [breadth], on_conflict='scan_date')
         log.info(f"  📈 Market breadth saved: {breadth['advances']}↑ {breadth['declines']}↓ Stage2:{breadth['stage2_count']}")
+
+    # ── Cross-sectional RS ranking (matches Pine Script exactly) ──────────
+    # Pine Script ranks each stock's rawRS against ALL other stocks' rawRS
+    # to produce the final 1-99 rating. We do the same here.
+    tv_raws  = [(s, s['rs_tv'])       for s in processed if s['rs_tv']      is not None]
+    mid_raws = [(s, s['rs_mid_raw'])  for s in processed if s['rs_mid_raw'] is not None]
+    sml_raws = [(s, s['rs_sml_raw'])  for s in processed if s['rs_sml_raw'] is not None]
+
+    def cross_rank(pairs):
+        vals = [v for _, v in pairs]
+        for s, v in pairs:
+            s_key = id(s)
+            rank = min(99, max(1, round((sum(1 for x in vals if x < v) / len(vals)) * 98) + 1))
+            yield s, rank
+
+    for s, rank in cross_rank(tv_raws):
+        s['rs_tv'] = rank
+    for s, rank in cross_rank(mid_raws):
+        s['rs_midcap'] = rank
+    for s, rank in cross_rank(sml_raws):
+        s['rs_smallcap'] = rank
+
+    # Clean up temp raw fields
+    for s in processed:
+        s.pop('rs_mid_raw', None)
+        s.pop('rs_sml_raw', None)
+
+    log.info(f"  RS-TV cross-ranked: {len(tv_raws)} stocks | Mid: {len(mid_raws)} | Sml: {len(sml_raws)}")
 
     # Step 6: Build sector RS
     sector_rows = build_sector_rs(processed, SECTOR_MAP)
@@ -2363,8 +1819,6 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
 # ── Main loop ─────────────────────────────────────────────────────────
 async def main():
     global ALL_STOCKS, NIFTY50, MIDCAP, SMALLCAP, MICROCAP
-    global nifty_cache, index_history_cache, historical_cache
-    global instrument_key_map, weekly_cache, hourly_cache
 
     log.info("=" * 60)
     log.info("  PocketRS Pro — Live Update Server")
@@ -2425,34 +1879,6 @@ async def main():
         # Step 3: Load historical data cache at startup
         log.info("Loading historical data cache at startup…")
         await load_historical_cache(session)
-        # Fallback: if Nifty cache empty (Upstox rejected outside hours),
-        # build it from RELIANCE/HDFCBANK price history as Nifty proxy
-        # OR better: use the Nifty index historical candle with a different key
-        if not nifty_cache.get('prices'):
-            log.warning("⚠️ Nifty cache empty — retrying with alternate key...")
-            # Try alternate Nifty key format
-            for nifty_key in ["NSE_INDEX|Nifty 50", "NSE_INDEX|NIFTY 50", "NSE_EQ|NIFTY"]:
-                encoded = nifty_key.replace('|','%7C').replace(' ','%20')
-                url = f"https://api.upstox.com/v2/historical-candle/{encoded}/day/{datetime.now(IST).strftime('%Y-%m-%d')}/{(datetime.now(IST)-timedelta(days=420)).strftime('%Y-%m-%d')}"
-                try:
-                    async with session.get(url, headers={"Authorization":f"Bearer {ANALYTICS_TOKEN}","Accept":"application/json"},
-                                          timeout=aiohttp.ClientTimeout(total=30)) as r:
-                        if r.status == 200:
-                            data = await r.json()
-                            candles = list(reversed(data.get('data',{}).get('candles',[])))
-                            if candles:
-                                nifty_cache.clear()
-                                nifty_cache.update({'prices':[c[4] for c in candles],'volumes':[c[5] for c in candles]})
-                                log.info(f"✅ Nifty loaded with key {nifty_key}: {len(nifty_cache['prices'])} days")
-                                break
-                except Exception as e:
-                    log.warning(f"Nifty retry {nifty_key} failed: {e}")
-
-        if not nifty_cache.get('prices'):
-            log.error("❌ Nifty cache still empty after retries — RS-TV will be None for all stocks")
-        else:
-            log.info(f"✅ Nifty cache ready: {len(nifty_cache['prices'])} days — RS-TV will be calculated")
-
         log.info("✅ Proceeding to initial scan…")
 
         # Step 4: Run initial scan (hard timeout so a stall can't hang the process forever)
@@ -2461,11 +1887,12 @@ async def main():
         # close, the first scan should reflect that correctly.
         SCAN_TIMEOUT = 600  # 10 minutes max for a single scan cycle
         ist_now_initial = datetime.now(IST)
-        # Always run batch_morning first — calculates RS-TV from historical data
-        # This ensures RS-TV is populated immediately even outside market hours
-        # If market is open, we'll also get live prices in this scan
-        initial_scan_type = 'batch_morning'
-        log.info(f"Starting with batch_morning scan to populate RS-TV from history...")
+        if is_market_open():
+            initial_scan_type = 'live'
+        elif ist_now_initial.hour >= MARKET_CLOSE_H:
+            initial_scan_type = 'batch_eod'
+        else:
+            initial_scan_type = 'batch_morning'
         log.info(f"Initial scan type detected: {initial_scan_type} (current time {ist_now_initial.strftime('%H:%M IST')})")
 
         try:
@@ -2493,17 +1920,8 @@ async def main():
                             log.error(f"⏱ Scan exceeded {SCAN_TIMEOUT}s timeout — skipping this cycle")
                         last_scan = time.time()
                     else:
-                        # Market closed — still run scan using historical data
-                        # This ensures RS-TV is always calculated and saved
                         ist_now = datetime.now(IST)
-                        log.info(f"📊 Market closed ({ist_now.strftime('%H:%M IST')}) — running historical scan for RS-TV...")
-                        try:
-                            await asyncio.wait_for(run_scan(session, 'batch_morning'), timeout=SCAN_TIMEOUT)
-                            log.info("✅ Historical scan done — RS-TV updated")
-                            # After hours: scan every 30 mins not every minute
-                            await asyncio.sleep(1800)
-                        except Exception as e:
-                            log.error(f"Historical scan failed: {e}")
+                        log.info(f"⏸ Market closed ({ist_now.strftime('%H:%M IST')}) — next check in {UPDATE_INTERVAL}s")
                         last_scan = time.time()
 
                 await asyncio.sleep(5)  # check every 5 seconds
