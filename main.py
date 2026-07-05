@@ -1121,29 +1121,80 @@ async def load_index_cache(session: aiohttp.ClientSession):
         "Accept": "application/json"
     }
     loaded = 0
+    # Alternative key formats to try if primary fails
+    KEY_ALTERNATIVES = {
+        "Midcap 150":   ["NSE_INDEX|Nifty Midcap 150", "NSE_INDEX|NIFTY MIDCAP 150", "NSE_INDEX|Nifty MidCap 150"],
+        "Smallcap 250": ["NSE_INDEX|Nifty Smallcap 250", "NSE_INDEX|NIFTY SMALLCAP 250", "NSE_INDEX|Nifty SmallCap 250"],
+        "Microcap 250": ["NSE_INDEX|Nifty Microcap 250", "NSE_INDEX|NIFTY MICROCAP 250", "NSE_INDEX|Nifty MicroCap 250"],
+    }
     for name, ikey in INDEX_TRACKER.items():
-        encoded = ikey.replace('|', '%7C').replace(' ', '%20')
-        url = f"https://api.upstox.com/v2/historical-candle/{encoded}/day/{to}/{from_}"
-        try:
-            async with session.get(url, headers=headers,
-                                   timeout=aiohttp.ClientTimeout(total=15)) as r:
-                if r.status == 200:
-                    data = await r.json()
-                    candles = list(reversed(data.get('data', {}).get('candles', [])))
-                    if candles:
-                        index_history_cache[name] = {
-                            'prices':  [c[4] for c in candles],
-                            'volumes': [c[5] for c in candles],
-                            'highs':   [c[2] for c in candles],
-                            'lows':    [c[3] for c in candles],
-                        }
-                        loaded += 1
-                else:
-                    log.warning(f"Index {name} fetch failed: {r.status}")
-        except Exception as e:
-            log.warning(f"Index {name} error: {e}")
-        await asyncio.sleep(0.2)
+        # Try primary key, then alternatives
+        keys_to_try = KEY_ALTERNATIVES.get(name, [ikey])
+        if ikey not in keys_to_try:
+            keys_to_try = [ikey] + keys_to_try
+        success = False
+        for try_key in keys_to_try:
+            encoded = try_key.replace('|', '%7C').replace(' ', '%20')
+            url = f"https://api.upstox.com/v2/historical-candle/{encoded}/day/{to}/{from_}"
+            try:
+                async with session.get(url, headers=headers,
+                                       timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        candles = list(reversed(data.get('data', {}).get('candles', [])))
+                        if candles:
+                            index_history_cache[name] = {
+                                'prices':  [c[4] for c in candles],
+                                'volumes': [c[5] for c in candles],
+                                'highs':   [c[2] for c in candles],
+                                'lows':    [c[3] for c in candles],
+                            }
+                            loaded += 1
+                            # Update tracker with working key
+                            INDEX_TRACKER[name] = try_key
+                            success = True
+                            break
+                    else:
+                        body = await r.text()
+                        log.warning(f"Index {name} key '{try_key}' failed: {r.status} — {body[:150]}")
+            except Exception as e:
+                log.warning(f"Index {name} error: {e}")
+            await asyncio.sleep(0.2)
+        if not success:
+            log.warning(f"⚠️ Index {name}: all key formats failed — MID/SML RS will use Nifty as fallback")
     log.info(f"✅ Index cache loaded: {loaded}/{len(INDEX_TRACKER)} indices")
+
+
+async def ensure_db_columns(session: aiohttp.ClientSession):
+    """Auto-add any missing columns to Supabase stocks table via direct SQL."""
+    sql = """
+    alter table public.stocks add column if not exists rs_tv int;
+    alter table public.stocks add column if not exists rs_midcap int;
+    alter table public.stocks add column if not exists rs_smallcap int;
+    alter table public.stocks add column if not exists rs_sector int;
+    alter table public.stocks add column if not exists rs_nifty50 int;
+    alter table public.stocks add column if not exists rs_microcap int;
+    """
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal"
+    }
+    try:
+        async with session.post(
+            f"{SUPABASE_URL}/rest/v1/rpc/exec_sql",
+            headers=headers,
+            json={"query": sql},
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status in (200, 201, 204):
+                log.info("✅ DB columns verified/added")
+            else:
+                # Not critical — columns may already exist, or exec_sql not available
+                log.info("✅ DB column check skipped (run SQL manually if rs_tv missing)")
+    except Exception as e:
+        log.info(f"✅ DB column check skipped: {e}")
 
 
 async def load_nifty_cache(session: aiohttp.ClientSession):
@@ -1873,6 +1924,8 @@ async def main():
         # Step 2: Load instrument master to get correct API keys
         await load_instrument_master(session)
 
+        # Step 2a: Ensure all required DB columns exist
+        await ensure_db_columns(session)
         # Step 2b: Load Nifty 50 + all index histories for TV RS calc and index dashboard
         await load_nifty_cache(session)
         await load_index_cache(session)
