@@ -1519,25 +1519,24 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         # the synchronous CPU-bound work below (especially squeeze/VCP math)
         # across ~2400 stocks can block the event loop for minutes straight,
         # freezing heartbeats, timeouts, and Railway health checks.
-        if loop_idx % 100 == 0:
+        if loop_idx % 50 == 0:
             await asyncio.sleep(0)
 
-        # RS (IBD percentile — kept for trend/history sparkline)
+        # RS (IBD percentile — kept for sparkline/trend)
         my_raw_val = raw_by_sym.get(sym)
         rs = percentile_rank(raw_vals, my_raw_val) if my_raw_val is not None else 0
         hist = rs_history.get(sym, [])
         trend_data = rs_slope(hist)
 
-        # RS — TradingView / Lakshmi Mata Pine Script formula
-        # Compute raw scores vs each benchmark index
-        # Cross-sectional percentile rank happens AFTER all stocks are computed
+        # RS-TV — TradingView / Lakshmi Mata Pine Script formula
         nifty_prices    = nifty_cache.get('prices', [])
         midcap_prices   = midcap_cache.get('prices', [])   or nifty_prices
         smallcap_prices = smallcap_cache.get('prices', []) or nifty_prices
 
-        raw_tv       = calc_rs_tv_normalized(prices, nifty_prices)    if nifty_prices    else None
-        raw_mid      = calc_rs_tv_normalized(prices, midcap_prices)   if midcap_prices   else None
-        raw_sml      = calc_rs_tv_normalized(prices, smallcap_prices) if smallcap_prices else None
+        # Fast single-pass: compute full rawRS series, then normalize
+        raw_tv  = normalize_rs(calc_raw_rs_series(prices, nifty_prices))    if nifty_prices    else None
+        raw_mid = normalize_rs(calc_raw_rs_series(prices, midcap_prices))   if midcap_prices   else None
+        raw_sml = normalize_rs(calc_raw_rs_series(prices, smallcap_prices)) if smallcap_prices else None
         # Sector-relative RS — percentile rank vs same sector peers
         my_raw    = my_raw_val
         my_sector = sym_to_sector.get(sym, 'Other')
