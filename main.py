@@ -2384,7 +2384,8 @@ async def main():
                             data = await r.json()
                             candles = list(reversed(data.get('data',{}).get('candles',[])))
                             if candles:
-                                nifty_cache = {'prices':[c[4] for c in candles],'volumes':[c[5] for c in candles]}
+                                nifty_cache.clear()
+                                nifty_cache.update({'prices':[c[4] for c in candles],'volumes':[c[5] for c in candles]})
                                 log.info(f"✅ Nifty loaded with key {nifty_key}: {len(nifty_cache['prices'])} days")
                                 break
                 except Exception as e:
