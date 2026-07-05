@@ -513,14 +513,26 @@ def calc_raw_rs_series(prices: list, bench_prices: list) -> list:
     return result
 
 
-def normalize_rs(raw_series: list) -> Optional[float]:
-    """Return raw score for cross-sectional ranking — done after all stocks computed."""
+def normalize_rs(raw_series: list) -> Optional[int]:
+    """
+    Self-normalized RS matching Pine Script exactly.
+    With stooq providing 500+ days, we have 250 valid rawRS points for min/max window.
+    """
     if not raw_series:
         return None
     valid = [v for v in raw_series if v is not None]
-    if not valid:
+    if len(valid) < 2:
         return None
-    return valid[-1]  # today's rawRS — ranked cross-sectionally in run_scan()
+    current = raw_series[-1]
+    if current is None:
+        return None
+    # Use last 252 valid points for normalization window (Pine Script: ta.highest/lowest 252)
+    window = [v for v in raw_series[-300:] if v is not None][-252:]
+    hi = max(window)
+    lo = min(window)
+    if hi == lo:
+        return 50
+    return max(1, min(99, round(((current - lo) / (hi - lo)) * 98 + 1)))
 
 
 def calc_rs_tv_normalized(prices: list, bench_prices: list, end_idx: int = None) -> Optional[int]:
@@ -1663,9 +1675,9 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'chg_pct':        chg,
             'volume':         int(vol),
             'rs':             rs,
-            'rs_tv':          raw_tv,   # raw score — cross-ranked below
-            'rs_mid':         raw_mid,  # raw score — cross-ranked below
-            'rs_sml':         raw_sml,  # raw score — cross-ranked below
+            'rs_tv':          raw_tv,
+            'rs_midcap':      raw_mid,
+            'rs_smallcap':    raw_sml,
             'rvol':           rvol_data.get('rvol'),
             'vol_signal':     rvol_data.get('vol_signal'),
             'rs_line_new_high': rs_line_data.get('rs_line_new_high', False),
@@ -1798,23 +1810,6 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         log.info(f"  📈 Market breadth saved: {breadth['advances']}↑ {breadth['declines']}↓ Stage2:{breadth['stage2_count']}")
 
 
-
-    # ── Cross-sectional RS ranking ─────────────────────────────────────────
-    # Rank each stock's rawRS against all stocks — gives reliable 1-99 scores
-    # even with limited history. Strong stocks rank high, weak stocks rank low.
-    def cross_rank(stocks, key_raw, key_out):
-        raws = [(s, s[key_raw]) for s in stocks if s.get(key_raw) is not None]
-        if not raws: return
-        vals = [v for _, v in raws]
-        for s, v in raws:
-            s[key_out] = min(99, max(1, round((sum(1 for x in vals if x < v) / len(vals)) * 98) + 1))
-        for s in stocks:
-            s.pop(key_raw, None)
-
-    cross_rank(processed, 'rs_tv',  'rs_tv')
-    cross_rank(processed, 'rs_mid', 'rs_midcap')
-    cross_rank(processed, 'rs_sml', 'rs_smallcap')
-    log.info(f"  RS ranked cross-sectionally: {len(processed)} stocks")
 
     # Step 6: Build sector RS
     sector_rows = build_sector_rs(processed, SECTOR_MAP)
