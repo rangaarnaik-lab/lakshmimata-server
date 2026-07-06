@@ -1315,6 +1315,142 @@ async def load_index_history_from_db(session: aiohttp.ClientSession, name: str) 
         log.warning(f"  Load index history failed: {e}")
     return []
 
+
+async def fetch_full_nifty_history(session: aiohttp.ClientSession) -> dict:
+    """
+    One-time fetch of 5yr Nifty/Midcap/Smallcap history.
+    Tries multiple sources until one works.
+    Returns dict: {"Nifty 50": [prices...], "Midcap 150": [...], "Smallcap 250": [...]}
+    """
+    results = {}
+
+    # Source 1: Yahoo Finance (yfinance style direct URL)
+    yahoo_map = {
+        "Nifty 50":    "%5ENSEI",
+        "Midcap 150":  "%5ENIMDCP150",
+        "Smallcap 250":"%5ENSMCP250",
+    }
+    for name, ticker in yahoo_map.items():
+        if name in results:
+            continue
+        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=5y"
+        try:
+            async with session.get(url,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+                timeout=aiohttp.ClientTimeout(total=15)) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    closes = data["chart"]["result"][0]["indicators"]["quote"][0]["close"]
+                    prices = [c for c in closes if c is not None]
+                    if len(prices) >= 500:
+                        results[name] = prices
+                        log.info(f"  ✅ Yahoo {name}: {len(prices)} days")
+        except Exception as e:
+            log.warning(f"  Yahoo {name}: {e}")
+        await asyncio.sleep(0.3)
+
+    # Source 2: NSE Bhavcopy index CSV (already works for constituents)
+    if "Nifty 50" not in results:
+        nse_indices = {
+            "Nifty 50":    "NIFTY 50",
+            "Midcap 150":  "NIFTY MIDCAP 150",
+            "Smallcap 250":"NIFTY SMALLCAP 250",
+        }
+        # Try NSE index historical API
+        for name, idx_name in nse_indices.items():
+            if name in results:
+                continue
+            encoded = idx_name.replace(" ", "%20")
+            url = f"https://www.nseindia.com/api/historical/indicesHistory?indexType={encoded}&from=01-Jan-2020&to=06-Jul-2026"
+            try:
+                async with session.get(url,
+                    headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.nseindia.com"},
+                    timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        records = data.get("data", {}).get("indexCloseOnlineRecords", [])
+                        prices = [float(rec["EOD_CLOSE_INDEX_VAL"]) for rec in reversed(records)]
+                        if len(prices) >= 500:
+                            results[name] = prices
+                            log.info(f"  ✅ NSE {name}: {len(prices)} days")
+            except Exception as e:
+                log.warning(f"  NSE {name}: {e}")
+            await asyncio.sleep(0.5)
+
+    # Source 3: Stooq CSV
+    stooq_map = {
+        "Nifty 50":    "%5ensei",
+        "Midcap 150":  "%5ecnxmc",
+        "Smallcap 250":"%5ecnxsc",
+    }
+    for name, ticker in stooq_map.items():
+        if name in results:
+            continue
+        url = f"https://stooq.com/q/d/l/?s={ticker}&i=d"
+        try:
+            async with session.get(url,
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=aiohttp.ClientTimeout(total=15)) as r:
+                if r.status == 200:
+                    text = await r.text()
+                    lines = text.strip().split("\n")
+                    prices = []
+                    for line in lines[1:]:
+                        parts = line.split(",")
+                        if len(parts) >= 5 and parts[4] not in ("N/D", "null", ""):
+                            try: prices.append(float(parts[4]))
+                            except: pass
+                    prices = list(reversed(prices))
+                    if len(prices) >= 500:
+                        results[name] = prices
+                        log.info(f"  ✅ Stooq {name}: {len(prices)} days")
+        except Exception as e:
+            log.warning(f"  Stooq {name}: {e}")
+        await asyncio.sleep(0.3)
+
+    return results
+
+
+async def load_full_history_once(session: aiohttp.ClientSession):
+    """
+    Check if we already have 2yr history in DB.
+    If not, fetch full history from external source and save to DB.
+    Only runs once — after that DB has enough history.
+    """
+    global nifty_cache, midcap_cache, smallcap_cache
+
+    # Check current DB history length
+    db_nifty = await load_index_history_from_db(session, "Nifty 50")
+    if len(db_nifty) >= 600:
+        log.info(f"✅ Full history already in DB: Nifty={len(db_nifty)}d — skipping one-time fetch")
+        return
+
+    log.info(f"📥 DB has only {len(db_nifty)}d — fetching full 5yr history one-time…")
+    results = await fetch_full_nifty_history(session)
+
+    if not results:
+        log.warning("⚠️ All external sources blocked — history will accumulate daily")
+        return
+
+    for name, prices in results.items():
+        # Merge with existing DB data
+        existing = await load_index_history_from_db(session, name)
+        if existing and len(existing) > len(prices):
+            merged = prices  # fresh data is longer/more accurate
+        else:
+            merged = prices
+        await save_index_history_to_db(session, name, merged)
+        log.info(f"  💾 Saved {name}: {len(merged)} days to DB")
+
+    # Update caches
+    if "Nifty 50" in results:
+        nifty_cache = {"prices": results["Nifty 50"]}
+    if "Midcap 150" in results:
+        midcap_cache = {"prices": results["Midcap 150"]}
+    if "Smallcap 250" in results:
+        smallcap_cache = {"prices": results["Smallcap 250"]}
+    log.info("✅ Full history loaded — RS will now match TradingView exactly!")
+
 async def load_nifty_cache(session: aiohttp.ClientSession):
     """Fetch Nifty 50 daily close history needed for TradingView-style RS calculation."""
     global nifty_cache
@@ -2031,6 +2167,8 @@ async def main():
         # Step 2b: Load Nifty 50 + all index histories
         await load_nifty_cache(session)
         await load_index_cache(session)
+        # Step 2c: One-time full history fetch if DB doesn't have 2yr yet
+        await load_full_history_once(session)
 
         # Step 3: Load historical data cache at startup
         log.info("Loading historical data cache at startup…")
