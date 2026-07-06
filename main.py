@@ -1331,17 +1331,21 @@ async def seed_index_history_if_needed(session: aiohttp.ClientSession):
         log.info(f"✅ Nifty 50 already seeded: {len(existing)} days in DB")
         return
 
-    # Get fresh data from Upstox (covers 2026)
+    # Get fresh data from Upstox (covers last 371 days including 2026)
     upstox_prices = nifty_cache.get("prices", [])
 
-    # Merge: seed (2020-2025) + Upstox fresh (last 30 days of 2026)
-    # Upstox gives ~371 days back from today, seed ends Dec 2025
-    # Take only the NEW days from Upstox (after Dec 2025)
-    seed = NIFTY50_SEED_PRICES
+    seed = NIFTY50_SEED_PRICES  # 2020-01-01 to 2025-12-31 (1492 days)
+
     if upstox_prices:
-        # Upstox data after seed ends — approx last 6 months
-        new_days = upstox_prices[max(0, len(upstox_prices)-180):]
-        merged = seed + new_days
+        # Seed ends Dec 2025. Upstox goes back ~371 days from today (Jul 2026).
+        # Overlap is ~Jul 2025 to Dec 2025 (~125 days).
+        # Solution: take seed as base, then append ONLY the new days from Upstox
+        # that are AFTER the seed ends (i.e. Jan 2026 onwards).
+        # Upstox has 371 days back from today — roughly last 125 days are overlap.
+        # New days = last (371 - 125) = ~246 days from Upstox
+        overlap_days = 125  # approximate overlap between seed end and Upstox start
+        new_from_upstox = upstox_prices[overlap_days:]  # only 2026 data
+        merged = seed + new_from_upstox
     else:
         merged = seed
 
@@ -1504,11 +1508,25 @@ async def load_nifty_cache(session: aiohttp.ClientSession):
                 return
             data = await r.json()
             candles = list(reversed(data.get('data', {}).get('candles', [])))
-            nifty_cache = {
-                'prices':  [c[4] for c in candles],  # close
-                'volumes': [c[5] for c in candles],
-            }
-            log.info(f"✅ Nifty 50 history: {len(nifty_cache['prices'])} days")
+            fresh_prices = [c[4] for c in candles]
+
+            # Merge with DB seed (2020-2025) — no overlap
+            # DB seed ends Dec 2025, Upstox starts ~Jul 2025 (371 days back)
+            # Overlap ~125 days. Solution: take DB base + Upstox tail only
+            db_prices = await load_index_history_from_db(session, "Nifty 50")
+            if db_prices and len(db_prices) > len(fresh_prices):
+                # DB has more history (seed). Replace last N days with fresh.
+                # This avoids overlap: base = everything before Upstox window
+                base = db_prices[:-len(fresh_prices)]
+                merged = base + fresh_prices
+                log.info(f"✅ Nifty 50: {len(merged)}d total (seed:{len(base)}d + fresh:{len(fresh_prices)}d, no overlap)")
+            else:
+                merged = fresh_prices
+                log.info(f"✅ Nifty 50: {len(merged)}d from Upstox only")
+
+            nifty_cache = {'prices': merged, 'volumes': [c[5] for c in candles]}
+            # Save back to DB for next restart
+            await save_index_history_to_db(session, "Nifty 50", merged)
     except Exception as e:
         log.warning(f"Nifty cache load failed: {e}")
 
