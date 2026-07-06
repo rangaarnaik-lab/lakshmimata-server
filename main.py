@@ -1455,14 +1455,10 @@ async def load_full_history_once(session: aiohttp.ClientSession):
     """
     global nifty_cache, midcap_cache, smallcap_cache
 
-    # Check current DB history length
-    db_nifty = await load_index_history_from_db(session, "Nifty 50")
     # Check AFTER seed has run — seed saves 1492+ days
     db_nifty = await load_index_history_from_db(session, "Nifty 50")
     if len(db_nifty) >= 1400:
         log.info(f"✅ Full history already in DB: Nifty={len(db_nifty)}d — skipping external fetch")
-        # Update caches with DB data
-        global nifty_cache, midcap_cache, smallcap_cache
         if len(db_nifty) > len(nifty_cache.get('prices', [])):
             nifty_cache = {'prices': db_nifty}
             log.info(f"✅ Nifty cache updated from DB: {len(db_nifty)}d")
@@ -1487,8 +1483,6 @@ async def load_full_history_once(session: aiohttp.ClientSession):
         await save_index_history_to_db(session, name, prices)
         log.info(f"  💾 Saved {name}: {len(prices)} days to DB")
 
-    # Update caches with best available
-    global nifty_cache, midcap_cache, smallcap_cache
     if "Nifty 50" in results and len(results["Nifty 50"]) > len(nifty_cache.get('prices', [])):
         nifty_cache = {"prices": results["Nifty 50"]}
     if "Midcap 150" in results:
