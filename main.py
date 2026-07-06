@@ -1450,6 +1450,7 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         await load_nifty_cache(session)
         await load_index_cache(session)
         # Rebuild synthetic indices with fresh EOD data
+        global midcap_cache, smallcap_cache
         midcap_cache   = build_synthetic_index(list(MIDCAP),   historical_cache, min_stocks=50)
         smallcap_cache = build_synthetic_index(list(SMALLCAP), historical_cache, min_stocks=80)
         log.info(f"  Synthetic indices rebuilt: Mid={len(midcap_cache.get('prices',[]))}d Sml={len(smallcap_cache.get('prices',[]))}d")
