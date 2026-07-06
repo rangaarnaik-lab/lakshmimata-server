@@ -1328,7 +1328,7 @@ async def seed_index_history_if_needed(session: aiohttp.ClientSession):
     """
     existing = await load_index_history_from_db(session, "Nifty 50")
     if len(existing) >= 1400:
-        log.info(f"✅ Nifty 50 already seeded: {len(existing)} days in DB")
+        log.info(f"✅ Nifty 50 already seeded: {len(existing)} days in DB — skipping")
         return
 
     # Get fresh data from Upstox (covers last 371 days including 2026)
@@ -1469,14 +1469,14 @@ async def load_full_history_once(session: aiohttp.ClientSession):
         return
 
     for name, prices in results.items():
-        # Merge with existing DB data
+        # Load existing DB data
         existing = await load_index_history_from_db(session, name)
-        if existing and len(existing) > len(prices):
-            merged = prices  # fresh data is longer/more accurate
-        else:
-            merged = prices
-        await save_index_history_to_db(session, name, merged)
-        log.info(f"  💾 Saved {name}: {len(merged)} days to DB")
+        # Always keep the LONGER history
+        if existing and len(existing) >= len(prices):
+            log.info(f"  DB already has {len(existing)}d for {name} — keeping (longer than {len(prices)}d from external)")
+            continue
+        await save_index_history_to_db(session, name, prices)
+        log.info(f"  💾 Saved {name}: {len(prices)} days to DB")
 
     # Update caches
     if "Nifty 50" in results:
