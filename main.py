@@ -2417,29 +2417,25 @@ async def main():
         log.info(f"✅ Smallcap index: {len(sml_prices)}d (DB had {len(db_sml)}d)")
 
         log.info("✅ Proceeding to initial scan…")
-        # Extend stock histories from Yahoo in background
-        asyncio.create_task(extend_stock_history_from_yahoo(session))
 
-        # Step 4: Run initial scan (hard timeout so a stall can't hang the process forever)
-        # Detect the correct scan type based on actual time, rather than always
-        # forcing 'batch_morning' — if Railway restarts mid-afternoon or after
-        # close, the first scan should reflect that correctly.
-        SCAN_TIMEOUT = 900  # 15 minutes max — RS self-normalization adds compute time
+        # Step 4: Run initial scan
+        SCAN_TIMEOUT = 900
         ist_now_initial = datetime.now(IST)
         if is_market_open():
             initial_scan_type = 'live'
-        elif ist_now_initial.hour >= MARKET_CLOSE_H:
-            initial_scan_type = 'batch_eod'
-        else:
+        elif ist_now_initial.hour < 9 or (ist_now_initial.hour == 9 and ist_now_initial.minute < 15):
             initial_scan_type = 'batch_morning'
+        else:
+            initial_scan_type = 'batch_eod'
         log.info(f"Initial scan type detected: {initial_scan_type} (current time {ist_now_initial.strftime('%H:%M IST')})")
-
         try:
             await asyncio.wait_for(run_scan(session, initial_scan_type), timeout=SCAN_TIMEOUT)
         except asyncio.TimeoutError:
             log.error(f"⏱ Initial scan exceeded {SCAN_TIMEOUT}s timeout — aborting and continuing to main loop")
-        except Exception as e:
-            log.error(f"❌ Initial scan failed: {e}")
+
+        # Extend stock histories from Yahoo AFTER initial scan
+        log.info("🔄 Starting Yahoo history extension in background…")
+        asyncio.create_task(extend_stock_history_from_yahoo(session))
 
         last_scan = time.time()
         scan_count = 0
