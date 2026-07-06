@@ -1791,6 +1791,12 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         raw_tv  = normalize_rs(calc_raw_rs_series(prices, nifty_prices))    if nifty_prices    else None
         raw_mid = normalize_rs(calc_raw_rs_series(prices, midcap_prices))   if midcap_prices   else None
         raw_sml = normalize_rs(calc_raw_rs_series(prices, smallcap_prices)) if smallcap_prices else None
+
+        # Debug first scan: log RS details for GRSE
+        if sym == 'GRSE' and loop_idx < 5:
+            tv_series = calc_raw_rs_series(prices, nifty_prices) if nifty_prices else []
+            valid_pts = [v for v in tv_series if v is not None]
+            log.info(f"  🔍 GRSE: stock_history={len(prices)}d, nifty={len(nifty_prices)}d, rawRS_points={len(valid_pts)}, rs_tv={raw_tv}")
         # Sector-relative RS — percentile rank vs same sector peers
         my_raw    = my_raw_val
         my_sector = sym_to_sector.get(sym, 'Other')
