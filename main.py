@@ -1722,19 +1722,41 @@ async def load_historical_cache(session: aiohttp.ClientSession):
     log.info(f"Loading historical data for {len(ALL_STOCKS)} stocks…")
     BATCH = 10
     loaded = 0
+    failed_syms = []
     for i in range(0, len(ALL_STOCKS), BATCH):
         batch = ALL_STOCKS[i:i+BATCH]
         results = await asyncio.gather(*[
-            fetch_historical(session, sym, instrument_key_map.get(sym))
+            fetch_historical(session, sym, instrument_key_map.get(sym, f"NSE_EQ|{sym}"))
             for sym in batch
         ])
         for sym, data in zip(batch, results):
             if data:
                 historical_cache[sym] = data
                 loaded += 1
-        await asyncio.sleep(0.5)  # rate limit
+            else:
+                failed_syms.append(sym)
+        await asyncio.sleep(0.5)
         if (i // BATCH) % 10 == 0:
             log.info(f"  Loaded {loaded}/{len(ALL_STOCKS)} stocks…")
+
+    # Retry failed stocks with BSE exchange key
+    if failed_syms:
+        log.info(f"  Retrying {len(failed_syms)} failed stocks with BSE keys…")
+        retry_loaded = 0
+        for i in range(0, len(failed_syms), BATCH):
+            batch = failed_syms[i:i+BATCH]
+            results = await asyncio.gather(*[
+                fetch_historical(session, sym, f"BSE_EQ|{sym}")
+                for sym in batch
+            ])
+            for sym, data in zip(batch, results):
+                if data:
+                    historical_cache[sym] = data
+                    loaded += 1
+                    retry_loaded += 1
+            await asyncio.sleep(0.5)
+        log.info(f"  BSE retry: {retry_loaded} additional stocks loaded")
+
     log.info(f"✅ Historical cache loaded: {loaded} stocks")
 
 # ── Main scan function ────────────────────────────────────────────────
