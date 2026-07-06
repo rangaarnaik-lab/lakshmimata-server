@@ -1497,9 +1497,18 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         await load_index_cache(session)
         # Rebuild synthetic indices with fresh EOD data
         global midcap_cache, smallcap_cache
-        midcap_cache   = build_synthetic_index(list(MIDCAP),   historical_cache, min_stocks=50)
-        smallcap_cache = build_synthetic_index(list(SMALLCAP), historical_cache, min_stocks=80)
-        log.info(f"  Synthetic indices rebuilt: Mid={len(midcap_cache.get('prices',[]))}d Sml={len(smallcap_cache.get('prices',[]))}d")
+        fresh_mid = build_synthetic_index(list(MIDCAP),   historical_cache, min_stocks=50)
+        fresh_sml = build_synthetic_index(list(SMALLCAP), historical_cache, min_stocks=80)
+        db_mid = await load_index_history_from_db(session, "Midcap 150")
+        db_sml = await load_index_history_from_db(session, "Smallcap 250")
+        def merge_p(db, fresh):
+            fp = fresh.get('prices', [])
+            return db[:-len(fp)] + fp if db and len(db) > len(fp) else fp
+        midcap_cache   = {'prices': merge_p(db_mid, fresh_mid)}
+        smallcap_cache = {'prices': merge_p(db_sml, fresh_sml)}
+        if midcap_cache['prices']:   await save_index_history_to_db(session, "Midcap 150",   midcap_cache['prices'])
+        if smallcap_cache['prices']: await save_index_history_to_db(session, "Smallcap 250", smallcap_cache['prices'])
+        log.info(f"  Indices rebuilt: Mid={len(midcap_cache['prices'])}d Sml={len(smallcap_cache['prices'])}d")
 
     # Step 3: DO NOT mutate historical_cache prices in place (was causing chg% drift).
     # Instead, keep historical close as the immutable baseline and use live price
@@ -2029,10 +2038,33 @@ async def main():
 
         # Step 3b: Build synthetic Midcap/Smallcap indices AFTER history is loaded
         global midcap_cache, smallcap_cache
-        midcap_cache   = build_synthetic_index(list(MIDCAP),   historical_cache, min_stocks=50)
-        smallcap_cache = build_synthetic_index(list(SMALLCAP), historical_cache, min_stocks=80)
-        log.info(f"✅ Synthetic Midcap index: {len(midcap_cache.get('prices',[]))} days from {len([s for s in MIDCAP if s in historical_cache])} stocks")
-        log.info(f"✅ Synthetic Smallcap index: {len(smallcap_cache.get('prices',[]))} days from {len([s for s in SMALLCAP if s in historical_cache])} stocks")
+
+        # Build fresh from constituents
+        fresh_mid = build_synthetic_index(list(MIDCAP),   historical_cache, min_stocks=50)
+        fresh_sml = build_synthetic_index(list(SMALLCAP), historical_cache, min_stocks=80)
+
+        # Merge with accumulated DB history
+        db_mid = await load_index_history_from_db(session, "Midcap 150")
+        db_sml = await load_index_history_from_db(session, "Smallcap 250")
+
+        def merge_prices(db, fresh):
+            fp = fresh.get('prices', [])
+            if db and len(db) > len(fp):
+                return db[:-len(fp)] + fp
+            return fp
+
+        mid_prices = merge_prices(db_mid, fresh_mid)
+        sml_prices = merge_prices(db_sml, fresh_sml)
+
+        midcap_cache   = {'prices': mid_prices}
+        smallcap_cache = {'prices': sml_prices}
+
+        # Save back to DB
+        if mid_prices: await save_index_history_to_db(session, "Midcap 150",   mid_prices)
+        if sml_prices: await save_index_history_to_db(session, "Smallcap 250", sml_prices)
+
+        log.info(f"✅ Midcap index: {len(mid_prices)}d (DB had {len(db_mid)}d)")
+        log.info(f"✅ Smallcap index: {len(sml_prices)}d (DB had {len(db_sml)}d)")
 
         log.info("✅ Proceeding to initial scan…")
 
