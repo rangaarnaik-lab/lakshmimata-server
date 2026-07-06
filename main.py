@@ -1457,11 +1457,22 @@ async def load_full_history_once(session: aiohttp.ClientSession):
 
     # Check current DB history length
     db_nifty = await load_index_history_from_db(session, "Nifty 50")
-    if len(db_nifty) >= 600:
-        log.info(f"✅ Full history already in DB: Nifty={len(db_nifty)}d — skipping one-time fetch")
+    # Check AFTER seed has run — seed saves 1492+ days
+    db_nifty = await load_index_history_from_db(session, "Nifty 50")
+    if len(db_nifty) >= 1400:
+        log.info(f"✅ Full history already in DB: Nifty={len(db_nifty)}d — skipping external fetch")
+        # Update caches with DB data
+        global nifty_cache, midcap_cache, smallcap_cache
+        if len(db_nifty) > len(nifty_cache.get('prices', [])):
+            nifty_cache = {'prices': db_nifty}
+            log.info(f"✅ Nifty cache updated from DB: {len(db_nifty)}d")
+        db_mid = await load_index_history_from_db(session, "Midcap 150")
+        db_sml = await load_index_history_from_db(session, "Smallcap 250")
+        if db_mid: midcap_cache = {'prices': db_mid}
+        if db_sml: smallcap_cache = {'prices': db_sml}
         return
 
-    log.info(f"📥 DB has only {len(db_nifty)}d — fetching full 5yr history one-time…")
+    log.info(f"📥 DB has only {len(db_nifty)}d — fetching full history from external sources…")
     results = await fetch_full_nifty_history(session)
 
     if not results:
@@ -1469,23 +1480,22 @@ async def load_full_history_once(session: aiohttp.ClientSession):
         return
 
     for name, prices in results.items():
-        # Load existing DB data
         existing = await load_index_history_from_db(session, name)
-        # Always keep the LONGER history
         if existing and len(existing) >= len(prices):
-            log.info(f"  DB already has {len(existing)}d for {name} — keeping (longer than {len(prices)}d from external)")
+            log.info(f"  Keeping DB {len(existing)}d for {name} (longer than external {len(prices)}d)")
             continue
         await save_index_history_to_db(session, name, prices)
         log.info(f"  💾 Saved {name}: {len(prices)} days to DB")
 
-    # Update caches
-    if "Nifty 50" in results:
+    # Update caches with best available
+    global nifty_cache, midcap_cache, smallcap_cache
+    if "Nifty 50" in results and len(results["Nifty 50"]) > len(nifty_cache.get('prices', [])):
         nifty_cache = {"prices": results["Nifty 50"]}
     if "Midcap 150" in results:
         midcap_cache = {"prices": results["Midcap 150"]}
     if "Smallcap 250" in results:
         smallcap_cache = {"prices": results["Smallcap 250"]}
-    log.info("✅ Full history loaded — RS will now match TradingView exactly!")
+    log.info("✅ Full history loaded!")
 
 async def load_nifty_cache(session: aiohttp.ClientSession):
     """Fetch Nifty 50 daily close history needed for TradingView-style RS calculation."""
