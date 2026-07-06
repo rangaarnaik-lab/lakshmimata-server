@@ -1458,17 +1458,25 @@ async def load_full_history_once(session: aiohttp.ClientSession):
     """
     global nifty_cache, midcap_cache, smallcap_cache
 
-    # Check AFTER seed has run — seed saves 1492+ days
-    db_nifty = await load_index_history_from_db(session, "Nifty 50")
-    if len(db_nifty) >= 1400:
-        log.info(f"✅ Full history already in DB: Nifty={len(db_nifty)}d — skipping external fetch")
-        if len(db_nifty) > len(nifty_cache.get('prices', [])):
-            nifty_cache = {'prices': db_nifty}
-            log.info(f"✅ Nifty cache updated from DB: {len(db_nifty)}d")
+    # Check nifty_cache directly — seed updates it immediately without DB round-trip
+    if len(nifty_cache.get('prices', [])) >= 1400:
+        log.info(f"✅ Nifty cache has {len(nifty_cache['prices'])}d — skipping external fetch")
+        # Still try to get Midcap/Smallcap from Yahoo if not cached
         db_mid = await load_index_history_from_db(session, "Midcap 150")
         db_sml = await load_index_history_from_db(session, "Smallcap 250")
         if db_mid: midcap_cache = {'prices': db_mid}
         if db_sml: smallcap_cache = {'prices': db_sml}
+        if not db_mid or not db_sml:
+            # Fetch Midcap/Smallcap from Yahoo
+            results = await fetch_full_nifty_history(session)
+            if "Midcap 150" in results:
+                midcap_cache = {"prices": results["Midcap 150"]}
+                await save_index_history_to_db(session, "Midcap 150", results["Midcap 150"])
+                log.info(f"  💾 Saved Midcap 150: {len(results['Midcap 150'])} days")
+            if "Smallcap 250" in results:
+                smallcap_cache = {"prices": results["Smallcap 250"]}
+                await save_index_history_to_db(session, "Smallcap 250", results["Smallcap 250"])
+                log.info(f"  💾 Saved Smallcap 250: {len(results['Smallcap 250'])} days")
         return
 
     log.info(f"📥 DB has only {len(db_nifty)}d — fetching full history from external sources…")
