@@ -1504,18 +1504,22 @@ async def load_full_history_once(session: aiohttp.ClientSession):
 
 
 async def fetch_yahoo_stock_history(session: aiohttp.ClientSession, sym: str) -> list:
-    """Fetch 2yr daily closes for a single NSE stock from Yahoo Finance."""
-    url = f"https://query2.finance.yahoo.com/v8/finance/chart/{sym}.NS?interval=1d&range=2y"
-    try:
-        async with session.get(url,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
-            timeout=aiohttp.ClientTimeout(total=10)) as r:
-            if r.status == 200:
-                data = await r.json()
-                closes = data["chart"]["result"][0]["indicators"]["quote"][0]["close"]
-                return [c for c in closes if c is not None]
-    except:
-        pass
+    """Fetch 2yr daily closes for a single NSE stock from Yahoo Finance.
+    Tries NSE (.NS) first, then BSE (.BO) as fallback."""
+    for suffix in [".NS", ".BO"]:
+        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{sym}{suffix}?interval=1d&range=2y"
+        try:
+            async with session.get(url,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+                timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    closes = data["chart"]["result"][0]["indicators"]["quote"][0]["close"]
+                    prices = [c for c in closes if c is not None]
+                    if len(prices) >= 100:
+                        return prices
+        except:
+            pass
     return []
 
 
@@ -1528,7 +1532,7 @@ async def extend_stock_history_from_yahoo(session: aiohttp.ClientSession):
     global historical_cache
     
     short_stocks = [sym for sym, data in historical_cache.items() 
-                    if len(data.get('prices', [])) < 400]
+                    if len(data.get('prices', [])) < 450]
     
     if not short_stocks:
         log.info("✅ All stocks have 400+ days history — no Yahoo extension needed")
