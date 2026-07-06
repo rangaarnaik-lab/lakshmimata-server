@@ -1545,9 +1545,11 @@ async def extend_stock_history_from_yahoo(session: aiohttp.ClientSession):
         async with sem:
             yahoo_prices = await fetch_yahoo_stock_history(session, sym)
             if len(yahoo_prices) > len(historical_cache.get(sym, {}).get('prices', [])):
+                # Keep existing volumes — just extend the prices
+                existing_vols = historical_cache.get(sym, {}).get('volumes', [])
                 historical_cache[sym] = {
                     'prices':  yahoo_prices,
-                    'volumes': historical_cache.get(sym, {}).get('volumes', []),
+                    'volumes': existing_vols,  # keep original Upstox volumes
                 }
                 extended += 1
             else:
@@ -1822,6 +1824,13 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         sym = s['sym']
         prices  = s['prices']
         volumes = s['volumes']
+        # Safety: align prices and volumes to same length
+        if volumes and len(volumes) != len(prices):
+            min_len = min(len(prices), len(volumes))
+            prices  = prices[-min_len:]
+            volumes = volumes[-min_len:]
+        elif not volumes:
+            volumes = [0] * len(prices)
         n = len(prices)
 
         # Yield control back to the event loop periodically. Without this,
