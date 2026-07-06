@@ -1326,34 +1326,25 @@ async def seed_index_history_if_needed(session: aiohttp.ClientSession):
     One-time seed: push 1492 days of Nifty 50 history to Supabase.
     Then merge with Upstox fresh data (2026 onwards) for complete history.
     """
+    global nifty_cache
     existing = await load_index_history_from_db(session, "Nifty 50")
     if len(existing) >= 1400:
         log.info(f"✅ Nifty 50 already seeded: {len(existing)} days in DB — skipping")
         return
 
-    # Get fresh data from Upstox (covers last 371 days including 2026)
     upstox_prices = nifty_cache.get("prices", [])
-
-    seed = NIFTY50_SEED_PRICES  # 2020-01-01 to 2025-12-31 (1492 days)
+    seed = NIFTY50_SEED_PRICES
 
     if upstox_prices:
-        # Seed ends Dec 2025. Upstox goes back ~371 days from today (Jul 2026).
-        # Overlap is ~Jul 2025 to Dec 2025 (~125 days).
-        # Solution: take seed as base, then append ONLY the new days from Upstox
-        # that are AFTER the seed ends (i.e. Jan 2026 onwards).
-        # Upstox has 371 days back from today — roughly last 125 days are overlap.
-        # New days = last (371 - 125) = ~246 days from Upstox
-        overlap_days = 125  # approximate overlap between seed end and Upstox start
-        new_from_upstox = upstox_prices[overlap_days:]  # only 2026 data
+        overlap_days = 125
+        new_from_upstox = upstox_prices[overlap_days:]
         merged = seed + new_from_upstox
     else:
         merged = seed
 
     await save_index_history_to_db(session, "Nifty 50", merged)
-    # Update cache immediately — don't wait for DB round-trip
-    global nifty_cache
     nifty_cache = {'prices': merged, 'volumes': nifty_cache.get('volumes', [])}
-    log.info(f"✅ Seeded Nifty 50: {len(merged)} days (CSV:{len(seed)} + Upstox:{len(upstox_prices)}) saved to DB!")
+    log.info(f"✅ Seeded Nifty 50: {len(merged)} days saved to DB!")
 
 async def fetch_full_nifty_history(session: aiohttp.ClientSession) -> dict:
     """
