@@ -769,7 +769,30 @@ MICROCAP = [
   "MEDANTA","MASTEK","MARATHON","MASFIN","MANINFRA","MAHASTEEL","LGBBROSLTD"
 ]
 
-ALL_STOCKS = list(dict.fromkeys(NIFTY50 + MIDCAP + SMALLCAP + MICROCAP))
+
+# Popular NSE stocks not in major indices — PSU, Defence, Mid/Small caps
+EXTRA_STOCKS = [
+    # Defence PSU
+    "GRSE","BDL","HAL","BEL","MIDHANI","BEML","COCHINSHIP","MAZAGON",
+    # PSU Banks/Finance  
+    "BANKBARODA","PNB","UNIONBANK","CANARABANK","INDIANB","IOB","CENTRALBK",
+    # PSU Energy/Infra
+    "NHPC","SJVN","IRFC","RVNL","IRCON","NBCC","HUDCO","RAILTEL",
+    # Popular midcap/smallcap
+    "SHAKTIPUMP","ELECON","GPIL","JYOTICNC","PNCINFRA","KNRCON",
+    "HGINFRA","AHLUCONT","CAPACITE","WELCORP","RAMCOCEM","DALBHARAT",
+    "JKCEMENT","NUVOCO","HEIDELBERG","BIRLACORPN","ORIENTCEM",
+    # Auto ancillary
+    "SUPRAJIT","LUMAXTECH","SANDHAR","ENDURANCE","SUBROS","UCALFUEL",
+    # Chemicals
+    "DEEPAKFERT","GNFC","GSFC","RASHTRIYA","CHAMBAL","COROMANDEL",
+    # Textiles  
+    "GRASIM","VARDHMAN","RAYMOND","ARVIND","WELSPUNIND","TRIDENT",
+    # Pharma
+    "IPCALAB","AJANTPHARM","NATCOPHARM","GRANULES","SOLARA","AARTI",
+]
+
+ALL_STOCKS = list(dict.fromkeys(NIFTY50 + MIDCAP + SMALLCAP + MICROCAP + EXTRA_STOCKS))
 
 # ── Official index constituent lists (fetched live at startup) ────────
 # The hardcoded NIFTY50/MIDCAP/SMALLCAP/MICROCAP arrays above are small
@@ -865,7 +888,30 @@ async def load_official_index_lists(session: aiohttp.ClientSession):
     # Rebuild ALL_STOCKS to include any official-list stocks not already covered
     # (ALL_STOCKS itself is later overwritten by the Upstox instrument master in
     # main(), so this just ensures the index membership flags stay consistent)
-    ALL_STOCKS = list(dict.fromkeys(NIFTY50 + MIDCAP + SMALLCAP + MICROCAP))
+    
+# Popular NSE stocks not in major indices — PSU, Defence, Mid/Small caps
+EXTRA_STOCKS = [
+    # Defence PSU
+    "GRSE","BDL","HAL","BEL","MIDHANI","BEML","COCHINSHIP","MAZAGON",
+    # PSU Banks/Finance  
+    "BANKBARODA","PNB","UNIONBANK","CANARABANK","INDIANB","IOB","CENTRALBK",
+    # PSU Energy/Infra
+    "NHPC","SJVN","IRFC","RVNL","IRCON","NBCC","HUDCO","RAILTEL",
+    # Popular midcap/smallcap
+    "SHAKTIPUMP","ELECON","GPIL","JYOTICNC","PNCINFRA","KNRCON",
+    "HGINFRA","AHLUCONT","CAPACITE","WELCORP","RAMCOCEM","DALBHARAT",
+    "JKCEMENT","NUVOCO","HEIDELBERG","BIRLACORPN","ORIENTCEM",
+    # Auto ancillary
+    "SUPRAJIT","LUMAXTECH","SANDHAR","ENDURANCE","SUBROS","UCALFUEL",
+    # Chemicals
+    "DEEPAKFERT","GNFC","GSFC","RASHTRIYA","CHAMBAL","COROMANDEL",
+    # Textiles  
+    "GRASIM","VARDHMAN","RAYMOND","ARVIND","WELSPUNIND","TRIDENT",
+    # Pharma
+    "IPCALAB","AJANTPHARM","NATCOPHARM","GRANULES","SOLARA","AARTI",
+]
+
+ALL_STOCKS = list(dict.fromkeys(NIFTY50 + MIDCAP + SMALLCAP + MICROCAP + EXTRA_STOCKS))
 
 async def fetch_instruments(session: aiohttp.ClientSession) -> list:
     """Fetch all NSE instrument keys from Upstox."""
