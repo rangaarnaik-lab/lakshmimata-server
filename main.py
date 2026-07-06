@@ -1350,6 +1350,9 @@ async def seed_index_history_if_needed(session: aiohttp.ClientSession):
         merged = seed
 
     await save_index_history_to_db(session, "Nifty 50", merged)
+    # Update cache immediately — don't wait for DB round-trip
+    global nifty_cache
+    nifty_cache = {'prices': merged, 'volumes': nifty_cache.get('volumes', [])}
     log.info(f"✅ Seeded Nifty 50: {len(merged)} days (CSV:{len(seed)} + Upstox:{len(upstox_prices)}) saved to DB!")
 
 async def fetch_full_nifty_history(session: aiohttp.ClientSession) -> dict:
@@ -2221,9 +2224,11 @@ async def main():
         # Step 2b: Load Nifty 50 + all index histories
         await load_nifty_cache(session)
         await load_index_cache(session)
-        # Step 2c: Seed Nifty 50 history from built-in data if needed
+        # Step 2c: Seed + load history
         await seed_index_history_if_needed(session)
-        # Step 2d: Try external sources for Midcap/Smallcap
+        # Small wait to ensure DB write completes
+        await asyncio.sleep(2)
+        # Step 2d: Try external sources for Midcap/Smallcap only
         await load_full_history_once(session)
 
         # Step 3: Load historical data cache at startup
