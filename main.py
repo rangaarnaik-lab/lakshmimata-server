@@ -1269,6 +1269,52 @@ async def ensure_db_columns(session: aiohttp.ClientSession):
 
 
 
+
+async def save_index_history_to_db(session: aiohttp.ClientSession, name: str, prices: list):
+    """Save index price history to Supabase for persistence across restarts."""
+    import json as _json
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates"
+    }
+    row = {"name": name, "prices": _json.dumps(prices), "updated_at": datetime.now(IST).isoformat()}
+    try:
+        async with session.post(
+            f"{SUPABASE_URL}/rest/v1/index_price_history",
+            headers=headers,
+            json=row,
+            timeout=aiohttp.ClientTimeout(total=15)
+        ) as r:
+            if r.status in (200, 201):
+                log.info(f"  💾 Saved {name} history: {len(prices)} days to DB")
+    except Exception as e:
+        log.warning(f"  Save index history failed: {e}")
+
+
+async def load_index_history_from_db(session: aiohttp.ClientSession, name: str) -> list:
+    """Load index price history from Supabase — may have 2+ years accumulated."""
+    import json as _json
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+    }
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/index_price_history?name=eq.{name}&select=prices",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=15)
+        ) as r:
+            if r.status == 200:
+                data = await r.json()
+                if data and data[0].get("prices"):
+                    prices = _json.loads(data[0]["prices"])
+                    return prices
+    except Exception as e:
+        log.warning(f"  Load index history failed: {e}")
+    return []
+
 async def load_nifty_cache(session: aiohttp.ClientSession):
     """Fetch Nifty 50 daily close history needed for TradingView-style RS calculation."""
     global nifty_cache
