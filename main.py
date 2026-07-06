@@ -1502,6 +1502,61 @@ async def load_full_history_once(session: aiohttp.ClientSession):
         smallcap_cache = {"prices": results["Smallcap 250"]}
     log.info("✅ Full history loaded!")
 
+
+async def fetch_yahoo_stock_history(session: aiohttp.ClientSession, sym: str) -> list:
+    """Fetch 2yr daily closes for a single NSE stock from Yahoo Finance."""
+    url = f"https://query2.finance.yahoo.com/v8/finance/chart/{sym}.NS?interval=1d&range=2y"
+    try:
+        async with session.get(url,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status == 200:
+                data = await r.json()
+                closes = data["chart"]["result"][0]["indicators"]["quote"][0]["close"]
+                return [c for c in closes if c is not None]
+    except:
+        pass
+    return []
+
+
+async def extend_stock_history_from_yahoo(session: aiohttp.ClientSession):
+    """
+    One-time: extend stock histories from Yahoo Finance (2yr).
+    Only fetches stocks where Upstox gave < 400 days.
+    Runs in background after initial scan starts.
+    """
+    global historical_cache
+    
+    short_stocks = [sym for sym, data in historical_cache.items() 
+                    if len(data.get('prices', [])) < 400]
+    
+    if not short_stocks:
+        log.info("✅ All stocks have 400+ days history — no Yahoo extension needed")
+        return
+        
+    log.info(f"📥 Extending history for {len(short_stocks)} stocks via Yahoo Finance…")
+    extended = 0
+    failed = 0
+    
+    sem = asyncio.Semaphore(10)  # 10 concurrent requests
+    
+    async def fetch_one(sym):
+        nonlocal extended, failed
+        async with sem:
+            yahoo_prices = await fetch_yahoo_stock_history(session, sym)
+            if len(yahoo_prices) > len(historical_cache.get(sym, {}).get('prices', [])):
+                historical_cache[sym] = {
+                    'prices':  yahoo_prices,
+                    'volumes': historical_cache.get(sym, {}).get('volumes', []),
+                }
+                extended += 1
+            else:
+                failed += 1
+            await asyncio.sleep(0.05)
+    
+    tasks = [fetch_one(sym) for sym in short_stocks[:500]]  # batch 500 first
+    await asyncio.gather(*tasks)
+    log.info(f"✅ Yahoo history extension: {extended} extended, {failed} failed/skipped")
 async def load_nifty_cache(session: aiohttp.ClientSession):
     """Fetch Nifty 50 daily close history needed for TradingView-style RS calculation."""
     global nifty_cache
@@ -2280,6 +2335,8 @@ async def main():
         log.info(f"✅ Smallcap index: {len(sml_prices)}d (DB had {len(db_sml)}d)")
 
         log.info("✅ Proceeding to initial scan…")
+        # Extend stock histories from Yahoo in background
+        asyncio.create_task(extend_stock_history_from_yahoo(session))
 
         # Step 4: Run initial scan (hard timeout so a stall can't hang the process forever)
         # Detect the correct scan type based on actual time, rather than always
