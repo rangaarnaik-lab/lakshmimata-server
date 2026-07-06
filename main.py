@@ -2387,8 +2387,8 @@ async def main():
                 log.info("Shutting down…")
                 break
             except Exception as e:
-                log.error(f"Loop error: {e}")
-                await asyncio.sleep(30)
+                import traceback
+                log.error(f"Loop error: {e}\n{traceback.format_exc()}")
 
 if __name__ == '__main__':
     asyncio.run(main())
