@@ -2450,18 +2450,13 @@ async def main():
                 elapsed = now - last_scan
 
                 if elapsed >= UPDATE_INTERVAL:
-                    if is_scan_time():
-                        scan_type = 'live' if is_market_open() else 'batch_eod'
-                        try:
-                            await asyncio.wait_for(run_scan(session, scan_type), timeout=SCAN_TIMEOUT)
-                            scan_count += 1
-                        except asyncio.TimeoutError:
-                            log.error(f"⏱ Scan exceeded {SCAN_TIMEOUT}s timeout — skipping this cycle")
-                        last_scan = time.time()
-                    else:
-                        ist_now = datetime.now(IST)
-                        log.info(f"⏸ Market closed ({ist_now.strftime('%H:%M IST')}) — next check in {UPDATE_INTERVAL}s")
-                        last_scan = time.time()
+                    scan_type = 'live' if is_market_open() else 'batch_eod'
+                    try:
+                        await asyncio.wait_for(run_scan(session, scan_type), timeout=SCAN_TIMEOUT)
+                        scan_count += 1
+                    except asyncio.TimeoutError:
+                        log.error(f"⏱ Scan exceeded {SCAN_TIMEOUT}s timeout — skipping this cycle")
+                    last_scan = time.time()
 
                 await asyncio.sleep(5)  # check every 5 seconds
 
