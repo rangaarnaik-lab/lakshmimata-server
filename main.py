@@ -1554,7 +1554,7 @@ async def extend_stock_history_from_yahoo(session: aiohttp.ClientSession):
                 failed += 1
             await asyncio.sleep(0.05)
     
-    tasks = [fetch_one(sym) for sym in short_stocks[:500]]  # batch 500 first
+    tasks = [fetch_one(sym) for sym in short_stocks]  # all stocks
     await asyncio.gather(*tasks)
     log.info(f"✅ Yahoo history extension: {extended} extended, {failed} failed/skipped")
 async def load_nifty_cache(session: aiohttp.ClientSession):
