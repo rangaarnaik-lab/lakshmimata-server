@@ -1659,9 +1659,10 @@ async def load_instrument_master(session: aiohttp.ClientSession):
     global instrument_key_map, ALL_STOCKS
     log.info("Fetching instrument master from Upstox…")
     try:
-        # Use the publicly available JSON master file
+        # Primary: Analytics API instrument list
         url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as r:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=60),
+            headers={"Accept-Encoding": "gzip"}) as r:
             if r.status == 200:
                 import gzip, io
                 content = await r.read()
