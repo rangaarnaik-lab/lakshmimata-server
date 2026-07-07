@@ -194,7 +194,13 @@ def calc_rs_line(prices: list, bench_prices: list) -> dict:
     """
     if len(prices) < 60 or len(bench_prices) < 60:
         return {'rs_line_new_high': False, 'rs_line_trend': 'flat'}
+    # Right-align: both series end on "today" but are usually different
+    # lengths (stock's own history vs a much longer benchmark cache), so
+    # trim from the front to match up the same calendar period — see the
+    # same fix/comment in calc_raw_rs_series.
     n = min(len(prices), len(bench_prices))
+    prices = prices[-n:]
+    bench_prices = bench_prices[-n:]
     rs_line = [prices[i] / bench_prices[i] * 100 for i in range(n) if bench_prices[i] > 0]
     if len(rs_line) < 30:
         return {'rs_line_new_high': False, 'rs_line_trend': 'flat'}
@@ -492,8 +498,18 @@ def calc_raw_rs_series(prices: list, bench_prices: list) -> list:
     Compute full rawRS series for a stock vs benchmark in ONE pass.
     Returns list of rawRS values (one per day, None where not computable).
     This is called ONCE per stock — result is cached and used for normalization.
+
+    CRITICAL: prices and bench_prices are usually different lengths (e.g. a
+    stock's own ~500-day Yahoo history vs a ~1738-day Nifty cache seeded
+    with years of extra history). Both arrays end on the same "today", so
+    they must be RIGHT-aligned (trimmed from the front) before comparing by
+    index — left-aligning (as a naive `arr[i]` for i in range(min(len...)))
+    would compare the stock's recent prices against the benchmark's oldest
+    prices, from a completely different calendar period.
     """
     n = min(len(prices), len(bench_prices))
+    prices = prices[-n:]
+    bench_prices = bench_prices[-n:]
     result = []
     for i in range(n):
         if i < 252:
