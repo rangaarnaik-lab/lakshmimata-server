@@ -2370,7 +2370,7 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'rs_nifty50':     None,        # deprecated — use rs_tv
             'rs_microcap':    None,
             'rs_sector':      rs_sector,
-            'rs_raw':         round(my_raw_val, 6) if my_raw_val is not None else None,
+            'rs_raw':         round(tv_raw_series[-1], 6) if tv_raw_series and tv_raw_series[-1] is not None else None,
             'rs_trend':       trend_data['trend'],
             'rs_slope':       trend_data['slope'],
             'rs_hist':        hist,
@@ -2809,6 +2809,17 @@ async def main():
                         scan_count += 1
                     except asyncio.TimeoutError:
                         log.error(f"⏱ Scan exceeded {SCAN_TIMEOUT}s timeout — skipping this cycle")
+                    except Exception as e:
+                        # Any other exception (bug, bad data, etc.) must NOT
+                        # be allowed to skip past last_scan's update below —
+                        # otherwise elapsed stays >= UPDATE_INTERVAL forever
+                        # and this becomes an instant, zero-delay retry loop
+                        # (which is exactly what happened once already: a
+                        # NameError crashed every scan attempt back-to-back,
+                        # multiple times per second, for as long as the bug
+                        # was live).
+                        import traceback
+                        log.error(f"Scan failed with unexpected error: {e}\n{traceback.format_exc()}")
                     last_scan = time.time()
 
                 await asyncio.sleep(5)  # check every 5 seconds
@@ -2819,6 +2830,10 @@ async def main():
             except Exception as e:
                 import traceback
                 log.error(f"Loop error: {e}\n{traceback.format_exc()}")
+                # Defense in depth: even if something outside run_scan itself
+                # throws (e.g. is_market_open(), the 5s sleep call site, etc.),
+                # back off before retrying instead of spinning immediately.
+                await asyncio.sleep(10)
 
 if __name__ == '__main__':
     asyncio.run(main())
