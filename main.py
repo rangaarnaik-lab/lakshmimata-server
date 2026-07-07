@@ -1210,7 +1210,9 @@ def is_scan_time() -> bool:
 prev_squeeze_state: dict = {}
 
 
-historical_cache: dict = {}   # sym -> {prices, volumes}
+historical_cache: dict = {}   # sym -> {prices, volumes, highs, lows}
+history_dates_cache: dict = {}  # sym -> [dates] — parallel to historical_cache,
+# tracked separately since RS calc doesn't need dates but incremental merges do
 last_eod_refresh_date: Optional[str] = None  # IST date string — ensures the
 # expensive EOD refresh (full Yahoo re-fetch + fundamentals) runs only ONCE
 # per day, not on every single scan cycle while the market stays closed.
@@ -1653,11 +1655,17 @@ async def extend_stock_history_from_yahoo(session: aiohttp.ClientSession):
 
 
 # ── Full 2yr history → Supabase (all stocks, at startup) ──────────────
-async def fetch_yahoo_full_ohlcv(session: aiohttp.ClientSession, sym: str) -> Optional[dict]:
-    """Fetch full 2yr daily OHLCV (dates, close, volume, high, low) for one
-    NSE stock from Yahoo Finance. Tries .NS first, then .BO as fallback."""
+async def fetch_yahoo_full_ohlcv(session: aiohttp.ClientSession, sym: str,
+                                  range_period: str = "2y", min_points: int = 100) -> Optional[dict]:
+    """Fetch daily OHLCV (dates, close, volume, high, low) for one NSE stock
+    from Yahoo Finance. Tries .NS first, then .BO as fallback.
+    range_period/min_points let this double as either a full 2yr backfill
+    (range='2y', min_points=100) or a lightweight incremental fetch for the
+    EOD daily update (range='10d', min_points=1) — same parsing logic,
+    much smaller response for the common case where we already have most
+    of the history and just need the last day or two."""
     for suffix in [".NS", ".BO"]:
-        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{sym}{suffix}?interval=1d&range=2y"
+        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{sym}{suffix}?interval=1d&range={range_period}"
         try:
             async with session.get(url,
                 headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
@@ -1692,7 +1700,7 @@ async def fetch_yahoo_full_ohlcv(session: aiohttp.ClientSession, sym: str) -> Op
                     l = lows[i] if i < len(lows) else None
                     lo.append(round(l, 2) if l is not None else None)
 
-                if len(prices) >= 100:
+                if len(prices) >= min_points:
                     return {'dates': dates, 'prices': prices, 'volumes': vols,
                             'highs': hi, 'lows': lo}
         except Exception:
@@ -1800,22 +1808,27 @@ async def save_full_history_batch_to_db(session: aiohttp.ClientSession, rows: li
     log.info(f"  💾 Uploaded {uploaded}/{len(rows)} full-history rows to Supabase")
 
 
-async def push_full_history_to_supabase(session: aiohttp.ClientSession):
+async def fetch_full_history_for_symbols(session: aiohttp.ClientSession, symbols: list,
+                                          label: str = "full") -> int:
     """
-    Startup task: fetch the full 2-year daily OHLCV history from Yahoo
-    Finance for every stock in ALL_STOCKS (all ~2387 NSE stocks) and
-    persist it into the Supabase `stock_full_history` table, so the
-    frontend / other tools can pull complete 2yr price history per
-    symbol straight from Supabase rather than re-fetching from Yahoo.
+    Fetch the full 2-year daily OHLCV history from Yahoo Finance for the
+    given list of symbols and persist it into Supabase `stock_full_history`
+    + historical_cache/history_dates_cache. This is the expensive full
+    fetch — used only for symbols that are missing or stale in Supabase,
+    NOT for every stock on every restart (see load_history_at_startup).
+    Returns the count of symbols successfully fetched.
     """
+    if not symbols:
+        return 0
+
     table_ready = await ensure_full_history_table(session)
     if not table_ready:
-        log.error("⏭️  Skipping full 2yr Yahoo history fetch this run — table still unavailable "
+        log.error("⏭️  Skipping Yahoo history fetch this run — table still unavailable "
                    "(will try again on next restart).")
-        return
+        return 0
 
-    total = len(ALL_STOCKS)
-    log.info(f"📥 Fetching full 2yr Yahoo history for {total} stocks (startup)…")
+    total = len(symbols)
+    log.info(f"📥 Fetching full 2yr Yahoo history for {total} stocks ({label})…")
 
     sem = asyncio.Semaphore(20)
     rows: list = []
@@ -1846,18 +1859,9 @@ async def push_full_history_to_supabase(session: aiohttp.ClientSession):
                 mkt_open = is_market_open()
                 will_trim = mkt_open and data['dates'] and data['dates'][-1] == today_ist
 
-                if sym in ('THANGAMAYL', 'RRKABEL'):
-                    log.info(f"  🔍 {sym} pre-trim: market_open={mkt_open}, today_ist={today_ist}, "
-                             f"last3_dates={data['dates'][-3:]}, last3_prices={data['prices'][-3:]}, "
-                             f"will_trim={will_trim}")
-
                 if will_trim:
                     for k in ('dates', 'prices', 'volumes', 'highs', 'lows'):
                         data[k] = data[k][:-1]
-
-                if sym in ('THANGAMAYL', 'RRKABEL'):
-                    log.info(f"  🔍 {sym} post-trim: last3_dates={data['dates'][-3:]}, "
-                             f"last3_prices={data['prices'][-3:]}")
 
                 rows.append({
                     'sym':        sym,
@@ -1869,22 +1873,20 @@ async def push_full_history_to_supabase(session: aiohttp.ClientSession):
                     'days_count': len(data['prices']),
                     'updated_at': datetime.now(timezone.utc).isoformat(),
                 })
-                # Also feed straight into the in-memory historical_cache used
-                # by RS calculations — Upstox only gives ~550 days at best,
-                # so this Yahoo 2yr pull is the authoritative source for RS.
+                # Also feed straight into the in-memory caches used by RS
+                # calculations — Upstox only gives ~550 days at best, so
+                # this Yahoo 2yr pull is the authoritative source for RS.
                 historical_cache[sym] = {
                     'prices':  data['prices'],
                     'volumes': [v if v is not None else 0 for v in data['volumes']],
                     'highs':   [h if h is not None else p for h, p in zip(data['highs'], data['prices'])],
                     'lows':    [l if l is not None else p for l, p in zip(data['lows'],  data['prices'])],
                 }
+                history_dates_cache[sym] = data['dates']
                 done += 1
             else:
                 failed += 1
                 failed_syms.append(sym)
-                if sym == 'RRKABEL':
-                    log.warning(f"  🔍 RRKABEL: Yahoo fetch FAILED this run — historical_cache "
-                                f"keeps whatever value it already had (may be stale).")
             seen = done + failed
             if seen % 200 == 0 or seen == total:
                 log.info(f"  …{seen}/{total} fetched ({done} ok, {failed} failed)")
@@ -1893,7 +1895,7 @@ async def push_full_history_to_supabase(session: aiohttp.ClientSession):
                 batch, rows[:] = rows[:], []
                 await save_full_history_batch_to_db(session, batch)
 
-    await asyncio.gather(*[fetch_one(sym) for sym in ALL_STOCKS])
+    await asyncio.gather(*[fetch_one(sym) for sym in symbols])
 
     # Retry pass — Yahoo fails a random subset of requests each run
     # (rate-limits, timeouts) that has nothing to do with the symbol itself.
@@ -1915,8 +1917,266 @@ async def push_full_history_to_supabase(session: aiohttp.ClientSession):
     if rows:
         await save_full_history_batch_to_db(session, rows)
 
-    log.info(f"✅ Full 2yr history push complete: {done} ok, {failed} failed out of {total}")
-    log.info(f"✅ historical_cache now backed by Yahoo 2yr data for {done} stocks (RS calc uses this)")
+    log.info(f"✅ Yahoo history fetch ({label}) complete: {done} ok, {failed} failed out of {total}")
+    return done
+
+
+async def load_all_history_from_supabase(session: aiohttp.ClientSession) -> list:
+    """
+    Load previously-fetched full-history rows straight from Supabase —
+    ZERO Yahoo calls. This is the key optimization: without it, every
+    single restart re-fetched full 2yr history from Yahoo for all ~2385
+    stocks, which is both slow and the main source of Yahoo rate-limiting
+    (the cause of the RRKABEL stale-data bug earlier). Now a restart just
+    loads what's already stored, and Yahoo is only hit for symbols that
+    are missing entirely or whose stored data has gone stale.
+    Returns the list of symbols that need a Yahoo fetch (missing/stale).
+    """
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    all_rows: list = []
+    PAGE = 1000
+    offset = 0
+    while True:
+        try:
+            page_headers = {**headers, "Range": f"{offset}-{offset + PAGE - 1}"}
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/stock_full_history"
+                f"?select=sym,dates,prices,volumes,highs,lows,updated_at",
+                headers=page_headers, timeout=aiohttp.ClientTimeout(total=30)
+            ) as r:
+                if r.status not in (200, 206):
+                    log.warning(f"load_all_history_from_supabase page failed: status={r.status}")
+                    break
+                page = await r.json()
+                all_rows.extend(page)
+                if len(page) < PAGE:
+                    break
+                offset += PAGE
+        except Exception as e:
+            log.error(f"load_all_history_from_supabase error: {e}")
+            break
+
+    loaded = 0
+    stale_or_missing: list = []
+    found_syms: set = set()
+    today = datetime.now(IST).date()
+
+    for row in all_rows:
+        sym = row.get('sym')
+        if not sym:
+            continue
+        found_syms.add(sym)
+        try:
+            def parse(v):
+                if v is None:
+                    return []
+                return json.loads(v) if isinstance(v, str) else v
+            dates   = parse(row.get('dates'))
+            prices  = parse(row.get('prices'))
+            volumes = parse(row.get('volumes'))
+            highs   = parse(row.get('highs'))
+            lows    = parse(row.get('lows'))
+
+            if len(prices) < 100:
+                stale_or_missing.append(sym)
+                continue
+
+            historical_cache[sym] = {
+                'prices':  prices,
+                'volumes': [v if v is not None else 0 for v in volumes],
+                'highs':   [h if h is not None else p for h, p in zip(highs, prices)],
+                'lows':    [l if l is not None else p for l, p in zip(lows,  prices)],
+            }
+            history_dates_cache[sym] = dates
+            loaded += 1
+
+            # Freshness check — allow up to 4 calendar days back so
+            # weekends/the odd market holiday don't falsely flag as stale.
+            last_date_str = dates[-1] if dates else None
+            is_stale = True
+            if last_date_str:
+                try:
+                    last_date = datetime.strptime(last_date_str, '%Y-%m-%d').date()
+                    is_stale = (today - last_date).days > 4
+                except Exception:
+                    is_stale = True
+            if is_stale:
+                stale_or_missing.append(sym)
+        except Exception:
+            stale_or_missing.append(sym)
+
+    missing_entirely = [s for s in ALL_STOCKS if s not in found_syms]
+    stale_or_missing.extend(missing_entirely)
+
+    log.info(f"📦 Loaded {loaded} stocks from Supabase stock_full_history "
+             f"(0 Yahoo calls) — {len(stale_or_missing)} need a Yahoo fetch "
+             f"(missing or stale)")
+    return stale_or_missing
+
+
+async def load_history_at_startup(session: aiohttp.ClientSession):
+    """
+    Startup replacement for the old 'always re-fetch all ~2385 stocks from
+    Yahoo' behavior. Loads everything already stored in Supabase first
+    (fast, free), then only hits Yahoo for symbols that are missing or
+    whose stored data is stale — normally a small fraction of the universe
+    (new IPOs, or symbols that failed every fetch attempt for several
+    days running), rather than the whole thing every single restart.
+    """
+    table_ready = await ensure_full_history_table(session)
+    if not table_ready:
+        log.error("⏭️  stock_full_history table unavailable — falling back to full "
+                   "Yahoo fetch for all stocks this run.")
+        await fetch_full_history_for_symbols(session, list(ALL_STOCKS), label="startup-fallback-all")
+        return
+
+    stale_or_missing = await load_all_history_from_supabase(session)
+    if stale_or_missing:
+        await fetch_full_history_for_symbols(session, stale_or_missing, label="startup-backfill")
+
+
+def merge_incremental_days(existing_dates: list, existing_prices: list, existing_volumes: list,
+                            existing_highs: list, existing_lows: list,
+                            fresh: dict, max_days: int = 504) -> dict:
+    """
+    Append new trailing day(s) from a lightweight incremental Yahoo fetch
+    onto an existing full-history series, matching by date so an already-
+    stored day isn't duplicated. If the fresh fetch's date matches the
+    last stored date, it OVERWRITES that day instead (handles the case
+    where we'd previously stored an EOD close and Yahoo later has a
+    correction, or where a day stored mid-session gets finalized).
+    Trims from the front afterward to keep a rolling ~2yr window.
+    """
+    dates   = list(existing_dates)
+    prices  = list(existing_prices)
+    volumes = list(existing_volumes)
+    highs   = list(existing_highs)
+    lows    = list(existing_lows)
+
+    last_date = dates[-1] if dates else None
+
+    for i, d in enumerate(fresh.get('dates', [])):
+        if d is None:
+            continue
+        p = fresh['prices'][i]
+        v = fresh['volumes'][i] if fresh['volumes'][i] is not None else 0
+        h = fresh['highs'][i]   if fresh['highs'][i]   is not None else p
+        l = fresh['lows'][i]    if fresh['lows'][i]    is not None else p
+
+        if last_date and d <= last_date:
+            if d == last_date and dates:
+                prices[-1], volumes[-1], highs[-1], lows[-1] = p, v, h, l
+            continue  # already have an earlier day than this — skip
+
+        dates.append(d)
+        prices.append(p)
+        volumes.append(v)
+        highs.append(h)
+        lows.append(l)
+        last_date = d
+
+    if len(dates) > max_days:
+        dates   = dates[-max_days:]
+        prices  = prices[-max_days:]
+        volumes = volumes[-max_days:]
+        highs   = highs[-max_days:]
+        lows    = lows[-max_days:]
+
+    return {'dates': dates, 'prices': prices, 'volumes': volumes, 'highs': highs, 'lows': lows}
+
+
+async def incremental_eod_update(session: aiohttp.ClientSession):
+    """
+    Once-per-day EOD task: instead of re-pulling the full 2-year history
+    from Yahoo for all ~2385 stocks (slow, and the main source of Yahoo
+    rate-limiting), fetch just a small recent window (range=10d) per
+    stock and merge the new day(s) into what's already stored — a much
+    lighter request that still keeps the rolling 2yr window current.
+    Stocks with no existing history yet (new IPOs, or ones that never
+    successfully backfilled) fall back to a full fetch instead.
+    """
+    table_ready = await ensure_full_history_table(session)
+    if not table_ready:
+        log.error("⏭️  Skipping EOD history update — table still unavailable.")
+        return
+
+    has_history  = [s for s in ALL_STOCKS if s in historical_cache and s in history_dates_cache
+                    and len(historical_cache[s].get('prices', [])) >= 100]
+    needs_full   = [s for s in ALL_STOCKS if s not in has_history]
+
+    total = len(has_history)
+    log.info(f"📥 EOD incremental update: {total} stocks (light fetch), "
+             f"{len(needs_full)} need a full fetch first…")
+
+    if needs_full:
+        await fetch_full_history_for_symbols(session, needs_full, label="eod-backfill")
+
+    sem = asyncio.Semaphore(20)
+    rows: list = []
+    done = 0
+    failed = 0
+    failed_syms: list = []
+    lock = asyncio.Lock()
+
+    async def fetch_one(sym):
+        nonlocal done, failed
+        async with sem:
+            data = await fetch_yahoo_full_ohlcv(session, sym, range_period="10d", min_points=1)
+            await asyncio.sleep(0.02)
+        async with lock:
+            if data:
+                merged = merge_incremental_days(
+                    history_dates_cache.get(sym, []),
+                    historical_cache.get(sym, {}).get('prices', []),
+                    historical_cache.get(sym, {}).get('volumes', []),
+                    historical_cache.get(sym, {}).get('highs', []),
+                    historical_cache.get(sym, {}).get('lows', []),
+                    data,
+                )
+                historical_cache[sym] = {
+                    'prices':  merged['prices'],
+                    'volumes': merged['volumes'],
+                    'highs':   merged['highs'],
+                    'lows':    merged['lows'],
+                }
+                history_dates_cache[sym] = merged['dates']
+                rows.append({
+                    'sym':        sym,
+                    'dates':      json.dumps(merged['dates']),
+                    'prices':     json.dumps(merged['prices']),
+                    'volumes':    json.dumps(merged['volumes']),
+                    'highs':      json.dumps(merged['highs']),
+                    'lows':       json.dumps(merged['lows']),
+                    'days_count': len(merged['prices']),
+                    'updated_at': datetime.now(timezone.utc).isoformat(),
+                })
+                done += 1
+            else:
+                failed += 1
+                failed_syms.append(sym)
+            seen = done + failed
+            if seen % 200 == 0 or seen == total:
+                log.info(f"  …{seen}/{total} incremental-updated ({done} ok, {failed} failed)")
+            if len(rows) >= 200:
+                batch, rows[:] = rows[:], []
+                await save_full_history_batch_to_db(session, batch)
+
+    await asyncio.gather(*[fetch_one(sym) for sym in has_history])
+
+    if failed_syms:
+        retry_list = failed_syms[:]
+        failed_syms = []
+        log.info(f"🔁 Retrying {len(retry_list)} stocks that failed the incremental fetch…")
+        await asyncio.sleep(2)
+        await asyncio.gather(*[fetch_one(sym) for sym in retry_list])
+        recovered = len(retry_list) - len(failed_syms)
+        failed -= recovered
+        log.info(f"🔁 Retry pass complete: {recovered} recovered, {len(failed_syms)} still failing")
+
+    if rows:
+        await save_full_history_batch_to_db(session, rows)
+
+    log.info(f"✅ EOD incremental update complete: {done} ok, {failed} failed out of {total}")
 
 
 async def load_nifty_cache(session: aiohttp.ClientSession):
@@ -2141,11 +2401,11 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
                      f"(scan loop keeps tagging cycles 'batch_eod' for as long as the "
                      f"market stays closed, so this must be a once-per-day guard).")
         else:
-            log.info("  End-of-day scan — refreshing full 2yr Yahoo history to bake in today's final close…")
-            # Use Yahoo (2yr) instead of Upstox (~550 days max) as the source of
-            # truth for RS calculations — this refreshes historical_cache AND
-            # re-persists to Supabase stock_full_history in one pass.
-            await push_full_history_to_supabase(session)
+            log.info("  End-of-day scan — incrementally updating Yahoo history to bake in today's final close…")
+            # Lightweight incremental update (small per-stock fetch + merge)
+            # instead of re-pulling the full 2yr history for every stock —
+            # much less Yahoo load, same result (today's close gets added).
+            await incremental_eod_update(session)
             await load_nifty_cache(session)
             await load_index_cache(session)
             last_eod_refresh_date = today_ist_check
@@ -2757,18 +3017,19 @@ async def main():
         log.info(f"✅ Midcap index: {len(mid_prices)}d (DB had {len(db_mid)}d)")
         log.info(f"✅ Smallcap index: {len(sml_prices)}d (DB had {len(db_sml)}d)")
 
-        # Step 3c: Fetch full 2yr Yahoo Finance history for ALL stocks and
-        # persist to Supabase (stock_full_history table). Runs once at
-        # startup, blocking, with a generous timeout so a slow/failed
-        # symbol can't hang the whole server indefinitely.
-        FULL_HISTORY_TIMEOUT = 1800  # 30 min ceiling for ~2387 stocks
+        # Step 3c: Load full 2yr history at startup — from Supabase first
+        # (fast, zero Yahoo calls), falling back to Yahoo only for symbols
+        # that are missing or stale. Previously this always re-fetched all
+        # ~2385 stocks from Yahoo on every single restart, which was slow
+        # and the main source of Yahoo rate-limit failures.
+        FULL_HISTORY_TIMEOUT = 1800  # 30 min ceiling if a large backfill is needed
         try:
-            await asyncio.wait_for(push_full_history_to_supabase(session), timeout=FULL_HISTORY_TIMEOUT)
+            await asyncio.wait_for(load_history_at_startup(session), timeout=FULL_HISTORY_TIMEOUT)
         except asyncio.TimeoutError:
-            log.error(f"⏱ Full 2yr history fetch exceeded {FULL_HISTORY_TIMEOUT}s — continuing with partial data")
+            log.error(f"⏱ Startup history load exceeded {FULL_HISTORY_TIMEOUT}s — continuing with partial data")
         except Exception as e:
             import traceback
-            log.error(f"Full 2yr history fetch error: {e}\n{traceback.format_exc()}")
+            log.error(f"Startup history load error: {e}\n{traceback.format_exc()}")
 
         log.info("✅ Proceeding to initial scan…")
 
@@ -2789,7 +3050,7 @@ async def main():
             log.error(f"⏱ Initial scan exceeded {SCAN_TIMEOUT}s timeout — aborting and continuing to main loop")
 
         # NOTE: the legacy per-stock Yahoo "extend short history" background
-        # task is no longer needed here — push_full_history_to_supabase()
+        # task is no longer needed here — load_history_at_startup()
         # (called earlier, before the initial scan) already gives every
         # stock full 2yr Yahoo OHLCV directly into historical_cache, which
         # is a strict superset of what extend_stock_history_from_yahoo did.
