@@ -2589,8 +2589,20 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
                      f"prices_last3={prices[-3:]}, true_prev_close={true_prev_close}, "
                      f"live_price={live_price}, last={last}, prev={prev}, chg={chg}")
 
-        # PP
-        pp = detect_pp(prices, volumes)
+        # PP — needs to trigger intraday, not just at EOD. detect_pp reads
+        # only the static historical prices/volumes, which during live
+        # market hours still end on YESTERDAY's close (today's close only
+        # lands there after the EOD update) — so PP would otherwise lag a
+        # full day behind. Build a live-augmented series with today's live
+        # price/volume appended as an extra trailing point when we're still
+        # mid-session; once prices[-1] already IS today (post-EOD), no
+        # augmentation is needed since today's real close is already there.
+        if prices_last_is_today or not (live_price and live_price > 0):
+            rt_prices, rt_volumes = prices, volumes
+        else:
+            rt_prices  = prices + [live_price]
+            rt_volumes = volumes + [vol]
+        pp = detect_pp(rt_prices, rt_volumes)
 
         # Volume signals
         yr_vols  = volumes[-252:] if len(volumes) >= 252 else volumes
