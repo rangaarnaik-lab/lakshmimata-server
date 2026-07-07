@@ -1196,6 +1196,9 @@ prev_squeeze_state: dict = {}
 
 
 historical_cache: dict = {}   # sym -> {prices, volumes}
+last_eod_refresh_date: Optional[str] = None  # IST date string — ensures the
+# expensive EOD refresh (full Yahoo re-fetch + fundamentals) runs only ONCE
+# per day, not on every single scan cycle while the market stays closed.
 nifty_cache: dict = {}        # {'prices': [...]} — Nifty index daily closes for TV RS calc
 midcap_cache: dict = {}       # {'prices': [...]} — synthetic Midcap 150 index
 smallcap_cache: dict = {}     # {'prices': [...]} — synthetic Smallcap 250 index
@@ -2113,28 +2116,38 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
     # batch_morning-tagged cycle was wasted API calls and the root cause of
     # repeated multi-minute "stalls" that looked like the live data was
     # not updating.
+    global last_eod_refresh_date
+    today_ist_check = datetime.now(IST).strftime('%Y-%m-%d')
+    is_first_eod_today = (scan_type == 'batch_eod' and last_eod_refresh_date != today_ist_check)
+
     if scan_type == 'batch_eod':
-        log.info("  End-of-day scan — refreshing full 2yr Yahoo history to bake in today's final close…")
-        # Use Yahoo (2yr) instead of Upstox (~550 days max) as the source of
-        # truth for RS calculations — this refreshes historical_cache AND
-        # re-persists to Supabase stock_full_history in one pass.
-        await push_full_history_to_supabase(session)
-        await load_nifty_cache(session)
-        await load_index_cache(session)
-        # Rebuild synthetic indices with fresh EOD data
-        global midcap_cache, smallcap_cache
-        fresh_mid = build_synthetic_index(list(MIDCAP),   historical_cache, min_stocks=50)
-        fresh_sml = build_synthetic_index(list(SMALLCAP), historical_cache, min_stocks=80)
-        db_mid = await load_index_history_from_db(session, "Midcap 150")
-        db_sml = await load_index_history_from_db(session, "Smallcap 250")
-        def merge_p(db, fresh):
-            fp = fresh.get('prices', [])
-            return db[:-len(fp)] + fp if db and len(db) > len(fp) else fp
-        midcap_cache   = {'prices': merge_p(db_mid, fresh_mid)}
-        smallcap_cache = {'prices': merge_p(db_sml, fresh_sml)}
-        if midcap_cache['prices']:   await save_index_history_to_db(session, "Midcap 150",   midcap_cache['prices'])
-        if smallcap_cache['prices']: await save_index_history_to_db(session, "Smallcap 250", smallcap_cache['prices'])
-        log.info(f"  Indices rebuilt: Mid={len(midcap_cache['prices'])}d Sml={len(smallcap_cache['prices'])}d")
+        if not is_first_eod_today:
+            log.info(f"  End-of-day refresh already done today ({today_ist_check}) — skipping "
+                     f"(scan loop keeps tagging cycles 'batch_eod' for as long as the "
+                     f"market stays closed, so this must be a once-per-day guard).")
+        else:
+            log.info("  End-of-day scan — refreshing full 2yr Yahoo history to bake in today's final close…")
+            # Use Yahoo (2yr) instead of Upstox (~550 days max) as the source of
+            # truth for RS calculations — this refreshes historical_cache AND
+            # re-persists to Supabase stock_full_history in one pass.
+            await push_full_history_to_supabase(session)
+            await load_nifty_cache(session)
+            await load_index_cache(session)
+            last_eod_refresh_date = today_ist_check
+            # Rebuild synthetic indices with fresh EOD data
+            global midcap_cache, smallcap_cache
+            fresh_mid = build_synthetic_index(list(MIDCAP),   historical_cache, min_stocks=50)
+            fresh_sml = build_synthetic_index(list(SMALLCAP), historical_cache, min_stocks=80)
+            db_mid = await load_index_history_from_db(session, "Midcap 150")
+            db_sml = await load_index_history_from_db(session, "Smallcap 250")
+            def merge_p(db, fresh):
+                fp = fresh.get('prices', [])
+                return db[:-len(fp)] + fp if db and len(db) > len(fp) else fp
+            midcap_cache   = {'prices': merge_p(db_mid, fresh_mid)}
+            smallcap_cache = {'prices': merge_p(db_sml, fresh_sml)}
+            if midcap_cache['prices']:   await save_index_history_to_db(session, "Midcap 150",   midcap_cache['prices'])
+            if smallcap_cache['prices']: await save_index_history_to_db(session, "Smallcap 250", smallcap_cache['prices'])
+            log.info(f"  Indices rebuilt: Mid={len(midcap_cache['prices'])}d Sml={len(smallcap_cache['prices'])}d")
 
     # Step 3: DO NOT mutate historical_cache prices in place (was causing chg% drift).
     # Instead, keep historical close as the immutable baseline and use live price
@@ -2182,8 +2195,9 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
     # Step 5: Build full stock records
     log.info(f"  Building per-stock records (RS/PP/squeeze/VCP) for {len(stocks_with_hist)} stocks…")
 
-    # Fetch fundamentals only at EOD — they change quarterly, no point fetching more often
-    if scan_type == 'batch_eod':
+    # Fetch fundamentals only once per day at EOD — they change quarterly,
+    # no point fetching every ~60-90s for as long as the market stays closed.
+    if is_first_eod_today:
         all_syms = [s['sym'] for s in stocks_with_hist]
         await load_fundamentals_batch(session, all_syms)
 
@@ -2582,7 +2596,7 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
     # Step 7.5: At end-of-day, also archive a permanent daily snapshot.
     # This is what powers the "view any past date" history feature —
     # without this, only today's live state is ever available.
-    if scan_type == 'batch_eod':
+    if is_first_eod_today:
         snapshot_date = now_ist.strftime('%Y-%m-%d')
         log.info(f"  📸 Archiving EOD snapshot for {snapshot_date}…")
 
