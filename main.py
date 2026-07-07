@@ -1803,6 +1803,7 @@ async def push_full_history_to_supabase(session: aiohttp.ClientSession):
     rows: list = []
     done = 0
     failed = 0
+    failed_syms: list = []
     lock = asyncio.Lock()
 
     async def fetch_one(sym):
@@ -1862,6 +1863,7 @@ async def push_full_history_to_supabase(session: aiohttp.ClientSession):
                 done += 1
             else:
                 failed += 1
+                failed_syms.append(sym)
                 if sym == 'RRKABEL':
                     log.warning(f"  🔍 RRKABEL: Yahoo fetch FAILED this run — historical_cache "
                                 f"keeps whatever value it already had (may be stale).")
@@ -1874,6 +1876,23 @@ async def push_full_history_to_supabase(session: aiohttp.ClientSession):
                 await save_full_history_batch_to_db(session, batch)
 
     await asyncio.gather(*[fetch_one(sym) for sym in ALL_STOCKS])
+
+    # Retry pass — Yahoo fails a random subset of requests each run
+    # (rate-limits, timeouts) that has nothing to do with the symbol itself.
+    # Without a retry, a stock that's unlucky on this particular run keeps
+    # whatever historical_cache value it already had — potentially days
+    # stale — until some future run happens to succeed for it. One retry
+    # pass over just the failures fixes most of these transient misses
+    # cheaply, since it's usually a small fraction of the full universe.
+    if failed_syms:
+        retry_list = failed_syms[:]
+        failed_syms = []
+        log.info(f"🔁 Retrying {len(retry_list)} stocks that failed the first Yahoo fetch pass…")
+        await asyncio.sleep(2)
+        await asyncio.gather(*[fetch_one(sym) for sym in retry_list])
+        recovered = len(retry_list) - len(failed_syms)
+        failed -= recovered  # these ultimately succeeded — don't double-count as failed
+        log.info(f"🔁 Retry pass complete: {recovered} recovered, {len(failed_syms)} still failing after retry")
 
     if rows:
         await save_full_history_batch_to_db(session, rows)
