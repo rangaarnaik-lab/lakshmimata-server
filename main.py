@@ -2583,6 +2583,12 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         chg = round((last - prev) / prev * 100, 2) if prev else 0
         vol = live.get('volume') if live.get('volume') else (volumes[n-1] if volumes else 0)
 
+        if sym == 'RRKABEL':
+            log.info(f"  🔍 RRKABEL chg-calc: n={n}, dates_last3={dates_for_sym[-3:] if dates_for_sym else None}, "
+                     f"today_str={today_str}, prices_last_is_today={prices_last_is_today}, "
+                     f"prices_last3={prices[-3:]}, true_prev_close={true_prev_close}, "
+                     f"live_price={live_price}, last={last}, prev={prev}, chg={chg}")
+
         # PP
         pp = detect_pp(prices, volumes)
 
