@@ -1045,6 +1045,175 @@ async def fetch_fundamentals_screener(session: aiohttp.ClientSession, sym: str) 
 fundamentals_cache: dict = {}  # sym -> {market_cap, pe, roe, eps, debt_eq, promoter, fetched_at}
 FUNDAMENTALS_TTL = 7 * 24 * 3600  # refresh weekly (data changes quarterly)
 
+async def ensure_fundamentals_table(session: aiohttp.ClientSession,
+                                     retries: int = 6, delay: float = 10.0) -> bool:
+    """Same self-healing pattern as ensure_full_history_table — see that
+    function for why the retry loop is needed (PostgREST schema cache lag
+    after creating a table via the SQL Editor)."""
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+    }
+    last_status = None
+    last_body = ""
+    for attempt in range(1, retries + 1):
+        try:
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/stock_fundamentals?select=sym&limit=1",
+                headers=headers, timeout=aiohttp.ClientTimeout(total=10)
+            ) as r:
+                if r.status == 200:
+                    log.info("✅ stock_fundamentals table OK"
+                              + (f" (after {attempt} attempt(s))" if attempt > 1 else ""))
+                    return True
+                last_status = r.status
+                last_body = await r.text()
+        except Exception as e:
+            last_status = None
+            last_body = str(e)
+        if attempt < retries:
+            log.warning(f"stock_fundamentals not ready yet (attempt {attempt}/{retries}, "
+                        f"status={last_status}) — retrying in {delay:.0f}s…")
+            await asyncio.sleep(delay)
+
+    log.error("❌ stock_fundamentals table MISSING or misconfigured (after retries)!")
+    log.error(f"   status={last_status} body={last_body[:200]}")
+    log.error("   → Go to Supabase SQL Editor and run:")
+    log.error("   create table if not exists public.stock_fundamentals (")
+    log.error("     sym text primary key,")
+    log.error("     market_cap numeric, pe numeric, roe numeric,")
+    log.error("     eps numeric, debt_eq numeric, promoter numeric,")
+    log.error("     fetched_at timestamptz")
+    log.error("   );")
+    return False
+
+
+async def load_fundamentals_from_supabase(session: aiohttp.ClientSession) -> list:
+    """
+    Load previously-fetched fundamentals straight from Supabase — zero
+    Screener.in requests. Same optimization as load_all_history_from_supabase:
+    without this, fundamentals_cache (pure in-memory) was wiped on every
+    restart, forcing a full ~2385-stock re-scrape (at ~5 stocks/sec, that's
+    8-15+ minutes) gated behind a once-per-day flag — so a restart mid-fetch
+    meant most stocks never got fundamentals until the NEXT calendar day.
+    Returns the list of symbols that are missing or past the TTL.
+    """
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    all_rows: list = []
+    PAGE = 1000
+    offset = 0
+    while True:
+        try:
+            page_headers = {**headers, "Range": f"{offset}-{offset + PAGE - 1}"}
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/stock_fundamentals"
+                f"?select=sym,market_cap,pe,roe,eps,debt_eq,promoter,fetched_at",
+                headers=page_headers, timeout=aiohttp.ClientTimeout(total=30)
+            ) as r:
+                if r.status not in (200, 206):
+                    log.warning(f"load_fundamentals_from_supabase page failed: status={r.status}")
+                    break
+                page = await r.json()
+                all_rows.extend(page)
+                if len(page) < PAGE:
+                    break
+                offset += PAGE
+        except Exception as e:
+            log.error(f"load_fundamentals_from_supabase error: {e}")
+            break
+
+    now = time.time()
+    loaded = 0
+    stale_or_missing: list = []
+    found_syms: set = set()
+
+    for row in all_rows:
+        sym = row.get('sym')
+        if not sym:
+            continue
+        found_syms.add(sym)
+        fetched_at_str = row.get('fetched_at')
+        fetched_at_ts = 0.0
+        if fetched_at_str:
+            try:
+                fetched_at_ts = datetime.fromisoformat(fetched_at_str.replace('Z', '+00:00')).timestamp()
+            except Exception:
+                fetched_at_ts = 0.0
+        fundamentals_cache[sym] = {
+            'market_cap': row.get('market_cap'), 'pe': row.get('pe'), 'roe': row.get('roe'),
+            'eps': row.get('eps'), 'debt_eq': row.get('debt_eq'), 'promoter': row.get('promoter'),
+            'fetched_at': fetched_at_ts,
+        }
+        loaded += 1
+        if (now - fetched_at_ts) > FUNDAMENTALS_TTL:
+            stale_or_missing.append(sym)
+
+    missing_entirely = [s for s in ALL_STOCKS if s not in found_syms]
+    stale_or_missing.extend(missing_entirely)
+
+    log.info(f"📊 Loaded {loaded} stocks' fundamentals from Supabase (0 Screener.in requests) — "
+             f"{len(stale_or_missing)} need fetching (missing or >{FUNDAMENTALS_TTL//86400}d stale)")
+    return stale_or_missing
+
+
+async def save_fundamentals_batch_to_db(session: aiohttp.ClientSession, rows: list):
+    """Upsert fundamentals rows into Supabase — same chunked pattern as
+    save_full_history_batch_to_db, though these rows are tiny so a larger
+    chunk size is fine here."""
+    if not rows:
+        return
+    url = f"{SUPABASE_URL}/rest/v1/stock_fundamentals?on_conflict=sym"
+    headers = {
+        "apikey":        SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type":  "application/json",
+        "Prefer":        "resolution=merge-duplicates",
+    }
+    CHUNK = 200
+    chunks = [rows[i:i+CHUNK] for i in range(0, len(rows), CHUNK)]
+    sem = asyncio.Semaphore(5)
+    uploaded = 0
+
+    async def upload(chunk):
+        nonlocal uploaded
+        async with sem:
+            try:
+                async with session.post(url, headers=headers, json=chunk,
+                                        timeout=aiohttp.ClientTimeout(total=30)) as r:
+                    if r.status in (200, 201, 204):
+                        uploaded += len(chunk)
+                    else:
+                        text = await r.text()
+                        log.warning(f"stock_fundamentals upsert failed: {r.status} {text[:150]}")
+            except Exception as e:
+                log.error(f"stock_fundamentals upsert error: {e}")
+
+    await asyncio.gather(*[upload(c) for c in chunks])
+    log.info(f"  💾 Uploaded {uploaded}/{len(rows)} fundamentals rows to Supabase")
+
+
+async def load_fundamentals_at_startup(session: aiohttp.ClientSession):
+    """
+    Startup: load fundamentals from Supabase first (fast, free), then
+    kick off a BACKGROUND task to scrape Screener.in only for symbols
+    that are missing or stale — decoupled from the once-per-day EOD gate,
+    so it can actually finish across restarts instead of always starting
+    over from zero. Runs as a background task (not awaited) since a full
+    scrape can take 8-15+ minutes and fundamentals aren't as time-critical
+    as price data.
+    """
+    table_ready = await ensure_fundamentals_table(session)
+    if not table_ready:
+        log.error("⏭️  stock_fundamentals table unavailable — will rely on the once-daily "
+                   "EOD Screener.in fetch only (no persistence across restarts until fixed).")
+        return
+
+    stale_or_missing = await load_fundamentals_from_supabase(session)
+    if stale_or_missing:
+        log.info(f"📊 Starting background fundamentals fetch for {len(stale_or_missing)} stocks…")
+        asyncio.create_task(load_fundamentals_batch(session, stale_or_missing))
+
 async def load_fundamentals_batch(session: aiohttp.ClientSession, symbols: list):
     """Fetch fundamentals for a batch of symbols, respecting TTL cache."""
     now = time.time()
@@ -1059,6 +1228,7 @@ async def load_fundamentals_batch(session: aiohttp.ClientSession, symbols: list)
     log.info(f"  Fetching fundamentals for {len(to_fetch)} stocks from Screener.in…")
     BATCH = 5  # small batches to be respectful
     fetched = 0
+    rows_to_save: list = []
     for i in range(0, len(to_fetch), BATCH):
         batch = to_fetch[i:i+BATCH]
         results = await asyncio.gather(*[
@@ -1069,7 +1239,21 @@ async def load_fundamentals_batch(session: aiohttp.ClientSession, symbols: list)
             fundamentals_cache[sym] = data
             if any(v is not None for k, v in data.items() if k != 'fetched_at'):
                 fetched += 1
+            rows_to_save.append({
+                'sym': sym, **{k: v for k, v in data.items() if k != 'fetched_at'},
+                'fetched_at': datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
+            })
         await asyncio.sleep(1)  # be gentle with Screener.in
+
+        # Persist incrementally — a slow scrape (8-15+ min for the full
+        # universe) shouldn't lose everything if the process restarts
+        # partway through.
+        if len(rows_to_save) >= 100:
+            batch_rows, rows_to_save[:] = rows_to_save[:], []
+            await save_fundamentals_batch_to_db(session, batch_rows)
+
+    if rows_to_save:
+        await save_fundamentals_batch_to_db(session, rows_to_save)
 
     log.info(f"  Fundamentals loaded: {fetched}/{len(to_fetch)} stocks")
 
@@ -3059,6 +3243,16 @@ async def main():
         except Exception as e:
             import traceback
             log.error(f"Startup history load error: {e}\n{traceback.format_exc()}")
+
+        # Step 3d: Load fundamentals — Supabase first, then a background
+        # scrape for anything missing/stale (not blocking, since a full
+        # scrape can take 8-15+ minutes and fundamentals aren't as
+        # time-critical as price data).
+        try:
+            await load_fundamentals_at_startup(session)
+        except Exception as e:
+            import traceback
+            log.error(f"Startup fundamentals load error: {e}\n{traceback.format_exc()}")
 
         log.info("✅ Proceeding to initial scan…")
 
