@@ -974,7 +974,13 @@ async def fetch_instruments(session: aiohttp.ClientSession) -> list:
 async def fetch_fundamentals_screener(session: aiohttp.ClientSession, sym: str) -> dict:
     """
     Scrape fundamental data from Screener.in company page.
-    Free, no auth needed. Returns: market_cap, pe, roe, eps, debt_eq, promoter.
+    Free, no auth needed. Returns two families of data:
+    - Snapshot ratios: market_cap, pe, roe, eps, debt_eq, promoter
+    - Trend data (from the Quarterly Results + Shareholding Pattern tables):
+      eps_qoq/eps_yoy (earnings growth — the core CANSLIM signal),
+      sales_qoq/sales_yoy, opm_pct/opm_trend (margin + direction),
+      eps_growth_streak (consecutive quarters of EPS growth),
+      fii_pct/fii_trend, dii_pct/dii_trend, promoter_trend, peg_ratio
     """
     url = f"https://www.screener.in/company/{sym}/consolidated/"
     headers = {
@@ -982,8 +988,11 @@ async def fetch_fundamentals_screener(session: aiohttp.ClientSession, sym: str) 
         "Accept": "text/html,application/xhtml+xml",
     }
     result = {
-        'market_cap': None, 'pe': None, 'roe': None,
-        'eps': None, 'debt_eq': None, 'promoter': None,
+        'market_cap': None, 'pe': None, 'roe': None, 'eps': None, 'debt_eq': None, 'promoter': None,
+        'eps_qoq': None, 'eps_yoy': None, 'sales_qoq': None, 'sales_yoy': None,
+        'opm_pct': None, 'opm_trend': None, 'eps_growth_streak': None,
+        'fii_pct': None, 'fii_trend': None, 'dii_pct': None, 'dii_trend': None,
+        'promoter_trend': None, 'peg_ratio': None,
     }
     try:
         async with session.get(url, headers=headers,
@@ -1001,7 +1010,6 @@ async def fetch_fundamentals_screener(session: aiohttp.ClientSession, sym: str) 
             else:
                 html = await r.text()
 
-        # Parse key ratios from the #top-ratios list
         import re
 
         def extract_ratio(label: str, html: str) -> str:
@@ -1027,15 +1035,109 @@ async def fetch_fundamentals_screener(session: aiohttp.ClientSession, sym: str) 
         result['eps']        = parse_number(extract_ratio('EPS', html))
         result['debt_eq']    = parse_number(extract_ratio('Debt to equity', html))
 
-        # Promoter holding — from shareholding section
-        prom_m = re.search(r'Promoters?\s*</td>\s*<td[^>]*>([\d.]+)%?</td>', html, re.IGNORECASE)
-        if prom_m:
-            result['promoter'] = float(prom_m.group(1))
-        else:
-            # Alternative pattern
-            prom_m2 = re.search(r'"promoters":\s*([\d.]+)', html, re.IGNORECASE)
-            if prom_m2:
-                result['promoter'] = float(prom_m2.group(1))
+        def extract_row_series(label: str, html: str) -> list:
+            """Pull all data-cell values from a Screener table row (Quarterly
+            Results / Shareholding Pattern), oldest-to-newest as Screener
+            lists them left-to-right. Returns a list with None for any
+            cell that isn't a plain number (e.g. a '+' expand button cell)."""
+            pattern = rf'<td[^>]*>\s*{re.escape(label)}.*?</td>(.*?)</tr>'
+            m = re.search(pattern, html, re.DOTALL | re.IGNORECASE)
+            if not m:
+                return []
+            cells = re.findall(r'<td[^>]*>(.*?)</td>', m.group(1), re.DOTALL)
+            vals = []
+            for c in cells:
+                clean = re.sub(r'<[^>]+>', '', c).strip()
+                clean = clean.replace(',', '').replace('%', '').replace('₹', '').strip()
+                try:
+                    vals.append(float(clean))
+                except Exception:
+                    vals.append(None)
+            return vals
+
+        def pct_change(curr, prev):
+            if curr is None or prev is None or prev == 0:
+                return None
+            return round((curr - prev) / abs(prev) * 100, 2)
+
+        def point_diff(curr, prev):
+            if curr is None or prev is None:
+                return None
+            return round(curr - prev, 2)
+
+        def last_two_valid(series):
+            """Return (latest, previous) skipping any None cells."""
+            valid = [v for v in series if v is not None]
+            if len(valid) < 2:
+                return (valid[-1] if valid else None, None)
+            return (valid[-1], valid[-2])
+
+        def growth_streak(series):
+            """Consecutive quarters of growth, counting back from latest."""
+            valid = [v for v in series if v is not None]
+            streak = 0
+            for i in range(len(valid) - 1, 0, -1):
+                if valid[i] > valid[i-1]:
+                    streak += 1
+                else:
+                    break
+            return streak
+
+        # Quarterly Results table — the core CANSLIM earnings-acceleration data
+        eps_series   = extract_row_series('EPS in Rs', html)
+        sales_series = extract_row_series('Sales', html)
+        opm_series   = extract_row_series('OPM %', html)
+
+        eps_latest, eps_prev = last_two_valid(eps_series)
+        sales_latest, sales_prev = last_two_valid(sales_series)
+        opm_latest, opm_prev = last_two_valid(opm_series)
+
+        result['eps_qoq'] = pct_change(eps_latest, eps_prev)
+        valid_eps = [v for v in eps_series if v is not None]
+        result['eps_yoy'] = pct_change(valid_eps[-1], valid_eps[-5]) if len(valid_eps) >= 5 else None
+
+        result['sales_qoq'] = pct_change(sales_latest, sales_prev)
+        valid_sales = [v for v in sales_series if v is not None]
+        result['sales_yoy'] = pct_change(valid_sales[-1], valid_sales[-5]) if len(valid_sales) >= 5 else None
+
+        result['opm_pct']   = opm_latest
+        result['opm_trend'] = point_diff(opm_latest, opm_prev)
+        result['eps_growth_streak'] = growth_streak(eps_series)
+
+        # PEG ratio — cheap growth vs expensive growth. Only meaningful
+        # when earnings are actually growing (a negative/zero YoY growth
+        # makes PEG uninterpretable, so leave it None in that case).
+        if result['pe'] and result['eps_yoy'] and result['eps_yoy'] > 0:
+            result['peg_ratio'] = round(result['pe'] / result['eps_yoy'], 2)
+
+        # Shareholding Pattern table — promoter/FII/DII holding + trend
+        promoter_series = extract_row_series('Promoters', html)
+        fii_series      = extract_row_series('FIIs', html)
+        dii_series      = extract_row_series('DIIs', html)
+
+        prom_latest, prom_prev = last_two_valid(promoter_series)
+        fii_latest, fii_prev   = last_two_valid(fii_series)
+        dii_latest, dii_prev   = last_two_valid(dii_series)
+
+        if prom_latest is not None:
+            result['promoter'] = prom_latest  # supersedes the old first-match extraction below if found
+        result['promoter_trend'] = point_diff(prom_latest, prom_prev)
+        result['fii_pct']    = fii_latest
+        result['fii_trend']  = point_diff(fii_latest, fii_prev)
+        result['dii_pct']    = dii_latest
+        result['dii_trend']  = point_diff(dii_latest, dii_prev)
+
+        # Fallback promoter extraction (original method) if the table-row
+        # approach above didn't find anything — some older Screener page
+        # layouts use a different structure for this section.
+        if result['promoter'] is None:
+            prom_m = re.search(r'Promoters?\s*</td>\s*<td[^>]*>([\d.]+)%?</td>', html, re.IGNORECASE)
+            if prom_m:
+                result['promoter'] = float(prom_m.group(1))
+            else:
+                prom_m2 = re.search(r'"promoters":\s*([\d.]+)', html, re.IGNORECASE)
+                if prom_m2:
+                    result['promoter'] = float(prom_m2.group(1))
 
     except Exception as e:
         pass
@@ -1084,8 +1186,27 @@ async def ensure_fundamentals_table(session: aiohttp.ClientSession,
     log.error("     sym text primary key,")
     log.error("     market_cap numeric, pe numeric, roe numeric,")
     log.error("     eps numeric, debt_eq numeric, promoter numeric,")
+    log.error("     eps_qoq numeric, eps_yoy numeric, sales_qoq numeric, sales_yoy numeric,")
+    log.error("     opm_pct numeric, opm_trend numeric, eps_growth_streak int,")
+    log.error("     fii_pct numeric, fii_trend numeric, dii_pct numeric, dii_trend numeric,")
+    log.error("     promoter_trend numeric, peg_ratio numeric,")
     log.error("     fetched_at timestamptz")
     log.error("   );")
+    log.error("   → If the table already exists from before, instead run:")
+    log.error("   alter table public.stock_fundamentals")
+    log.error("     add column if not exists eps_qoq numeric,")
+    log.error("     add column if not exists eps_yoy numeric,")
+    log.error("     add column if not exists sales_qoq numeric,")
+    log.error("     add column if not exists sales_yoy numeric,")
+    log.error("     add column if not exists opm_pct numeric,")
+    log.error("     add column if not exists opm_trend numeric,")
+    log.error("     add column if not exists eps_growth_streak int,")
+    log.error("     add column if not exists fii_pct numeric,")
+    log.error("     add column if not exists fii_trend numeric,")
+    log.error("     add column if not exists dii_pct numeric,")
+    log.error("     add column if not exists dii_trend numeric,")
+    log.error("     add column if not exists promoter_trend numeric,")
+    log.error("     add column if not exists peg_ratio numeric;")
     return False
 
 
@@ -1108,7 +1229,9 @@ async def load_fundamentals_from_supabase(session: aiohttp.ClientSession) -> lis
             page_headers = {**headers, "Range": f"{offset}-{offset + PAGE - 1}"}
             async with session.get(
                 f"{SUPABASE_URL}/rest/v1/stock_fundamentals"
-                f"?select=sym,market_cap,pe,roe,eps,debt_eq,promoter,fetched_at",
+                f"?select=sym,market_cap,pe,roe,eps,debt_eq,promoter,"
+                f"eps_qoq,eps_yoy,sales_qoq,sales_yoy,opm_pct,opm_trend,eps_growth_streak,"
+                f"fii_pct,fii_trend,dii_pct,dii_trend,promoter_trend,peg_ratio,fetched_at",
                 headers=page_headers, timeout=aiohttp.ClientTimeout(total=30)
             ) as r:
                 if r.status not in (200, 206):
@@ -1143,6 +1266,13 @@ async def load_fundamentals_from_supabase(session: aiohttp.ClientSession) -> lis
         fundamentals_cache[sym] = {
             'market_cap': row.get('market_cap'), 'pe': row.get('pe'), 'roe': row.get('roe'),
             'eps': row.get('eps'), 'debt_eq': row.get('debt_eq'), 'promoter': row.get('promoter'),
+            'eps_qoq': row.get('eps_qoq'), 'eps_yoy': row.get('eps_yoy'),
+            'sales_qoq': row.get('sales_qoq'), 'sales_yoy': row.get('sales_yoy'),
+            'opm_pct': row.get('opm_pct'), 'opm_trend': row.get('opm_trend'),
+            'eps_growth_streak': row.get('eps_growth_streak'),
+            'fii_pct': row.get('fii_pct'), 'fii_trend': row.get('fii_trend'),
+            'dii_pct': row.get('dii_pct'), 'dii_trend': row.get('dii_trend'),
+            'promoter_trend': row.get('promoter_trend'), 'peg_ratio': row.get('peg_ratio'),
             'fetched_at': fetched_at_ts,
         }
         loaded += 1
@@ -1513,7 +1643,11 @@ async def load_index_cache(session: aiohttp.ClientSession):
 
 
 async def ensure_db_columns(session: aiohttp.ClientSession):
-    """Verify rs_tv column exists by doing a test query."""
+    """Verify rs_tv and eps_qoq columns exist by doing test queries.
+    IMPORTANT: if a column used in the per-scan stocks upsert is missing,
+    Supabase/PostgREST can reject the WHOLE upsert with a 400 error — not
+    just silently skip that one field — so this check matters for every
+    field added to the stock record, not just these two canaries."""
     headers = {
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
@@ -1538,6 +1672,35 @@ async def ensure_db_columns(session: aiohttp.ClientSession):
                     log.error("   alter table public.stocks add column if not exists rs_sector int;")
     except Exception as e:
         log.warning(f"DB column check error: {e}")
+
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/stocks?select=eps_qoq&limit=1",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ DB columns OK — eps_qoq (fundamentals growth) column exists")
+            elif r.status == 400:
+                log.error("❌ Fundamentals growth/trend columns MISSING from stocks table! "
+                          "The per-scan upsert may be failing entirely until this is fixed.")
+                log.error("   → Go to Supabase SQL Editor and run:")
+                log.error("   alter table public.stocks")
+                log.error("     add column if not exists eps_qoq numeric,")
+                log.error("     add column if not exists eps_yoy numeric,")
+                log.error("     add column if not exists sales_qoq numeric,")
+                log.error("     add column if not exists sales_yoy numeric,")
+                log.error("     add column if not exists opm_pct numeric,")
+                log.error("     add column if not exists opm_trend numeric,")
+                log.error("     add column if not exists eps_growth_streak int,")
+                log.error("     add column if not exists fii_pct numeric,")
+                log.error("     add column if not exists fii_trend numeric,")
+                log.error("     add column if not exists dii_pct numeric,")
+                log.error("     add column if not exists dii_trend numeric,")
+                log.error("     add column if not exists promoter_trend numeric,")
+                log.error("     add column if not exists peg_ratio numeric;")
+    except Exception as e:
+        log.warning(f"DB column check error (fundamentals growth): {e}")
 
 
 
@@ -2892,6 +3055,21 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'eps':            fundamentals_cache.get(sym, {}).get('eps'),
             'debt_eq':        fundamentals_cache.get(sym, {}).get('debt_eq'),
             'promoter':       fundamentals_cache.get(sym, {}).get('promoter'),
+            # Growth/trend fundamentals — earnings acceleration (CANSLIM-style)
+            # and smart-money holding trends, not just static snapshots
+            'eps_qoq':            fundamentals_cache.get(sym, {}).get('eps_qoq'),
+            'eps_yoy':            fundamentals_cache.get(sym, {}).get('eps_yoy'),
+            'sales_qoq':          fundamentals_cache.get(sym, {}).get('sales_qoq'),
+            'sales_yoy':          fundamentals_cache.get(sym, {}).get('sales_yoy'),
+            'opm_pct':            fundamentals_cache.get(sym, {}).get('opm_pct'),
+            'opm_trend':          fundamentals_cache.get(sym, {}).get('opm_trend'),
+            'eps_growth_streak':  fundamentals_cache.get(sym, {}).get('eps_growth_streak'),
+            'fii_pct':            fundamentals_cache.get(sym, {}).get('fii_pct'),
+            'fii_trend':          fundamentals_cache.get(sym, {}).get('fii_trend'),
+            'dii_pct':            fundamentals_cache.get(sym, {}).get('dii_pct'),
+            'dii_trend':          fundamentals_cache.get(sym, {}).get('dii_trend'),
+            'promoter_trend':     fundamentals_cache.get(sym, {}).get('promoter_trend'),
+            'peg_ratio':          fundamentals_cache.get(sym, {}).get('peg_ratio'),
             'last_updated':   now_ist.isoformat(),
             'scan_type':      scan_type,
         })
