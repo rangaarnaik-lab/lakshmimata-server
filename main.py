@@ -682,13 +682,20 @@ async def build_rs_history(all_stocks: list, days: int = 15) -> dict:
     if not valid:
         log.warning("No stocks with sufficient history — skipping RS history")
         return {s['sym']: [None]*days for s in all_stocks}
-    n = len(valid[0]['prices'])
     history = {s['sym']: [] for s in all_stocks}
     for d in range(days-1, -1, -1):
-        end_idx = n - 1 - d
         raw_map = {}
         for s in valid:
             try:
+                # Right-align per stock: "d days ago" must be measured from
+                # THIS stock's own most recent day, not from some other
+                # stock's array length. Stocks can have slightly different
+                # total history lengths (Yahoo fetch failures, fallback to
+                # shorter Upstox data, etc.) even though they all end on the
+                # same "today" — using one shared end_idx for every stock
+                # silently compared different calendar dates across stocks,
+                # corrupting the whole day's percentile-rank pool.
+                end_idx = len(s['prices']) - 1 - d
                 raw = calc_rs_raw(s['prices'], end_idx)
                 if raw is not None:
                     raw_map[s['sym']] = raw
