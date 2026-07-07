@@ -1609,6 +1609,178 @@ async def extend_stock_history_from_yahoo(session: aiohttp.ClientSession):
     tasks = [fetch_one(sym) for sym in short_stocks]  # all stocks
     await asyncio.gather(*tasks)
     log.info(f"✅ Yahoo history extension: {extended} extended, {failed} failed/skipped")
+
+
+# ── Full 2yr history → Supabase (all stocks, at startup) ──────────────
+async def fetch_yahoo_full_ohlcv(session: aiohttp.ClientSession, sym: str) -> Optional[dict]:
+    """Fetch full 2yr daily OHLCV (dates, close, volume, high, low) for one
+    NSE stock from Yahoo Finance. Tries .NS first, then .BO as fallback."""
+    for suffix in [".NS", ".BO"]:
+        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{sym}{suffix}?interval=1d&range=2y"
+        try:
+            async with session.get(url,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+                timeout=aiohttp.ClientTimeout(total=12)) as r:
+                if r.status != 200:
+                    continue
+                data = await r.json()
+                result_list = data.get("chart", {}).get("result") or []
+                if not result_list:
+                    continue
+                result = result_list[0]
+                timestamps = result.get("timestamp") or []
+                quote = (result.get("indicators", {}).get("quote") or [{}])[0]
+                closes  = quote.get("close")  or []
+                volumes = quote.get("volume") or []
+                highs   = quote.get("high")   or []
+                lows    = quote.get("low")    or []
+
+                dates, prices, vols, hi, lo = [], [], [], [], []
+                for i, c in enumerate(closes):
+                    if c is None:
+                        continue
+                    ts = timestamps[i] if i < len(timestamps) else None
+                    dates.append(
+                        datetime.fromtimestamp(ts, tz=IST).strftime('%Y-%m-%d') if ts else None
+                    )
+                    prices.append(round(c, 2))
+                    v = volumes[i] if i < len(volumes) else None
+                    vols.append(int(v) if v is not None else None)
+                    h = highs[i] if i < len(highs) else None
+                    hi.append(round(h, 2) if h is not None else None)
+                    l = lows[i] if i < len(lows) else None
+                    lo.append(round(l, 2) if l is not None else None)
+
+                if len(prices) >= 100:
+                    return {'dates': dates, 'prices': prices, 'volumes': vols,
+                            'highs': hi, 'lows': lo}
+        except Exception:
+            pass
+    return None
+
+
+async def ensure_full_history_table(session: aiohttp.ClientSession):
+    """Verify the stock_full_history table exists; log the CREATE TABLE SQL if not."""
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/stock_full_history?select=sym&limit=1",
+            headers=headers, timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ stock_full_history table OK")
+                return True
+            body = await r.text()
+            log.error("❌ stock_full_history table MISSING or misconfigured!")
+            log.error(f"   status={r.status} body={body[:200]}")
+            log.error("   → Go to Supabase SQL Editor and run:")
+            log.error("   create table if not exists public.stock_full_history (")
+            log.error("     sym text primary key,")
+            log.error("     dates jsonb, prices jsonb, volumes jsonb,")
+            log.error("     highs jsonb, lows jsonb,")
+            log.error("     days_count int, updated_at timestamptz")
+            log.error("   );")
+            return False
+    except Exception as e:
+        log.warning(f"stock_full_history check error: {e}")
+        return False
+
+
+async def save_full_history_batch_to_db(session: aiohttp.ClientSession, rows: list):
+    """Upsert full-history rows into Supabase in small chunks (payload per
+    row is large — full 2yr OHLCV — so chunks are kept smaller than the
+    generic supabase_upsert default)."""
+    if not rows:
+        return
+    url = f"{SUPABASE_URL}/rest/v1/stock_full_history?on_conflict=sym"
+    headers = {
+        "apikey":        SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type":  "application/json",
+        "Prefer":        "resolution=merge-duplicates",
+    }
+    CHUNK = 40
+    chunks = [rows[i:i+CHUNK] for i in range(0, len(rows), CHUNK)]
+    sem = asyncio.Semaphore(5)
+    uploaded = 0
+
+    async def upload(chunk):
+        nonlocal uploaded
+        async with sem:
+            try:
+                async with session.post(url, headers=headers, json=chunk,
+                                        timeout=aiohttp.ClientTimeout(total=60)) as r:
+                    if r.status in (200, 201, 204):
+                        uploaded += len(chunk)
+                    else:
+                        text = await r.text()
+                        log.warning(f"stock_full_history upsert failed: {r.status} {text[:150]}")
+            except Exception as e:
+                log.error(f"stock_full_history upsert error: {e}")
+
+    await asyncio.gather(*[upload(c) for c in chunks])
+    log.info(f"  💾 Uploaded {uploaded}/{len(rows)} full-history rows to Supabase")
+
+
+async def push_full_history_to_supabase(session: aiohttp.ClientSession):
+    """
+    Startup task: fetch the full 2-year daily OHLCV history from Yahoo
+    Finance for every stock in ALL_STOCKS (all ~2387 NSE stocks) and
+    persist it into the Supabase `stock_full_history` table, so the
+    frontend / other tools can pull complete 2yr price history per
+    symbol straight from Supabase rather than re-fetching from Yahoo.
+    """
+    await ensure_full_history_table(session)
+
+    total = len(ALL_STOCKS)
+    log.info(f"📥 Fetching full 2yr Yahoo history for {total} stocks (startup)…")
+
+    sem = asyncio.Semaphore(20)
+    rows: list = []
+    done = 0
+    failed = 0
+    lock = asyncio.Lock()
+
+    async def fetch_one(sym):
+        nonlocal done, failed
+        async with sem:
+            data = await fetch_yahoo_full_ohlcv(session, sym)
+            await asyncio.sleep(0.02)
+        async with lock:
+            if data:
+                rows.append({
+                    'sym':        sym,
+                    'dates':      json.dumps(data['dates']),
+                    'prices':     json.dumps(data['prices']),
+                    'volumes':    json.dumps(data['volumes']),
+                    'highs':      json.dumps(data['highs']),
+                    'lows':       json.dumps(data['lows']),
+                    'days_count': len(data['prices']),
+                    'updated_at': datetime.now(timezone.utc).isoformat(),
+                })
+                done += 1
+            else:
+                failed += 1
+            seen = done + failed
+            if seen % 200 == 0 or seen == total:
+                log.info(f"  …{seen}/{total} fetched ({done} ok, {failed} failed)")
+            # Upload incrementally so partial progress survives a crash/timeout
+            if len(rows) >= 200:
+                batch, rows[:] = rows[:], []
+                await save_full_history_batch_to_db(session, batch)
+
+    await asyncio.gather(*[fetch_one(sym) for sym in ALL_STOCKS])
+
+    if rows:
+        await save_full_history_batch_to_db(session, rows)
+
+    log.info(f"✅ Full 2yr history push complete: {done} ok, {failed} failed out of {total}")
+
+
 async def load_nifty_cache(session: aiohttp.ClientSession):
     """Fetch Nifty 50 daily close history needed for TradingView-style RS calculation."""
     global nifty_cache
@@ -2416,7 +2588,21 @@ async def main():
         log.info(f"✅ Midcap index: {len(mid_prices)}d (DB had {len(db_mid)}d)")
         log.info(f"✅ Smallcap index: {len(sml_prices)}d (DB had {len(db_sml)}d)")
 
+        # Step 3c: Fetch full 2yr Yahoo Finance history for ALL stocks and
+        # persist to Supabase (stock_full_history table). Runs once at
+        # startup, blocking, with a generous timeout so a slow/failed
+        # symbol can't hang the whole server indefinitely.
+        FULL_HISTORY_TIMEOUT = 1800  # 30 min ceiling for ~2387 stocks
+        try:
+            await asyncio.wait_for(push_full_history_to_supabase(session), timeout=FULL_HISTORY_TIMEOUT)
+        except asyncio.TimeoutError:
+            log.error(f"⏱ Full 2yr history fetch exceeded {FULL_HISTORY_TIMEOUT}s — continuing with partial data")
+        except Exception as e:
+            import traceback
+            log.error(f"Full 2yr history fetch error: {e}\n{traceback.format_exc()}")
+
         log.info("✅ Proceeding to initial scan…")
+
 
         # Step 4: Run initial scan
         SCAN_TIMEOUT = 900
