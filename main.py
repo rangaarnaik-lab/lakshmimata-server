@@ -1823,9 +1823,22 @@ async def push_full_history_to_supabase(session: aiohttp.ClientSession):
                 # close — producing wrong/stale % change all session long.
                 # Drop that last bar in this case; keep it once the market
                 # has closed (EOD refresh), when it's a genuine final close.
-                if is_market_open() and data['dates'] and data['dates'][-1] == datetime.now(IST).strftime('%Y-%m-%d'):
+                today_ist = datetime.now(IST).strftime('%Y-%m-%d')
+                mkt_open = is_market_open()
+                will_trim = mkt_open and data['dates'] and data['dates'][-1] == today_ist
+
+                if sym == 'THANGAMAYL':
+                    log.info(f"  🔍 THANGAMAYL pre-trim: market_open={mkt_open}, today_ist={today_ist}, "
+                             f"last3_dates={data['dates'][-3:]}, last3_prices={data['prices'][-3:]}, "
+                             f"will_trim={will_trim}")
+
+                if will_trim:
                     for k in ('dates', 'prices', 'volumes', 'highs', 'lows'):
                         data[k] = data[k][:-1]
+
+                if sym == 'THANGAMAYL':
+                    log.info(f"  🔍 THANGAMAYL post-trim: last3_dates={data['dates'][-3:]}, "
+                             f"last3_prices={data['prices'][-3:]}")
 
                 rows.append({
                     'sym':        sym,
@@ -2233,6 +2246,10 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         live = live_data.get(sym, {})
         true_prev_close = prices[n-1]               # most recent completed close
         live_price = live.get('last_price', 0)
+
+        if sym == 'THANGAMAYL':
+            log.info(f"  🔍 THANGAMAYL chg-calc: n={n}, prices_last3={prices[-3:]}, "
+                     f"true_prev_close={true_prev_close}, live_price={live_price}")
 
         if live_price and live_price > 0:
             last = live_price
