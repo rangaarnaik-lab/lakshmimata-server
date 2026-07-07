@@ -1659,35 +1659,57 @@ async def fetch_yahoo_full_ohlcv(session: aiohttp.ClientSession, sym: str) -> Op
     return None
 
 
-async def ensure_full_history_table(session: aiohttp.ClientSession):
-    """Verify the stock_full_history table exists; log the CREATE TABLE SQL if not."""
+async def ensure_full_history_table(session: aiohttp.ClientSession,
+                                     retries: int = 6, delay: float = 10.0) -> bool:
+    """
+    Verify the stock_full_history table exists. Supabase's PostgREST layer
+    caches its schema, so a table created via the SQL Editor can 404 for a
+    short while after creation even though it exists in Postgres. Retry a
+    few times with a delay before giving up, so a fresh table created just
+    before a deploy doesn't need a second manual restart.
+    """
     headers = {
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
         "Content-Type": "application/json",
     }
-    try:
-        async with session.get(
-            f"{SUPABASE_URL}/rest/v1/stock_full_history?select=sym&limit=1",
-            headers=headers, timeout=aiohttp.ClientTimeout(total=10)
-        ) as r:
-            if r.status == 200:
-                log.info("✅ stock_full_history table OK")
-                return True
-            body = await r.text()
-            log.error("❌ stock_full_history table MISSING or misconfigured!")
-            log.error(f"   status={r.status} body={body[:200]}")
-            log.error("   → Go to Supabase SQL Editor and run:")
-            log.error("   create table if not exists public.stock_full_history (")
-            log.error("     sym text primary key,")
-            log.error("     dates jsonb, prices jsonb, volumes jsonb,")
-            log.error("     highs jsonb, lows jsonb,")
-            log.error("     days_count int, updated_at timestamptz")
-            log.error("   );")
-            return False
-    except Exception as e:
-        log.warning(f"stock_full_history check error: {e}")
-        return False
+    last_status = None
+    last_body = ""
+    for attempt in range(1, retries + 1):
+        try:
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/stock_full_history?select=sym&limit=1",
+                headers=headers, timeout=aiohttp.ClientTimeout(total=10)
+            ) as r:
+                if r.status == 200:
+                    log.info("✅ stock_full_history table OK"
+                              + (f" (after {attempt} attempt(s))" if attempt > 1 else ""))
+                    return True
+                last_status = r.status
+                last_body = await r.text()
+        except Exception as e:
+            last_status = None
+            last_body = str(e)
+
+        if attempt < retries:
+            log.warning(f"stock_full_history not ready yet (attempt {attempt}/{retries}, "
+                        f"status={last_status}) — retrying in {delay:.0f}s "
+                        f"(PostgREST schema cache may still be reloading)…")
+            await asyncio.sleep(delay)
+
+    log.error("❌ stock_full_history table MISSING or misconfigured (after retries)!")
+    log.error(f"   status={last_status} body={last_body[:200]}")
+    log.error("   → If you already ran the CREATE TABLE SQL, force a schema reload:")
+    log.error("     Supabase Dashboard → Settings → API → 'Reload schema', or run:")
+    log.error("     NOTIFY pgrst, 'reload schema';")
+    log.error("   → Otherwise, go to Supabase SQL Editor and run:")
+    log.error("   create table if not exists public.stock_full_history (")
+    log.error("     sym text primary key,")
+    log.error("     dates jsonb, prices jsonb, volumes jsonb,")
+    log.error("     highs jsonb, lows jsonb,")
+    log.error("     days_count int, updated_at timestamptz")
+    log.error("   );")
+    return False
 
 
 async def save_full_history_batch_to_db(session: aiohttp.ClientSession, rows: list):
@@ -1711,16 +1733,27 @@ async def save_full_history_batch_to_db(session: aiohttp.ClientSession, rows: li
     async def upload(chunk):
         nonlocal uploaded
         async with sem:
-            try:
-                async with session.post(url, headers=headers, json=chunk,
-                                        timeout=aiohttp.ClientTimeout(total=60)) as r:
-                    if r.status in (200, 201, 204):
-                        uploaded += len(chunk)
-                    else:
+            for attempt in (1, 2):
+                try:
+                    async with session.post(url, headers=headers, json=chunk,
+                                            timeout=aiohttp.ClientTimeout(total=60)) as r:
+                        if r.status in (200, 201, 204):
+                            uploaded += len(chunk)
+                            return
                         text = await r.text()
+                        # PGRST205 = PostgREST schema cache hasn't picked up the
+                        # table yet — wait a bit and try once more before giving up.
+                        if attempt == 1 and r.status == 404 and 'PGRST205' in text:
+                            await asyncio.sleep(5)
+                            continue
                         log.warning(f"stock_full_history upsert failed: {r.status} {text[:150]}")
-            except Exception as e:
-                log.error(f"stock_full_history upsert error: {e}")
+                        return
+                except Exception as e:
+                    if attempt == 1:
+                        await asyncio.sleep(2)
+                        continue
+                    log.error(f"stock_full_history upsert error: {e}")
+                    return
 
     await asyncio.gather(*[upload(c) for c in chunks])
     log.info(f"  💾 Uploaded {uploaded}/{len(rows)} full-history rows to Supabase")
@@ -1734,7 +1767,11 @@ async def push_full_history_to_supabase(session: aiohttp.ClientSession):
     frontend / other tools can pull complete 2yr price history per
     symbol straight from Supabase rather than re-fetching from Yahoo.
     """
-    await ensure_full_history_table(session)
+    table_ready = await ensure_full_history_table(session)
+    if not table_ready:
+        log.error("⏭️  Skipping full 2yr Yahoo history fetch this run — table still unavailable "
+                   "(will try again on next restart).")
+        return
 
     total = len(ALL_STOCKS)
     log.info(f"📥 Fetching full 2yr Yahoo history for {total} stocks (startup)…")
