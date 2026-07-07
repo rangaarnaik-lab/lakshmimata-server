@@ -1911,7 +1911,11 @@ async def fetch_full_history_for_symbols(session: aiohttp.ClientSession, symbols
         await asyncio.sleep(2)
         await asyncio.gather(*[fetch_one(sym) for sym in retry_list])
         recovered = len(retry_list) - len(failed_syms)
-        failed -= recovered  # these ultimately succeeded — don't double-count as failed
+        # Use the final unresolved list as the source of truth instead of
+        # subtracting — fetch_one's failure branch increments `failed` on
+        # EVERY attempt, so a symbol that fails both the first pass and the
+        # retry was being counted twice (e.g. "144 failed out of 72").
+        failed = len(failed_syms)
         log.info(f"🔁 Retry pass complete: {recovered} recovered, {len(failed_syms)} still failing after retry")
 
     if rows:
@@ -2170,7 +2174,7 @@ async def incremental_eod_update(session: aiohttp.ClientSession):
         await asyncio.sleep(2)
         await asyncio.gather(*[fetch_one(sym) for sym in retry_list])
         recovered = len(retry_list) - len(failed_syms)
-        failed -= recovered
+        failed = len(failed_syms)  # authoritative count — see comment in fetch_full_history_for_symbols
         log.info(f"🔁 Retry pass complete: {recovered} recovered, {len(failed_syms)} still failing")
 
     if rows:
@@ -2526,7 +2530,7 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             if 0 < stitch_idx < len(nifty_prices) - 1:
                 stitch_note = (f", nifty@stitch-1={nifty_prices[stitch_idx-1]:.1f}, "
                                 f"nifty@stitch={nifty_prices[stitch_idx]:.1f}")
-            log.info(f"  🔍 GRSE: stock_days={len(prices)}, nifty_days={len(nifty_prices)}, "
+            log.info(f"  🔍 {sym}: stock_days={len(prices)}, nifty_days={len(nifty_prices)}, "
                      f"rawRS_valid_points={len(valid_pts)}, current_rawRS={current}, "
                      f"norm_window_hi={hi}, norm_window_lo={lo}, rs_tv={raw_tv}{stitch_note}")
 
