@@ -1812,6 +1812,21 @@ async def push_full_history_to_supabase(session: aiohttp.ClientSession):
             await asyncio.sleep(0.02)
         async with lock:
             if data:
+                # Yahoo's range=2y/interval=1d includes TODAY's still-forming
+                # candle whenever the market is open — its "close" is really
+                # just the latest traded price at fetch time, not a real
+                # daily close. If we let that become prices[-1] while the
+                # market is open, every live scan's chg% calc (which assumes
+                # prices[-1] is the most recent COMPLETED close) ends up
+                # comparing live price against a stale intraday snapshot
+                # from whenever this fetch ran, instead of yesterday's real
+                # close — producing wrong/stale % change all session long.
+                # Drop that last bar in this case; keep it once the market
+                # has closed (EOD refresh), when it's a genuine final close.
+                if is_market_open() and data['dates'] and data['dates'][-1] == datetime.now(IST).strftime('%Y-%m-%d'):
+                    for k in ('dates', 'prices', 'volumes', 'highs', 'lows'):
+                        data[k] = data[k][:-1]
+
                 rows.append({
                     'sym':        sym,
                     'dates':      json.dumps(data['dates']),
