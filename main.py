@@ -1799,6 +1799,15 @@ async def push_full_history_to_supabase(session: aiohttp.ClientSession):
                     'days_count': len(data['prices']),
                     'updated_at': datetime.now(timezone.utc).isoformat(),
                 })
+                # Also feed straight into the in-memory historical_cache used
+                # by RS calculations — Upstox only gives ~550 days at best,
+                # so this Yahoo 2yr pull is the authoritative source for RS.
+                historical_cache[sym] = {
+                    'prices':  data['prices'],
+                    'volumes': [v if v is not None else 0 for v in data['volumes']],
+                    'highs':   [h if h is not None else p for h, p in zip(data['highs'], data['prices'])],
+                    'lows':    [l if l is not None else p for l, p in zip(data['lows'],  data['prices'])],
+                }
                 done += 1
             else:
                 failed += 1
@@ -1816,6 +1825,7 @@ async def push_full_history_to_supabase(session: aiohttp.ClientSession):
         await save_full_history_batch_to_db(session, rows)
 
     log.info(f"✅ Full 2yr history push complete: {done} ok, {failed} failed out of {total}")
+    log.info(f"✅ historical_cache now backed by Yahoo 2yr data for {done} stocks (RS calc uses this)")
 
 
 async def load_nifty_cache(session: aiohttp.ClientSession):
@@ -2031,8 +2041,11 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
     # repeated multi-minute "stalls" that looked like the live data was
     # not updating.
     if scan_type == 'batch_eod':
-        log.info("  End-of-day scan — reloading full historical cache to bake in today's final close…")
-        await load_historical_cache(session)
+        log.info("  End-of-day scan — refreshing full 2yr Yahoo history to bake in today's final close…")
+        # Use Yahoo (2yr) instead of Upstox (~550 days max) as the source of
+        # truth for RS calculations — this refreshes historical_cache AND
+        # re-persists to Supabase stock_full_history in one pass.
+        await push_full_history_to_supabase(session)
         await load_nifty_cache(session)
         await load_index_cache(session)
         # Rebuild synthetic indices with fresh EOD data
@@ -2656,9 +2669,11 @@ async def main():
         except asyncio.TimeoutError:
             log.error(f"⏱ Initial scan exceeded {SCAN_TIMEOUT}s timeout — aborting and continuing to main loop")
 
-        # Extend stock histories from Yahoo AFTER initial scan
-        log.info("🔄 Starting Yahoo history extension in background…")
-        asyncio.create_task(extend_stock_history_from_yahoo(session))
+        # NOTE: the legacy per-stock Yahoo "extend short history" background
+        # task is no longer needed here — push_full_history_to_supabase()
+        # (called earlier, before the initial scan) already gives every
+        # stock full 2yr Yahoo OHLCV directly into historical_cache, which
+        # is a strict superset of what extend_stock_history_from_yahoo did.
 
         last_scan = time.time()
         scan_count = 0
