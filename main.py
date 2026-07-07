@@ -2551,18 +2551,25 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         is_s2_new = calc_stage2_new_entry(prices)
 
         # Live price — use sym-based lookup
-        # IMPORTANT: historical_cache prices are NEVER mutated. The last element of
-        # `prices` is the most recent COMPLETED daily close (yesterday's close during
-        # market hours, or today's close after EOD batch). We use that as the
-        # baseline "prev" and overlay live_data's last_price as "today" ONLY for
-        # display (last/chg) — RS/PP/etc continue to use the immutable closes.
+        # IMPORTANT: historical_cache prices are NEVER mutated for RS/PP/etc,
+        # which always read the raw array. But for chg% specifically we need
+        # to know whether prices[-1] represents YESTERDAY's close (live
+        # market hours — compare it against today's live_price) or TODAY's
+        # close (after the EOD incremental update has already baked today's
+        # close in) — in the latter case, live_price also reflects today, so
+        # comparing it against prices[-1] (also today) always gives 0.00%.
+        # Use history_dates_cache to tell which case we're in.
         live = live_data.get(sym, {})
-        true_prev_close = prices[n-1]               # most recent completed close
         live_price = live.get('last_price', 0)
 
-        if sym == 'THANGAMAYL':
-            log.info(f"  🔍 THANGAMAYL chg-calc: n={n}, prices_last3={prices[-3:]}, "
-                     f"true_prev_close={true_prev_close}, live_price={live_price}")
+        dates_for_sym = history_dates_cache.get(sym, [])
+        today_str = datetime.now(IST).strftime('%Y-%m-%d')
+        prices_last_is_today = bool(dates_for_sym) and dates_for_sym[-1] == today_str
+
+        if prices_last_is_today and n > 1:
+            true_prev_close = prices[n-2]  # prices[-1] is today — baseline is the day before
+        else:
+            true_prev_close = prices[n-1]  # prices[-1] is still yesterday — baseline as-is
 
         if live_price and live_price > 0:
             last = live_price
