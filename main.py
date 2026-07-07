@@ -2151,11 +2151,26 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         raw_mid = normalize_rs(calc_raw_rs_series(prices, midcap_prices))   if midcap_prices   else None
         raw_sml = normalize_rs(calc_raw_rs_series(prices, smallcap_prices)) if smallcap_prices else None
 
-        # Debug first scan: log RS details for GRSE
-        if sym == 'GRSE' and loop_idx < 5:
+        # Debug: log RS details for GRSE every scan (previous guard used
+        # loop_idx — GRSE's position within this scan's stock list — which
+        # almost never lands under 5 out of ~2300+ stocks, so this never
+        # actually fired before). Also checks for a discontinuity at the
+        # seed/fresh Nifty data stitch point, a likely source of RS-TV drift.
+        if sym == 'GRSE':
             tv_series = calc_raw_rs_series(prices, nifty_prices) if nifty_prices else []
             valid_pts = [v for v in tv_series if v is not None]
-            log.info(f"  🔍 GRSE: stock_history={len(prices)}d, nifty={len(nifty_prices)}d, rawRS_points={len(valid_pts)}, rs_tv={raw_tv}")
+            window = [v for v in tv_series[-300:] if v is not None][-252:]
+            hi = max(window) if window else None
+            lo = min(window) if window else None
+            current = tv_series[-1] if tv_series else None
+            stitch_idx = len(nifty_prices) - 371  # fresh Upstox data starts ~371d back
+            stitch_note = ""
+            if 0 < stitch_idx < len(nifty_prices) - 1:
+                stitch_note = (f", nifty@stitch-1={nifty_prices[stitch_idx-1]:.1f}, "
+                                f"nifty@stitch={nifty_prices[stitch_idx]:.1f}")
+            log.info(f"  🔍 GRSE: stock_days={len(prices)}, nifty_days={len(nifty_prices)}, "
+                     f"rawRS_valid_points={len(valid_pts)}, current_rawRS={current}, "
+                     f"norm_window_hi={hi}, norm_window_lo={lo}, rs_tv={raw_tv}{stitch_note}")
         # Sector-relative RS — percentile rank vs same sector peers
         my_raw    = my_raw_val
         my_sector = sym_to_sector.get(sym, 'Other')
