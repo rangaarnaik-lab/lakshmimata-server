@@ -1827,8 +1827,8 @@ async def push_full_history_to_supabase(session: aiohttp.ClientSession):
                 mkt_open = is_market_open()
                 will_trim = mkt_open and data['dates'] and data['dates'][-1] == today_ist
 
-                if sym == 'THANGAMAYL':
-                    log.info(f"  🔍 THANGAMAYL pre-trim: market_open={mkt_open}, today_ist={today_ist}, "
+                if sym in ('THANGAMAYL', 'RRKABEL'):
+                    log.info(f"  🔍 {sym} pre-trim: market_open={mkt_open}, today_ist={today_ist}, "
                              f"last3_dates={data['dates'][-3:]}, last3_prices={data['prices'][-3:]}, "
                              f"will_trim={will_trim}")
 
@@ -1836,8 +1836,8 @@ async def push_full_history_to_supabase(session: aiohttp.ClientSession):
                     for k in ('dates', 'prices', 'volumes', 'highs', 'lows'):
                         data[k] = data[k][:-1]
 
-                if sym == 'THANGAMAYL':
-                    log.info(f"  🔍 THANGAMAYL post-trim: last3_dates={data['dates'][-3:]}, "
+                if sym in ('THANGAMAYL', 'RRKABEL'):
+                    log.info(f"  🔍 {sym} post-trim: last3_dates={data['dates'][-3:]}, "
                              f"last3_prices={data['prices'][-3:]}")
 
                 rows.append({
@@ -1862,6 +1862,9 @@ async def push_full_history_to_supabase(session: aiohttp.ClientSession):
                 done += 1
             else:
                 failed += 1
+                if sym == 'RRKABEL':
+                    log.warning(f"  🔍 RRKABEL: Yahoo fetch FAILED this run — historical_cache "
+                                f"keeps whatever value it already had (may be stale).")
             seen = done + failed
             if seen % 200 == 0 or seen == total:
                 log.info(f"  …{seen}/{total} fetched ({done} ok, {failed} failed)")
@@ -2207,7 +2210,7 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         # almost never lands under 5 out of ~2300+ stocks, so this never
         # actually fired before). Also checks for a discontinuity at the
         # seed/fresh Nifty data stitch point, a likely source of RS-TV drift.
-        if sym == 'GRSE':
+        if sym in ('GRSE', 'RRKABEL'):
             tv_series = calc_raw_rs_series(prices, nifty_prices) if nifty_prices else []
             valid_pts = [v for v in tv_series if v is not None]
             window = [v for v in tv_series[-300:] if v is not None][-252:]
