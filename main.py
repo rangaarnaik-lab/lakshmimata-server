@@ -558,6 +558,21 @@ def calc_rs_tv_normalized(prices: list, bench_prices: list, end_idx: int = None)
         raw = raw[:end_idx+1]
     return normalize_rs(raw)
 
+
+def tv_history_from_raw(raw_series: list, days: int = 15) -> list:
+    """
+    Build a day-by-day TV-style (self-normalized) RS history from an
+    already-computed raw RS series, so the sparkline/trend uses the SAME
+    methodology as the main RS-TV score — instead of a completely different
+    percentile-rank scale that doesn't match the Pine Script numbers.
+    """
+    n = len(raw_series)
+    hist = []
+    for d in range(days - 1, -1, -1):
+        end_idx = n - 1 - d
+        hist.append(normalize_rs(raw_series[:end_idx + 1]) if end_idx >= 0 else None)
+    return hist
+
 def percentile_rank(values: list, val: float) -> int:
     below = sum(1 for v in values if v < val)
     return min(99, max(1, round((below / len(values)) * 99) + 1))
@@ -2165,32 +2180,22 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         log.warning("⚠️ No stocks with historical data yet — skipping scan, will retry next cycle")
         return 0
 
-    # Raw RS scores
-    raw_scores = []
+    # Build one synthetic price index per sector (average of that sector's
+    # member stocks' own price histories) so sector-relative RS can use the
+    # SAME TV-style, self-normalized-vs-benchmark method as Nifty/Midcap/
+    # Smallcap, instead of a totally different percentile-rank scale that
+    # doesn't match the Pine Script numbers at all.
+    sym_to_sector: dict = {}
     for s in stocks_with_hist:
-        raw = calc_rs_raw(s['prices'])
-        if raw is not None:
-            raw_scores.append({'sym': s['sym'], 'raw': raw})
-    raw_vals = [r['raw'] for r in raw_scores]
-    log.info(f"  Computed raw RS scores for {len(raw_scores)} stocks, building 15-day history…")
+        sym_to_sector[s['sym']] = get_sector(s['sym'])
 
-    # Per-index raw score pools for index-relative RS
-    raw_by_sym = {r['sym']: r['raw'] for r in raw_scores}
-    nifty50_raws  = [raw_by_sym[s] for s in NIFTY50   if s in raw_by_sym]
-    midcap_raws   = [raw_by_sym[s] for s in MIDCAP    if s in raw_by_sym]
-    smallcap_raws = [raw_by_sym[s] for s in SMALLCAP  if s in raw_by_sym]
-    microcap_raws = [raw_by_sym[s] for s in MICROCAP  if s in raw_by_sym]
+    sector_index_prices: dict = {}
+    for sector_name, sector_syms in SECTOR_MAP.items():
+        idx = build_synthetic_index(list(sector_syms), historical_cache, min_stocks=5)
+        if idx.get('prices'):
+            sector_index_prices[sector_name] = idx['prices']
 
-    # Per-sector raw score pools for sector-relative RS
-    sector_raws = {}  # sector_name -> [raw scores of its members]
-    sym_to_sector = {}
-    for sym in raw_by_sym:
-        sec = get_sector(sym)
-        sym_to_sector[sym] = sec
-        sector_raws.setdefault(sec, []).append(raw_by_sym[sym])
-
-    # RS history (15 days)
-    rs_history = await build_rs_history(stocks_with_hist, days=15)
+    log.info(f"  Built {len(sector_index_prices)} sector benchmark indices for TV-style sector RS")
 
     # Step 5: Build full stock records
     log.info(f"  Building per-stock records (RS/PP/squeeze/VCP) for {len(stocks_with_hist)} stocks…")
@@ -2222,21 +2227,28 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         if loop_idx % 50 == 0:
             await asyncio.sleep(0)
 
-        # RS (IBD percentile — kept for sparkline/trend)
-        my_raw_val = raw_by_sym.get(sym)
-        rs = percentile_rank(raw_vals, my_raw_val) if my_raw_val is not None else 0
-        hist = rs_history.get(sym, [])
-        trend_data = rs_slope(hist)
-
-        # RS-TV — TradingView / Lakshmi Mata Pine Script formula
+        # RS-TV — TradingView / Lakshmi Mata Pine Script formula.
+        # This is now the ONE methodology used everywhere: the main RS
+        # badge, the 15-day sparkline/trend, and sector-relative RS all
+        # derive from the same self-normalized-vs-benchmark calculation —
+        # previously the main badge/sparkline used a totally different
+        # IBD-style percentile-rank scale that didn't match the Pine
+        # Script numbers at all (e.g. showing 96 while RS-TV showed 72).
         nifty_prices    = nifty_cache.get('prices', [])
         midcap_prices   = midcap_cache.get('prices', [])   or nifty_prices
         smallcap_prices = smallcap_cache.get('prices', []) or nifty_prices
 
-        # Fast single-pass: compute full rawRS series, then normalize
-        raw_tv  = normalize_rs(calc_raw_rs_series(prices, nifty_prices))    if nifty_prices    else None
+        # Compute the raw series ONCE per stock, reuse for current value,
+        # 15-day history, and (via debug block below) diagnostics — avoids
+        # recomputing the same O(n) series 2-3x per stock like before.
+        tv_raw_series = calc_raw_rs_series(prices, nifty_prices) if nifty_prices else []
+        raw_tv  = normalize_rs(tv_raw_series) if tv_raw_series else None
         raw_mid = normalize_rs(calc_raw_rs_series(prices, midcap_prices))   if midcap_prices   else None
         raw_sml = normalize_rs(calc_raw_rs_series(prices, smallcap_prices)) if smallcap_prices else None
+
+        rs = raw_tv if raw_tv is not None else 0  # main badge now TV-style, matches RS-TV exactly
+        hist = tv_history_from_raw(tv_raw_series, days=15) if tv_raw_series else [None] * 15
+        trend_data = rs_slope(hist)
 
         # Debug: log RS details for GRSE every scan (previous guard used
         # loop_idx — GRSE's position within this scan's stock list — which
@@ -2244,12 +2256,11 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         # actually fired before). Also checks for a discontinuity at the
         # seed/fresh Nifty data stitch point, a likely source of RS-TV drift.
         if sym in ('GRSE', 'RRKABEL'):
-            tv_series = calc_raw_rs_series(prices, nifty_prices) if nifty_prices else []
-            valid_pts = [v for v in tv_series if v is not None]
-            window = [v for v in tv_series[-300:] if v is not None][-252:]
+            valid_pts = [v for v in tv_raw_series if v is not None]
+            window = [v for v in tv_raw_series[-300:] if v is not None][-252:]
             hi = max(window) if window else None
             lo = min(window) if window else None
-            current = tv_series[-1] if tv_series else None
+            current = tv_raw_series[-1] if tv_raw_series else None
             stitch_idx = len(nifty_prices) - 371  # fresh Upstox data starts ~371d back
             stitch_note = ""
             if 0 < stitch_idx < len(nifty_prices) - 1:
@@ -2258,11 +2269,13 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             log.info(f"  🔍 GRSE: stock_days={len(prices)}, nifty_days={len(nifty_prices)}, "
                      f"rawRS_valid_points={len(valid_pts)}, current_rawRS={current}, "
                      f"norm_window_hi={hi}, norm_window_lo={lo}, rs_tv={raw_tv}{stitch_note}")
-        # Sector-relative RS — percentile rank vs same sector peers
-        my_raw    = my_raw_val
-        my_sector = sym_to_sector.get(sym, 'Other')
-        sec_pool  = sector_raws.get(my_sector, [])
-        rs_sector = percentile_rank(sec_pool, my_raw) if my_raw is not None and len(sec_pool) >= 5 else None
+
+        # Sector-relative RS — TV-style vs a synthetic sector benchmark
+        # index (same method as Nifty/Midcap/Smallcap), replacing the old
+        # percentile-rank-vs-sector-peers approach for consistency.
+        my_sector    = sym_to_sector.get(sym, 'Other')
+        sector_bench = sector_index_prices.get(my_sector)
+        rs_sector = normalize_rs(calc_raw_rs_series(prices, sector_bench)) if sector_bench else None
 
         # RVOL — relative volume
         rvol_data = calc_rvol(volumes)
