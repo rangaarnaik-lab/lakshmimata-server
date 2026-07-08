@@ -1069,38 +1069,52 @@ async def fetch_upstox_fundamentals(session: aiohttp.ClientSession, sym: str, is
         except Exception:
             return None
 
+    async def get_with_retry(url):
+        """GET with one retry + backoff specifically for 429 (rate-limit)
+        responses — Upstox's fundamentals endpoints do have a real rate
+        limit (confirmed: hundreds of 429s once concurrency went up),
+        unlike Screener.in this is a normal, well-behaved API limit, not
+        adversarial blocking, so a short backoff and retry is the
+        appropriate fix rather than treating it as a hard failure."""
+        for attempt in (1, 2):
+            async with session.get(url, headers=headers,
+                                   timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status == 429 and attempt == 1:
+                    await asyncio.sleep(1.5 + random.uniform(0, 1.5))
+                    continue
+                if r.status == 200:
+                    return r.status, await r.json()
+                return r.status, None
+        return 429, None
+
     try:
-        async with session.get(
-            f"https://api.upstox.com/v2/fundamentals/{isin}/key-ratios",
-            headers=headers, timeout=aiohttp.ClientTimeout(total=10)
-        ) as r:
-            if debug:
-                log.info(f"  🔍 {sym} ({isin}) Upstox key-ratios: status={r.status}")
-            if r.status == 200:
-                data = await r.json()
-                if debug and _upstox_fundamentals_debug_count < 8:
-                    _upstox_fundamentals_debug_count += 1
-                    log.info(f"  🔍 {sym} key-ratios raw response: {json.dumps(data)[:1500]}")
-                items = data.get('data', [])
-                if isinstance(items, dict):
-                    items = [items]
-                ratio_map = {}
-                for item in items or []:
-                    if isinstance(item, dict) and item.get('name'):
-                        ratio_map[item['name']] = parse_num(item.get('company_value'))
-                if ratio_map:
-                    got_any = True
-                    result['pe']  = ratio_map.get('P/E') or ratio_map.get('PE')
-                    result['roe'] = ratio_map.get('ROE')
-                    # Market Cap/EPS/Debt-Equity aren't in this endpoint's
-                    # response (confirmed against real data) — left None
-                    # here so the Screener.in fallback fills them in.
-                else:
-                    _fetch_error_counts['upstox_key_ratios_empty_200'] = \
-                        _fetch_error_counts.get('upstox_key_ratios_empty_200', 0) + 1
+        status, data = await get_with_retry(f"https://api.upstox.com/v2/fundamentals/{isin}/key-ratios")
+        if debug:
+            log.info(f"  🔍 {sym} ({isin}) Upstox key-ratios: status={status}")
+        if status == 200:
+            if debug and _upstox_fundamentals_debug_count < 8:
+                _upstox_fundamentals_debug_count += 1
+                log.info(f"  🔍 {sym} key-ratios raw response: {json.dumps(data)[:1500]}")
+            items = data.get('data', [])
+            if isinstance(items, dict):
+                items = [items]
+            ratio_map = {}
+            for item in items or []:
+                if isinstance(item, dict) and item.get('name'):
+                    ratio_map[item['name']] = parse_num(item.get('company_value'))
+            if ratio_map:
+                got_any = True
+                result['pe']  = ratio_map.get('P/E') or ratio_map.get('PE')
+                result['roe'] = ratio_map.get('ROE')
+                # Market Cap/EPS/Debt-Equity aren't in this endpoint's
+                # response (confirmed against real data) — left None
+                # here so the Screener.in fallback fills them in.
             else:
-                key = f'upstox_key_ratios_status_{r.status}'
-                _fetch_error_counts[key] = _fetch_error_counts.get(key, 0) + 1
+                _fetch_error_counts['upstox_key_ratios_empty_200'] = \
+                    _fetch_error_counts.get('upstox_key_ratios_empty_200', 0) + 1
+        else:
+            key = f'upstox_key_ratios_status_{status}'
+            _fetch_error_counts[key] = _fetch_error_counts.get(key, 0) + 1
     except Exception as e:
         _fetch_error_counts[f'upstox_key_ratios_{type(e).__name__}'] = \
             _fetch_error_counts.get(f'upstox_key_ratios_{type(e).__name__}', 0) + 1
@@ -1108,65 +1122,61 @@ async def fetch_upstox_fundamentals(session: aiohttp.ClientSession, sym: str, is
             log.info(f"  🔍 {sym} Upstox key-ratios exception: {type(e).__name__}: {e}")
 
     try:
-        async with session.get(
-            f"https://api.upstox.com/v2/fundamentals/{isin}/share-holdings",
-            headers=headers, timeout=aiohttp.ClientTimeout(total=10)
-        ) as r:
-            if debug:
-                log.info(f"  🔍 {sym} ({isin}) Upstox share-holdings: status={r.status}")
-            if r.status == 200:
-                data = await r.json()
-                if debug and _upstox_shareholding_debug_count < 8:
-                    _upstox_shareholding_debug_count += 1
-                    log.info(f"  🔍 {sym} share-holdings raw response: {json.dumps(data)[:1500]}")
+        status, data = await get_with_retry(f"https://api.upstox.com/v2/fundamentals/{isin}/share-holdings")
+        if debug:
+            log.info(f"  🔍 {sym} ({isin}) Upstox share-holdings: status={status}")
+        if status == 200:
+            if debug and _upstox_shareholding_debug_count < 8:
+                _upstox_shareholding_debug_count += 1
+                log.info(f"  🔍 {sym} share-holdings raw response: {json.dumps(data)[:1500]}")
 
-                # Confirmed real shape: {"data": [{"category": "promoters",
-                # "history": [{"value": 25.08, "period": "Mar 2026"}, ...]},
-                # {"category": "fii", ...}, {"category": "other_dii", ...},
-                # {"category": "mutual_funds", ...}, {"category":
-                # "retail_and_other", ...}]} — history is ordered NEWEST
-                # FIRST. There's no single "dii" category; Upstox splits
-                # domestic institutional holders into other_dii +
-                # mutual_funds, so DII% here is their sum (matching the
-                # conventional FII/DII/Promoter/Retail breakdown).
-                items = data.get('data', [])
-                cat_history = {}
-                for entry in items or []:
-                    if isinstance(entry, dict) and entry.get('category'):
-                        cat_history[entry['category']] = entry.get('history') or []
+            # Confirmed real shape: {"data": [{"category": "promoters",
+            # "history": [{"value": 25.08, "period": "Mar 2026"}, ...]},
+            # {"category": "fii", ...}, {"category": "other_dii", ...},
+            # {"category": "mutual_funds", ...}, {"category":
+            # "retail_and_other", ...}]} — history is ordered NEWEST
+            # FIRST. There's no single "dii" category; Upstox splits
+            # domestic institutional holders into other_dii +
+            # mutual_funds, so DII% here is their sum (matching the
+            # conventional FII/DII/Promoter/Retail breakdown).
+            items = data.get('data', [])
+            cat_history = {}
+            for entry in items or []:
+                if isinstance(entry, dict) and entry.get('category'):
+                    cat_history[entry['category']] = entry.get('history') or []
 
-                def latest_prev(hist):
-                    vals = [parse_num(h.get('value')) for h in hist if isinstance(h, dict)]
-                    vals = [v for v in vals if v is not None]
-                    latest = vals[0] if len(vals) >= 1 else None
-                    prev   = vals[1] if len(vals) >= 2 else None
-                    return latest, prev
+            def latest_prev(hist):
+                vals = [parse_num(h.get('value')) for h in hist if isinstance(h, dict)]
+                vals = [v for v in vals if v is not None]
+                latest = vals[0] if len(vals) >= 1 else None
+                prev   = vals[1] if len(vals) >= 2 else None
+                return latest, prev
 
-                prom_latest, prom_prev = latest_prev(cat_history.get('promoters', []))
-                fii_latest,  fii_prev  = latest_prev(cat_history.get('fii', []))
-                dii1_latest, dii1_prev = latest_prev(cat_history.get('other_dii', []))
-                dii2_latest, dii2_prev = latest_prev(cat_history.get('mutual_funds', []))
+            prom_latest, prom_prev = latest_prev(cat_history.get('promoters', []))
+            fii_latest,  fii_prev  = latest_prev(cat_history.get('fii', []))
+            dii1_latest, dii1_prev = latest_prev(cat_history.get('other_dii', []))
+            dii2_latest, dii2_prev = latest_prev(cat_history.get('mutual_funds', []))
 
-                if prom_latest is not None:
-                    got_any = True
-                    result['promoter'] = prom_latest
-                    if prom_prev is not None:
-                        result['promoter_trend'] = round(prom_latest - prom_prev, 2)
-                if fii_latest is not None:
-                    got_any = True
-                    result['fii_pct'] = fii_latest
-                    if fii_prev is not None:
-                        result['fii_trend'] = round(fii_latest - fii_prev, 2)
-                if dii1_latest is not None or dii2_latest is not None:
-                    got_any = True
-                    dii_latest = (dii1_latest or 0) + (dii2_latest or 0)
-                    result['dii_pct'] = round(dii_latest, 2)
-                    if dii1_prev is not None or dii2_prev is not None:
-                        dii_prev = (dii1_prev or 0) + (dii2_prev or 0)
-                        result['dii_trend'] = round(dii_latest - dii_prev, 2)
-            else:
-                key = f'upstox_share_holdings_status_{r.status}'
-                _fetch_error_counts[key] = _fetch_error_counts.get(key, 0) + 1
+            if prom_latest is not None:
+                got_any = True
+                result['promoter'] = prom_latest
+                if prom_prev is not None:
+                    result['promoter_trend'] = round(prom_latest - prom_prev, 2)
+            if fii_latest is not None:
+                got_any = True
+                result['fii_pct'] = fii_latest
+                if fii_prev is not None:
+                    result['fii_trend'] = round(fii_latest - fii_prev, 2)
+            if dii1_latest is not None or dii2_latest is not None:
+                got_any = True
+                dii_latest = (dii1_latest or 0) + (dii2_latest or 0)
+                result['dii_pct'] = round(dii_latest, 2)
+                if dii1_prev is not None or dii2_prev is not None:
+                    dii_prev = (dii1_prev or 0) + (dii2_prev or 0)
+                    result['dii_trend'] = round(dii_latest - dii_prev, 2)
+        else:
+            key = f'upstox_share_holdings_status_{status}'
+            _fetch_error_counts[key] = _fetch_error_counts.get(key, 0) + 1
     except Exception as e:
         _fetch_error_counts[f'upstox_share_holdings_{type(e).__name__}'] = \
             _fetch_error_counts.get(f'upstox_share_holdings_{type(e).__name__}', 0) + 1
@@ -1645,12 +1655,12 @@ async def load_fundamentals_batch(session: aiohttp.ClientSession, symbols: list)
         return await fetch_fundamentals_screener(session, sym, debug=debug)
 
     global _fundamentals_debug_count
-    # Upstox's fundamentals API is a real authenticated endpoint, not
-    # scraping — safe to run much faster than the old Screener.in-only
-    # pace. The Screener.in fallback path (for symbols Upstox can't
-    # resolve) still goes through fetch_fundamentals_screener's own
-    # rotating headers, so it stays gentle even at this batch size.
-    BATCH = 20
+    # Confirmed via the error-type summary: BATCH=20 (x2 endpoints per
+    # stock = ~40 concurrent requests) was hitting Upstox's own rate
+    # limit hard — hundreds of 429s per run. Reduced to ease pressure;
+    # combined with the 429-retry-with-backoff in get_with_retry above,
+    # this should recover most of what was previously rate-limited.
+    BATCH = 8
     fetched = 0
     rows_to_save: list = []
     for i in range(0, len(to_fetch), BATCH):
