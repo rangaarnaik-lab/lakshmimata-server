@@ -1258,8 +1258,13 @@ async def load_fundamentals_from_supabase(session: aiohttp.ClientSession) -> lis
 
     now = time.time()
     loaded = 0
+    blank = 0
     stale_or_missing: list = []
     found_syms: set = set()
+    DATA_FIELDS = ('market_cap', 'pe', 'roe', 'eps', 'debt_eq', 'promoter',
+                   'eps_qoq', 'eps_yoy', 'sales_qoq', 'sales_yoy', 'opm_pct',
+                   'opm_trend', 'eps_growth_streak', 'fii_pct', 'fii_trend',
+                   'dii_pct', 'dii_trend', 'promoter_trend', 'peg_ratio')
 
     for row in all_rows:
         sym = row.get('sym')
@@ -1286,14 +1291,26 @@ async def load_fundamentals_from_supabase(session: aiohttp.ClientSession) -> lis
             'fetched_at': fetched_at_ts,
         }
         loaded += 1
-        if (now - fetched_at_ts) > FUNDAMENTALS_TTL:
+        is_blank = all(row.get(f) is None for f in DATA_FIELDS)
+        if is_blank:
+            blank += 1
+        # A row that's entirely blank means the scrape failed to extract
+        # anything useful (Screener.in rate-limit/block, page structure
+        # mismatch, etc.) — that's fundamentally different from "we
+        # successfully confirmed this stock has no data," so retry it
+        # regardless of how fresh the fetched_at timestamp is. Without
+        # this, a stock unlucky enough to get blocked once stays blank
+        # for a full 7-day TTL window before ever being retried.
+        if is_blank or (now - fetched_at_ts) > FUNDAMENTALS_TTL:
             stale_or_missing.append(sym)
 
     missing_entirely = [s for s in ALL_STOCKS if s not in found_syms]
     stale_or_missing.extend(missing_entirely)
 
     log.info(f"📊 Loaded {loaded} stocks' fundamentals from Supabase (0 Screener.in requests) — "
-             f"{len(stale_or_missing)} need fetching (missing or >{FUNDAMENTALS_TTL//86400}d stale)")
+             f"{blank} are blank (all fields None — scrape failed, will retry), "
+             f"{len(stale_or_missing)} total need fetching (blank, missing, or "
+             f">{FUNDAMENTALS_TTL//86400}d stale)")
     return stale_or_missing
 
 
@@ -1357,9 +1374,18 @@ async def load_fundamentals_at_startup(session: aiohttp.ClientSession):
 async def load_fundamentals_batch(session: aiohttp.ClientSession, symbols: list):
     """Fetch fundamentals for a batch of symbols, respecting TTL cache."""
     now = time.time()
+    DATA_FIELDS = ('market_cap', 'pe', 'roe', 'eps', 'debt_eq', 'promoter',
+                   'eps_qoq', 'eps_yoy', 'sales_qoq', 'sales_yoy', 'opm_pct',
+                   'opm_trend', 'eps_growth_streak', 'fii_pct', 'fii_trend',
+                   'dii_pct', 'dii_trend', 'promoter_trend', 'peg_ratio')
+    def is_blank_cache(sym):
+        c = fundamentals_cache.get(sym)
+        return c is not None and all(c.get(f) is None for f in DATA_FIELDS)
+
     to_fetch = [
         sym for sym in symbols
         if sym not in fundamentals_cache
+        or is_blank_cache(sym)  # scrape failed last time — don't wait out the TTL
         or (now - fundamentals_cache[sym].get('fetched_at', 0)) > FUNDAMENTALS_TTL
     ]
     if not to_fetch:
