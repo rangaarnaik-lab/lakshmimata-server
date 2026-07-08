@@ -17,6 +17,7 @@ import sys
 import time
 import json
 import math
+import random
 import asyncio
 import aiohttp
 import logging
@@ -986,6 +987,44 @@ async def fetch_instruments(session: aiohttp.ClientSession) -> list:
         log.info(f"Fetched {len(instruments)} NSE equity instruments")
         return instruments
 
+_SCREENER_HEADER_SETS = [
+    {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "Upgrade-Insecure-Requests": "1",
+        "Referer": "https://www.google.com/",
+    },
+    {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+                      "(KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.screener.in/",
+    },
+    {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Referer": "https://www.google.com/",
+    },
+    {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-IN,en;q=0.9",
+        "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Linux"',
+        "Referer": "https://www.screener.in/",
+    },
+]
+
+
 async def fetch_fundamentals_screener(session: aiohttp.ClientSession, sym: str, debug: bool = False) -> dict:
     """
     Scrape fundamental data from Screener.in company page.
@@ -996,12 +1035,17 @@ async def fetch_fundamentals_screener(session: aiohttp.ClientSession, sym: str, 
       sales_qoq/sales_yoy, opm_pct/opm_trend (margin + direction),
       eps_growth_streak (consecutive quarters of EPS growth),
       fii_pct/fii_trend, dii_pct/dii_trend, promoter_trend, peg_ratio
+
+    NOTE: ~98% of fetches were coming back blank in earlier testing — far
+    too high to be individual page-structure mismatches, more consistent
+    with Screener.in rate-limiting/blocking requests from Railway's
+    datacenter IP. A single hardcoded User-Agent with minimal headers is
+    itself a bot-detection signal, so this rotates between several
+    realistic full browser header sets (UA + Accept-Language + sec-ch-ua
+    etc.) to look more like normal traffic.
     """
     url = f"https://www.screener.in/company/{sym}/consolidated/"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "text/html,application/xhtml+xml",
-    }
+    headers = random.choice(_SCREENER_HEADER_SETS)
     result = {
         'market_cap': None, 'pe': None, 'roe': None, 'eps': None, 'debt_eq': None, 'promoter': None,
         'eps_qoq': None, 'eps_yoy': None, 'sales_qoq': None, 'sales_yoy': None,
@@ -1025,6 +1069,8 @@ async def fetch_fundamentals_screener(session: aiohttp.ClientSession, sym: str, 
                         return result
                     html = await r2.text()
             elif r.status != 200:
+                if r.status in (429, 503):
+                    log.warning(f"  ⚠️ {sym}: status {r.status} — looks like rate-limiting/blocking, not a normal error")
                 if debug:
                     log.info(f"  🔍 {sym}: non-200/404 status ({r.status}), returning blank result")
                 return result
@@ -1441,7 +1487,9 @@ async def load_fundamentals_batch(session: aiohttp.ClientSession, symbols: list)
                 'sym': sym, **{k: v for k, v in data.items() if k != 'fetched_at'},
                 'fetched_at': datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
             })
-        await asyncio.sleep(1)  # be gentle with Screener.in
+        await asyncio.sleep(1.2 + random.uniform(0, 1.3))  # jittered — a fixed
+        # 1s delay every batch is itself a bot-detection signal; random
+        # spacing looks more like normal traffic
 
         # Persist incrementally — a slow scrape (8-15+ min for the full
         # universe) shouldn't lose everything if the process restarts
