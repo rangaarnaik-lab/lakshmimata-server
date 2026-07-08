@@ -1034,17 +1034,20 @@ async def fetch_upstox_fundamentals(session: aiohttp.ClientSession, sym: str, is
     bot-detection/rate-limiting risk at all, since it's not scraping.
 
     Uses two endpoints:
-    - /v2/fundamentals/{isin}/key-ratios — P/E, ROE, EPS, Debt/Equity,
-      Market Cap, and quarterly EPS/Sales/OPM trend data
+    - /v2/fundamentals/{isin}/key-ratios — confirmed real shape (from
+      debug logging against live data) is NOT flat keys but a list of
+      {"name": "P/E", "company_value": "21.46", "sector_value": "21.45"}
+      entries. Confirmed available ratio names seen so far: P/E, P/B,
+      ROA, ROE, ROCE, EV/EBITDA, Quick Ratio. Market Cap/EPS/Debt-Equity
+      do NOT appear in this endpoint's response — those still come from
+      the Screener.in fallback (merged in, not replaced — see
+      load_fundamentals_batch's fetch_one_fundamentals).
     - /v2/fundamentals/{isin}/share-holdings — Promoter/FII/DII % + trend
-
-    NOTE: exact response field names are being verified against real
-    responses via the debug logging below for the first several calls —
-    Upstox's public docs don't have a fully confirmed sample response for
-    key-ratios at the time this was written, so field mapping may need a
-    follow-up adjustment once we see real data.
+      (shape not yet confirmed — debug logging below will show it on
+      the next run, since key-ratios calls exhausted the previous
+      shared debug budget before any share-holdings response got logged)
     """
-    global _upstox_fundamentals_debug_count
+    global _upstox_fundamentals_debug_count, _upstox_shareholding_debug_count
     headers = {"Authorization": f"Bearer {ANALYTICS_TOKEN}", "Accept": "application/json"}
     result = {
         'market_cap': None, 'pe': None, 'roe': None, 'eps': None, 'debt_eq': None, 'promoter': None,
@@ -1054,6 +1057,17 @@ async def fetch_upstox_fundamentals(session: aiohttp.ClientSession, sym: str, is
         'promoter_trend': None, 'peg_ratio': None,
     }
     got_any = False
+
+    def parse_num(v):
+        """Upstox returns ratio values as strings like '21.46' or '14.59%'."""
+        if v is None:
+            return None
+        if isinstance(v, (int, float)):
+            return float(v)
+        try:
+            return float(str(v).replace('%', '').replace(',', '').strip())
+        except Exception:
+            return None
 
     try:
         async with session.get(
@@ -1067,27 +1081,20 @@ async def fetch_upstox_fundamentals(session: aiohttp.ClientSession, sym: str, is
                 if debug and _upstox_fundamentals_debug_count < 8:
                     _upstox_fundamentals_debug_count += 1
                     log.info(f"  🔍 {sym} key-ratios raw response: {json.dumps(data)[:1500]}")
-                payload = data.get('data', data)
-                if isinstance(payload, list):
-                    payload = payload[0] if payload else {}
-                if isinstance(payload, dict) and payload:
+                items = data.get('data', [])
+                if isinstance(items, dict):
+                    items = [items]
+                ratio_map = {}
+                for item in items or []:
+                    if isinstance(item, dict) and item.get('name'):
+                        ratio_map[item['name']] = parse_num(item.get('company_value'))
+                if ratio_map:
                     got_any = True
-
-                    def pick(*keys):
-                        for k in keys:
-                            v = payload.get(k)
-                            if v is not None:
-                                if isinstance(v, dict):
-                                    v = v.get('value', v.get('formatted'))
-                                return v
-                        return None
-
-                    result['market_cap'] = pick('market_cap', 'marketCap', 'market_capitalization')
-                    result['pe']         = pick('pe_ratio', 'pe', 'price_to_earnings')
-                    result['roe']        = pick('roe', 'return_on_equity')
-                    result['eps']        = pick('eps', 'earnings_per_share')
-                    result['debt_eq']    = pick('debt_to_equity', 'debt_equity', 'debtEquity')
-                    result['opm_pct']    = pick('operating_margin', 'opm', 'operating_profit_margin')
+                    result['pe']  = ratio_map.get('P/E') or ratio_map.get('PE')
+                    result['roe'] = ratio_map.get('ROE')
+                    # Market Cap/EPS/Debt-Equity aren't in this endpoint's
+                    # response (confirmed against real data) — left None
+                    # here so the Screener.in fallback fills them in.
     except Exception as e:
         if debug:
             log.info(f"  🔍 {sym} Upstox key-ratios exception: {type(e).__name__}: {e}")
@@ -1101,7 +1108,8 @@ async def fetch_upstox_fundamentals(session: aiohttp.ClientSession, sym: str, is
                 log.info(f"  🔍 {sym} ({isin}) Upstox share-holdings: status={r.status}")
             if r.status == 200:
                 data = await r.json()
-                if debug and _upstox_fundamentals_debug_count < 8:
+                if debug and _upstox_shareholding_debug_count < 8:
+                    _upstox_shareholding_debug_count += 1
                     log.info(f"  🔍 {sym} share-holdings raw response: {json.dumps(data)[:1500]}")
                 payload = data.get('data', data)
                 periods = payload if isinstance(payload, list) else payload.get('periods', [])
@@ -1114,7 +1122,7 @@ async def fetch_upstox_fundamentals(session: aiohttp.ClientSession, sym: str, is
                         for k in keys:
                             v = d.get(k)
                             if v is not None:
-                                return v
+                                return parse_num(v)
                         return None
 
                     result['promoter'] = num(latest, 'promoters', 'promoter', 'promoter_holding')
@@ -1334,6 +1342,7 @@ fundamentals_cache: dict = {}  # sym -> {market_cap, pe, roe, eps, debt_eq, prom
 FUNDAMENTALS_TTL = 7 * 24 * 3600  # refresh weekly (data changes quarterly)
 _fundamentals_debug_count = 0  # caps detailed per-request diagnostic logging
 _upstox_fundamentals_debug_count = 0  # caps raw-response logging for the new Upstox fundamentals API
+_upstox_shareholding_debug_count = 0  # separate budget so share-holdings isn't starved by key-ratios logging
 
 async def ensure_fundamentals_table(session: aiohttp.ClientSession,
                                      retries: int = 6, delay: float = 10.0) -> bool:
@@ -1582,12 +1591,18 @@ async def load_fundamentals_batch(session: aiohttp.ClientSession, symbols: list)
 
     async def fetch_one_fundamentals(sym, debug):
         isin = isin_for(sym)
-        if isin:
-            data = await fetch_upstox_fundamentals(session, sym, isin, debug=debug)
-            if data:
-                return data
-        # Fallback to scraping only if Upstox has no ISIN for this symbol
-        # or its fundamentals API didn't return anything usable.
+        upstox_data = await fetch_upstox_fundamentals(session, sym, isin, debug=debug) if isin else None
+        if upstox_data is not None:
+            # Upstox succeeded — use it as-is. Note key-ratios doesn't
+            # include Market Cap/EPS/Debt-Equity (confirmed against real
+            # responses), so those stay None here. Falling back to
+            # Screener.in for just those 3 fields would mean scraping
+            # EVERY stock again (since they're always missing from
+            # Upstox), defeating the point of moving off scraping — so
+            # this is a deliberate trade-off, not an oversight. Getting
+            # those 3 fields from a different Upstox endpoint (company
+            # profile / balance sheet) is a reasonable follow-up.
+            return upstox_data
         return await fetch_fundamentals_screener(session, sym, debug=debug)
 
     global _fundamentals_debug_count
