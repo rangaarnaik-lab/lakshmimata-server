@@ -971,7 +971,7 @@ async def fetch_instruments(session: aiohttp.ClientSession) -> list:
         log.info(f"Fetched {len(instruments)} NSE equity instruments")
         return instruments
 
-async def fetch_fundamentals_screener(session: aiohttp.ClientSession, sym: str) -> dict:
+async def fetch_fundamentals_screener(session: aiohttp.ClientSession, sym: str, debug: bool = False) -> dict:
     """
     Scrape fundamental data from Screener.in company page.
     Free, no auth needed. Returns two families of data:
@@ -997,27 +997,31 @@ async def fetch_fundamentals_screener(session: aiohttp.ClientSession, sym: str) 
     try:
         async with session.get(url, headers=headers,
                                timeout=aiohttp.ClientTimeout(total=10)) as r:
-            if sym == 'TARSONS':
-                log.info(f"  🔍 TARSONS fetch: url={url}, status={r.status}")
+            if sym == 'TARSONS' or debug:
+                log.info(f"  🔍 {sym} fetch: url={url}, status={r.status}")
             if r.status == 404:
                 # Try standalone (non-consolidated)
                 url2 = f"https://www.screener.in/company/{sym}/"
                 async with session.get(url2, headers=headers,
                                        timeout=aiohttp.ClientTimeout(total=10)) as r2:
-                    if sym == 'TARSONS':
-                        log.info(f"  🔍 TARSONS fallback fetch: url={url2}, status={r2.status}")
+                    if sym == 'TARSONS' or debug:
+                        log.info(f"  🔍 {sym} fallback fetch: url={url2}, status={r2.status}")
                     if r2.status != 200:
                         return result
                     html = await r2.text()
             elif r.status != 200:
+                if debug:
+                    log.info(f"  🔍 {sym}: non-200/404 status ({r.status}), returning blank result")
                 return result
             else:
                 html = await r.text()
 
-        if sym == 'TARSONS':
-            log.info(f"  🔍 TARSONS html length={len(html)}, "
+        if sym == 'TARSONS' or debug:
+            log.info(f"  🔍 {sym} html length={len(html)}, "
                      f"has_market_cap_text={'Market Cap' in html}, "
-                     f"has_eps_row={'EPS in Rs' in html}")
+                     f"has_eps_row={'EPS in Rs' in html}, "
+                     f"has_captcha_or_challenge={'captcha' in html.lower() or 'cloudflare' in html.lower() or 'cf-' in html.lower()}, "
+                     f"html_snippet={html[:200]!r}")
 
         import re
 
@@ -1149,13 +1153,14 @@ async def fetch_fundamentals_screener(session: aiohttp.ClientSession, sym: str) 
                     result['promoter'] = float(prom_m2.group(1))
 
     except Exception as e:
-        if sym == 'TARSONS':
-            log.info(f"  🔍 TARSONS fetch raised exception: {type(e).__name__}: {e}")
+        if sym == 'TARSONS' or debug:
+            log.info(f"  🔍 {sym} fetch raised exception: {type(e).__name__}: {e}")
     return result
 
 # Cache fundamentals to avoid re-fetching every minute
 fundamentals_cache: dict = {}  # sym -> {market_cap, pe, roe, eps, debt_eq, promoter, fetched_at}
 FUNDAMENTALS_TTL = 7 * 24 * 3600  # refresh weekly (data changes quarterly)
+_fundamentals_debug_count = 0  # caps detailed per-request diagnostic logging
 
 async def ensure_fundamentals_table(session: aiohttp.ClientSession,
                                      retries: int = 6, delay: float = 10.0) -> bool:
@@ -1397,19 +1402,24 @@ async def load_fundamentals_batch(session: aiohttp.ClientSession, symbols: list)
     elif 'TARSONS' in symbols:
         cached = fundamentals_cache.get('TARSONS', {})
         log.info(f"  🔍 TARSONS NOT in to_fetch (already cached, not stale) — cached data: {cached}")
+
+    global _fundamentals_debug_count
     BATCH = 5  # small batches to be respectful
     fetched = 0
     rows_to_save: list = []
     for i in range(0, len(to_fetch), BATCH):
         batch = to_fetch[i:i+BATCH]
+        debug_this_batch = _fundamentals_debug_count < 10
         results = await asyncio.gather(*[
-            fetch_fundamentals_screener(session, sym) for sym in batch
+            fetch_fundamentals_screener(session, sym, debug=debug_this_batch) for sym in batch
         ])
         for sym, data in zip(batch, results):
             data['fetched_at'] = now
             fundamentals_cache[sym] = data
             if any(v is not None for k, v in data.items() if k != 'fetched_at'):
                 fetched += 1
+            elif debug_this_batch:
+                _fundamentals_debug_count += 1
             if sym == 'TARSONS':
                 log.info(f"  🔍 TARSONS scrape result: {data}")
             rows_to_save.append({
