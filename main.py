@@ -1947,16 +1947,20 @@ async def load_index_cache(session: aiohttp.ClientSession):
         # Newer additions — exact Upstox naming for these is less certain
         # than the well-established ones above, so try a few common
         # variants each (same self-healing approach as Mid/Small/Microcap).
-        "Defence":            ["NSE_INDEX|Nifty India Defence", "NSE_INDEX|Nifty Defence"],
+        "Defence":            ["NSE_INDEX|Nifty India Defence", "NSE_INDEX|Nifty Defence",
+                                "NSE_INDEX|NIFTY INDIA DEFENCE"],
         "Financial Services": ["NSE_INDEX|Nifty Fin Service", "NSE_INDEX|Nifty Financial Services"],
         "PSU Bank":           ["NSE_INDEX|Nifty PSU Bank"],
         "Private Bank":       ["NSE_INDEX|Nifty Pvt Bank", "NSE_INDEX|Nifty Private Bank"],
         "PSE":                ["NSE_INDEX|Nifty PSE"],
         "Media":              ["NSE_INDEX|Nifty Media"],
         "Infrastructure":     ["NSE_INDEX|Nifty Infra", "NSE_INDEX|Nifty Infrastructure"],
-        "Healthcare":         ["NSE_INDEX|Nifty Healthcare", "NSE_INDEX|Nifty Healthcare Index"],
-        "Consumer Durables":  ["NSE_INDEX|Nifty Consr Durable", "NSE_INDEX|Nifty Consumer Durables"],
-        "Oil & Gas":          ["NSE_INDEX|Nifty Oil & Gas", "NSE_INDEX|Nifty Oil and Gas"],
+        "Healthcare":         ["NSE_INDEX|Nifty Healthcare", "NSE_INDEX|Nifty Healthcare Index",
+                                "NSE_INDEX|NIFTY HEALTHCARE INDEX"],
+        "Consumer Durables":  ["NSE_INDEX|Nifty Consr Durable", "NSE_INDEX|Nifty Consumer Durables",
+                                "NSE_INDEX|NIFTY CONSR DURABLE"],
+        "Oil & Gas":          ["NSE_INDEX|Nifty Oil & Gas", "NSE_INDEX|Nifty Oil and Gas",
+                                "NSE_INDEX|NIFTY OIL & GAS"],
         "Chemicals":          ["NSE_INDEX|Nifty Chemicals"],
         "Commodities":        ["NSE_INDEX|Nifty Commodities"],
         "MNC":                ["NSE_INDEX|Nifty MNC"],
@@ -1969,7 +1973,7 @@ async def load_index_cache(session: aiohttp.ClientSession):
             keys_to_try = [ikey] + keys_to_try
         success = False
         for try_key in keys_to_try:
-            encoded = try_key.replace('|', '%7C').replace(' ', '%20')
+            encoded = try_key.replace('|', '%7C').replace(' ', '%20').replace('&', '%26')
             url = f"https://api.upstox.com/v2/historical-candle/{encoded}/day/{to}/{from_}"
             try:
                 async with session.get(url, headers=headers,
