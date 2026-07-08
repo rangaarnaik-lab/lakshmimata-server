@@ -1111,32 +1111,51 @@ async def fetch_upstox_fundamentals(session: aiohttp.ClientSession, sym: str, is
                 if debug and _upstox_shareholding_debug_count < 8:
                     _upstox_shareholding_debug_count += 1
                     log.info(f"  🔍 {sym} share-holdings raw response: {json.dumps(data)[:1500]}")
-                payload = data.get('data', data)
-                periods = payload if isinstance(payload, list) else payload.get('periods', [])
-                if periods:
+
+                # Confirmed real shape: {"data": [{"category": "promoters",
+                # "history": [{"value": 25.08, "period": "Mar 2026"}, ...]},
+                # {"category": "fii", ...}, {"category": "other_dii", ...},
+                # {"category": "mutual_funds", ...}, {"category":
+                # "retail_and_other", ...}]} — history is ordered NEWEST
+                # FIRST. There's no single "dii" category; Upstox splits
+                # domestic institutional holders into other_dii +
+                # mutual_funds, so DII% here is their sum (matching the
+                # conventional FII/DII/Promoter/Retail breakdown).
+                items = data.get('data', [])
+                cat_history = {}
+                for entry in items or []:
+                    if isinstance(entry, dict) and entry.get('category'):
+                        cat_history[entry['category']] = entry.get('history') or []
+
+                def latest_prev(hist):
+                    vals = [parse_num(h.get('value')) for h in hist if isinstance(h, dict)]
+                    vals = [v for v in vals if v is not None]
+                    latest = vals[0] if len(vals) >= 1 else None
+                    prev   = vals[1] if len(vals) >= 2 else None
+                    return latest, prev
+
+                prom_latest, prom_prev = latest_prev(cat_history.get('promoters', []))
+                fii_latest,  fii_prev  = latest_prev(cat_history.get('fii', []))
+                dii1_latest, dii1_prev = latest_prev(cat_history.get('other_dii', []))
+                dii2_latest, dii2_prev = latest_prev(cat_history.get('mutual_funds', []))
+
+                if prom_latest is not None:
                     got_any = True
-                    latest = periods[-1] if isinstance(periods[-1], dict) else {}
-                    prev   = periods[-2] if len(periods) >= 2 and isinstance(periods[-2], dict) else {}
-
-                    def num(d, *keys):
-                        for k in keys:
-                            v = d.get(k)
-                            if v is not None:
-                                return parse_num(v)
-                        return None
-
-                    result['promoter'] = num(latest, 'promoters', 'promoter', 'promoter_holding')
-                    result['fii_pct']  = num(latest, 'fii', 'fiis', 'fii_holding')
-                    result['dii_pct']  = num(latest, 'dii', 'diis', 'dii_holding')
-                    prom_prev = num(prev, 'promoters', 'promoter', 'promoter_holding')
-                    fii_prev  = num(prev, 'fii', 'fiis', 'fii_holding')
-                    dii_prev  = num(prev, 'dii', 'diis', 'dii_holding')
-                    if result['promoter'] is not None and prom_prev is not None:
-                        result['promoter_trend'] = round(result['promoter'] - prom_prev, 2)
-                    if result['fii_pct'] is not None and fii_prev is not None:
-                        result['fii_trend'] = round(result['fii_pct'] - fii_prev, 2)
-                    if result['dii_pct'] is not None and dii_prev is not None:
-                        result['dii_trend'] = round(result['dii_pct'] - dii_prev, 2)
+                    result['promoter'] = prom_latest
+                    if prom_prev is not None:
+                        result['promoter_trend'] = round(prom_latest - prom_prev, 2)
+                if fii_latest is not None:
+                    got_any = True
+                    result['fii_pct'] = fii_latest
+                    if fii_prev is not None:
+                        result['fii_trend'] = round(fii_latest - fii_prev, 2)
+                if dii1_latest is not None or dii2_latest is not None:
+                    got_any = True
+                    dii_latest = (dii1_latest or 0) + (dii2_latest or 0)
+                    result['dii_pct'] = round(dii_latest, 2)
+                    if dii1_prev is not None or dii2_prev is not None:
+                        dii_prev = (dii1_prev or 0) + (dii2_prev or 0)
+                        result['dii_trend'] = round(dii_latest - dii_prev, 2)
     except Exception as e:
         if debug:
             log.info(f"  🔍 {sym} Upstox share-holdings exception: {type(e).__name__}: {e}")
