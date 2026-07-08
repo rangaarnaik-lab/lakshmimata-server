@@ -1766,6 +1766,26 @@ async def ensure_db_columns(session: aiohttp.ClientSession):
     except Exception as e:
         log.warning(f"DB column check error (fundamentals growth): {e}")
 
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/index_dashboard?select=rank_d&limit=1",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ DB columns OK — rank_d (index performance ranks) column exists")
+            elif r.status == 400:
+                log.error("❌ rank_d/rank_w/rank_m columns MISSING from index_dashboard table! "
+                          "The index dashboard upsert may be failing entirely until this is fixed.")
+                log.error("   → Go to Supabase SQL Editor and run:")
+                log.error("   alter table public.index_dashboard")
+                log.error("     add column if not exists rank_d int,")
+                log.error("     add column if not exists rank_w int,")
+                log.error("     add column if not exists rank_m int,")
+                log.error("     add column if not exists total_indices int;")
+    except Exception as e:
+        log.warning(f"DB column check error (index ranks): {e}")
+
 
 
 
@@ -3320,6 +3340,17 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'bot_stocks':    json.dumps(bot_stocks),
             'last_updated':  now_ist.isoformat(),
         })
+
+    # Rank each index's daily/weekly/monthly performance against all other
+    # indices (1 = best performer for that timeframe). Needs a second pass
+    # since ranking requires seeing every index's chg value first.
+    for field, rank_field in (('chg_d', 'rank_d'), ('chg_w', 'rank_w'), ('chg_m', 'rank_m')):
+        ordered = sorted(index_rows, key=lambda r: r[field], reverse=True)
+        for rank, row in enumerate(ordered, start=1):
+            row[rank_field] = rank
+    total_indices = len(index_rows)
+    for row in index_rows:
+        row['total_indices'] = total_indices
 
     if index_rows:
         await supabase_upsert(session, 'index_dashboard', index_rows, on_conflict='name')
