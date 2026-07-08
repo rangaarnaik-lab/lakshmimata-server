@@ -735,12 +735,27 @@ def build_sector_rs(processed: list, sector_map: dict) -> list:
         pp_count = sum(1 for s in members if s.get('is_pp'))
         improving= sum(1 for s in members if s.get('rs_trend') == 'improving')
         top5     = sorted(members, key=lambda x: x['rs'], reverse=True)[:5]
+
+        # Breadth — % of this sector's stocks advancing at each timeframe.
+        # Matches the "Segment Advances %" concept: not just "is the
+        # sector index up", but "how broad is the move across its members"
+        # (a sector up 2% on one large-cap carrying it looks very
+        # different from one up 2% with 80% of members participating).
+        def advance_pct(field):
+            vals = [s.get(field) for s in members if s.get(field) is not None]
+            if not vals:
+                return None
+            return round(sum(1 for v in vals if v > 0) / len(vals) * 100, 2)
+
         sectors.append({
             'sector':   sector,
             'avg_rs':   avg_rs,
             'count':    len(members),
             'pp_count': pp_count,
             'improving':improving,
+            'advances_d': advance_pct('chg_pct'),
+            'advances_w': advance_pct('chg_w_pct'),
+            'advances_m': advance_pct('chg_m_pct'),
             'top_stocks': [{'sym': s['sym'], 'rs': s['rs']} for s in top5],
         })
     sectors.sort(key=lambda x: x['avg_rs'], reverse=True)
@@ -1768,23 +1783,46 @@ async def ensure_db_columns(session: aiohttp.ClientSession):
 
     try:
         async with session.get(
-            f"{SUPABASE_URL}/rest/v1/index_dashboard?select=rank_d&limit=1",
+            f"{SUPABASE_URL}/rest/v1/index_dashboard?select=rank_d,advances_d&limit=1",
             headers=headers,
             timeout=aiohttp.ClientTimeout(total=10)
         ) as r:
             if r.status == 200:
-                log.info("✅ DB columns OK — rank_d (index performance ranks) column exists")
+                log.info("✅ DB columns OK — rank_d/advances_d (index ranks + breadth) columns exist")
             elif r.status == 400:
-                log.error("❌ rank_d/rank_w/rank_m columns MISSING from index_dashboard table! "
-                          "The index dashboard upsert may be failing entirely until this is fixed.")
+                log.error("❌ rank_d/rank_w/rank_m/advances_d/advances_w/advances_m columns MISSING "
+                          "from index_dashboard table! The index dashboard upsert may be failing "
+                          "entirely until this is fixed.")
                 log.error("   → Go to Supabase SQL Editor and run:")
                 log.error("   alter table public.index_dashboard")
                 log.error("     add column if not exists rank_d int,")
                 log.error("     add column if not exists rank_w int,")
                 log.error("     add column if not exists rank_m int,")
-                log.error("     add column if not exists total_indices int;")
+                log.error("     add column if not exists total_indices int,")
+                log.error("     add column if not exists advances_d numeric,")
+                log.error("     add column if not exists advances_w numeric,")
+                log.error("     add column if not exists advances_m numeric;")
     except Exception as e:
-        log.warning(f"DB column check error (index ranks): {e}")
+        log.warning(f"DB column check error (index ranks/breadth): {e}")
+
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/sectors?select=advances_d&limit=1",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ DB columns OK — advances_d (sector breadth) column exists")
+            elif r.status == 400:
+                log.error("❌ advances_d/advances_w/advances_m columns MISSING from sectors table! "
+                          "The sectors upsert may be failing entirely until this is fixed.")
+                log.error("   → Go to Supabase SQL Editor and run:")
+                log.error("   alter table public.sectors")
+                log.error("     add column if not exists advances_d numeric,")
+                log.error("     add column if not exists advances_w numeric,")
+                log.error("     add column if not exists advances_m numeric;")
+    except Exception as e:
+        log.warning(f"DB column check error (sector breadth): {e}")
 
 
 
@@ -3014,6 +3052,11 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         chg = round((last - prev) / prev * 100, 2) if prev else 0
         vol = live.get('volume') if live.get('volume') else (volumes[n-1] if volumes else 0)
 
+        # Weekly/monthly % change per stock — needed for sector breadth
+        # (% of stocks advancing) at each timeframe, not just daily.
+        chg_w = round((last - prices[n-6])  / prices[n-6]  * 100, 2) if n >= 6  and prices[n-6]  else None
+        chg_m = round((last - prices[n-22]) / prices[n-22] * 100, 2) if n >= 22 and prices[n-22] else None
+
         if sym == 'RRKABEL':
             log.info(f"  🔍 RRKABEL chg-calc: n={n}, dates_last3={dates_for_sym[-3:] if dates_for_sym else None}, "
                      f"today_str={today_str}, prices_last_is_today={prices_last_is_today}, "
@@ -3076,6 +3119,8 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'close':          round(last, 2),
             'prev_close':     round(prev, 2),
             'chg_pct':        chg,
+            'chg_w_pct':      chg_w,
+            'chg_m_pct':      chg_m,
             'volume':         int(vol),
             'rs':             rs,
             'rs_tv':          raw_tv,
@@ -3305,6 +3350,7 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
 
         # Top 3 stocks in this index from our scan (only for constituent indices)
         top_stocks = []
+        adv_d = adv_w = adv_m = None
         constituent_map = {
             'Nifty 50':    [s for s in processed if s.get('in_nifty50')],
             'Midcap 150':  [s for s in processed if s.get('in_midcap')],
@@ -3317,6 +3363,17 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             bot3    = sorted(members, key=lambda x: x.get('rs_tv') or x.get('rs') or 0)[:3]
             top_stocks = [{'sym':s['sym'],'rs':s.get('rs_tv') or s.get('rs')} for s in top3]
             bot_stocks = [{'sym':s['sym'],'rs':s.get('rs_tv') or s.get('rs')} for s in bot3]
+
+            # Breadth — % of this index's constituent stocks advancing at
+            # each timeframe (same concept as sector breadth). Two indices
+            # both "up 1% today" look very different if one has 90% of
+            # members participating vs one carried by a handful of names.
+            def _adv_pct(field):
+                vals = [m.get(field) for m in members if m.get(field) is not None]
+                return round(sum(1 for v in vals if v > 0) / len(vals) * 100, 2) if vals else None
+            adv_d = _adv_pct('chg_pct')
+            adv_w = _adv_pct('chg_w_pct')
+            adv_m = _adv_pct('chg_m_pct')
         else:
             bot_stocks = []
 
@@ -3336,6 +3393,9 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'high_52w':      round(h52, 2),
             'low_52w':       round(l52, 2),
             'pct_from_high': pct_from_high,
+            'advances_d':    adv_d,
+            'advances_w':    adv_w,
+            'advances_m':    adv_m,
             'top_stocks':    json.dumps(top_stocks),
             'bot_stocks':    json.dumps(bot_stocks),
             'last_updated':  now_ist.isoformat(),
