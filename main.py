@@ -1095,7 +1095,15 @@ async def fetch_upstox_fundamentals(session: aiohttp.ClientSession, sym: str, is
                     # Market Cap/EPS/Debt-Equity aren't in this endpoint's
                     # response (confirmed against real data) — left None
                     # here so the Screener.in fallback fills them in.
+                else:
+                    _fetch_error_counts['upstox_key_ratios_empty_200'] = \
+                        _fetch_error_counts.get('upstox_key_ratios_empty_200', 0) + 1
+            else:
+                key = f'upstox_key_ratios_status_{r.status}'
+                _fetch_error_counts[key] = _fetch_error_counts.get(key, 0) + 1
     except Exception as e:
+        _fetch_error_counts[f'upstox_key_ratios_{type(e).__name__}'] = \
+            _fetch_error_counts.get(f'upstox_key_ratios_{type(e).__name__}', 0) + 1
         if debug:
             log.info(f"  🔍 {sym} Upstox key-ratios exception: {type(e).__name__}: {e}")
 
@@ -1156,7 +1164,12 @@ async def fetch_upstox_fundamentals(session: aiohttp.ClientSession, sym: str, is
                     if dii1_prev is not None or dii2_prev is not None:
                         dii_prev = (dii1_prev or 0) + (dii2_prev or 0)
                         result['dii_trend'] = round(dii_latest - dii_prev, 2)
+            else:
+                key = f'upstox_share_holdings_status_{r.status}'
+                _fetch_error_counts[key] = _fetch_error_counts.get(key, 0) + 1
     except Exception as e:
+        _fetch_error_counts[f'upstox_share_holdings_{type(e).__name__}'] = \
+            _fetch_error_counts.get(f'upstox_share_holdings_{type(e).__name__}', 0) + 1
         if debug:
             log.info(f"  🔍 {sym} Upstox share-holdings exception: {type(e).__name__}: {e}")
 
@@ -1352,6 +1365,8 @@ async def fetch_fundamentals_screener(session: aiohttp.ClientSession, sym: str, 
                     result['promoter'] = float(prom_m2.group(1))
 
     except Exception as e:
+        _fetch_error_counts[f'screener_{type(e).__name__}'] = \
+            _fetch_error_counts.get(f'screener_{type(e).__name__}', 0) + 1
         if sym == 'TARSONS' or debug:
             log.info(f"  🔍 {sym} fetch raised exception: {type(e).__name__}: {e}")
     return result
@@ -1362,6 +1377,9 @@ FUNDAMENTALS_TTL = 7 * 24 * 3600  # refresh weekly (data changes quarterly)
 _fundamentals_debug_count = 0  # caps detailed per-request diagnostic logging
 _upstox_fundamentals_debug_count = 0  # caps raw-response logging for the new Upstox fundamentals API
 _upstox_shareholding_debug_count = 0  # separate budget so share-holdings isn't starved by key-ratios logging
+_fetch_error_counts: dict = {}  # exception-type name -> count, reset per load_fundamentals_batch call,
+# aggregated (not logged per-call) so a systemic failure shows up as one
+# clear summary line instead of thousands of repeated log entries
 
 async def ensure_fundamentals_table(session: aiohttp.ClientSession,
                                      retries: int = 6, delay: float = 10.0) -> bool:
@@ -1579,6 +1597,8 @@ async def load_fundamentals_at_startup(session: aiohttp.ClientSession):
 
 async def load_fundamentals_batch(session: aiohttp.ClientSession, symbols: list):
     """Fetch fundamentals for a batch of symbols, respecting TTL cache."""
+    global _fetch_error_counts
+    _fetch_error_counts = {}  # reset so this run's summary isn't polluted by a previous run's counts
     now = time.time()
     DATA_FIELDS = ('market_cap', 'pe', 'roe', 'eps', 'debt_eq', 'promoter',
                    'eps_qoq', 'eps_yoy', 'sales_qoq', 'sales_yoy', 'opm_pct',
@@ -1669,6 +1689,9 @@ async def load_fundamentals_batch(session: aiohttp.ClientSession, symbols: list)
         await save_fundamentals_batch_to_db(session, rows_to_save)
 
     log.info(f"  Fundamentals loaded: {fetched}/{len(to_fetch)} stocks")
+    if _fetch_error_counts:
+        summary = ', '.join(f"{k}={v}" for k, v in sorted(_fetch_error_counts.items(), key=lambda x: -x[1]))
+        log.info(f"  📋 Fetch outcome breakdown: {summary}")
 
 
 async def fetch_bulk_ohlc(session: aiohttp.ClientSession, instrument_keys: list) -> dict:
