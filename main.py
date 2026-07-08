@@ -1909,6 +1909,20 @@ INDEX_TRACKER = {
     "Metal":          "NSE_INDEX|Nifty Metal",
     "Realty":         "NSE_INDEX|Nifty Realty",
     "Energy":         "NSE_INDEX|Nifty Energy",
+    "Defence":            "NSE_INDEX|Nifty India Defence",
+    "Financial Services": "NSE_INDEX|Nifty Fin Service",
+    "PSU Bank":           "NSE_INDEX|Nifty PSU Bank",
+    "Private Bank":       "NSE_INDEX|Nifty Pvt Bank",
+    "PSE":                "NSE_INDEX|Nifty PSE",
+    "Media":              "NSE_INDEX|Nifty Media",
+    "Infrastructure":     "NSE_INDEX|Nifty Infra",
+    "Healthcare":         "NSE_INDEX|Nifty Healthcare",
+    "Consumer Durables":  "NSE_INDEX|Nifty Consr Durable",
+    "Oil & Gas":          "NSE_INDEX|Nifty Oil & Gas",
+    "Chemicals":          "NSE_INDEX|Nifty Chemicals",
+    "Commodities":        "NSE_INDEX|Nifty Commodities",
+    "MNC":                "NSE_INDEX|Nifty MNC",
+    "Consumption":        "NSE_INDEX|Nifty India Consumption",
 }
 
 # Cache for all index historical data
@@ -1930,6 +1944,23 @@ async def load_index_cache(session: aiohttp.ClientSession):
         "Midcap 150":   ["NSE_INDEX|Nifty Midcap 150", "NSE_INDEX|NIFTY MIDCAP 150", "NSE_INDEX|Nifty MidCap 150"],
         "Smallcap 250": ["NSE_INDEX|Nifty Smallcap 250", "NSE_INDEX|NIFTY SMALLCAP 250", "NSE_INDEX|Nifty SmallCap 250"],
         "Microcap 250": ["NSE_INDEX|Nifty Microcap 250", "NSE_INDEX|NIFTY MICROCAP 250", "NSE_INDEX|Nifty MicroCap 250"],
+        # Newer additions — exact Upstox naming for these is less certain
+        # than the well-established ones above, so try a few common
+        # variants each (same self-healing approach as Mid/Small/Microcap).
+        "Defence":            ["NSE_INDEX|Nifty India Defence", "NSE_INDEX|Nifty Defence"],
+        "Financial Services": ["NSE_INDEX|Nifty Fin Service", "NSE_INDEX|Nifty Financial Services"],
+        "PSU Bank":           ["NSE_INDEX|Nifty PSU Bank"],
+        "Private Bank":       ["NSE_INDEX|Nifty Pvt Bank", "NSE_INDEX|Nifty Private Bank"],
+        "PSE":                ["NSE_INDEX|Nifty PSE"],
+        "Media":              ["NSE_INDEX|Nifty Media"],
+        "Infrastructure":     ["NSE_INDEX|Nifty Infra", "NSE_INDEX|Nifty Infrastructure"],
+        "Healthcare":         ["NSE_INDEX|Nifty Healthcare", "NSE_INDEX|Nifty Healthcare Index"],
+        "Consumer Durables":  ["NSE_INDEX|Nifty Consr Durable", "NSE_INDEX|Nifty Consumer Durables"],
+        "Oil & Gas":          ["NSE_INDEX|Nifty Oil & Gas", "NSE_INDEX|Nifty Oil and Gas"],
+        "Chemicals":          ["NSE_INDEX|Nifty Chemicals"],
+        "Commodities":        ["NSE_INDEX|Nifty Commodities"],
+        "MNC":                ["NSE_INDEX|Nifty MNC"],
+        "Consumption":        ["NSE_INDEX|Nifty India Consumption", "NSE_INDEX|Nifty Consumption"],
     }
     for name, ikey in INDEX_TRACKER.items():
         # Try primary key, then alternatives
