@@ -1442,34 +1442,45 @@ async def load_fundamentals_batch(session: aiohttp.ClientSession, symbols: list)
 
 
 async def fetch_bulk_ohlc(session: aiohttp.ClientSession, instrument_keys: list) -> dict:
-    """Fetch OHLC for instruments in one call. Keep batch small — GET URL length limits apply."""
-    url = "https://api.upstox.com/v2/market-quote/ohlc"
+    """
+    Fetch live quotes for instruments in one call.
+    IMPORTANT: uses Upstox's Full Market Quotes endpoint (/market-quote/quotes),
+    NOT the OHLC endpoint (/market-quote/ohlc) — the OHLC endpoint's response
+    shape is just {"ohlc": {...}, "last_price": ...} and has NO "volume" field
+    at all. Every volume-dependent signal (HY/HT/rvol) was silently falling
+    back to yesterday's completed volume the entire time, since live.get(
+    'volume') was always None/missing from that endpoint — not a bug in the
+    signal logic itself, just fetching from an endpoint that never had live
+    volume to give. Full Market Quotes includes live_price, volume (live,
+    updating all session), depth, etc.
+    Keep batch small — GET URL length limits apply.
+    """
+    url = "https://api.upstox.com/v2/market-quote/quotes"
     headers = {
         "Authorization": f"Bearer {ANALYTICS_TOKEN}",
         "Accept": "application/json"
     }
     params = {
         "instrument_key": ",".join(instrument_keys),
-        "interval": "1d"
     }
     try:
         async with session.get(url, headers=headers, params=params,
                                timeout=aiohttp.ClientTimeout(total=30)) as r:
             text = await r.text()
             if r.status != 200:
-                log.warning(f"OHLC fetch failed: {r.status} — {text[:300]}")
+                log.warning(f"Quotes fetch failed: {r.status} — {text[:300]}")
                 return {}
             try:
                 data = json.loads(text)
             except Exception:
-                log.warning(f"OHLC response not JSON: {text[:200]}")
+                log.warning(f"Quotes response not JSON: {text[:200]}")
                 return {}
             result = data.get('data', {})
             if not result:
-                log.warning(f"OHLC empty data field. Full response keys: {list(data.keys())} status={data.get('status')}")
+                log.warning(f"Quotes empty data field. Full response keys: {list(data.keys())} status={data.get('status')}")
             return result
     except Exception as e:
-        log.error(f"OHLC fetch error: {e}")
+        log.error(f"Quotes fetch error: {e}")
         return {}
 
 async def fetch_historical(session: aiohttp.ClientSession, sym: str,
