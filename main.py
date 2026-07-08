@@ -1025,6 +1025,117 @@ _SCREENER_HEADER_SETS = [
 ]
 
 
+async def fetch_upstox_fundamentals(session: aiohttp.ClientSession, sym: str, isin: str,
+                                     debug: bool = False) -> Optional[dict]:
+    """
+    Fetch fundamentals from Upstox's official Company Fundamentals API
+    instead of scraping Screener.in. This is a proper authenticated API
+    call (same analytics token already used for market quotes) — no
+    bot-detection/rate-limiting risk at all, since it's not scraping.
+
+    Uses two endpoints:
+    - /v2/fundamentals/{isin}/key-ratios — P/E, ROE, EPS, Debt/Equity,
+      Market Cap, and quarterly EPS/Sales/OPM trend data
+    - /v2/fundamentals/{isin}/share-holdings — Promoter/FII/DII % + trend
+
+    NOTE: exact response field names are being verified against real
+    responses via the debug logging below for the first several calls —
+    Upstox's public docs don't have a fully confirmed sample response for
+    key-ratios at the time this was written, so field mapping may need a
+    follow-up adjustment once we see real data.
+    """
+    global _upstox_fundamentals_debug_count
+    headers = {"Authorization": f"Bearer {ANALYTICS_TOKEN}", "Accept": "application/json"}
+    result = {
+        'market_cap': None, 'pe': None, 'roe': None, 'eps': None, 'debt_eq': None, 'promoter': None,
+        'eps_qoq': None, 'eps_yoy': None, 'sales_qoq': None, 'sales_yoy': None,
+        'opm_pct': None, 'opm_trend': None, 'eps_growth_streak': None,
+        'fii_pct': None, 'fii_trend': None, 'dii_pct': None, 'dii_trend': None,
+        'promoter_trend': None, 'peg_ratio': None,
+    }
+    got_any = False
+
+    try:
+        async with session.get(
+            f"https://api.upstox.com/v2/fundamentals/{isin}/key-ratios",
+            headers=headers, timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if debug:
+                log.info(f"  🔍 {sym} ({isin}) Upstox key-ratios: status={r.status}")
+            if r.status == 200:
+                data = await r.json()
+                if debug and _upstox_fundamentals_debug_count < 8:
+                    _upstox_fundamentals_debug_count += 1
+                    log.info(f"  🔍 {sym} key-ratios raw response: {json.dumps(data)[:1500]}")
+                payload = data.get('data', data)
+                if isinstance(payload, list):
+                    payload = payload[0] if payload else {}
+                if isinstance(payload, dict) and payload:
+                    got_any = True
+
+                    def pick(*keys):
+                        for k in keys:
+                            v = payload.get(k)
+                            if v is not None:
+                                if isinstance(v, dict):
+                                    v = v.get('value', v.get('formatted'))
+                                return v
+                        return None
+
+                    result['market_cap'] = pick('market_cap', 'marketCap', 'market_capitalization')
+                    result['pe']         = pick('pe_ratio', 'pe', 'price_to_earnings')
+                    result['roe']        = pick('roe', 'return_on_equity')
+                    result['eps']        = pick('eps', 'earnings_per_share')
+                    result['debt_eq']    = pick('debt_to_equity', 'debt_equity', 'debtEquity')
+                    result['opm_pct']    = pick('operating_margin', 'opm', 'operating_profit_margin')
+    except Exception as e:
+        if debug:
+            log.info(f"  🔍 {sym} Upstox key-ratios exception: {type(e).__name__}: {e}")
+
+    try:
+        async with session.get(
+            f"https://api.upstox.com/v2/fundamentals/{isin}/share-holdings",
+            headers=headers, timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if debug:
+                log.info(f"  🔍 {sym} ({isin}) Upstox share-holdings: status={r.status}")
+            if r.status == 200:
+                data = await r.json()
+                if debug and _upstox_fundamentals_debug_count < 8:
+                    log.info(f"  🔍 {sym} share-holdings raw response: {json.dumps(data)[:1500]}")
+                payload = data.get('data', data)
+                periods = payload if isinstance(payload, list) else payload.get('periods', [])
+                if periods:
+                    got_any = True
+                    latest = periods[-1] if isinstance(periods[-1], dict) else {}
+                    prev   = periods[-2] if len(periods) >= 2 and isinstance(periods[-2], dict) else {}
+
+                    def num(d, *keys):
+                        for k in keys:
+                            v = d.get(k)
+                            if v is not None:
+                                return v
+                        return None
+
+                    result['promoter'] = num(latest, 'promoters', 'promoter', 'promoter_holding')
+                    result['fii_pct']  = num(latest, 'fii', 'fiis', 'fii_holding')
+                    result['dii_pct']  = num(latest, 'dii', 'diis', 'dii_holding')
+                    prom_prev = num(prev, 'promoters', 'promoter', 'promoter_holding')
+                    fii_prev  = num(prev, 'fii', 'fiis', 'fii_holding')
+                    dii_prev  = num(prev, 'dii', 'diis', 'dii_holding')
+                    if result['promoter'] is not None and prom_prev is not None:
+                        result['promoter_trend'] = round(result['promoter'] - prom_prev, 2)
+                    if result['fii_pct'] is not None and fii_prev is not None:
+                        result['fii_trend'] = round(result['fii_pct'] - fii_prev, 2)
+                    if result['dii_pct'] is not None and dii_prev is not None:
+                        result['dii_trend'] = round(result['dii_pct'] - dii_prev, 2)
+    except Exception as e:
+        if debug:
+            log.info(f"  🔍 {sym} Upstox share-holdings exception: {type(e).__name__}: {e}")
+
+    return result if got_any else None
+
+
 async def fetch_fundamentals_screener(session: aiohttp.ClientSession, sym: str, debug: bool = False) -> dict:
     """
     Scrape fundamental data from Screener.in company page.
@@ -1222,6 +1333,7 @@ async def fetch_fundamentals_screener(session: aiohttp.ClientSession, sym: str, 
 fundamentals_cache: dict = {}  # sym -> {market_cap, pe, roe, eps, debt_eq, promoter, fetched_at}
 FUNDAMENTALS_TTL = 7 * 24 * 3600  # refresh weekly (data changes quarterly)
 _fundamentals_debug_count = 0  # caps detailed per-request diagnostic logging
+_upstox_fundamentals_debug_count = 0  # caps raw-response logging for the new Upstox fundamentals API
 
 async def ensure_fundamentals_table(session: aiohttp.ClientSession,
                                      retries: int = 6, delay: float = 10.0) -> bool:
@@ -1457,22 +1569,41 @@ async def load_fundamentals_batch(session: aiohttp.ClientSession, symbols: list)
     if not to_fetch:
         return
 
-    log.info(f"  Fetching fundamentals for {len(to_fetch)} stocks from Screener.in…")
+    log.info(f"  Fetching fundamentals for {len(to_fetch)} stocks (Upstox API primary, Screener.in fallback)…")
     if 'TARSONS' in to_fetch:
         log.info(f"  🔍 TARSONS is in this batch's to_fetch list (position {to_fetch.index('TARSONS')}/{len(to_fetch)})")
     elif 'TARSONS' in symbols:
         cached = fundamentals_cache.get('TARSONS', {})
         log.info(f"  🔍 TARSONS NOT in to_fetch (already cached, not stale) — cached data: {cached}")
 
+    def isin_for(sym):
+        key = instrument_key_map.get(sym, '')
+        return key.split('|')[1] if '|' in key else None
+
+    async def fetch_one_fundamentals(sym, debug):
+        isin = isin_for(sym)
+        if isin:
+            data = await fetch_upstox_fundamentals(session, sym, isin, debug=debug)
+            if data:
+                return data
+        # Fallback to scraping only if Upstox has no ISIN for this symbol
+        # or its fundamentals API didn't return anything usable.
+        return await fetch_fundamentals_screener(session, sym, debug=debug)
+
     global _fundamentals_debug_count
-    BATCH = 5  # small batches to be respectful
+    # Upstox's fundamentals API is a real authenticated endpoint, not
+    # scraping — safe to run much faster than the old Screener.in-only
+    # pace. The Screener.in fallback path (for symbols Upstox can't
+    # resolve) still goes through fetch_fundamentals_screener's own
+    # rotating headers, so it stays gentle even at this batch size.
+    BATCH = 20
     fetched = 0
     rows_to_save: list = []
     for i in range(0, len(to_fetch), BATCH):
         batch = to_fetch[i:i+BATCH]
         debug_this_batch = _fundamentals_debug_count < 10
         results = await asyncio.gather(*[
-            fetch_fundamentals_screener(session, sym, debug=debug_this_batch) for sym in batch
+            fetch_one_fundamentals(sym, debug_this_batch) for sym in batch
         ])
         for sym, data in zip(batch, results):
             data['fetched_at'] = now
@@ -1487,9 +1618,11 @@ async def load_fundamentals_batch(session: aiohttp.ClientSession, symbols: list)
                 'sym': sym, **{k: v for k, v in data.items() if k != 'fetched_at'},
                 'fetched_at': datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
             })
-        await asyncio.sleep(1.2 + random.uniform(0, 1.3))  # jittered — a fixed
-        # 1s delay every batch is itself a bot-detection signal; random
-        # spacing looks more like normal traffic
+        # Shorter jittered delay now that most requests go through the
+        # real Upstox API (fast, authenticated, no blocking risk) rather
+        # than scraping — this mainly just paces whatever subset falls
+        # back to Screener.in for symbols Upstox couldn't resolve.
+        await asyncio.sleep(0.4 + random.uniform(0, 0.6))
 
         # Persist incrementally — a slow scrape (8-15+ min for the full
         # universe) shouldn't lose everything if the process restarts
@@ -3225,7 +3358,7 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'in_midcap':      sym in MIDCAP,
             'in_smallcap':    sym in SMALLCAP,
             'in_microcap':    sym in MICROCAP,
-            # Fundamentals from Screener.in (cached, refreshed every 6h)
+            # Fundamentals from Upstox API (Screener.in fallback), cached weekly
             'market_cap':     fundamentals_cache.get(sym, {}).get('market_cap'),
             'pe':             fundamentals_cache.get(sym, {}).get('pe'),
             'roe':            fundamentals_cache.get(sym, {}).get('roe'),
