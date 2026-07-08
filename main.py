@@ -997,11 +997,15 @@ async def fetch_fundamentals_screener(session: aiohttp.ClientSession, sym: str) 
     try:
         async with session.get(url, headers=headers,
                                timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if sym == 'TARSONS':
+                log.info(f"  🔍 TARSONS fetch: url={url}, status={r.status}")
             if r.status == 404:
                 # Try standalone (non-consolidated)
                 url2 = f"https://www.screener.in/company/{sym}/"
                 async with session.get(url2, headers=headers,
                                        timeout=aiohttp.ClientTimeout(total=10)) as r2:
+                    if sym == 'TARSONS':
+                        log.info(f"  🔍 TARSONS fallback fetch: url={url2}, status={r2.status}")
                     if r2.status != 200:
                         return result
                     html = await r2.text()
@@ -1009,6 +1013,11 @@ async def fetch_fundamentals_screener(session: aiohttp.ClientSession, sym: str) 
                 return result
             else:
                 html = await r.text()
+
+        if sym == 'TARSONS':
+            log.info(f"  🔍 TARSONS html length={len(html)}, "
+                     f"has_market_cap_text={'Market Cap' in html}, "
+                     f"has_eps_row={'EPS in Rs' in html}")
 
         import re
 
@@ -1140,7 +1149,8 @@ async def fetch_fundamentals_screener(session: aiohttp.ClientSession, sym: str) 
                     result['promoter'] = float(prom_m2.group(1))
 
     except Exception as e:
-        pass
+        if sym == 'TARSONS':
+            log.info(f"  🔍 TARSONS fetch raised exception: {type(e).__name__}: {e}")
     return result
 
 # Cache fundamentals to avoid re-fetching every minute
@@ -1356,6 +1366,11 @@ async def load_fundamentals_batch(session: aiohttp.ClientSession, symbols: list)
         return
 
     log.info(f"  Fetching fundamentals for {len(to_fetch)} stocks from Screener.in…")
+    if 'TARSONS' in to_fetch:
+        log.info(f"  🔍 TARSONS is in this batch's to_fetch list (position {to_fetch.index('TARSONS')}/{len(to_fetch)})")
+    elif 'TARSONS' in symbols:
+        cached = fundamentals_cache.get('TARSONS', {})
+        log.info(f"  🔍 TARSONS NOT in to_fetch (already cached, not stale) — cached data: {cached}")
     BATCH = 5  # small batches to be respectful
     fetched = 0
     rows_to_save: list = []
@@ -1369,6 +1384,8 @@ async def load_fundamentals_batch(session: aiohttp.ClientSession, symbols: list)
             fundamentals_cache[sym] = data
             if any(v is not None for k, v in data.items() if k != 'fetched_at'):
                 fetched += 1
+            if sym == 'TARSONS':
+                log.info(f"  🔍 TARSONS scrape result: {data}")
             rows_to_save.append({
                 'sym': sym, **{k: v for k, v in data.items() if k != 'fetched_at'},
                 'fetched_at': datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
