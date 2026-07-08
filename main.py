@@ -1964,6 +1964,26 @@ async def ensure_db_columns(session: aiohttp.ClientSession):
 
     try:
         async with session.get(
+            f"{SUPABASE_URL}/rest/v1/stocks?select=chg_m_pct&limit=1",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ DB columns OK — chg_m_pct (weekly/monthly change) column exists")
+            elif r.status == 400:
+                log.error("❌ chg_w_pct/chg_m_pct columns MISSING from stocks table! "
+                          "The ENTIRE per-scan stocks upsert has been failing (not just these "
+                          "two fields) since these were added — PostgREST rejects the whole "
+                          "request when any field is unrecognized.")
+                log.error("   → Go to Supabase SQL Editor and run:")
+                log.error("   alter table public.stocks")
+                log.error("     add column if not exists chg_w_pct numeric,")
+                log.error("     add column if not exists chg_m_pct numeric;")
+    except Exception as e:
+        log.warning(f"DB column check error (chg_w_pct/chg_m_pct): {e}")
+
+    try:
+        async with session.get(
             f"{SUPABASE_URL}/rest/v1/index_dashboard?select=rank_d,advances_d&limit=1",
             headers=headers,
             timeout=aiohttp.ClientTimeout(total=10)
