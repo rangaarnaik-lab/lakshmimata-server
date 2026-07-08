@@ -3236,9 +3236,13 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         chg_q = round((last - qtr)  / qtr  * 100, 2) if qtr  else 0
         chg_y = round((last - yr)   / yr   * 100, 2) if yr   else 0
 
-        # RS-TV using Nifty as benchmark (skip for Nifty itself)
+        # RS-TV using Nifty as benchmark — meaningless for Nifty 50 itself
+        # (comparing an index against itself trivially gives 0 relative
+        # performance every day, which normalizes to a degenerate 50).
+        # Showing a plain "50" there looks like a real median reading
+        # rather than "not applicable", so use None (renders as "—") instead.
         if idx_name == 'Nifty 50':
-            rs_tv_idx = 50  # Nifty vs itself is always median
+            rs_tv_idx = None
         elif nifty_prices and len(nifty_prices) >= 252:
             rs_tv_idx = calc_rs_tv_normalized(prices, nifty_prices)
         else:
@@ -3253,13 +3257,21 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         l52   = min(prices[-252:]) if n >= 252 else min(prices)
         pct_from_high = round((last - h52) / h52 * 100, 1) if h52 else 0
 
-        # Stage logic for index
-        if ma30 and last > ma30 and chg_d >= 0:
+        # Stage logic for index — uses MA10-vs-MA30 (a stable, multi-day
+        # trend-confirmation signal, same as the up/down arrows already
+        # shown in the UI) instead of today's single-day price change.
+        # The previous version gated Stage 2/3/4 on chg_d >= 0 / <= 0,
+        # meaning a single red day in an established uptrend (rising
+        # MA10, rising MA30, strong 1W/1M/3M returns) would flip the
+        # whole index down to "S1 Base" — which is exactly why so many
+        # genuinely-uptrending indices were all showing "Base" together
+        # on an ordinary red day for the broader market.
+        if ma30 and last > ma30 and ma10 and ma10 >= ma30:
             if pct_from_high >= -5:
                 stage = 3
             else:
                 stage = 2
-        elif ma30 and last < ma30 and chg_d <= 0:
+        elif ma30 and last < ma30 and ma10 and ma10 <= ma30:
             stage = 4
         else:
             stage = 1
