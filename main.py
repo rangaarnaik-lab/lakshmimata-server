@@ -1421,6 +1421,7 @@ _fundamentals_debug_count = 0  # caps detailed per-request diagnostic logging
 _upstox_fundamentals_debug_count = 0  # caps raw-response logging for the new Upstox fundamentals API
 _upstox_shareholding_debug_count = 0  # separate budget so share-holdings isn't starved by key-ratios logging
 _live_nifty_debug_count = 0  # caps raw-response logging for the live Nifty price fetch
+_live_index_debug_count = 0  # caps raw-response logging for the live all-indices price fetch
 _fetch_error_counts: dict = {}  # exception-type name -> count, reset per load_fundamentals_batch call,
 # aggregated (not logged per-call) so a systemic failure shows up as one
 # clear summary line instead of thousands of repeated log entries
@@ -3264,6 +3265,30 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
     live_midcap_price   = _live_synthetic_price(MIDCAP)
     live_smallcap_price = _live_synthetic_price(SMALLCAP)
 
+    # Live prices for ALL tracked indices (Index Dashboard page) — same
+    # idea as the live Nifty/Midcap/Smallcap prices above, but for every
+    # index shown on the Indices tab, not just the three used for RS-TV
+    # benchmarking. Without this, the whole Index Dashboard (price, %
+    # change, RS-TV, stage) was frozen at yesterday's close all session.
+    global _live_index_debug_count
+    live_index_data: dict = {}
+    try:
+        idx_instrument_keys = list(INDEX_TRACKER.values())
+        idx_live_raw = await fetch_bulk_ohlc(session, idx_instrument_keys)
+        debug_idx = _live_index_debug_count < 3
+        if debug_idx:
+            _live_index_debug_count += 1
+            log.info(f"  🔍 Live index fetch: requested {len(idx_instrument_keys)} keys, "
+                     f"got {len(idx_live_raw)} back. Sample response keys: {list(idx_live_raw.keys())[:5]}")
+        for name, ikey in INDEX_TRACKER.items():
+            resp_key = ikey.replace('|', ':')
+            if resp_key in idx_live_raw:
+                live_index_data[name] = idx_live_raw[resp_key].get('last_price')
+        if debug_idx:
+            log.info(f"  🔍 Live index prices resolved: {len(live_index_data)}/{len(INDEX_TRACKER)}")
+    except Exception as e:
+        log.warning(f"Live index prices fetch failed: {e}")
+
     if live_data:
         sample = list(live_data.keys())[:3]
         log.info(f"  Sample OHLC keys: {[f'NSE_EQ:{s}' for s in sample]}")
@@ -3739,8 +3764,21 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         if n < 5:
             continue
 
-        last    = prices[-1]
-        prev    = prices[-2]  if n >= 2   else last
+        # Live override — index_history_cache only refreshes at startup +
+        # once daily at EOD (confirmed: load_index_cache is called inside
+        # the is_first_eod_today guard), so during live market hours
+        # prices[-1] is still yesterday's close. Once the market closes,
+        # that EOD refresh has already happened by the time this runs
+        # again, so the historical array is already current — no live
+        # override needed then, hence gating on is_market_open().
+        live_idx_price = live_index_data.get(idx_name)
+        mkt_open_now = is_market_open()
+        if mkt_open_now and live_idx_price:
+            last = live_idx_price
+            prev = prices[-1]  # yesterday's close (correct baseline while market is open)
+        else:
+            last = prices[-1]
+            prev = prices[-2] if n >= 2 else last
         week    = prices[-6]  if n >= 6   else prices[0]
         month   = prices[-22] if n >= 22  else prices[0]
         qtr     = prices[-66] if n >= 66  else prices[0]
@@ -3761,6 +3799,18 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             rs_tv_idx = None
         elif nifty_prices and len(nifty_prices) >= 252:
             rs_tv_idx = calc_rs_tv_normalized(prices, nifty_prices)
+            # Live-update this index's own RS-TV too, same approach as
+            # the per-stock live RS-TV above — otherwise the Index
+            # Dashboard's RS-TV would stay just as frozen as everything
+            # else was before this fix.
+            if mkt_open_now and live_idx_price and live_nifty_price:
+                idx_raw_series = calc_raw_rs_series(prices, nifty_prices)
+                live_idx_raw = calc_live_raw_rs_today(prices, nifty_prices, live_idx_price, live_nifty_price)
+                if live_idx_raw is not None:
+                    window = [v for v in idx_raw_series[-300:] if v is not None][-252:]
+                    if window:
+                        hi, lo = max(window), min(window)
+                        rs_tv_idx = 50 if hi == lo else max(1, min(99, round(((live_idx_raw - lo) / (hi - lo)) * 98 + 1)))
         else:
             rs_tv_idx = None
 
