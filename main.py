@@ -1889,6 +1889,9 @@ prev_squeeze_state: dict = {}
 historical_cache: dict = {}   # sym -> {prices, volumes, highs, lows}
 history_dates_cache: dict = {}  # sym -> [dates] — parallel to historical_cache,
 # tracked separately since RS calc doesn't need dates but incremental merges do
+opens_cache: dict = {}  # sym -> [opens] — parallel to historical_cache, tracked
+# separately since RS/PP/signal calc doesn't need Open prices, only the
+# persisted stock_full_history table (for candlestick charts) does
 last_eod_refresh_date: Optional[str] = None  # IST date string — ensures the
 # expensive EOD refresh (full Yahoo re-fetch + fundamentals) runs only ONCE
 # per day, not on every single scan cycle while the market stays closed.
@@ -2159,6 +2162,22 @@ async def ensure_db_columns(session: aiohttp.ClientSession):
                 log.error("     add column if not exists rank_w_change int;")
     except Exception as e:
         log.warning(f"DB column check error (rank_w_change): {e}")
+
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/stock_full_history?select=opens&limit=1",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ DB columns OK — opens (candlestick chart data) column exists")
+            elif r.status == 400:
+                log.error("❌ opens column MISSING from stock_full_history table! "
+                          "Candlestick charts need Open prices, not just Close/High/Low.")
+                log.error("   → Go to Supabase SQL Editor and run:")
+                log.error("   alter table public.stock_full_history add column if not exists opens jsonb;")
+    except Exception as e:
+        log.warning(f"DB column check error (opens): {e}")
 
     try:
         async with session.get(
@@ -2535,8 +2554,9 @@ async def fetch_yahoo_full_ohlcv(session: aiohttp.ClientSession, sym: str,
                 volumes = quote.get("volume") or []
                 highs   = quote.get("high")   or []
                 lows    = quote.get("low")    or []
+                opens   = quote.get("open")   or []
 
-                dates, prices, vols, hi, lo = [], [], [], [], []
+                dates, prices, vols, hi, lo, op = [], [], [], [], [], []
                 for i, c in enumerate(closes):
                     if c is None:
                         continue
@@ -2551,10 +2571,12 @@ async def fetch_yahoo_full_ohlcv(session: aiohttp.ClientSession, sym: str,
                     hi.append(round(h, 2) if h is not None else None)
                     l = lows[i] if i < len(lows) else None
                     lo.append(round(l, 2) if l is not None else None)
+                    o = opens[i] if i < len(opens) else None
+                    op.append(round(o, 2) if o is not None else None)
 
                 if len(prices) >= min_points:
                     return {'dates': dates, 'prices': prices, 'volumes': vols,
-                            'highs': hi, 'lows': lo}
+                            'highs': hi, 'lows': lo, 'opens': op}
         except Exception:
             pass
     return None
@@ -2607,7 +2629,7 @@ async def ensure_full_history_table(session: aiohttp.ClientSession,
     log.error("   create table if not exists public.stock_full_history (")
     log.error("     sym text primary key,")
     log.error("     dates jsonb, prices jsonb, volumes jsonb,")
-    log.error("     highs jsonb, lows jsonb,")
+    log.error("     highs jsonb, lows jsonb, opens jsonb,")
     log.error("     days_count int, updated_at timestamptz")
     log.error("   );")
     return False
@@ -2712,7 +2734,7 @@ async def fetch_full_history_for_symbols(session: aiohttp.ClientSession, symbols
                 will_trim = mkt_open and data['dates'] and data['dates'][-1] == today_ist
 
                 if will_trim:
-                    for k in ('dates', 'prices', 'volumes', 'highs', 'lows'):
+                    for k in ('dates', 'prices', 'volumes', 'highs', 'lows', 'opens'):
                         data[k] = data[k][:-1]
 
                 rows.append({
@@ -2722,6 +2744,7 @@ async def fetch_full_history_for_symbols(session: aiohttp.ClientSession, symbols
                     'volumes':    json.dumps(data['volumes']),
                     'highs':      json.dumps(data['highs']),
                     'lows':       json.dumps(data['lows']),
+                    'opens':      json.dumps(data.get('opens', [])),
                     'days_count': len(data['prices']),
                     'updated_at': datetime.now(timezone.utc).isoformat(),
                 })
@@ -2735,6 +2758,7 @@ async def fetch_full_history_for_symbols(session: aiohttp.ClientSession, symbols
                     'lows':    [l if l is not None else p for l, p in zip(data['lows'],  data['prices'])],
                 }
                 history_dates_cache[sym] = data['dates']
+                opens_cache[sym] = data.get('opens', [])
                 done += 1
             else:
                 failed += 1
@@ -2797,7 +2821,7 @@ async def load_all_history_from_supabase(session: aiohttp.ClientSession) -> list
             page_headers = {**headers, "Range": f"{offset}-{offset + PAGE - 1}"}
             async with session.get(
                 f"{SUPABASE_URL}/rest/v1/stock_full_history"
-                f"?select=sym,dates,prices,volumes,highs,lows,updated_at",
+                f"?select=sym,dates,prices,volumes,highs,lows,opens,updated_at",
                 headers=page_headers, timeout=aiohttp.ClientTimeout(total=30)
             ) as r:
                 if r.status not in (200, 206):
@@ -2832,10 +2856,13 @@ async def load_all_history_from_supabase(session: aiohttp.ClientSession) -> list
             volumes = parse(row.get('volumes'))
             highs   = parse(row.get('highs'))
             lows    = parse(row.get('lows'))
+            opens   = parse(row.get('opens'))
 
             if len(prices) < 100:
                 stale_or_missing.append(sym)
                 continue
+
+            opens_cache[sym] = opens
 
             historical_cache[sym] = {
                 'prices':  prices,
@@ -2892,8 +2919,8 @@ async def load_history_at_startup(session: aiohttp.ClientSession):
 
 
 def merge_incremental_days(existing_dates: list, existing_prices: list, existing_volumes: list,
-                            existing_highs: list, existing_lows: list,
-                            fresh: dict, max_days: int = 504) -> dict:
+                            existing_highs: list, existing_lows: list, existing_opens: list = None,
+                            fresh: dict = None, max_days: int = 504) -> dict:
     """
     Append new trailing day(s) from a lightweight incremental Yahoo fetch
     onto an existing full-history series, matching by date so an already-
@@ -2908,8 +2935,10 @@ def merge_incremental_days(existing_dates: list, existing_prices: list, existing
     volumes = list(existing_volumes)
     highs   = list(existing_highs)
     lows    = list(existing_lows)
+    opens   = list(existing_opens) if existing_opens else [None] * len(dates)
 
     last_date = dates[-1] if dates else None
+    fresh_opens = fresh.get('opens') or []
 
     for i, d in enumerate(fresh.get('dates', [])):
         if d is None:
@@ -2918,10 +2947,13 @@ def merge_incremental_days(existing_dates: list, existing_prices: list, existing
         v = fresh['volumes'][i] if fresh['volumes'][i] is not None else 0
         h = fresh['highs'][i]   if fresh['highs'][i]   is not None else p
         l = fresh['lows'][i]    if fresh['lows'][i]    is not None else p
+        o = fresh_opens[i] if i < len(fresh_opens) and fresh_opens[i] is not None else p
 
         if last_date and d <= last_date:
             if d == last_date and dates:
                 prices[-1], volumes[-1], highs[-1], lows[-1] = p, v, h, l
+                if opens:
+                    opens[-1] = o
             continue  # already have an earlier day than this — skip
 
         dates.append(d)
@@ -2929,6 +2961,7 @@ def merge_incremental_days(existing_dates: list, existing_prices: list, existing
         volumes.append(v)
         highs.append(h)
         lows.append(l)
+        opens.append(o)
         last_date = d
 
     if len(dates) > max_days:
@@ -2937,8 +2970,9 @@ def merge_incremental_days(existing_dates: list, existing_prices: list, existing
         volumes = volumes[-max_days:]
         highs   = highs[-max_days:]
         lows    = lows[-max_days:]
+        opens   = opens[-max_days:]
 
-    return {'dates': dates, 'prices': prices, 'volumes': volumes, 'highs': highs, 'lows': lows}
+    return {'dates': dates, 'prices': prices, 'volumes': volumes, 'highs': highs, 'lows': lows, 'opens': opens}
 
 
 async def incremental_eod_update(session: aiohttp.ClientSession):
@@ -2987,6 +3021,7 @@ async def incremental_eod_update(session: aiohttp.ClientSession):
                     historical_cache.get(sym, {}).get('volumes', []),
                     historical_cache.get(sym, {}).get('highs', []),
                     historical_cache.get(sym, {}).get('lows', []),
+                    opens_cache.get(sym, []),
                     data,
                 )
                 historical_cache[sym] = {
@@ -2996,6 +3031,7 @@ async def incremental_eod_update(session: aiohttp.ClientSession):
                     'lows':    merged['lows'],
                 }
                 history_dates_cache[sym] = merged['dates']
+                opens_cache[sym] = merged['opens']
                 rows.append({
                     'sym':        sym,
                     'dates':      json.dumps(merged['dates']),
@@ -3003,6 +3039,7 @@ async def incremental_eod_update(session: aiohttp.ClientSession):
                     'volumes':    json.dumps(merged['volumes']),
                     'highs':      json.dumps(merged['highs']),
                     'lows':       json.dumps(merged['lows']),
+                    'opens':      json.dumps(merged['opens']),
                     'days_count': len(merged['prices']),
                     'updated_at': datetime.now(timezone.utc).isoformat(),
                 })
