@@ -1087,7 +1087,7 @@ async def fetch_upstox_fundamentals(session: aiohttp.ClientSession, sym: str, is
         'eps_qoq': None, 'eps_yoy': None, 'sales_qoq': None, 'sales_yoy': None,
         'opm_pct': None, 'opm_trend': None, 'eps_growth_streak': None,
         'fii_pct': None, 'fii_trend': None, 'dii_pct': None, 'dii_trend': None,
-        'promoter_trend': None, 'peg_ratio': None,
+        'promoter_trend': None, 'peg_ratio': None, 'industry': None,
     }
     got_any = False
 
@@ -1216,6 +1216,32 @@ async def fetch_upstox_fundamentals(session: aiohttp.ClientSession, sym: str, is
         if debug:
             log.info(f"  🔍 {sym} Upstox share-holdings exception: {type(e).__name__}: {e}")
 
+    # Industry classification — from the company-profile endpoint. Field
+    # names unverified against real data yet (same as key-ratios/share-
+    # holdings were initially), so raw responses are logged for the first
+    # few calls; the tolerant picker below tries the likely name variants.
+    try:
+        status, data = await get_with_retry(f"https://api.upstox.com/v2/fundamentals/{isin}/company-profile")
+        if status == 200 and data:
+            if debug and _upstox_fundamentals_debug_count < 8:
+                log.info(f"  🔍 {sym} company-profile raw response: {json.dumps(data)[:1200]}")
+            payload = data.get('data', data)
+            if isinstance(payload, list):
+                payload = payload[0] if payload else {}
+            if isinstance(payload, dict):
+                for k in ('industry', 'industry_name', 'basic_industry', 'sector_industry', 'ind'):
+                    v = payload.get(k)
+                    if v and isinstance(v, str):
+                        result['industry'] = v.strip()
+                        got_any = True
+                        break
+        elif status != 200:
+            key = f'upstox_company_profile_status_{status}'
+            _fetch_error_counts[key] = _fetch_error_counts.get(key, 0) + 1
+    except Exception as e:
+        _fetch_error_counts[f'upstox_company_profile_{type(e).__name__}'] = \
+            _fetch_error_counts.get(f'upstox_company_profile_{type(e).__name__}', 0) + 1
+
     return result if got_any else None
 
 
@@ -1245,7 +1271,7 @@ async def fetch_fundamentals_screener(session: aiohttp.ClientSession, sym: str, 
         'eps_qoq': None, 'eps_yoy': None, 'sales_qoq': None, 'sales_yoy': None,
         'opm_pct': None, 'opm_trend': None, 'eps_growth_streak': None,
         'fii_pct': None, 'fii_trend': None, 'dii_pct': None, 'dii_trend': None,
-        'promoter_trend': None, 'peg_ratio': None,
+        'promoter_trend': None, 'peg_ratio': None, 'industry': None,
     }
     try:
         async with session.get(url, headers=headers,
@@ -1509,7 +1535,7 @@ async def load_fundamentals_from_supabase(session: aiohttp.ClientSession) -> lis
             async with session.get(
                 f"{SUPABASE_URL}/rest/v1/stock_fundamentals"
                 f"?select=sym,market_cap,pe,roe,eps,debt_eq,promoter,"
-                f"eps_qoq,eps_yoy,sales_qoq,sales_yoy,opm_pct,opm_trend,eps_growth_streak,"
+                f"eps_qoq,eps_yoy,sales_qoq,sales_yoy,opm_pct,opm_trend,eps_growth_streak,industry,"
                 f"fii_pct,fii_trend,dii_pct,dii_trend,promoter_trend,peg_ratio,fetched_at",
                 headers=page_headers, timeout=aiohttp.ClientTimeout(total=30)
             ) as r:
@@ -1533,7 +1559,7 @@ async def load_fundamentals_from_supabase(session: aiohttp.ClientSession) -> lis
     DATA_FIELDS = ('market_cap', 'pe', 'roe', 'eps', 'debt_eq', 'promoter',
                    'eps_qoq', 'eps_yoy', 'sales_qoq', 'sales_yoy', 'opm_pct',
                    'opm_trend', 'eps_growth_streak', 'fii_pct', 'fii_trend',
-                   'dii_pct', 'dii_trend', 'promoter_trend', 'peg_ratio')
+                   'dii_pct', 'dii_trend', 'promoter_trend', 'peg_ratio', 'industry')
 
     for row in all_rows:
         sym = row.get('sym')
@@ -1557,6 +1583,7 @@ async def load_fundamentals_from_supabase(session: aiohttp.ClientSession) -> lis
             'fii_pct': row.get('fii_pct'), 'fii_trend': row.get('fii_trend'),
             'dii_pct': row.get('dii_pct'), 'dii_trend': row.get('dii_trend'),
             'promoter_trend': row.get('promoter_trend'), 'peg_ratio': row.get('peg_ratio'),
+            'industry': row.get('industry'),
             'fetched_at': fetched_at_ts,
         }
         loaded += 1
@@ -1648,7 +1675,7 @@ async def load_fundamentals_batch(session: aiohttp.ClientSession, symbols: list)
     DATA_FIELDS = ('market_cap', 'pe', 'roe', 'eps', 'debt_eq', 'promoter',
                    'eps_qoq', 'eps_yoy', 'sales_qoq', 'sales_yoy', 'opm_pct',
                    'opm_trend', 'eps_growth_streak', 'fii_pct', 'fii_trend',
-                   'dii_pct', 'dii_trend', 'promoter_trend', 'peg_ratio')
+                   'dii_pct', 'dii_trend', 'promoter_trend', 'peg_ratio', 'industry')
     def is_blank_cache(sym):
         c = fundamentals_cache.get(sym)
         return c is not None and all(c.get(f) is None for f in DATA_FIELDS)
@@ -2195,6 +2222,22 @@ async def ensure_db_columns(session: aiohttp.ClientSession):
                 log.error("     add column if not exists rank_change int;")
     except Exception as e:
         log.warning(f"DB column check error (sector rank_change): {e}")
+
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/stocks?select=industry&limit=1",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ DB columns OK — industry column exists")
+            elif r.status == 400:
+                log.error("❌ industry column MISSING! The whole stocks upsert may be failing.")
+                log.error("   → Go to Supabase SQL Editor and run:")
+                log.error("   alter table public.stocks add column if not exists industry text;")
+                log.error("   alter table public.stock_fundamentals add column if not exists industry text;")
+    except Exception as e:
+        log.warning(f"DB column check error (industry): {e}")
 
     try:
         async with session.get(
@@ -3756,6 +3799,7 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'dii_trend':          fundamentals_cache.get(sym, {}).get('dii_trend'),
             'promoter_trend':     fundamentals_cache.get(sym, {}).get('promoter_trend'),
             'peg_ratio':          fundamentals_cache.get(sym, {}).get('peg_ratio'),
+            'industry':           fundamentals_cache.get(sym, {}).get('industry'),
             'last_updated':   now_ist.isoformat(),
             'scan_type':      scan_type,
         })
