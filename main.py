@@ -2181,6 +2181,23 @@ async def ensure_db_columns(session: aiohttp.ClientSession):
 
     try:
         async with session.get(
+            f"{SUPABASE_URL}/rest/v1/sectors?select=rank_change&limit=1",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ DB columns OK — rank_change (sector week-over-week movement) column exists")
+            elif r.status == 400:
+                log.error("❌ rank_history/rank_change columns MISSING from sectors table!")
+                log.error("   → Go to Supabase SQL Editor and run:")
+                log.error("   alter table public.sectors")
+                log.error("     add column if not exists rank_history text,")
+                log.error("     add column if not exists rank_change int;")
+    except Exception as e:
+        log.warning(f"DB column check error (sector rank_change): {e}")
+
+    try:
+        async with session.get(
             f"{SUPABASE_URL}/rest/v1/sectors?select=advances_d&limit=1",
             headers=headers,
             timeout=aiohttp.ClientTimeout(total=10)
@@ -2282,6 +2299,33 @@ async def load_index_rank_history(session: aiohttp.ClientSession) -> dict:
                 log.warning(f"  Load index rank history failed: {r.status} — {body[:150]}")
     except Exception as e:
         log.warning(f"  Load index rank history error: {e}")
+    return result
+
+
+async def load_sector_rank_history(session: aiohttp.ClientSession) -> dict:
+    """Same idea as load_index_rank_history, for sectors — loads each
+    sector's existing rank_history from Supabase in one query."""
+    import json as _json
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    result: dict = {}
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/sectors?select=sector,rank_history",
+            headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+        ) as r:
+            if r.status == 200:
+                for row in await r.json():
+                    raw = row.get('rank_history')
+                    if raw:
+                        try:
+                            result[row['sector']] = _json.loads(raw) if isinstance(raw, str) else raw
+                        except Exception:
+                            pass
+            else:
+                body = await r.text()
+                log.warning(f"  Load sector rank history failed: {r.status} — {body[:150]}")
+    except Exception as e:
+        log.warning(f"  Load sector rank history error: {e}")
     return result
 
 
@@ -3978,6 +4022,22 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
     # Step 7: Save to Supabase
     log.info(f"  Saving {len(processed)} stocks to Supabase…")
     await supabase_upsert(session, 'stocks', processed)
+
+    # Week-over-week rank movement for sectors — same approach as the
+    # Index Dashboard's rank_w_change: append today's rank once per day,
+    # compute change vs the oldest entry in an 8-day rolling window.
+    prev_sector_history = await load_sector_rank_history(session)
+    for s in sector_rows:
+        hist = list(prev_sector_history.get(s['sector'], []))
+        if is_first_eod_today:
+            hist.append(s['rank'])
+            hist = hist[-8:]
+        elif not hist:
+            hist = [s['rank']]
+        s['rank_history'] = json.dumps(hist)
+        s['rank_change'] = (hist[0] - hist[-1]) if len(hist) >= 2 else None
+        # Positive = rank number went down = moved UP the standings (good).
+
     await supabase_upsert(session, 'sectors', [
         {**s, 'last_updated': now_ist.isoformat(), 'top_stocks': json.dumps(s['top_stocks'])}
         for s in sector_rows
