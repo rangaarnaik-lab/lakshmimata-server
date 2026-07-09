@@ -3251,6 +3251,19 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
     except Exception as e:
         log.warning(f"Live Nifty fetch failed: {e}")
 
+    # Live synthetic Midcap 150 / Smallcap 250 values — same simple-average
+    # method as build_synthetic_index (the historical version), just using
+    # this scan's live prices instead of historical closes. Lets RS-TV's
+    # Midcap/Smallcap-benchmarked variants also react intraday, not just
+    # the Nifty-benchmarked one.
+    def _live_synthetic_price(symbols, min_stocks=20):
+        vals = [live_data[s]['last_price'] for s in symbols
+                if s in live_data and live_data[s].get('last_price')]
+        return (sum(vals) / len(vals)) if len(vals) >= min_stocks else None
+
+    live_midcap_price   = _live_synthetic_price(MIDCAP)
+    live_smallcap_price = _live_synthetic_price(SMALLCAP)
+
     if live_data:
         sample = list(live_data.keys())[:3]
         log.info(f"  Sample OHLC keys: {[f'NSE_EQ:{s}' for s in sample]}")
@@ -3376,31 +3389,44 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         # Compute the raw series ONCE per stock, reuse for current value,
         # 15-day history, and (via debug block below) diagnostics — avoids
         # recomputing the same O(n) series 2-3x per stock like before.
-        tv_raw_series = calc_raw_rs_series(prices, nifty_prices) if nifty_prices else []
-        raw_tv  = normalize_rs(tv_raw_series) if tv_raw_series else None
-        raw_mid = normalize_rs(calc_raw_rs_series(prices, midcap_prices))   if midcap_prices   else None
-        raw_sml = normalize_rs(calc_raw_rs_series(prices, smallcap_prices)) if smallcap_prices else None
+        tv_raw_series  = calc_raw_rs_series(prices, nifty_prices)     if nifty_prices    else []
+        mid_raw_series = calc_raw_rs_series(prices, midcap_prices)    if midcap_prices   else []
+        sml_raw_series = calc_raw_rs_series(prices, smallcap_prices)  if smallcap_prices else []
+        raw_tv  = normalize_rs(tv_raw_series)  if tv_raw_series  else None
+        raw_mid = normalize_rs(mid_raw_series) if mid_raw_series else None
+        raw_sml = normalize_rs(sml_raw_series) if sml_raw_series else None
 
-        # Make today's RS-TV live instead of frozen at yesterday's close.
-        # historical_cache (and therefore tv_raw_series above) only
-        # refreshes at startup + once daily at EOD, so during live market
-        # hours raw_tv reflects YESTERDAY's strength, not today's. If we
-        # have a live price for both this stock and Nifty, compute a
-        # live "today" raw RS value and normalize it against the SAME
-        # historical hi/lo window — giving a genuinely live-updating
-        # RS-TV without needing historical_cache itself to change.
+        # Make today's RS-TV (and Mid/Smallcap-benchmarked RS) live instead
+        # of frozen at yesterday's close. historical_cache only refreshes
+        # at startup + once daily at EOD, so during live market hours the
+        # values above reflect YESTERDAY's strength, not today's. If we
+        # have live prices for both this stock and the benchmark, compute
+        # a live "today" raw RS value and normalize it against the SAME
+        # historical hi/lo window each benchmark already has.
         _live_for_rs = live_data.get(sym, {})
         _live_price_for_rs = _live_for_rs.get('last_price', 0)
         _dates_for_rs = history_dates_cache.get(sym, [])
         _today_str_for_rs = datetime.now(IST).strftime('%Y-%m-%d')
         _prices_already_today = bool(_dates_for_rs) and _dates_for_rs[-1] == _today_str_for_rs
-        if (not _prices_already_today) and _live_price_for_rs and live_nifty_price and tv_raw_series:
-            live_raw = calc_live_raw_rs_today(prices, nifty_prices, _live_price_for_rs, live_nifty_price)
-            if live_raw is not None:
-                window = [v for v in tv_raw_series[-300:] if v is not None][-252:]
-                if window:
-                    hi, lo = max(window), min(window)
-                    raw_tv = 50 if hi == lo else max(1, min(99, round(((live_raw - lo) / (hi - lo)) * 98 + 1)))
+
+        def _live_normalized(bench_prices, bench_raw_series, live_bench_price):
+            if _prices_already_today or not _live_price_for_rs or not live_bench_price or not bench_raw_series:
+                return None
+            live_raw = calc_live_raw_rs_today(prices, bench_prices, _live_price_for_rs, live_bench_price)
+            if live_raw is None:
+                return None
+            window = [v for v in bench_raw_series[-300:] if v is not None][-252:]
+            if not window:
+                return None
+            hi, lo = max(window), min(window)
+            return 50 if hi == lo else max(1, min(99, round(((live_raw - lo) / (hi - lo)) * 98 + 1)))
+
+        _live_tv  = _live_normalized(nifty_prices,    tv_raw_series,  live_nifty_price)
+        _live_mid = _live_normalized(midcap_prices,   mid_raw_series, live_midcap_price)
+        _live_sml = _live_normalized(smallcap_prices, sml_raw_series, live_smallcap_price)
+        if _live_tv  is not None: raw_tv  = _live_tv
+        if _live_mid is not None: raw_mid = _live_mid
+        if _live_sml is not None: raw_sml = _live_sml
 
         rs = raw_tv if raw_tv is not None else 0  # main badge now TV-style, matches RS-TV exactly
         hist = tv_history_from_raw(tv_raw_series, days=15) if tv_raw_series else [None] * 15
