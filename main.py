@@ -2110,6 +2110,23 @@ async def ensure_db_columns(session: aiohttp.ClientSession):
 
     try:
         async with session.get(
+            f"{SUPABASE_URL}/rest/v1/index_dashboard?select=rank_w_change&limit=1",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ DB columns OK — rank_w_change (week-over-week rank movement) column exists")
+            elif r.status == 400:
+                log.error("❌ rank_w_history/rank_w_change columns MISSING from index_dashboard table!")
+                log.error("   → Go to Supabase SQL Editor and run:")
+                log.error("   alter table public.index_dashboard")
+                log.error("     add column if not exists rank_w_history text,")
+                log.error("     add column if not exists rank_w_change int;")
+    except Exception as e:
+        log.warning(f"DB column check error (rank_w_change): {e}")
+
+    try:
+        async with session.get(
             f"{SUPABASE_URL}/rest/v1/sectors?select=advances_d&limit=1",
             headers=headers,
             timeout=aiohttp.ClientTimeout(total=10)
@@ -2184,6 +2201,34 @@ async def load_index_history_from_db(session: aiohttp.ClientSession, name: str) 
     except Exception as e:
         log.warning(f"  Load index history failed: {e}")
     return []
+
+
+async def load_index_rank_history(session: aiohttp.ClientSession) -> dict:
+    """Load each index's existing rank_w_history from Supabase in one
+    query — used to compute week-over-week rank movement without
+    needing a per-index round trip."""
+    import json as _json
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    result: dict = {}
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/index_dashboard?select=name,rank_w_history",
+            headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+        ) as r:
+            if r.status == 200:
+                for row in await r.json():
+                    raw = row.get('rank_w_history')
+                    if raw:
+                        try:
+                            result[row['name']] = _json.loads(raw) if isinstance(raw, str) else raw
+                        except Exception:
+                            pass
+            else:
+                body = await r.text()
+                log.warning(f"  Load index rank history failed: {r.status} — {body[:150]}")
+    except Exception as e:
+        log.warning(f"  Load index rank history error: {e}")
+    return result
 
 
 
@@ -3714,6 +3759,27 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
     total_indices = len(index_rows)
     for row in index_rows:
         row['total_indices'] = total_indices
+
+    # Week-over-week rank movement — "was #7 a week ago, now #3" is more
+    # useful than a bare rank on its own. Loads each index's existing
+    # rank_w_history from Supabase, appends today's rank_w once per day
+    # (not every ~60-90s scan — a rolling weekly comparison shouldn't
+    # jitter intraday), and computes the change vs the oldest entry in
+    # an 8-day rolling window (roughly a week of trading days).
+    prev_history = await load_index_rank_history(session)
+    for row in index_rows:
+        hist = list(prev_history.get(row['name'], []))
+        if is_first_eod_today:
+            hist.append(row['rank_w'])
+            hist = hist[-8:]
+        elif not hist:
+            # No history yet at all (first run ever for this index) —
+            # seed it with today's value so a change becomes computable
+            # starting next week, rather than staying empty forever.
+            hist = [row['rank_w']]
+        row['rank_w_history'] = json.dumps(hist)
+        row['rank_w_change'] = (hist[0] - hist[-1]) if len(hist) >= 2 else None
+        # Positive = rank number went down = moved UP the standings (good).
 
     if index_rows:
         await supabase_upsert(session, 'index_dashboard', index_rows, on_conflict='name')
