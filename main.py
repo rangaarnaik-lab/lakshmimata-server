@@ -530,6 +530,39 @@ def calc_raw_rs_series(prices: list, bench_prices: list) -> list:
     return result
 
 
+def calc_live_raw_rs_today(prices: list, bench_prices: list,
+                            live_price: float, live_bench_price: float) -> Optional[float]:
+    """
+    Compute TODAY's raw RS using live price/benchmark instead of waiting
+    for historical_cache to be refreshed at EOD. During live market hours,
+    historical_cache's last element is still YESTERDAY's close — this
+    function treats live_price/live_bench_price as an implicit "today"
+    point one step past the end of the arrays, using the same 63/126/189/
+    252-day-back weighting as calc_raw_rs_series. The lookback anchors
+    (prices[-63] etc) are measured from yesterday rather than today, which
+    is off by one trading day out of a 63-252 day window — negligible.
+    """
+    if live_price is None or live_bench_price is None:
+        return None
+    n = min(len(prices), len(bench_prices))
+    if n < 252:
+        return None
+    prices = prices[-n:]
+    bench_prices = bench_prices[-n:]
+
+    def pct(last_val, arr, length):
+        prev = arr[-length]
+        return (last_val - prev) / prev * 100 if prev else None
+
+    r3,  br3  = pct(live_price, prices, 63),  pct(live_bench_price, bench_prices, 63)
+    r6,  br6  = pct(live_price, prices, 126), pct(live_bench_price, bench_prices, 126)
+    r9,  br9  = pct(live_price, prices, 189), pct(live_bench_price, bench_prices, 189)
+    r12, br12 = pct(live_price, prices, 252), pct(live_bench_price, bench_prices, 252)
+    if None in (r3, br3, r6, br6, r9, br9, r12, br12):
+        return None
+    return (r3-br3)*0.4 + (r6-br6)*0.2 + (r9-br9)*0.2 + (r12-br12)*0.2
+
+
 def normalize_rs(raw_series: list) -> Optional[int]:
     """
     Self-normalized RS matching Pine Script exactly.
@@ -1387,6 +1420,7 @@ FUNDAMENTALS_TTL = 7 * 24 * 3600  # refresh weekly (data changes quarterly)
 _fundamentals_debug_count = 0  # caps detailed per-request diagnostic logging
 _upstox_fundamentals_debug_count = 0  # caps raw-response logging for the new Upstox fundamentals API
 _upstox_shareholding_debug_count = 0  # separate budget so share-holdings isn't starved by key-ratios logging
+_live_nifty_debug_count = 0  # caps raw-response logging for the live Nifty price fetch
 _fetch_error_counts: dict = {}  # exception-type name -> count, reset per load_fundamentals_batch call,
 # aggregated (not logged per-call) so a systemic failure shows up as one
 # clear summary line instead of thousands of repeated log entries
@@ -3197,6 +3231,26 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
     for r in results:
         live_data.update(r)
 
+    # Live Nifty 50 price — needed so RS-TV can react intraday instead of
+    # only updating at EOD (historical_cache's Nifty series only refreshes
+    # once at startup + once daily, same as every stock's own history).
+    global _live_nifty_debug_count
+    live_nifty_price = None
+    try:
+        nifty_live_raw = await fetch_bulk_ohlc(session, [NIFTY_INSTRUMENT_KEY])
+        debug_nifty = _live_nifty_debug_count < 5
+        if debug_nifty:
+            _live_nifty_debug_count += 1
+            log.info(f"  🔍 Live Nifty fetch raw keys: {list(nifty_live_raw.keys())}")
+        for key_fmt in ("NSE_INDEX:Nifty 50", "NSE_INDEX:NIFTY 50", "NSE_INDEX|Nifty 50"):
+            if key_fmt in nifty_live_raw:
+                live_nifty_price = nifty_live_raw[key_fmt].get('last_price')
+                if debug_nifty:
+                    log.info(f"  🔍 Live Nifty price resolved via key '{key_fmt}': {live_nifty_price}")
+                break
+    except Exception as e:
+        log.warning(f"Live Nifty fetch failed: {e}")
+
     if live_data:
         sample = list(live_data.keys())[:3]
         log.info(f"  Sample OHLC keys: {[f'NSE_EQ:{s}' for s in sample]}")
@@ -3327,8 +3381,31 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         raw_mid = normalize_rs(calc_raw_rs_series(prices, midcap_prices))   if midcap_prices   else None
         raw_sml = normalize_rs(calc_raw_rs_series(prices, smallcap_prices)) if smallcap_prices else None
 
+        # Make today's RS-TV live instead of frozen at yesterday's close.
+        # historical_cache (and therefore tv_raw_series above) only
+        # refreshes at startup + once daily at EOD, so during live market
+        # hours raw_tv reflects YESTERDAY's strength, not today's. If we
+        # have a live price for both this stock and Nifty, compute a
+        # live "today" raw RS value and normalize it against the SAME
+        # historical hi/lo window — giving a genuinely live-updating
+        # RS-TV without needing historical_cache itself to change.
+        _live_for_rs = live_data.get(sym, {})
+        _live_price_for_rs = _live_for_rs.get('last_price', 0)
+        _dates_for_rs = history_dates_cache.get(sym, [])
+        _today_str_for_rs = datetime.now(IST).strftime('%Y-%m-%d')
+        _prices_already_today = bool(_dates_for_rs) and _dates_for_rs[-1] == _today_str_for_rs
+        if (not _prices_already_today) and _live_price_for_rs and live_nifty_price and tv_raw_series:
+            live_raw = calc_live_raw_rs_today(prices, nifty_prices, _live_price_for_rs, live_nifty_price)
+            if live_raw is not None:
+                window = [v for v in tv_raw_series[-300:] if v is not None][-252:]
+                if window:
+                    hi, lo = max(window), min(window)
+                    raw_tv = 50 if hi == lo else max(1, min(99, round(((live_raw - lo) / (hi - lo)) * 98 + 1)))
+
         rs = raw_tv if raw_tv is not None else 0  # main badge now TV-style, matches RS-TV exactly
         hist = tv_history_from_raw(tv_raw_series, days=15) if tv_raw_series else [None] * 15
+        if hist and raw_tv is not None:
+            hist[-1] = raw_tv  # keep "today" dot consistent with the live-updated main badge
         trend_data = rs_slope(hist)
 
         # Debug: log RS details for GRSE every scan (previous guard used
