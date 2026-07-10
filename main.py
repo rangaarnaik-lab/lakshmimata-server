@@ -2655,6 +2655,44 @@ async def extend_stock_history_from_yahoo(session: aiohttp.ClientSession):
 
 
 # ── Full 2yr history → Supabase (all stocks, at startup) ──────────────
+async def fetch_upstox_full_ohlcv(session: aiohttp.ClientSession, sym: str,
+                                   days: int = 730) -> Optional[dict]:
+    """
+    Fallback history source for the ~72 symbols whose Yahoo fetch always
+    fails (no .NS/.BO ticker) — uses Upstox's historical-candle API,
+    which works by ISIN instrument key (same API that loads index
+    history). Returns the same shape as fetch_yahoo_full_ohlcv. Requires
+    instrument_key_map to be populated (it is, before any scan runs).
+    Candle format: [ts, open, high, low, close, volume, oi], newest first.
+    """
+    ikey = instrument_key_map.get(sym)
+    if not ikey or '|' not in ikey:
+        return None
+    encoded = ikey.replace('|', '%7C').replace(' ', '%20').replace('&', '%26')
+    to = datetime.now(IST).strftime('%Y-%m-%d')
+    from_ = (datetime.now(IST) - timedelta(days=days)).strftime('%Y-%m-%d')
+    url = f"https://api.upstox.com/v2/historical-candle/{encoded}/day/{to}/{from_}"
+    headers = {"Authorization": f"Bearer {ANALYTICS_TOKEN}", "Accept": "application/json"}
+    try:
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as r:
+            if r.status != 200:
+                return None
+            data = await r.json()
+            candles = list(reversed(data.get('data', {}).get('candles', [])))
+            if len(candles) < 30:
+                return None
+            return {
+                'dates':   [str(c[0])[:10] for c in candles],
+                'prices':  [round(c[4], 2) for c in candles],
+                'volumes': [int(c[5] or 0) for c in candles],
+                'highs':   [round(c[2], 2) for c in candles],
+                'lows':    [round(c[3], 2) for c in candles],
+                'opens':   [round(c[1], 2) for c in candles],
+            }
+    except Exception:
+        return None
+
+
 async def fetch_yahoo_full_ohlcv(session: aiohttp.ClientSession, sym: str,
                                   range_period: str = "2y", min_points: int = 100) -> Optional[dict]:
     """Fetch daily OHLCV (dates, close, volume, high, low) for one NSE stock
@@ -2844,6 +2882,11 @@ async def fetch_full_history_for_symbols(session: aiohttp.ClientSession, symbols
         nonlocal done, failed
         async with sem:
             data = await fetch_yahoo_full_ohlcv(session, sym)
+            if not data:
+                # Yahoo permanently fails ~72 symbols (no .NS/.BO ticker) —
+                # they showed absurd chg% (stale prev close) and no chart
+                # data. Upstox's historical-candle API resolves them by ISIN.
+                data = await fetch_upstox_full_ohlcv(session, sym)
             await asyncio.sleep(0.02)
         async with lock:
             if data:
@@ -3141,6 +3184,8 @@ async def incremental_eod_update(session: aiohttp.ClientSession):
         nonlocal done, failed
         async with sem:
             data = await fetch_yahoo_full_ohlcv(session, sym, range_period="10d", min_points=1)
+            if not data:
+                data = await fetch_upstox_full_ohlcv(session, sym, days=15)
             await asyncio.sleep(0.02)
         async with lock:
             if data:
@@ -3713,6 +3758,21 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             prev = prices[n-2] if n > 1 else last
 
         chg = round((last - prev) / prev * 100, 2) if prev else 0
+        # Staleness guard — the ~72 Yahoo-failing symbols had prev closes
+        # months old, producing absurd chg like +896% (live price vs a
+        # pre-corporate-action stale close). If the last stored bar is
+        # over 7 calendar days old, the % against it is meaningless; use
+        # the live quote's own ohlc close (previous close) if available,
+        # else 0. The Upstox history fallback should eliminate most of
+        # these at the root once it backfills.
+        if dates_for_sym:
+            try:
+                _age_days = (datetime.now(IST).date() - datetime.strptime(dates_for_sym[-1], '%Y-%m-%d').date()).days
+                if _age_days > 7:
+                    _live_prev = live.get('ohlc', {}).get('close')
+                    chg = round((last - _live_prev) / _live_prev * 100, 2) if _live_prev else 0
+            except Exception:
+                pass
         vol = live.get('volume') if live.get('volume') else (volumes[n-1] if volumes else 0)
 
         # Weekly/monthly % change per stock — needed for sector breadth
