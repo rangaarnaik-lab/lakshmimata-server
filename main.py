@@ -1988,6 +1988,13 @@ INDEX_TRACKER = {
     "Commodities":        "NSE_INDEX|Nifty Commodities",
     "MNC":                "NSE_INDEX|Nifty MNC",
     "Consumption":        "NSE_INDEX|Nifty India Consumption",
+    "Manufacturing":      "NSE_INDEX|Nifty India Manufacturing",
+    "CPSE":               "NSE_INDEX|Nifty CPSE",
+    "Digital":            "NSE_INDEX|Nifty India Digital",
+    "EV & New Age Auto":  "NSE_INDEX|Nifty EV & New Age Automotive",
+    "Tourism":            "NSE_INDEX|Nifty India Tourism",
+    "Capital Markets":    "NSE_INDEX|Nifty Capital Markets",
+    "Housing":            "NSE_INDEX|Nifty Housing",
 }
 
 # Cache for all index historical data
@@ -2013,7 +2020,8 @@ async def load_index_cache(session: aiohttp.ClientSession):
         # than the well-established ones above, so try a few common
         # variants each (same self-healing approach as Mid/Small/Microcap).
         "Defence":            ["NSE_INDEX|Nifty India Defence", "NSE_INDEX|Nifty Defence",
-                                "NSE_INDEX|NIFTY INDIA DEFENCE"],
+                                "NSE_INDEX|NIFTY INDIA DEFENCE", "NSE_INDEX|Nifty Ind Defence",
+                                "NSE_INDEX|NIFTY IND DEFENCE"],
         "Financial Services": ["NSE_INDEX|Nifty Fin Service", "NSE_INDEX|Nifty Financial Services"],
         "PSU Bank":           ["NSE_INDEX|Nifty PSU Bank"],
         "Private Bank":       ["NSE_INDEX|Nifty Pvt Bank", "NSE_INDEX|Nifty Private Bank"],
@@ -2030,6 +2038,14 @@ async def load_index_cache(session: aiohttp.ClientSession):
         "Commodities":        ["NSE_INDEX|Nifty Commodities"],
         "MNC":                ["NSE_INDEX|Nifty MNC"],
         "Consumption":        ["NSE_INDEX|Nifty India Consumption", "NSE_INDEX|Nifty Consumption"],
+        "Manufacturing":      ["NSE_INDEX|Nifty India Manufacturing", "NSE_INDEX|NIFTY INDIA MANUFACTURING"],
+        "CPSE":               ["NSE_INDEX|Nifty CPSE", "NSE_INDEX|NIFTY CPSE"],
+        "Digital":            ["NSE_INDEX|Nifty India Digital", "NSE_INDEX|NIFTY INDIA DIGITAL"],
+        "EV & New Age Auto":  ["NSE_INDEX|Nifty EV & New Age Automotive", "NSE_INDEX|NIFTY EV & NEW AGE AUTOMOTIVE",
+                                "NSE_INDEX|Nifty EV and New Age Automotive"],
+        "Tourism":            ["NSE_INDEX|Nifty India Tourism", "NSE_INDEX|NIFTY INDIA TOURISM"],
+        "Capital Markets":    ["NSE_INDEX|Nifty Capital Markets", "NSE_INDEX|NIFTY CAPITAL MARKETS"],
+        "Housing":            ["NSE_INDEX|Nifty Housing", "NSE_INDEX|NIFTY HOUSING"],
     }
     for name, ikey in INDEX_TRACKER.items():
         # Try primary key, then alternatives
