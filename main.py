@@ -1216,31 +1216,56 @@ async def fetch_upstox_fundamentals(session: aiohttp.ClientSession, sym: str, is
         if debug:
             log.info(f"  🔍 {sym} Upstox share-holdings exception: {type(e).__name__}: {e}")
 
-    # Industry classification — from the company-profile endpoint. Field
-    # names unverified against real data yet (same as key-ratios/share-
-    # holdings were initially), so raw responses are logged for the first
-    # few calls; the tolerant picker below tries the likely name variants.
+    # Industry classification. company-profile returned 404 for EVERY
+    # stock (confirmed via error summary — endpoint path guess was wrong),
+    # so this now self-heals across candidate paths, remembering whichever
+    # works. Confirmed fallback: the competitors endpoint's response
+    # includes a "sector" field with industry-grade values (e.g.
+    # "Refineries") — used if no profile path resolves.
+    global _industry_endpoint_path
     try:
-        status, data = await get_with_retry(f"https://api.upstox.com/v2/fundamentals/{isin}/company-profile")
-        if status == 200 and data:
-            if debug and _upstox_fundamentals_debug_count < 8:
-                log.info(f"  🔍 {sym} company-profile raw response: {json.dumps(data)[:1200]}")
-            payload = data.get('data', data)
-            if isinstance(payload, list):
-                payload = payload[0] if payload else {}
-            if isinstance(payload, dict):
-                for k in ('industry', 'industry_name', 'basic_industry', 'sector_industry', 'ind'):
-                    v = payload.get(k)
+        candidate_paths = ([_industry_endpoint_path] if _industry_endpoint_path
+                           else ['company-profile', 'profile', 'company_profile', 'overview'])
+        found = False
+        for path in candidate_paths:
+            status, data = await get_with_retry(f"https://api.upstox.com/v2/fundamentals/{isin}/{path}")
+            if status == 200 and data:
+                if debug and _upstox_fundamentals_debug_count < 8:
+                    log.info(f"  🔍 {sym} {path} raw response: {json.dumps(data)[:1200]}")
+                payload = data.get('data', data)
+                if isinstance(payload, list):
+                    payload = payload[0] if payload else {}
+                if isinstance(payload, dict):
+                    for k in ('industry', 'industry_name', 'basic_industry', 'sector', 'sector_industry'):
+                        v = payload.get(k)
+                        if v and isinstance(v, str):
+                            result['industry'] = v.strip()
+                            got_any = True
+                            found = True
+                            if _industry_endpoint_path != path:
+                                _industry_endpoint_path = path
+                                log.info(f"  ✅ Industry endpoint resolved: /{path}")
+                            break
+            if found:
+                break
+        if not found and not _industry_endpoint_path:
+            # Fallback: competitors endpoint carries the company's peers'
+            # sector — the FIRST competitor's sector is the same industry
+            # bucket as the company itself (peers share it by definition).
+            status, data = await get_with_retry(f"https://api.upstox.com/v2/fundamentals/{isin}/competitors")
+            if status == 200 and data:
+                items = data.get('data', [])
+                if isinstance(items, list) and items and isinstance(items[0], dict):
+                    v = items[0].get('sector')
                     if v and isinstance(v, str):
                         result['industry'] = v.strip()
                         got_any = True
-                        break
-        elif status != 200:
-            key = f'upstox_company_profile_status_{status}'
-            _fetch_error_counts[key] = _fetch_error_counts.get(key, 0) + 1
+            elif status != 200:
+                key = f'upstox_industry_all_paths_status_{status}'
+                _fetch_error_counts[key] = _fetch_error_counts.get(key, 0) + 1
     except Exception as e:
-        _fetch_error_counts[f'upstox_company_profile_{type(e).__name__}'] = \
-            _fetch_error_counts.get(f'upstox_company_profile_{type(e).__name__}', 0) + 1
+        _fetch_error_counts[f'upstox_industry_{type(e).__name__}'] = \
+            _fetch_error_counts.get(f'upstox_industry_{type(e).__name__}', 0) + 1
 
     return result if got_any else None
 
@@ -1448,6 +1473,7 @@ _upstox_fundamentals_debug_count = 0  # caps raw-response logging for the new Up
 _upstox_shareholding_debug_count = 0  # separate budget so share-holdings isn't starved by key-ratios logging
 _live_nifty_debug_count = 0  # caps raw-response logging for the live Nifty price fetch
 _live_index_debug_count = 0  # caps raw-response logging for the live all-indices price fetch
+_industry_endpoint_path = None  # remembered once a working fundamentals industry path is found
 _fetch_error_counts: dict = {}  # exception-type name -> count, reset per load_fundamentals_batch call,
 # aggregated (not logged per-call) so a systemic failure shows up as one
 # clear summary line instead of thousands of repeated log entries
@@ -3420,25 +3446,32 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
     global _live_index_debug_count
     live_index_data: dict = {}
     try:
-        idx_instrument_keys = list(INDEX_TRACKER.values())
+        # Only request indices whose historical key already resolved —
+        # confirmed via logs: one invalid instrument key in a batch makes
+        # Upstox reject the WHOLE batch (all 16 missing indices were
+        # exactly the second half-batch, which contained the unresolvable
+        # thematic names). INDEX_TRACKER[name] is updated to the proven
+        # working key during load_index_cache, so use only those.
+        valid = [(n, INDEX_TRACKER[n]) for n in INDEX_TRACKER if n in index_history_cache]
         idx_live_raw = {}
-        HALF = (len(idx_instrument_keys) + 1) // 2
-        for chunk in (idx_instrument_keys[:HALF], idx_instrument_keys[HALF:]):
-            if chunk:
-                idx_live_raw.update(await fetch_bulk_ohlc(session, chunk))
+        CHUNK = 8
+        for ci in range(0, len(valid), CHUNK):
+            chunk_keys = [k for _, k in valid[ci:ci+CHUNK]]
+            if chunk_keys:
+                idx_live_raw.update(await fetch_bulk_ohlc(session, chunk_keys))
         debug_idx = _live_index_debug_count < 5
         if debug_idx:
             _live_index_debug_count += 1
-            log.info(f"  🔍 Live index fetch: requested {len(idx_instrument_keys)} keys, "
+            log.info(f"  🔍 Live index fetch: requested {len(valid)} resolved keys, "
                      f"got {len(idx_live_raw)} back. Sample response keys: {list(idx_live_raw.keys())[:6]}")
         norm_resp = {_norm_key(rk): rv for rk, rv in idx_live_raw.items()}
-        for name, ikey in INDEX_TRACKER.items():
+        for name, ikey in valid:
             hit = norm_resp.get(_norm_key(ikey))
             if hit:
                 live_index_data[name] = hit.get('last_price')
         if debug_idx:
-            missing = [n for n in INDEX_TRACKER if n not in live_index_data]
-            log.info(f"  🔍 Live index prices resolved: {len(live_index_data)}/{len(INDEX_TRACKER)}"
+            missing = [n for n, _ in valid if n not in live_index_data]
+            log.info(f"  🔍 Live index prices resolved: {len(live_index_data)}/{len(valid)}"
                      + (f" — missing: {missing}" if missing else ""))
     except Exception as e:
         log.warning(f"Live index prices fetch failed: {e}")
