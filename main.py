@@ -3359,6 +3359,13 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
     # Live Nifty 50 price — needed so RS-TV can react intraday instead of
     # only updating at EOD (historical_cache's Nifty series only refreshes
     # once at startup + once daily, same as every stock's own history).
+    # Response keys from the quotes endpoint don't reliably match the
+    # requested instrument key format (exchange prefix, |: separator,
+    # casing, and spacing all vary) — so match on a NORMALIZED form
+    # (lowercase, no spaces/separators/prefix) instead of exact strings.
+    def _norm_key(k):
+        return k.lower().replace('nse_index', '').replace('|', '').replace(':', '').replace(' ', '').replace('&', 'and')
+
     global _live_nifty_debug_count
     live_nifty_price = None
     try:
@@ -3367,11 +3374,12 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         if debug_nifty:
             _live_nifty_debug_count += 1
             log.info(f"  🔍 Live Nifty fetch raw keys: {list(nifty_live_raw.keys())}")
-        for key_fmt in ("NSE_INDEX:Nifty 50", "NSE_INDEX:NIFTY 50", "NSE_INDEX|Nifty 50"):
-            if key_fmt in nifty_live_raw:
-                live_nifty_price = nifty_live_raw[key_fmt].get('last_price')
+        want = _norm_key(NIFTY_INSTRUMENT_KEY)
+        for rk, rv in nifty_live_raw.items():
+            if _norm_key(rk) == want:
+                live_nifty_price = rv.get('last_price')
                 if debug_nifty:
-                    log.info(f"  🔍 Live Nifty price resolved via key '{key_fmt}': {live_nifty_price}")
+                    log.info(f"  🔍 Live Nifty price resolved via key '{rk}': {live_nifty_price}")
                 break
     except Exception as e:
         log.warning(f"Live Nifty fetch failed: {e}")
@@ -3390,26 +3398,32 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
     live_smallcap_price = _live_synthetic_price(SMALLCAP)
 
     # Live prices for ALL tracked indices (Index Dashboard page) — same
-    # idea as the live Nifty/Midcap/Smallcap prices above, but for every
-    # index shown on the Indices tab, not just the three used for RS-TV
-    # benchmarking. Without this, the whole Index Dashboard (price, %
-    # change, RS-TV, stage) was frozen at yesterday's close all session.
+    # normalized-key matching as the Nifty fetch above. Also splits the
+    # request into two batches: index quote requests can partially fail
+    # as a group, and a smaller batch reduces blast radius.
     global _live_index_debug_count
     live_index_data: dict = {}
     try:
         idx_instrument_keys = list(INDEX_TRACKER.values())
-        idx_live_raw = await fetch_bulk_ohlc(session, idx_instrument_keys)
-        debug_idx = _live_index_debug_count < 3
+        idx_live_raw = {}
+        HALF = (len(idx_instrument_keys) + 1) // 2
+        for chunk in (idx_instrument_keys[:HALF], idx_instrument_keys[HALF:]):
+            if chunk:
+                idx_live_raw.update(await fetch_bulk_ohlc(session, chunk))
+        debug_idx = _live_index_debug_count < 5
         if debug_idx:
             _live_index_debug_count += 1
             log.info(f"  🔍 Live index fetch: requested {len(idx_instrument_keys)} keys, "
-                     f"got {len(idx_live_raw)} back. Sample response keys: {list(idx_live_raw.keys())[:5]}")
+                     f"got {len(idx_live_raw)} back. Sample response keys: {list(idx_live_raw.keys())[:6]}")
+        norm_resp = {_norm_key(rk): rv for rk, rv in idx_live_raw.items()}
         for name, ikey in INDEX_TRACKER.items():
-            resp_key = ikey.replace('|', ':')
-            if resp_key in idx_live_raw:
-                live_index_data[name] = idx_live_raw[resp_key].get('last_price')
+            hit = norm_resp.get(_norm_key(ikey))
+            if hit:
+                live_index_data[name] = hit.get('last_price')
         if debug_idx:
-            log.info(f"  🔍 Live index prices resolved: {len(live_index_data)}/{len(INDEX_TRACKER)}")
+            missing = [n for n in INDEX_TRACKER if n not in live_index_data]
+            log.info(f"  🔍 Live index prices resolved: {len(live_index_data)}/{len(INDEX_TRACKER)}"
+                     + (f" — missing: {missing}" if missing else ""))
     except Exception as e:
         log.warning(f"Live index prices fetch failed: {e}")
 
