@@ -680,6 +680,32 @@ def detect_pp(prices: list, volumes: list) -> dict:
     result['vol_ratio'] = round(volumes[n-1] / max_down, 2) if max_down > 0 else 0.0
     return result
 
+
+def compute_hy_ht_history(prices: list, volumes: list) -> dict:
+    """
+    Last-10-day history for HY (volume near 52-week max) and HT (volume
+    near all-time max), same 'was this signal true on each of the last
+    10 trading days' pattern as detect_pp's pp_hist. Uses the historical
+    close-to-close change for each day (not live intraday data, since
+    these are past days) — the caller overrides the LAST element with
+    today's live-computed is_hy/is_ht for consistency with the live value.
+    """
+    n = len(volumes)
+    hy_hist, ht_hist = [], []
+    for d in range(9, -1, -1):
+        idx = n - 1 - d
+        if idx < 1 or idx >= n:
+            hy_hist.append(False); ht_hist.append(False)
+            continue
+        window_yr  = volumes[max(0, idx-251):idx+1]
+        max_yr     = max(window_yr) if window_yr else 0
+        window_all = volumes[:idx+1]
+        max_all    = max(window_all) if window_all else 0
+        day_chg    = prices[idx] - prices[idx-1]
+        hy_hist.append(bool(max_yr  > 0 and volumes[idx] >= 0.95 * max_yr  and day_chg > 0))
+        ht_hist.append(bool(max_all > 0 and volumes[idx] >= 0.95 * max_all and day_chg > 0))
+    return {'hy_hist': hy_hist, 'ht_hist': ht_hist}
+
 def detect_52wl(prices: list, volumes: list) -> dict:
     n = len(prices)
     empty = {
@@ -2308,6 +2334,23 @@ async def ensure_db_columns(session: aiohttp.ClientSession):
     except Exception as e:
         log.warning(f"DB column check error (ibv_signal): {e}")
 
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/stocks?select=hy_hist,ht_hist&limit=1",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ DB columns OK — hy_hist/ht_hist columns exist")
+            elif r.status == 400:
+                log.error("❌ hy_hist/ht_hist columns MISSING! The whole stocks upsert may be failing.")
+                log.error("   → Go to Supabase SQL Editor and run:")
+                log.error("   alter table public.stocks")
+                log.error("     add column if not exists hy_hist jsonb,")
+                log.error("     add column if not exists ht_hist jsonb;")
+    except Exception as e:
+        log.warning(f"DB column check error (hy_hist/ht_hist): {e}")
+
 
     try:
         async with session.get(
@@ -3864,6 +3907,13 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         max_all  = max(volumes) if volumes else 1
         hy_pct   = round(vol / max_yr * 100, 1) if max_yr > 0 else 0
         ht_pct   = round(vol / max_all * 100, 1) if max_all > 0 else 0
+        is_hy_today = hy_pct >= 95 and chg > 0
+        is_ht_today = ht_pct >= 95 and chg > 0
+        hy_ht_hist = compute_hy_ht_history(prices, volumes)
+        if hy_ht_hist['hy_hist']:
+            hy_ht_hist['hy_hist'][-1] = is_hy_today
+        if hy_ht_hist['ht_hist']:
+            hy_ht_hist['ht_hist'][-1] = is_ht_today
 
         # EMA9
         e9 = ema(prices, 9)
@@ -3926,10 +3976,12 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'pp_vol_ratio':   pp['vol_ratio'],
             'ma10':           round(pp['ma10'], 2) if pp['ma10'] else None,
             'ma50':           round(pp['ma50'], 2) if pp['ma50'] else None,
-            'is_hy':          hy_pct >= 95 and chg > 0,
+            'is_hy':          is_hy_today,
             'hy_pct':         hy_pct,
-            'is_ht':          ht_pct >= 95 and chg > 0,
+            'hy_hist':        hy_ht_hist['hy_hist'],
+            'is_ht':          is_ht_today,
             'ht_pct':         ht_pct,
+            'ht_hist':        hy_ht_hist['ht_hist'],
             'ema9':           e9,
             'near_ema9':      near_ema9,
             'pct_from_ema9':  pct_ema9,
