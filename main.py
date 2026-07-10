@@ -3336,16 +3336,23 @@ async def load_instrument_master(session: aiohttp.ClientSession):
                 except Exception:
                     data = json.loads(content)
 
-                # Build sym -> instrument_key map for EQ stocks
+                # Build sym -> instrument_key map for EQ stocks AND ETFs.
+                # CONFIRMED ROOT CAUSE (user report + investigation): this
+                # was EQ-only, so any ETF symbol (NV20, HDFCBSE500, and
+                # others named like index-tracking ETFs) got NO instrument
+                # key at all — meaning even the Upstox historical-candle
+                # fallback we built for Yahoo-failing symbols could never
+                # work for them, since that fallback depends entirely on
+                # instrument_key_map having a real entry.
                 for item in data:
                     sym = item.get('trading_symbol', '').replace('-EQ', '').replace('EQ', '')
                     itype = item.get('instrument_type', '')
                     exch = item.get('exchange', '')
                     key = item.get('instrument_key', '')
-                    if exch == 'NSE' and itype == 'EQ' and sym and key:
+                    if exch == 'NSE' and itype in ('EQ', 'ETF') and sym and key:
                         instrument_key_map[sym] = key
 
-                log.info(f"✅ Instrument master loaded: {len(instrument_key_map)} EQ stocks")
+                log.info(f"✅ Instrument master loaded: {len(instrument_key_map)} EQ+ETF instruments")
 
                 # Update ALL_STOCKS to only include stocks we have keys for
                 if len(instrument_key_map) > 100:
@@ -3364,12 +3371,12 @@ async def load_instrument_master(session: aiohttp.ClientSession):
                 content = gzip.decompress(await r.read()).decode('utf-8')
                 reader = csv.DictReader(io.StringIO(content))
                 for row in reader:
-                    if row.get('exchange') == 'NSE' and row.get('instrument_type') == 'EQ':
+                    if row.get('exchange') == 'NSE' and row.get('instrument_type') in ('EQ', 'ETF'):
                         sym = row.get('trading_symbol', '').replace('-EQ', '')
                         key = row.get('instrument_key', '')
                         if sym and key:
                             instrument_key_map[sym] = key
-                log.info(f"✅ CSV master loaded: {len(instrument_key_map)} EQ stocks")
+                log.info(f"✅ CSV master loaded: {len(instrument_key_map)} EQ+ETF instruments")
                 if len(instrument_key_map) > 100:
                     ALL_STOCKS = list(instrument_key_map.keys())
                 return True
