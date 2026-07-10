@@ -728,6 +728,64 @@ def detect_resistance_breakout(prices: list, live_price: float = None) -> dict:
     return {'is_breakout': False, 'r1': round(max(candidates), 2) if candidates else None}
 
 
+def detect_cup_handle_breakout(prices: list, live_price: float = None, lookback: int = 130) -> dict:
+    """
+    Same Cup & Handle heuristic the chart already draws (detectCupAndHandle
+    in chartAnalysis.js), reimplemented here using close prices so it can
+    run as a scanner signal across all stocks, not just one chart at a
+    time. Identical trade-off to detect_resistance_breakout: uses closes
+    rather than real highs/lows, since only prices/volumes are held in
+    the fast in-memory cache this runs against.
+
+    1. Left lip = highest close in the first ~15% of the window
+    2. Cup bottom = lowest close between the left lip and the handle zone
+    3. Right lip = highest close after the bottom, before the handle zone
+    4. Handle = a shallow (5-20%) pullback in the last ~20% of the window
+    5. "Breakout" = today's live price just crossed above the handle's
+       high (or the right lip if no handle), yesterday's close still at
+       or below it — a fresh crossover, not just "currently above".
+    """
+    n = len(prices)
+    empty = {'is_breakout': False, 'has_cup': False, 'depth_pct': None}
+    if n < lookback:
+        return empty
+    window = prices[-lookback:]
+
+    left_zone_end = int(lookback * 0.15)
+    left_lip_idx, left_lip = 0, -1
+    for i in range(left_zone_end):
+        if window[i] > left_lip:
+            left_lip, left_lip_idx = window[i], i
+
+    handle_zone_start = int(lookback * 0.8)
+    bottom_idx, bottom = left_lip_idx, float('inf')
+    for i in range(left_lip_idx, handle_zone_start):
+        if window[i] < bottom:
+            bottom, bottom_idx = window[i], i
+    depth_pct = (left_lip - bottom) / left_lip * 100 if left_lip else 0
+
+    right_lip_idx, right_lip = bottom_idx, -1
+    for i in range(bottom_idx, handle_zone_start):
+        if window[i] > right_lip:
+            right_lip, right_lip_idx = window[i], i
+    right_lip_recovery = right_lip / left_lip if left_lip else 0
+
+    is_valid_cup = (12 <= depth_pct <= 50 and right_lip_recovery >= 0.90
+                     and (bottom_idx - left_lip_idx) >= lookback * 0.15)
+    if not is_valid_cup:
+        return empty
+
+    handle_window = window[handle_zone_start:]
+    handle_high = max(handle_window) if handle_window else right_lip
+    breakout_level = max(right_lip, handle_high)
+
+    today_price = live_price if live_price is not None else prices[-1]
+    yesterday_price = prices[-2] if n >= 2 else prices[-1]
+    is_breakout = bool(yesterday_price <= breakout_level < today_price)
+
+    return {'is_breakout': is_breakout, 'has_cup': True, 'depth_pct': round(depth_pct)}
+
+
 def compute_hy_ht_history(prices: list, volumes: list) -> dict:
     """
     Last-10-day history for HY (volume near 52-week max) and HT (volume
@@ -2415,6 +2473,24 @@ async def ensure_db_columns(session: aiohttp.ClientSession):
     except Exception as e:
         log.warning(f"DB column check error (resistance_breakout): {e}")
 
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/stocks?select=is_cup_handle_breakout&limit=1",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ DB columns OK — is_cup_handle_breakout column exists")
+            elif r.status == 400:
+                log.error("❌ cup handle breakout columns MISSING! The whole stocks upsert may be failing.")
+                log.error("   → Go to Supabase SQL Editor and run:")
+                log.error("   alter table public.stocks")
+                log.error("     add column if not exists is_cup_handle_breakout boolean,")
+                log.error("     add column if not exists has_cup_pattern boolean,")
+                log.error("     add column if not exists cup_depth_pct numeric;")
+    except Exception as e:
+        log.warning(f"DB column check error (cup_handle_breakout): {e}")
+
 
     try:
         async with session.get(
@@ -3965,6 +4041,7 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             live.get('ohlc', {}).get('high'), live.get('ohlc', {}).get('low'), last
         )
         resistance_breakout = detect_resistance_breakout(prices, live_price=last)
+        cup_handle = detect_cup_handle_breakout(prices, live_price=last)
 
         # Volume signals
         yr_vols  = volumes[-252:] if len(volumes) >= 252 else volumes
@@ -4049,6 +4126,9 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'ht_hist':        hy_ht_hist['ht_hist'],
             'is_resistance_breakout': resistance_breakout['is_breakout'],
             'resistance_r1':          resistance_breakout['r1'],
+            'is_cup_handle_breakout': cup_handle['is_breakout'],
+            'has_cup_pattern':        cup_handle['has_cup'],
+            'cup_depth_pct':          cup_handle['depth_pct'],
             'ema9':           e9,
             'near_ema9':      near_ema9,
             'pct_from_ema9':  pct_ema9,
