@@ -2694,7 +2694,10 @@ async def fetch_upstox_full_ohlcv(session: aiohttp.ClientSession, sym: str,
     Candle format: [ts, open, high, low, close, volume, oi], newest first.
     """
     ikey = instrument_key_map.get(sym)
+    _debug_this = sym in ('GRSE', 'RRKABEL')
     if not ikey or '|' not in ikey:
+        if _debug_this:
+            log.info(f"  🔍 {sym} Upstox fallback: no valid instrument_key ({ikey!r}), bailing out")
         return None
     encoded = ikey.replace('|', '%7C').replace(' ', '%20').replace('&', '%26')
     to = datetime.now(IST).strftime('%Y-%m-%d')
@@ -2704,10 +2707,15 @@ async def fetch_upstox_full_ohlcv(session: aiohttp.ClientSession, sym: str,
     try:
         async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as r:
             if r.status != 200:
+                if _debug_this:
+                    body = await r.text()
+                    log.info(f"  🔍 {sym} Upstox historical-candle status={r.status} url={url} body={body[:200]}")
                 return None
             data = await r.json()
             candles = list(reversed(data.get('data', {}).get('candles', [])))
             if len(candles) < 30:
+                if _debug_this:
+                    log.info(f"  🔍 {sym} Upstox historical-candle returned only {len(candles)} candles (need 30+)")
                 return None
             return {
                 'dates':   [str(c[0])[:10] for c in candles],
@@ -2717,7 +2725,9 @@ async def fetch_upstox_full_ohlcv(session: aiohttp.ClientSession, sym: str,
                 'lows':    [round(c[3], 2) for c in candles],
                 'opens':   [round(c[1], 2) for c in candles],
             }
-    except Exception:
+    except Exception as e:
+        if _debug_this:
+            log.info(f"  🔍 {sym} Upstox historical-candle exception: {type(e).__name__}: {e}")
         return None
 
 
@@ -2908,13 +2918,21 @@ async def fetch_full_history_for_symbols(session: aiohttp.ClientSession, symbols
 
     async def fetch_one(sym):
         nonlocal done, failed
+        _debug_this = sym in ('GRSE', 'RRKABEL')
         async with sem:
             data = await fetch_yahoo_full_ohlcv(session, sym)
+            if _debug_this:
+                log.info(f"  🔍 {sym} Yahoo history fetch: {'got ' + str(len(data['prices'])) + ' days' if data else 'FAILED (no data)'}")
             if not data:
                 # Yahoo permanently fails ~72 symbols (no .NS/.BO ticker) —
                 # they showed absurd chg% (stale prev close) and no chart
                 # data. Upstox's historical-candle API resolves them by ISIN.
+                ikey = instrument_key_map.get(sym)
+                if _debug_this:
+                    log.info(f"  🔍 {sym} instrument_key_map lookup: {ikey!r}")
                 data = await fetch_upstox_full_ohlcv(session, sym)
+                if _debug_this:
+                    log.info(f"  🔍 {sym} Upstox fallback fetch: {'got ' + str(len(data['prices'])) + ' days' if data else 'FAILED (no data)'}")
             await asyncio.sleep(0.02)
         async with lock:
             if data:
