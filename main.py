@@ -681,6 +681,53 @@ def detect_pp(prices: list, volumes: list) -> dict:
     return result
 
 
+def detect_resistance_breakout(prices: list, live_price: float = None) -> dict:
+    """
+    Detects a fresh breakout above the nearest significant resistance
+    level (R1) — same swing-high concept the candlestick chart already
+    draws as a dashed line, computed here for every stock so it can be
+    used as a scanner signal, not just viewed one chart at a time.
+
+    Uses CLOSE prices for the swing-high detection (not intraday highs —
+    those aren't held in the in-memory cache this runs against, only
+    prices/volumes are; the chart's own R1/R2 uses real highs since it
+    has the full OHLC data for one stock at a time). A close-based swing
+    high is a reasonable approximation of the same idea: a bar counts as
+    a swing high if it's the local max within a +/-5 day window.
+
+    R1 = the closest swing high found in the lookback window, excluding
+    the last 10 days (so R1 isn't just "yesterday's high" — it needs to
+    be an established level the stock was actually held under for a
+    while). "Breakout" = today's price just crossed above that level
+    (yesterday's close was still at/below it).
+    """
+    n = len(prices)
+    empty = {'is_breakout': False, 'r1': None}
+    if n < 60:
+        return empty
+
+    lookback = min(n, 252)
+    window_start = n - lookback
+    swing_highs = []
+    for i in range(window_start + 5, n - 10):  # exclude the last 10 days from R1 candidates
+        seg = prices[max(0, i-5):i+6]
+        if seg and prices[i] == max(seg):
+            swing_highs.append(prices[i])
+    if not swing_highs:
+        return empty
+
+    today_price = live_price if live_price is not None else prices[-1]
+    yesterday_price = prices[-2] if n >= 2 else prices[-1]
+
+    # R1 = nearest swing high that today's price is now above, but
+    # yesterday's price was still at/below — i.e. a level just crossed.
+    candidates = sorted(set(swing_highs))
+    for level in candidates:
+        if yesterday_price <= level < today_price:
+            return {'is_breakout': True, 'r1': round(level, 2)}
+    return {'is_breakout': False, 'r1': round(max(candidates), 2) if candidates else None}
+
+
 def compute_hy_ht_history(prices: list, volumes: list) -> dict:
     """
     Last-10-day history for HY (volume near 52-week max) and HT (volume
@@ -2351,6 +2398,23 @@ async def ensure_db_columns(session: aiohttp.ClientSession):
     except Exception as e:
         log.warning(f"DB column check error (hy_hist/ht_hist): {e}")
 
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/stocks?select=is_resistance_breakout&limit=1",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ DB columns OK — is_resistance_breakout column exists")
+            elif r.status == 400:
+                log.error("❌ is_resistance_breakout/resistance_r1 columns MISSING! The whole stocks upsert may be failing.")
+                log.error("   → Go to Supabase SQL Editor and run:")
+                log.error("   alter table public.stocks")
+                log.error("     add column if not exists is_resistance_breakout boolean,")
+                log.error("     add column if not exists resistance_r1 numeric;")
+    except Exception as e:
+        log.warning(f"DB column check error (resistance_breakout): {e}")
+
 
     try:
         async with session.get(
@@ -3900,6 +3964,7 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             volumes, vol,
             live.get('ohlc', {}).get('high'), live.get('ohlc', {}).get('low'), last
         )
+        resistance_breakout = detect_resistance_breakout(prices, live_price=last)
 
         # Volume signals
         yr_vols  = volumes[-252:] if len(volumes) >= 252 else volumes
@@ -3982,6 +4047,8 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'is_ht':          is_ht_today,
             'ht_pct':         ht_pct,
             'ht_hist':        hy_ht_hist['ht_hist'],
+            'is_resistance_breakout': resistance_breakout['is_breakout'],
+            'resistance_r1':          resistance_breakout['r1'],
             'ema9':           e9,
             'near_ema9':      near_ema9,
             'pct_from_ema9':  pct_ema9,
