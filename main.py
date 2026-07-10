@@ -624,6 +624,18 @@ def rs_slope(hist: list) -> dict:
     trend = 'improving' if slope > 1.5 else 'declining' if slope < -1.5 else 'flat'
     return {'trend': trend, 'slope': slope}
 
+def detect_ibv_signal(volumes: list, live_vol, live_high, live_low, live_close) -> bool:
+    if not volumes or len(volumes) < 10 or not live_vol or not live_high or not live_low or not live_close:
+        return False
+    max_recent = max(volumes[-10:])
+    if max_recent <= 0 or live_vol < 2 * max_recent:
+        return False
+    day_range = live_high - live_low
+    if day_range <= 0:
+        return False
+    return (live_close - live_low) / day_range * 100 > 50
+
+
 def detect_pp(prices: list, volumes: list) -> dict:
     n = len(prices)
     result = {
@@ -2283,6 +2295,22 @@ async def ensure_db_columns(session: aiohttp.ClientSession):
 
     try:
         async with session.get(
+            f"{SUPABASE_URL}/rest/v1/stocks?select=ibv_signal&limit=1",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ DB columns OK — ibv_signal column exists")
+            elif r.status == 400:
+                log.error("❌ ibv_signal column MISSING! The whole stocks upsert may be failing.")
+                log.error("   → Go to Supabase SQL Editor and run:")
+                log.error("   alter table public.stocks add column if not exists ibv_signal boolean;")
+    except Exception as e:
+        log.warning(f"DB column check error (ibv_signal): {e}")
+
+
+    try:
+        async with session.get(
             f"{SUPABASE_URL}/rest/v1/sectors?select=advances_d&limit=1",
             headers=headers,
             timeout=aiohttp.ClientTimeout(total=10)
@@ -3800,6 +3828,10 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             rt_prices  = prices + [live_price]
             rt_volumes = volumes + [vol]
         pp = detect_pp(rt_prices, rt_volumes)
+        ibv_signal = detect_ibv_signal(
+            volumes, vol,
+            live.get('ohlc', {}).get('high'), live.get('ohlc', {}).get('low'), last
+        )
 
         # Volume signals
         yr_vols  = volumes[-252:] if len(volumes) >= 252 else volumes
@@ -3863,6 +3895,7 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'rs_slope':       trend_data['slope'],
             'rs_hist':        hist,
             'is_pp':          pp['is_pp'],
+            'ibv_signal':     ibv_signal,
             'pp_count_10d':   pp['pp_count_10d'],
             'pp_hist':        pp['pp_hist'],
             'pp_vol_ratio':   pp['vol_ratio'],
