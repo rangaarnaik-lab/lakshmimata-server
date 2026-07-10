@@ -4387,6 +4387,39 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         for s in sector_rows
     ])
 
+    # Clean up stale sector rows — SECTOR_MAP has been restructured a
+    # few times over this project's history, and the upsert above only
+    # adds/updates CURRENT sectors, never removes ones that no longer
+    # exist. A leftover row (e.g. an old 'Engineering' category) keeps
+    # showing cached top_stocks/avg_rs from whenever it was last live,
+    # while the actual stocks table correctly has zero members for it
+    # now — confusing 'sector shows data but has 0 stocks when expanded'
+    # symptom. Runs once per scan; cheap (one SELECT + occasional DELETE).
+    try:
+        current_sector_names = set(SECTOR_MAP.keys())
+        sec_headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/sectors?select=sector",
+            headers=sec_headers, timeout=aiohttp.ClientTimeout(total=15)
+        ) as r:
+            if r.status == 200:
+                existing_sector_names = {row['sector'] for row in await r.json() if row.get('sector')}
+                stale = existing_sector_names - current_sector_names
+                if stale:
+                    for stale_name in stale:
+                        del_headers = {**sec_headers, "Content-Type": "application/json"}
+                        async with session.delete(
+                            f"{SUPABASE_URL}/rest/v1/sectors",
+                            headers=del_headers,
+                            params={"sector": f"eq.{stale_name}"},
+                            timeout=aiohttp.ClientTimeout(total=15)
+                        ) as dr:
+                            if dr.status not in (200, 204):
+                                log.warning(f"  Failed to delete stale sector '{stale_name}': {dr.status}")
+                    log.info(f"  🧹 Cleaned up {len(stale)} stale sector row(s): {sorted(stale)}")
+    except Exception as e:
+        log.warning(f"Stale sector cleanup failed: {e}")
+
     # Step 7.5: At end-of-day, also archive a permanent daily snapshot.
     # This is what powers the "view any past date" history feature —
     # without this, only today's live state is ever available.
