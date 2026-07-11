@@ -2654,6 +2654,22 @@ async def ensure_db_columns(session: aiohttp.ClientSession):
     except Exception as e:
         log.warning(f"DB column check error (ibv_hist): {e}")
 
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/stocks?select=is_52wh_breakout&limit=1",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ DB columns OK — is_52wh_breakout column exists")
+            elif r.status == 400:
+                log.error("❌ is_52wh_breakout column MISSING! The whole stocks upsert will fail.")
+                log.error("   → Go to Supabase SQL Editor and run:")
+                log.error("   alter table public.stocks add column if not exists is_52wh_breakout boolean;")
+                log.error("   NOTIFY pgrst, 'reload schema';")
+    except Exception as e:
+        log.warning(f"DB column check error (is_52wh_breakout): {e}")
+
 
     try:
         async with session.get(
@@ -4487,10 +4503,16 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         l52   = min(p252)
         pct_from_h52 = round((last - h52) / h52 * 100, 1) if h52 else 0
         weinstein_stage = calc_weinstein_stage(rs, trend_data['trend'], pct_from_h52, hist)
+        # Fresh breakout above the prior 52-week high — yesterday's close
+        # was at/below it, today's live price is now above it. h52 is
+        # computed from stored history only (doesn't include today), so
+        # this genuinely detects "just broke out", not an ongoing state.
+        is_52wh_breakout = bool(h52 and prices[-1] <= h52 and last > h52)
 
         processed.append({
             'sym':            sym,
             'weinstein_stage': weinstein_stage,
+            'is_52wh_breakout': is_52wh_breakout,
             'last_price':     round(last, 2),
             'open':           round(live.get('ohlc', {}).get('open', last), 2),
             'high':           round(live.get('ohlc', {}).get('high', last), 2),
