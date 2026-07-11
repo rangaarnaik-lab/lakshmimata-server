@@ -2556,6 +2556,27 @@ async def ensure_db_columns(session: aiohttp.ClientSession):
     except Exception as e:
         log.warning(f"DB column check error (guppy_crossover): {e}")
 
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/stocks?select=near_ema21,near_ema50&limit=1",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ DB columns OK — near_ema21/near_ema50 columns exist")
+            elif r.status == 400:
+                log.error("❌ EMA21/EMA50 columns MISSING! The whole stocks upsert may be failing.")
+                log.error("   → Go to Supabase SQL Editor and run:")
+                log.error("   alter table public.stocks add column if not exists ema21 numeric;")
+                log.error("   alter table public.stocks add column if not exists near_ema21 boolean;")
+                log.error("   alter table public.stocks add column if not exists pct_from_ema21 numeric;")
+                log.error("   alter table public.stocks add column if not exists ema50 numeric;")
+                log.error("   alter table public.stocks add column if not exists near_ema50 boolean;")
+                log.error("   alter table public.stocks add column if not exists pct_from_ema50 numeric;")
+                log.error("   NOTIFY pgrst, 'reload schema';")
+    except Exception as e:
+        log.warning(f"DB column check error (ema21_ema50): {e}")
+
 
     try:
         async with session.get(
@@ -4131,6 +4152,24 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             pct_ema9  = round((last - e9) / e9 * 100, 2)
             near_ema9 = abs(pct_ema9) <= 3
 
+        # EMA21 / EMA50 — same "pullback to a rising average" idea as
+        # EMA9, just longer-term. Same rs>=90 gate (a pullback to a
+        # longer average is only a meaningful setup on an already-strong
+        # stock, same reasoning as EMA9).
+        e21 = ema(prices, 21)
+        near_ema21 = False
+        pct_ema21  = None
+        if e21 and rs >= 90:
+            pct_ema21  = round((last - e21) / e21 * 100, 2)
+            near_ema21 = abs(pct_ema21) <= 3
+
+        e50 = ema(prices, 50)
+        near_ema50 = False
+        pct_ema50  = None
+        if e50 and rs >= 90:
+            pct_ema50  = round((last - e50) / e50 * 100, 2)
+            near_ema50 = abs(pct_ema50) <= 3
+
         # 52WL
         wl = detect_52wl(prices, volumes)
 
@@ -4201,6 +4240,12 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'ema9':           e9,
             'near_ema9':      near_ema9,
             'pct_from_ema9':  pct_ema9,
+            'ema21':          e21,
+            'near_ema21':     near_ema21,
+            'pct_from_ema21': pct_ema21,
+            'ema50':          e50,
+            'near_ema50':     near_ema50,
+            'pct_from_ema50': pct_ema50,
             'low_52w':        round(l52, 2),
             'high_52w':       round(h52, 2),
             'pct_from_52wl':  wl['pct_from_52wl'],
