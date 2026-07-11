@@ -728,6 +728,51 @@ def detect_resistance_breakout(prices: list, live_price: float = None) -> dict:
     return {'is_breakout': False, 'r1': round(max(candidates), 2) if candidates else None}
 
 
+def detect_guppy_crossover(prices: list, live_price: float = None) -> dict:
+    """
+    Guppy Multiple Moving Average (GMMA) crossover — the standard short
+    group (EMA 3/5/8/10/12/15, representing short-term trader activity)
+    vs the long group (EMA 30/35/40/45/50/60, representing long-term
+    investor activity). A bullish crossover is when the AVERAGE of the
+    short group moves from at/below the average of the long group to
+    above it — short-term momentum picking up ahead of the longer trend,
+    the classic GMMA "compression then expansion" signal.
+
+    Uses the live price as an implicit extra final bar (same technique
+    used elsewhere for live RS/PP) so the crossover can fire intraday,
+    not just at yesterday's close.
+    """
+    empty = {'is_bullish_crossover': False, 'is_bearish_crossover': False, 'is_compressed': False}
+    n = len(prices)
+    if n < 65:
+        return empty
+
+    series = prices + [live_price] if live_price is not None else prices
+    short_periods = [3, 5, 8, 10, 12, 15]
+    long_periods = [30, 35, 40, 45, 50, 60]
+
+    short_emas = [ema_arr(series, p) for p in short_periods]
+    long_emas = [ema_arr(series, p) for p in long_periods]
+
+    def avg_at(emas, idx):
+        vals = [e[idx] for e in emas if e[idx] is not None]
+        return sum(vals) / len(vals) if vals else None
+
+    m = len(series)
+    today_short, today_long = avg_at(short_emas, m-1), avg_at(long_emas, m-1)
+    yday_short, yday_long = avg_at(short_emas, m-2), avg_at(long_emas, m-2)
+    if None in (today_short, today_long, yday_short, yday_long):
+        return empty
+
+    bullish = yday_short <= yday_long and today_short > today_long
+    bearish = yday_short >= yday_long and today_short < today_long
+    # "Compressed" — short and long groups within 2% of each other, the
+    # classic pre-breakout GMMA squeeze, regardless of direction.
+    compressed = today_long != 0 and abs(today_short - today_long) / today_long < 0.02
+
+    return {'is_bullish_crossover': bool(bullish), 'is_bearish_crossover': bool(bearish), 'is_compressed': bool(compressed)}
+
+
 def detect_cup_handle_breakout(prices: list, live_price: float = None, lookback: int = 130) -> dict:
     """
     Same Cup & Handle heuristic the chart already draws (detectCupAndHandle
@@ -2493,6 +2538,24 @@ async def ensure_db_columns(session: aiohttp.ClientSession):
     except Exception as e:
         log.warning(f"DB column check error (cup_handle_breakout): {e}")
 
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/stocks?select=is_guppy_bullish_crossover&limit=1",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ DB columns OK — is_guppy_bullish_crossover column exists")
+            elif r.status == 400:
+                log.error("❌ guppy crossover columns MISSING! The whole stocks upsert may be failing.")
+                log.error("   → Go to Supabase SQL Editor and run:")
+                log.error("   alter table public.stocks")
+                log.error("     add column if not exists is_guppy_bullish_crossover boolean,")
+                log.error("     add column if not exists is_guppy_bearish_crossover boolean,")
+                log.error("     add column if not exists is_guppy_compressed boolean;")
+    except Exception as e:
+        log.warning(f"DB column check error (guppy_crossover): {e}")
+
 
     try:
         async with session.get(
@@ -4044,6 +4107,7 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         )
         resistance_breakout = detect_resistance_breakout(prices, live_price=last)
         cup_handle = detect_cup_handle_breakout(prices, live_price=last)
+        guppy = detect_guppy_crossover(prices, live_price=last)
 
         # Volume signals
         yr_vols  = volumes[-252:] if len(volumes) >= 252 else volumes
@@ -4131,6 +4195,9 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'is_cup_handle_breakout': cup_handle['is_breakout'],
             'has_cup_pattern':        cup_handle['has_cup'],
             'cup_depth_pct':          cup_handle['depth_pct'],
+            'is_guppy_bullish_crossover': guppy['is_bullish_crossover'],
+            'is_guppy_bearish_crossover': guppy['is_bearish_crossover'],
+            'is_guppy_compressed':        guppy['is_compressed'],
             'ema9':           e9,
             'near_ema9':      near_ema9,
             'pct_from_ema9':  pct_ema9,
