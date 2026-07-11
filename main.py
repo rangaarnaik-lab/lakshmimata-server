@@ -3386,8 +3386,16 @@ async def backfill_ema_breadth_history(session: aiohttp.ClientSession, days: int
     # date -> [above_ema9, above_ema21, above_ema50, total]
     counts: dict = {}
     for row in all_rows:
-        dates = row.get('dates') or []
-        prices = row.get('prices') or []
+        # dates/prices are stored as JSON-encoded strings (json.dumps at
+        # write time), not native arrays — must be parsed back, or every
+        # row silently fails the length check below and gets skipped.
+        raw_dates = row.get('dates')
+        raw_prices = row.get('prices')
+        try:
+            dates = json.loads(raw_dates) if isinstance(raw_dates, str) else (raw_dates or [])
+            prices = json.loads(raw_prices) if isinstance(raw_prices, str) else (raw_prices or [])
+        except (json.JSONDecodeError, TypeError):
+            continue
         if len(dates) < 55 or len(prices) != len(dates):
             continue
         ema9  = ema_arr(prices, 9)
@@ -3490,8 +3498,16 @@ async def backfill_market_breadth_history(session: aiohttp.ClientSession):
     # date -> [advances, declines, unchanged]
     breadth: dict = {}
     for row in all_rows:
-        dates = row.get('dates') or []
-        prices = row.get('prices') or []
+        # dates/prices are stored as JSON-encoded strings (json.dumps at
+        # write time), not native arrays — must be parsed back, or every
+        # row silently fails the length check below and gets skipped.
+        raw_dates = row.get('dates')
+        raw_prices = row.get('prices')
+        try:
+            dates = json.loads(raw_dates) if isinstance(raw_dates, str) else (raw_dates or [])
+            prices = json.loads(raw_prices) if isinstance(raw_prices, str) else (raw_prices or [])
+        except (json.JSONDecodeError, TypeError):
+            continue
         if len(dates) < 2 or len(prices) != len(dates):
             continue
         for i in range(1, len(dates)):
