@@ -611,6 +611,31 @@ def percentile_rank(values: list, val: float) -> int:
     below = sum(1 for v in values if v < val)
     return min(99, max(1, round((below / len(values)) * 99) + 1))
 
+def calc_weinstein_stage(rs: float, trend: str, pct_from_high: float, hist: list) -> int:
+    """
+    Exact port of the frontend's calcWeinsteinStage (App.jsx) — kept
+    identical so a stock's Stage badge in the app and its contribution
+    to the Stage 2 breadth count always agree. Was previously only
+    computed client-side; 'weinstein_stage' was referenced for the
+    stage2_count/stage4_count breadth stats but never actually set,
+    so those counts had silently always been zero.
+    """
+    recent_rs = [h for h in (hist or []) if h][-5:]
+    avg_recent_rs = sum(recent_rs) / len(recent_rs) if recent_rs else rs
+
+    if rs >= 70 and trend in ('improving', 'flat') and pct_from_high >= -30:
+        return 3 if pct_from_high >= -5 else 2
+    if rs >= 70 and trend == 'declining':
+        return 3
+    if rs < 40 and (trend == 'declining' or avg_recent_rs < 40):
+        return 4
+    if rs < 50 and trend == 'flat':
+        return 1
+    if 50 <= rs < 70:
+        return 2
+    return 1
+
+
 def rs_slope(hist: list) -> dict:
     valid = [v for v in hist if v is not None]
     if len(valid) < 4:
@@ -3288,6 +3313,196 @@ async def fetch_full_history_for_symbols(session: aiohttp.ClientSession, symbols
     return done
 
 
+async def backfill_ema_breadth_history(session: aiohttp.ClientSession, lookback_days: int = 35):
+    """
+    One-time backfill of how many stocks were trading above their 9/21/50
+    day EMA, for each of the last ~35 trading days (a bit more than a
+    month, so the frontend can trim to exactly 30 trading days). Same
+    approach as backfill_market_breadth_history: computed from the price
+    history already stored per stock, self-guards to only run once.
+    """
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/ema_breadth_history?select=date&limit=1",
+            headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+        ) as r:
+            if r.status == 200 and await r.json():
+                log.info("  ema_breadth_history already populated — skipping backfill")
+                return
+            if r.status == 400:
+                log.error("❌ ema_breadth_history table missing! Run the SQL to create it, then restart.")
+                return
+    except Exception as e:
+        log.warning(f"ema_breadth_history check failed: {e}")
+        return
+
+    log.info("📊 Backfilling EMA breadth history from stored price data (one-time)...")
+    all_rows: list = []
+    PAGE = 1000
+    offset = 0
+    while True:
+        try:
+            page_headers = {**headers, "Range": f"{offset}-{offset + PAGE - 1}"}
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/stock_full_history?select=sym,dates,prices",
+                headers=page_headers, timeout=aiohttp.ClientTimeout(total=30)
+            ) as r:
+                if r.status not in (200, 206):
+                    break
+                page = await r.json()
+                all_rows.extend(page)
+                if len(page) < PAGE:
+                    break
+                offset += PAGE
+        except Exception as e:
+            log.error(f"backfill_ema_breadth_history fetch error: {e}")
+            break
+
+    # date -> {ema9: [above, valid], ema21: [...], ema50: [...]}
+    breadth: dict = {}
+    for row in all_rows:
+        dates = row.get('dates') or []
+        prices = row.get('prices') or []
+        if len(dates) < 55 or len(prices) != len(dates):
+            continue
+        e9 = ema_arr(prices, 9)
+        e21 = ema_arr(prices, 21)
+        e50 = ema_arr(prices, 50)
+        n = len(dates)
+        for i in range(max(0, n - lookback_days), n):
+            d = dates[i]
+            if d not in breadth:
+                breadth[d] = {'ema9': [0, 0], 'ema21': [0, 0], 'ema50': [0, 0]}
+            for key, arr in (('ema9', e9), ('ema21', e21), ('ema50', e50)):
+                if arr[i] is not None:
+                    breadth[d][key][1] += 1  # valid count
+                    if prices[i] > arr[i]:
+                        breadth[d][key][0] += 1  # above count
+
+    rows_to_save = []
+    for d, vals in breadth.items():
+        rows_to_save.append({
+            'date': d,
+            'above_ema9':  vals['ema9'][0],  'total_ema9':  vals['ema9'][1],
+            'above_ema21': vals['ema21'][0], 'total_ema21': vals['ema21'][1],
+            'above_ema50': vals['ema50'][0], 'total_ema50': vals['ema50'][1],
+        })
+    rows_to_save.sort(key=lambda r: r['date'])
+    log.info(f"  Computed EMA breadth for {len(rows_to_save)} trading days from {len(all_rows)} stocks")
+
+    BATCH = 500
+    for i in range(0, len(rows_to_save), BATCH):
+        batch = rows_to_save[i:i+BATCH]
+        try:
+            async with session.post(
+                f"{SUPABASE_URL}/rest/v1/ema_breadth_history",
+                headers={**headers, "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates"},
+                json=batch, timeout=aiohttp.ClientTimeout(total=30)
+            ) as r:
+                if r.status not in (200, 201, 204):
+                    body = await r.text()
+                    log.warning(f"  EMA breadth backfill batch failed: status={r.status} body={body[:200]}")
+        except Exception as e:
+            log.warning(f"  EMA breadth backfill batch error: {e}")
+    log.info(f"✅ EMA breadth backfill complete: {len(rows_to_save)} days saved")
+
+
+async def backfill_ema_breadth_history(session: aiohttp.ClientSession, days: int = 35):
+    """
+    One-time backfill of 'how many stocks are trading above their 9/21/
+    50-day EMA' for roughly the last month, using stored price history.
+    Unlike Stage 2 (which needs the cross-market RS-TV comparison and
+    can't be reconstructed after the fact), EMA-above is purely a
+    function of each stock's own price series, so this can be backfilled
+    the same way market breadth was. Self-guards to only run once.
+    """
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/ema_breadth_history?select=date&limit=1",
+            headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+        ) as r:
+            if r.status == 200 and await r.json():
+                log.info("  ema_breadth_history already populated — skipping backfill")
+                return
+            if r.status == 400:
+                log.error("❌ ema_breadth_history table missing! Run the SQL to create it, then restart.")
+                return
+    except Exception as e:
+        log.warning(f"ema_breadth_history check failed: {e}")
+        return
+
+    log.info("📊 Backfilling EMA breadth history from stored price data (one-time)...")
+    all_rows: list = []
+    PAGE = 1000
+    offset = 0
+    while True:
+        try:
+            page_headers = {**headers, "Range": f"{offset}-{offset + PAGE - 1}"}
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/stock_full_history?select=sym,dates,prices",
+                headers=page_headers, timeout=aiohttp.ClientTimeout(total=30)
+            ) as r:
+                if r.status not in (200, 206):
+                    break
+                page = await r.json()
+                all_rows.extend(page)
+                if len(page) < PAGE:
+                    break
+                offset += PAGE
+        except Exception as e:
+            log.error(f"backfill_ema_breadth_history fetch error: {e}")
+            break
+
+    # date -> [above_ema9, above_ema21, above_ema50, total]
+    counts: dict = {}
+    for row in all_rows:
+        dates = row.get('dates') or []
+        prices = row.get('prices') or []
+        if len(dates) < 55 or len(prices) != len(dates):
+            continue
+        ema9  = ema_arr(prices, 9)
+        ema21 = ema_arr(prices, 21)
+        ema50 = ema_arr(prices, 50)
+        for i in range(len(dates) - days, len(dates)):
+            if i < 0:
+                continue
+            d = dates[i]
+            if d not in counts:
+                counts[d] = [0, 0, 0, 0]
+            counts[d][3] += 1
+            if ema9[i] is not None and prices[i] > ema9[i]:
+                counts[d][0] += 1
+            if ema21[i] is not None and prices[i] > ema21[i]:
+                counts[d][1] += 1
+            if ema50[i] is not None and prices[i] > ema50[i]:
+                counts[d][2] += 1
+
+    rows_to_save = [
+        {'date': d, 'above_ema9': a9, 'above_ema21': a21, 'above_ema50': a50, 'total': tot}
+        for d, (a9, a21, a50, tot) in counts.items()
+    ]
+    rows_to_save.sort(key=lambda r: r['date'])
+    log.info(f"  Computed EMA breadth for {len(rows_to_save)} trading days from {len(all_rows)} stocks")
+
+    BATCH = 500
+    for i in range(0, len(rows_to_save), BATCH):
+        batch = rows_to_save[i:i+BATCH]
+        try:
+            async with session.post(
+                f"{SUPABASE_URL}/rest/v1/ema_breadth_history",
+                headers={**headers, "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates"},
+                json=batch, timeout=aiohttp.ClientTimeout(total=30)
+            ) as r:
+                if r.status not in (200, 201, 204):
+                    body = await r.text()
+                    log.warning(f"  EMA breadth backfill batch failed: status={r.status} body={body[:200]}")
+        except Exception as e:
+            log.warning(f"  EMA breadth backfill batch error: {e}")
+    log.info(f"✅ EMA breadth backfill complete: {len(rows_to_save)} days saved")
+
+
 async def backfill_market_breadth_history(session: aiohttp.ClientSession):
     """
     One-time backfill of daily market breadth (how many stocks advanced
@@ -4277,9 +4492,12 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         p252  = prices[-252:] if len(prices) >= 252 else prices
         h52   = max(p252)
         l52   = min(p252)
+        pct_from_h52 = round((last - h52) / h52 * 100, 1) if h52 else 0
+        weinstein_stage = calc_weinstein_stage(rs, trend_data['trend'], pct_from_h52, hist)
 
         processed.append({
             'sym':            sym,
+            'weinstein_stage': weinstein_stage,
             'last_price':     round(last, 2),
             'open':           round(live.get('ohlc', {}).get('open', last), 2),
             'high':           round(live.get('ohlc', {}).get('high', last), 2),
@@ -4747,6 +4965,22 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
                 'total': len(processed),
             }], on_conflict='date')
 
+        # Append today to the EMA-above-count line (backfilled for the
+        # past month at startup) and the Stage 2 count. Stage 2 can only
+        # ever accumulate going forward — it depends on RS-TV, a
+        # cross-market comparison that can't be reconstructed for past
+        # days from stored price history alone the way EMA-above can.
+        above9  = sum(1 for s in processed if s.get('last_price') and s.get('ema9')  and s['last_price'] > s['ema9'])
+        above21 = sum(1 for s in processed if s.get('last_price') and s.get('ema21') and s['last_price'] > s['ema21'])
+        above50 = sum(1 for s in processed if s.get('last_price') and s.get('ema50') and s['last_price'] > s['ema50'])
+        stage2_count = sum(1 for s in processed if s.get('weinstein_stage') == 2)
+        await supabase_upsert(session, 'ema_breadth_history', [{
+            'date': snapshot_date,
+            'above_ema9': above9, 'above_ema21': above21, 'above_ema50': above50,
+            'stage2_count': stage2_count,
+            'total': len(processed),
+        }], on_conflict='date')
+
         # Send daily Telegram digest at EOD
         if breadth:
             await send_daily_digest(session, processed, breadth)
@@ -4891,6 +5125,11 @@ async def main():
             await asyncio.wait_for(backfill_market_breadth_history(session), timeout=300)
         except Exception as e:
             log.warning(f"Market breadth backfill error (non-fatal): {e}")
+
+        try:
+            await asyncio.wait_for(backfill_ema_breadth_history(session), timeout=300)
+        except Exception as e:
+            log.warning(f"EMA breadth backfill error (non-fatal): {e}")
 
         # Step 3d: Load fundamentals — Supabase first, then a background
         # scrape for anything missing/stale (not blocking, since a full
