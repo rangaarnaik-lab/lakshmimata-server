@@ -3329,14 +3329,17 @@ async def fetch_full_history_for_symbols(session: aiohttp.ClientSession, symbols
     return done
 
 
-async def backfill_ema_breadth_history(session: aiohttp.ClientSession, days: int = 35):
+async def backfill_ema_breadth_history(session: aiohttp.ClientSession):
     """
     One-time backfill of 'how many stocks are trading above their 9/21/
-    50-day EMA' for roughly the last month, using stored price history.
-    Unlike Stage 2 (which needs the cross-market RS-TV comparison and
-    can't be reconstructed after the fact), EMA-above is purely a
-    function of each stock's own price series, so this can be backfilled
-    the same way market breadth was. Self-guards to only run once.
+    50-day EMA' for every available trading day (same full-history
+    approach as backfill_market_breadth_history — was previously capped
+    at ~35 days, extended so the frontend's 1M/3M/6M/1Y/2Y range picker
+    has real data to show beyond the most recent month). Unlike Stage 2
+    (which needs the cross-market RS-TV comparison and can't be
+    reconstructed after the fact), EMA-above is purely a function of
+    each stock's own price series, so this can be backfilled the same
+    way market breadth was. Self-guards to only run once.
     """
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
     try:
@@ -3350,7 +3353,7 @@ async def backfill_ema_breadth_history(session: aiohttp.ClientSession, days: int
                 content_range = r.headers.get('content-range', '')
                 if '/' in content_range:
                     existing_count = int(content_range.split('/')[-1])
-            if existing_count >= 20:
+            if existing_count >= 100:
                 log.info(f"  ema_breadth_history already has {existing_count} rows — skipping backfill")
                 return
             if r.status == 400:
@@ -3401,9 +3404,7 @@ async def backfill_ema_breadth_history(session: aiohttp.ClientSession, days: int
         ema9  = ema_arr(prices, 9)
         ema21 = ema_arr(prices, 21)
         ema50 = ema_arr(prices, 50)
-        for i in range(len(dates) - days, len(dates)):
-            if i < 0:
-                continue
+        for i in range(50, len(dates)):
             d = dates[i]
             if d not in counts:
                 counts[d] = [0, 0, 0, 0]
@@ -5080,7 +5081,7 @@ async def main():
             log.warning(f"Market breadth backfill error (non-fatal): {e}")
 
         try:
-            await asyncio.wait_for(backfill_ema_breadth_history(session), timeout=300)
+            await asyncio.wait_for(backfill_ema_breadth_history(session), timeout=600)
         except Exception as e:
             log.warning(f"EMA breadth backfill error (non-fatal): {e}")
 
