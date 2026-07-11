@@ -847,6 +847,35 @@ def detect_cup_handle_breakout(prices: list, live_price: float = None, lookback:
     return {'is_breakout': is_breakout, 'has_cup': True, 'depth_pct': round(depth_pct)}
 
 
+def compute_ibv_history(prices: list, volumes: list, highs: list = None, lows: list = None) -> dict:
+    """
+    Last-10-day history for IBV (Institutional-style Buying Volume) —
+    same 'was this signal true on each of the last 10 trading days'
+    pattern as compute_hy_ht_history. Falls back to close prices for
+    highs/lows if the real intraday range isn't available (same
+    fallback used elsewhere in this file for VCP/squeeze detection),
+    since only prices/volumes are guaranteed present in the fast cache.
+    """
+    n = len(volumes)
+    h = highs if highs and len(highs) == n else prices
+    l = lows if lows and len(lows) == n else prices
+    ibv_hist = []
+    for d in range(9, -1, -1):
+        idx = n - 1 - d
+        if idx < 10 or idx >= n:
+            ibv_hist.append(False)
+            continue
+        max_recent = max(volumes[idx-10:idx])
+        if max_recent <= 0 or volumes[idx] < 2 * max_recent:
+            ibv_hist.append(False)
+            continue
+        day_range = h[idx] - l[idx]
+        if day_range <= 0:
+            ibv_hist.append(False)
+            continue
+        ibv_hist.append(bool((prices[idx] - l[idx]) / day_range * 100 > 50))
+    return {'ibv_hist': ibv_hist}
+
 def compute_hy_ht_history(prices: list, volumes: list) -> dict:
     """
     Last-10-day history for HY (volume near 52-week max) and HT (volume
@@ -2608,6 +2637,22 @@ async def ensure_db_columns(session: aiohttp.ClientSession):
                 log.error("   NOTIFY pgrst, 'reload schema';")
     except Exception as e:
         log.warning(f"DB column check error (weinstein_stage): {e}")
+
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/stocks?select=ibv_hist&limit=1",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ DB columns OK — ibv_hist column exists")
+            elif r.status == 400:
+                log.error("❌ ibv_hist column MISSING! The whole stocks upsert will fail.")
+                log.error("   → Go to Supabase SQL Editor and run:")
+                log.error("   alter table public.stocks add column if not exists ibv_hist jsonb;")
+                log.error("   NOTIFY pgrst, 'reload schema';")
+    except Exception as e:
+        log.warning(f"DB column check error (ibv_hist): {e}")
 
 
     try:
@@ -4394,6 +4439,9 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             hy_ht_hist['hy_hist'][-1] = is_hy_today
         if hy_ht_hist['ht_hist']:
             hy_ht_hist['ht_hist'][-1] = is_ht_today
+        ibv_hist = compute_ibv_history(prices, volumes, s.get('highs'), s.get('lows'))
+        if ibv_hist['ibv_hist']:
+            ibv_hist['ibv_hist'][-1] = ibv_signal
 
         # EMA9
         e9 = ema(prices, 9)
@@ -4483,6 +4531,7 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'is_ht':          is_ht_today,
             'ht_pct':         ht_pct,
             'ht_hist':        hy_ht_hist['ht_hist'],
+            'ibv_hist':       ibv_hist['ibv_hist'],
             'is_resistance_breakout': resistance_breakout['is_breakout'],
             'resistance_r1':          resistance_breakout['r1'],
             'is_cup_handle_breakout': cup_handle['is_breakout'],
