@@ -3288,6 +3288,97 @@ async def fetch_full_history_for_symbols(session: aiohttp.ClientSession, symbols
     return done
 
 
+async def backfill_market_breadth_history(session: aiohttp.ClientSession):
+    """
+    One-time backfill of daily market breadth (how many stocks advanced
+    vs declined each day) using the 2 years of price history already
+    stored per stock in stock_full_history — so this doesn't have to
+    start from zero and only accumulate going forward. Guarded to only
+    run if market_breadth_history is empty, since it's a one-time job,
+    not something to redo on every restart.
+    """
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/market_breadth_history?select=date&limit=1",
+            headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+        ) as r:
+            if r.status == 200 and await r.json():
+                log.info("  market_breadth_history already populated — skipping backfill")
+                return
+            if r.status == 400:
+                log.error("❌ market_breadth_history table missing! Run the SQL to create it, then restart.")
+                return
+    except Exception as e:
+        log.warning(f"market_breadth_history check failed: {e}")
+        return
+
+    log.info("📊 Backfilling market breadth history from stored price data (one-time)...")
+    all_rows: list = []
+    PAGE = 1000
+    offset = 0
+    while True:
+        try:
+            page_headers = {**headers, "Range": f"{offset}-{offset + PAGE - 1}"}
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/stock_full_history?select=sym,dates,prices",
+                headers=page_headers, timeout=aiohttp.ClientTimeout(total=30)
+            ) as r:
+                if r.status not in (200, 206):
+                    break
+                page = await r.json()
+                all_rows.extend(page)
+                if len(page) < PAGE:
+                    break
+                offset += PAGE
+        except Exception as e:
+            log.error(f"backfill_market_breadth_history fetch error: {e}")
+            break
+
+    # date -> [advances, declines, unchanged]
+    breadth: dict = {}
+    for row in all_rows:
+        dates = row.get('dates') or []
+        prices = row.get('prices') or []
+        if len(dates) < 2 or len(prices) != len(dates):
+            continue
+        for i in range(1, len(dates)):
+            d = dates[i]
+            if prices[i] is None or prices[i-1] is None:
+                continue
+            if d not in breadth:
+                breadth[d] = [0, 0, 0]
+            if prices[i] > prices[i-1]:
+                breadth[d][0] += 1
+            elif prices[i] < prices[i-1]:
+                breadth[d][1] += 1
+            else:
+                breadth[d][2] += 1
+
+    rows_to_save = [
+        {'date': d, 'advances': a, 'declines': dec, 'unchanged': u, 'total': a+dec+u}
+        for d, (a, dec, u) in breadth.items()
+    ]
+    rows_to_save.sort(key=lambda r: r['date'])
+    log.info(f"  Computed breadth for {len(rows_to_save)} trading days from {len(all_rows)} stocks")
+
+    BATCH = 500
+    for i in range(0, len(rows_to_save), BATCH):
+        batch = rows_to_save[i:i+BATCH]
+        try:
+            async with session.post(
+                f"{SUPABASE_URL}/rest/v1/market_breadth_history",
+                headers={**headers, "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates"},
+                json=batch, timeout=aiohttp.ClientTimeout(total=30)
+            ) as r:
+                if r.status not in (200, 201, 204):
+                    body = await r.text()
+                    log.warning(f"  breadth backfill batch failed: status={r.status} body={body[:200]}")
+        except Exception as e:
+            log.warning(f"  breadth backfill batch error: {e}")
+    log.info(f"✅ Market breadth backfill complete: {len(rows_to_save)} days saved")
+
+
 async def load_all_history_from_supabase(session: aiohttp.ClientSession) -> list:
     """
     Load previously-fetched full-history rows straight from Supabase —
@@ -4643,6 +4734,19 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         ]
         await supabase_upsert(session, 'sector_history', sector_history_rows, on_conflict='snapshot_date,sector')
         log.info(f"  ✅ Snapshot archived: {len(history_rows)} stocks for {snapshot_date}")
+
+        # Append today to the historical advance/decline line — the
+        # one-time backfill at startup covers the past 2 years from
+        # stored price history; this keeps it current going forward.
+        if breadth:
+            await supabase_upsert(session, 'market_breadth_history', [{
+                'date': snapshot_date,
+                'advances': breadth.get('advances', 0),
+                'declines': breadth.get('declines', 0),
+                'unchanged': max(0, len(processed) - breadth.get('advances', 0) - breadth.get('declines', 0)),
+                'total': len(processed),
+            }], on_conflict='date')
+
         # Send daily Telegram digest at EOD
         if breadth:
             await send_daily_digest(session, processed, breadth)
@@ -4778,6 +4882,15 @@ async def main():
         except Exception as e:
             import traceback
             log.error(f"Startup history load error: {e}\n{traceback.format_exc()}")
+
+        # One-time backfill of the historical advance/decline line, using
+        # the price history just loaded above — self-guards to skip if
+        # already populated, so this is cheap on every restart after the
+        # first successful run.
+        try:
+            await asyncio.wait_for(backfill_market_breadth_history(session), timeout=300)
+        except Exception as e:
+            log.warning(f"Market breadth backfill error (non-fatal): {e}")
 
         # Step 3d: Load fundamentals — Supabase first, then a background
         # scrape for anything missing/stale (not blocking, since a full
