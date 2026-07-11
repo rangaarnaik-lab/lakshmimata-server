@@ -3329,101 +3329,6 @@ async def fetch_full_history_for_symbols(session: aiohttp.ClientSession, symbols
     return done
 
 
-async def backfill_ema_breadth_history(session: aiohttp.ClientSession, lookback_days: int = 35):
-    """
-    One-time backfill of how many stocks were trading above their 9/21/50
-    day EMA, for each of the last ~35 trading days (a bit more than a
-    month, so the frontend can trim to exactly 30 trading days). Same
-    approach as backfill_market_breadth_history: computed from the price
-    history already stored per stock, self-guards to only run once.
-    """
-    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
-    try:
-        async with session.get(
-            f"{SUPABASE_URL}/rest/v1/ema_breadth_history?select=date&limit=1",
-            headers=headers, timeout=aiohttp.ClientTimeout(total=15)
-        ) as r:
-            if r.status == 200 and await r.json():
-                log.info("  ema_breadth_history already populated — skipping backfill")
-                return
-            if r.status == 400:
-                log.error("❌ ema_breadth_history table missing! Run the SQL to create it, then restart.")
-                return
-    except Exception as e:
-        log.warning(f"ema_breadth_history check failed: {e}")
-        return
-
-    log.info("📊 Backfilling EMA breadth history from stored price data (one-time)...")
-    all_rows: list = []
-    PAGE = 1000
-    offset = 0
-    while True:
-        try:
-            page_headers = {**headers, "Range": f"{offset}-{offset + PAGE - 1}"}
-            async with session.get(
-                f"{SUPABASE_URL}/rest/v1/stock_full_history?select=sym,dates,prices",
-                headers=page_headers, timeout=aiohttp.ClientTimeout(total=30)
-            ) as r:
-                if r.status not in (200, 206):
-                    break
-                page = await r.json()
-                all_rows.extend(page)
-                if len(page) < PAGE:
-                    break
-                offset += PAGE
-        except Exception as e:
-            log.error(f"backfill_ema_breadth_history fetch error: {e}")
-            break
-
-    # date -> {ema9: [above, valid], ema21: [...], ema50: [...]}
-    breadth: dict = {}
-    for row in all_rows:
-        dates = row.get('dates') or []
-        prices = row.get('prices') or []
-        if len(dates) < 55 or len(prices) != len(dates):
-            continue
-        e9 = ema_arr(prices, 9)
-        e21 = ema_arr(prices, 21)
-        e50 = ema_arr(prices, 50)
-        n = len(dates)
-        for i in range(max(0, n - lookback_days), n):
-            d = dates[i]
-            if d not in breadth:
-                breadth[d] = {'ema9': [0, 0], 'ema21': [0, 0], 'ema50': [0, 0]}
-            for key, arr in (('ema9', e9), ('ema21', e21), ('ema50', e50)):
-                if arr[i] is not None:
-                    breadth[d][key][1] += 1  # valid count
-                    if prices[i] > arr[i]:
-                        breadth[d][key][0] += 1  # above count
-
-    rows_to_save = []
-    for d, vals in breadth.items():
-        rows_to_save.append({
-            'date': d,
-            'above_ema9':  vals['ema9'][0],  'total_ema9':  vals['ema9'][1],
-            'above_ema21': vals['ema21'][0], 'total_ema21': vals['ema21'][1],
-            'above_ema50': vals['ema50'][0], 'total_ema50': vals['ema50'][1],
-        })
-    rows_to_save.sort(key=lambda r: r['date'])
-    log.info(f"  Computed EMA breadth for {len(rows_to_save)} trading days from {len(all_rows)} stocks")
-
-    BATCH = 500
-    for i in range(0, len(rows_to_save), BATCH):
-        batch = rows_to_save[i:i+BATCH]
-        try:
-            async with session.post(
-                f"{SUPABASE_URL}/rest/v1/ema_breadth_history",
-                headers={**headers, "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates"},
-                json=batch, timeout=aiohttp.ClientTimeout(total=30)
-            ) as r:
-                if r.status not in (200, 201, 204):
-                    body = await r.text()
-                    log.warning(f"  EMA breadth backfill batch failed: status={r.status} body={body[:200]}")
-        except Exception as e:
-            log.warning(f"  EMA breadth backfill batch error: {e}")
-    log.info(f"✅ EMA breadth backfill complete: {len(rows_to_save)} days saved")
-
-
 async def backfill_ema_breadth_history(session: aiohttp.ClientSession, days: int = 35):
     """
     One-time backfill of 'how many stocks are trading above their 9/21/
@@ -3436,15 +3341,22 @@ async def backfill_ema_breadth_history(session: aiohttp.ClientSession, days: int
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
     try:
         async with session.get(
-            f"{SUPABASE_URL}/rest/v1/ema_breadth_history?select=date&limit=1",
-            headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+            f"{SUPABASE_URL}/rest/v1/ema_breadth_history?select=date",
+            headers={**headers, "Prefer": "count=exact"},
+            timeout=aiohttp.ClientTimeout(total=15)
         ) as r:
-            if r.status == 200 and await r.json():
-                log.info("  ema_breadth_history already populated — skipping backfill")
+            existing_count = 0
+            if r.status in (200, 206):
+                content_range = r.headers.get('content-range', '')
+                if '/' in content_range:
+                    existing_count = int(content_range.split('/')[-1])
+            if existing_count >= 20:
+                log.info(f"  ema_breadth_history already has {existing_count} rows — skipping backfill")
                 return
             if r.status == 400:
                 log.error("❌ ema_breadth_history table missing! Run the SQL to create it, then restart.")
                 return
+            log.info(f"  ema_breadth_history has only {existing_count} row(s) — running real backfill")
     except Exception as e:
         log.warning(f"ema_breadth_history check failed: {e}")
         return
@@ -3524,22 +3436,31 @@ async def backfill_market_breadth_history(session: aiohttp.ClientSession):
     One-time backfill of daily market breadth (how many stocks advanced
     vs declined each day) using the 2 years of price history already
     stored per stock in stock_full_history — so this doesn't have to
-    start from zero and only accumulate going forward. Guarded to only
-    run if market_breadth_history is empty, since it's a one-time job,
-    not something to redo on every restart.
+    start from zero and only accumulate going forward. Guarded to skip
+    only once a REAL backfill has run (>=20 rows) — not just "any row
+    exists", since the daily EOD step adds one row per day regardless,
+    and checking for "any data" meant that single daily row permanently
+    blocked the real backfill from ever running on subsequent restarts.
     """
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
     try:
         async with session.get(
-            f"{SUPABASE_URL}/rest/v1/market_breadth_history?select=date&limit=1",
-            headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+            f"{SUPABASE_URL}/rest/v1/market_breadth_history?select=date",
+            headers={**headers, "Prefer": "count=exact"},
+            timeout=aiohttp.ClientTimeout(total=15)
         ) as r:
-            if r.status == 200 and await r.json():
-                log.info("  market_breadth_history already populated — skipping backfill")
+            existing_count = 0
+            if r.status in (200, 206):
+                content_range = r.headers.get('content-range', '')
+                if '/' in content_range:
+                    existing_count = int(content_range.split('/')[-1])
+            if existing_count >= 20:
+                log.info(f"  market_breadth_history already has {existing_count} rows — skipping backfill")
                 return
             if r.status == 400:
                 log.error("❌ market_breadth_history table missing! Run the SQL to create it, then restart.")
                 return
+            log.info(f"  market_breadth_history has only {existing_count} row(s) — running real backfill")
     except Exception as e:
         log.warning(f"market_breadth_history check failed: {e}")
         return
