@@ -2602,6 +2602,22 @@ async def ensure_db_columns(session: aiohttp.ClientSession):
     except Exception as e:
         log.warning(f"DB column check error (ema21_ema50): {e}")
 
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/stocks?select=weinstein_stage&limit=1",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ DB columns OK — weinstein_stage column exists")
+            elif r.status == 400:
+                log.error("❌ weinstein_stage column MISSING! The whole stocks upsert has been failing.")
+                log.error("   → Go to Supabase SQL Editor and run:")
+                log.error("   alter table public.stocks add column if not exists weinstein_stage int;")
+                log.error("   NOTIFY pgrst, 'reload schema';")
+    except Exception as e:
+        log.warning(f"DB column check error (weinstein_stage): {e}")
+
 
     try:
         async with session.get(
