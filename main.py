@@ -5126,7 +5126,23 @@ async def main():
                 now = time.time()
                 elapsed = now - last_scan
 
-                if elapsed >= UPDATE_INTERVAL:
+                # Cost gating: this loop previously ran full scans (hitting
+                # Upstox for ~2,400 stocks + writing to Supabase) every
+                # UPDATE_INTERVAL unconditionally, 24/7 — including nights
+                # and weekends, when nothing about the market is actually
+                # changing. is_scan_time() already existed (market hours +
+                # 30min buffer) but was never used to gate anything, only
+                # to pick a label. Now: scan normally during that window;
+                # outside it, still allow ONE more scan if today's EOD
+                # snapshot/digest hasn't run yet (so that still completes
+                # shortly after close), then go quiet with a long sleep
+                # instead of polling every 5s and burning compute for no
+                # reason.
+                today_check = datetime.now(IST).strftime('%Y-%m-%d')
+                eod_pending_today = last_eod_refresh_date != today_check
+                should_scan_now = is_scan_time() or eod_pending_today
+
+                if should_scan_now and elapsed >= UPDATE_INTERVAL:
                     scan_type = 'live' if is_market_open() else 'batch_eod'
                     try:
                         await asyncio.wait_for(run_scan(session, scan_type), timeout=SCAN_TIMEOUT)
@@ -5146,7 +5162,10 @@ async def main():
                         log.error(f"Scan failed with unexpected error: {e}\n{traceback.format_exc()}")
                     last_scan = time.time()
 
-                await asyncio.sleep(5)  # check every 5 seconds
+                # Outside market hours with today's EOD already done: sleep
+                # long instead of polling every 5s. Still short enough to
+                # wake up promptly for tomorrow's pre-market window.
+                await asyncio.sleep(5 if should_scan_now else 1800)
 
             except KeyboardInterrupt:
                 log.info("Shutting down…")
