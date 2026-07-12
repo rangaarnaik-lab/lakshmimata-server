@@ -5795,6 +5795,28 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'total': len(processed),
         }], on_conflict='date')
 
+        # Retry the 30-day backfills daily, not just at process startup —
+        # previously these ONLY ran once at startup, meaning any fix to
+        # one of them (a schema change, a relaxed threshold, etc.) needed
+        # someone to manually restart Railway to actually take effect.
+        # Each backfill already self-guards on "do we have enough days
+        # already?", so calling them here every EOD is cheap on a normal
+        # day (a fast row-count check that says "already sufficient,
+        # skip") and self-healing on an abnormal one — no manual restart
+        # ever needed again for this class of issue.
+        try:
+            await asyncio.wait_for(backfill_stock_history_30days(session), timeout=1500)
+        except Exception as e:
+            log.warning(f"Daily stock_history backfill retry error (non-fatal): {e}")
+        try:
+            await asyncio.wait_for(backfill_sector_history_30days(session), timeout=120)
+        except Exception as e:
+            log.warning(f"Daily sector_history backfill retry error (non-fatal): {e}")
+        try:
+            await asyncio.wait_for(backfill_index_history_30days(session), timeout=300)
+        except Exception as e:
+            log.warning(f"Daily index_history backfill retry error (non-fatal): {e}")
+
         # Send daily Telegram digest at EOD
         if breadth:
             await send_daily_digest(session, processed, breadth)
