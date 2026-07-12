@@ -13,6 +13,7 @@ Environment variables:
 """
 
 import os
+import csv
 import sys
 import time
 import json
@@ -1055,22 +1056,68 @@ SECTOR_MAP = {
     "Exchange":      ["BSE","CDSL","CAMS","MCX","ANGELONE"],
 }
 
+def _load_sector_industry_lookup() -> dict:
+    """One-time load of the static sector/industry lookup table (built
+    from a broad market-cap sweep, ~2,355 symbols after dropping indices/
+    ETFs) into memory at import time. This is a far more reliable source
+    than fetch_fundamentals_screener()'s live scrape — that scraper has a
+    documented ~98% blank-response rate (Railway IP rate-limiting) and,
+    as of the last review, its sector/industry regex patterns don't even
+    match screener.in's current markup, so it was never actually
+    populating 'industry' in practice. This file needs periodic manual
+    refreshes (sector/industry classifications drift slowly, so this
+    doesn't need to be live), but the coverage is dramatically better
+    than SECTOR_MAP's ~150 hand-curated symbols, and it's zero extra API
+    calls or scraping.
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'sector_industry_lookup.csv')
+    lookup = {}
+    try:
+        with open(path, newline='', encoding='utf-8') as f:
+            for row in csv.DictReader(f):
+                sym = (row.get('symbol') or '').strip()
+                if sym:
+                    lookup[sym] = {
+                        'industry': (row.get('industry') or '').strip() or None,
+                        'sector':   (row.get('sector') or '').strip() or None,
+                    }
+        log.info(f"✅ Loaded sector/industry lookup: {len(lookup)} symbols from {path}")
+    except Exception as e:
+        log.warning(f"Sector/industry lookup load failed ({path}): {e} — falling back to SECTOR_MAP + live fetch only")
+    return lookup
+
+SECTOR_INDUSTRY_LOOKUP = _load_sector_industry_lookup()
+
 def get_sector(sym: str) -> str:
     for sector, stocks in SECTOR_MAP.items():
         if sym in stocks:
             return sector
     # SECTOR_MAP is hand-curated and only covers a subset of the ~2,400
-    # tracked stocks — anything outside it used to just default straight
-    # to "Other", even when a real classification was sitting right in
-    # fundamentals_cache the whole time (the Upstox/Screener-fetched
-    # 'industry' field, populated separately per stock, not hand-
-    # maintained — see fetch_upstox_fundamentals/fetch_fundamentals_
-    # screener). Use that before giving up, since it scales to every
-    # stock automatically instead of needing manual curation.
+    # tracked stocks. For anything outside it, prefer the static
+    # SECTOR_INDUSTRY_LOOKUP table (reliable, ~2,355 symbols, loaded once
+    # at startup) over the live Upstox/Screener-fetched 'industry' field
+    # in fundamentals_cache, which is sparse and frequently unpopulated —
+    # see _load_sector_industry_lookup() for why. Still fall back to
+    # fundamentals_cache as a last resort for any symbol not in either
+    # static source, since it costs nothing to check.
+    static = SECTOR_INDUSTRY_LOOKUP.get(sym, {}).get('sector')
+    if static:
+        return static
     auto = fundamentals_cache.get(sym, {}).get('industry')
     if auto:
         return auto
     return "Other"
+
+def get_industry(sym: str) -> Optional[str]:
+    """Distinct 'Industry' value (finer-grained than Sector) shown
+    alongside Sector in the Index/Sector tables. Prefers the live
+    Upstox/Screener-fetched value when present (it can be more current
+    than the static sheet), falling back to the static
+    SECTOR_INDUSTRY_LOOKUP table otherwise."""
+    live = fundamentals_cache.get(sym, {}).get('industry')
+    if live:
+        return live
+    return SECTOR_INDUSTRY_LOOKUP.get(sym, {}).get('industry')
 
 # ── Upstox API ────────────────────────────────────────────────────────
 NIFTY50   = ["RELIANCE","TCS","HDFCBANK","BHARTIARTL","ICICIBANK","INFOSYS","SBIN","HINDUNILVR","ITC","LT","KOTAKBANK","HCLTECH","AXISBANK","BAJFINANCE","MARUTI","ASIANPAINT","SUNPHARMA","TITAN","ULTRACEMCO","NESTLEIND","WIPRO","NTPC","POWERGRID","TECHM","TATAMOTORS","ADANIENT","ADANIPORTS","ONGC","BAJAJFINSV","JSWSTEEL","TATASTEEL","COALINDIA","HINDALCO","M&M","DRREDDY","CIPLA","EICHERMOT","DIVISLAB","BPCL","GRASIM","INDUSINDBK","APOLLOHOSP","BAJAJ-AUTO","HEROMOTOCO","TVSMOTOR","SHREECEM","BRITANNIA","VEDL","BEL","NTPC"]
@@ -3524,13 +3571,6 @@ async def backfill_stock_history_30days(session: aiohttp.ClientSession, target_d
         log.error("stock_history backfill: no Nifty 50 benchmark history found, aborting (RS-TV needs it)")
         return
 
-    # Sector lookup — reuse the same SECTOR_MAP the live scan uses so
-    # historical rows have a sector too, not just bare symbols.
-    sym_to_sector = {}
-    for sector_name, syms in SECTOR_MAP.items():
-        for s in syms:
-            sym_to_sector[s] = sector_name
-
     # Parse every stock's arrays once (JSON-string decoding, same gotcha
     # the breadth backfills hit) and precompute its full raw-RS series
     # once — the expensive O(n) part — so each of the 30 days only needs
@@ -3559,6 +3599,12 @@ async def backfill_stock_history_30days(session: aiohttp.ClientSession, target_d
     if not stock_data:
         log.error("stock_history backfill: no stocks had enough history to compute RS-TV, aborting")
         return
+
+    # Sector lookup — use get_sector() (not just a raw SECTOR_MAP scan)
+    # so historical rows get the same SECTOR_MAP + SECTOR_INDUSTRY_LOOKUP
+    # fallback chain the live scan uses, instead of silently defaulting
+    # every non-SECTOR_MAP stock to "Other" here.
+    sym_to_sector = {sym: get_sector(sym) for sym in stock_data}
 
     # Use whichever stock has the most days as the calendar reference —
     # take its last `target_days` dates as the trading days to backfill.
@@ -4926,7 +4972,7 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'dii_trend':          fundamentals_cache.get(sym, {}).get('dii_trend'),
             'promoter_trend':     fundamentals_cache.get(sym, {}).get('promoter_trend'),
             'peg_ratio':          fundamentals_cache.get(sym, {}).get('peg_ratio'),
-            'industry':           fundamentals_cache.get(sym, {}).get('industry'),
+            'industry':           get_industry(sym),
             'last_updated':   now_ist.isoformat(),
             'scan_type':      scan_type,
         })
