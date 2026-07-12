@@ -4942,6 +4942,15 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
     # Step 7.5: At end-of-day, also archive a permanent daily snapshot.
     # This is what powers the "view any past date" history feature —
     # without this, only today's live state is ever available.
+    #
+    # This previously failed SILENTLY for as long as the feature existed
+    # (stock_history's schema never got the same new columns stocks kept
+    # accumulating — weinstein_stage, ibv_hist, is_52wh_breakout, etc. —
+    # so PostgREST rejected the whole upsert every single day, and it
+    # only ever produced a single log.warning that nobody noticed since
+    # this only runs once daily, unlike the main stocks upsert which
+    # fails every ~scan and becomes obvious fast). Added an explicit
+    # verification step below so a failure here is loud, not silent.
     if is_first_eod_today:
         snapshot_date = now_ist.strftime('%Y-%m-%d')
         log.info(f"  📸 Archiving EOD snapshot for {snapshot_date}…")
@@ -4952,6 +4961,28 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             row['snapshot_date'] = snapshot_date
             history_rows.append(row)
         await supabase_upsert(session, 'stock_history', history_rows, on_conflict='snapshot_date,sym')
+
+        try:
+            verify_headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                               "Prefer": "count=exact"}
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/stock_history?select=sym&snapshot_date=eq.{snapshot_date}",
+                headers=verify_headers, timeout=aiohttp.ClientTimeout(total=15)
+            ) as vr:
+                saved_count = 0
+                if vr.status in (200, 206):
+                    cr = vr.headers.get('content-range', '')
+                    if '/' in cr:
+                        saved_count = int(cr.split('/')[-1])
+                if saved_count >= len(history_rows) * 0.9:  # allow small variance
+                    log.info(f"  ✅ EOD snapshot verified: {saved_count} stocks saved for {snapshot_date}")
+                else:
+                    log.error(f"  ❌ EOD snapshot for {snapshot_date} likely FAILED — only {saved_count}/"
+                               f"{len(history_rows)} rows found. This usually means stock_history's schema "
+                               f"is missing a column stocks has. Check Supabase: the columns on both tables "
+                               f"should match.")
+        except Exception as e:
+            log.warning(f"EOD snapshot verification check failed: {e}")
 
         sector_history_rows = [
             {
