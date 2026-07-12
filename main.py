@@ -3847,6 +3847,7 @@ async def backfill_stock_history_30days(session: aiohttp.ClientSession, target_d
     # once — the expensive O(n) part — so each of the 30 days only needs
     # a cheap re-normalization over a slice, not a full recompute.
     stock_data = {}
+    skip_reasons = {}  # reason -> [syms], so a skip is diagnosable instead of silent
     for row in all_rows:
         sym = row.get('sym')
         try:
@@ -3856,8 +3857,24 @@ async def backfill_stock_history_30days(session: aiohttp.ClientSession, target_d
             highs   = json.loads(row['highs'])   if isinstance(row.get('highs'), str)   else (row.get('highs') or [])
             lows    = json.loads(row['lows'])    if isinstance(row.get('lows'), str)    else (row.get('lows') or [])
         except (json.JSONDecodeError, TypeError):
+            skip_reasons.setdefault('json_decode_error', []).append(sym or '?')
             continue
-        if not sym or len(dates) < 260 or len(prices) != len(dates) or len(volumes) != len(dates):
+        if not sym:
+            continue
+        # Was `< 260` — but normalize_rs() degrades gracefully with fewer
+        # valid points (falls back to whatever window is available, only
+        # actually needs >=2), so requiring a near-full year here was
+        # excluding established, long-listed stocks whenever their stored
+        # history happened to be shorter than that for any reason —
+        # rather than giving them a shorter-but-real backfilled trail.
+        # >=35 just guarantees enough for target_days=30 plus a small
+        # margin, not "enough for a statistically ideal RS-TV window".
+        if len(dates) < 35:
+            skip_reasons.setdefault('too_few_dates', []).append(f"{sym}({len(dates)})")
+            continue
+        if len(prices) != len(dates) or len(volumes) != len(dates):
+            skip_reasons.setdefault('array_length_mismatch', []).append(
+                f"{sym}(dates={len(dates)},prices={len(prices)},volumes={len(volumes)})")
             continue
         raw_rs_series = calc_raw_rs_series(prices, nifty_prices)
         stock_data[sym] = {
@@ -3866,6 +3883,11 @@ async def backfill_stock_history_30days(session: aiohttp.ClientSession, target_d
             'lows':  lows  if len(lows)  == len(dates) else prices,
             'raw_rs_series': raw_rs_series,
         }
+
+    if skip_reasons:
+        for reason, syms in skip_reasons.items():
+            log.warning(f"  stock_history backfill: {len(syms)} stocks skipped ({reason}): "
+                        f"{syms[:15]}{'...' if len(syms) > 15 else ''}")
 
     if not stock_data:
         log.error("stock_history backfill: no stocks had enough history to compute RS-TV, aborting")
