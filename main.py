@@ -4998,7 +4998,30 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             for s in sector_rows
         ]
         await supabase_upsert(session, 'sector_history', sector_history_rows, on_conflict='snapshot_date,sector')
-        log.info(f"  ✅ Snapshot archived: {len(history_rows)} stocks for {snapshot_date}")
+        # (Removed the old unconditional "✅ Snapshot archived" log here —
+        # it printed success regardless of whether the upsert actually
+        # worked, which is exactly how the stock_history failure above
+        # went unnoticed for as long as it did. The verification block
+        # above this now reports the real outcome.)
+        try:
+            sec_verify_headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                                   "Prefer": "count=exact"}
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/sector_history?select=sector&snapshot_date=eq.{snapshot_date}",
+                headers=sec_verify_headers, timeout=aiohttp.ClientTimeout(total=15)
+            ) as svr:
+                sec_saved = 0
+                if svr.status in (200, 206):
+                    cr = svr.headers.get('content-range', '')
+                    if '/' in cr:
+                        sec_saved = int(cr.split('/')[-1])
+                if sec_saved >= len(sector_history_rows) * 0.9:
+                    log.info(f"  ✅ Sector snapshot verified: {sec_saved} sectors saved for {snapshot_date}")
+                else:
+                    log.error(f"  ❌ Sector snapshot for {snapshot_date} likely FAILED — only {sec_saved}/"
+                               f"{len(sector_history_rows)} rows found.")
+        except Exception as e:
+            log.warning(f"Sector snapshot verification check failed: {e}")
 
         # Append today to the historical advance/decline line — the
         # one-time backfill at startup covers the past 2 years from
