@@ -3381,6 +3381,214 @@ async def fetch_full_history_for_symbols(session: aiohttp.ClientSession, symbols
     return done
 
 
+async def backfill_stock_history_30days(session: aiohttp.ClientSession, target_days: int = 30):
+    """
+    Retroactively reconstructs stock_history for the past ~30 trading
+    days, using price history already stored in stock_full_history.
+    Unlike the simpler breadth backfills, this needs the FULL computed
+    scanner state per stock per day — RS-TV (a cross-market comparison,
+    normally the hardest thing to reconstruct after the fact), PP/HY/HT/
+    IBV signals, and Weinstein stage — not just a single metric.
+
+    Made feasible by calc_raw_rs_series()/normalize_rs() and detect_pp()
+    etc already being pure functions of (prices, volumes, ..., end_idx)
+    with no live-API dependency — computing "as of day N" just means
+    truncating each stock's arrays to end at day N and calling the same
+    functions the live scan already uses, not writing new logic.
+
+    Self-guards to skip if stock_history already has enough recent rows
+    (checked via a distinct-date count within the target window).
+    """
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+
+    # Guard: skip only if we already have close to target_days worth of
+    # DISTINCT dates — not just a row-count threshold, since a backfill
+    # that times out partway through (e.g. after 7 of 30 days) would
+    # already exceed a flat row-count threshold and incorrectly be
+    # skipped as "done" on the next restart instead of resuming. Queries
+    # the available_history_dates view (distinct dates already) rather
+    # than fetching every stock_history row just to dedupe client-side.
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/available_history_dates?select=snapshot_date",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=15)
+        ) as r:
+            if r.status == 400:
+                log.error("❌ available_history_dates view missing! Check Supabase.")
+                return
+            distinct_dates = set()
+            if r.status in (200, 206):
+                for row in await r.json():
+                    if row.get('snapshot_date'):
+                        distinct_dates.add(row['snapshot_date'])
+            if len(distinct_dates) >= target_days - 2:  # small buffer for holidays etc
+                log.info(f"  stock_history already has {len(distinct_dates)} distinct trading days "
+                         f"(target {target_days}) — skipping backfill")
+                return
+            log.info(f"  stock_history has {len(distinct_dates)}/{target_days} distinct days so far — "
+                     f"running backfill (re-upserting existing days is harmless, on_conflict handles it)")
+    except Exception as e:
+        log.warning(f"stock_history backfill guard check failed: {e}")
+        return
+
+    log.info("📚 Backfilling stock_history for the past ~30 trading days (one-time, this takes a while)...")
+
+    # Fetch every stock's full OHLCV history in one pass.
+    all_rows: list = []
+    PAGE = 1000
+    offset = 0
+    while True:
+        try:
+            page_headers = {**headers, "Range": f"{offset}-{offset + PAGE - 1}"}
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/stock_full_history?select=sym,dates,prices,volumes,highs,lows",
+                headers=page_headers, timeout=aiohttp.ClientTimeout(total=30)
+            ) as r:
+                if r.status not in (200, 206):
+                    body = await r.text()
+                    log.error(f"stock_history backfill: fetch failed {r.status} {body[:200]}")
+                    break
+                page = await r.json()
+                all_rows.extend(page)
+                if len(page) < PAGE:
+                    break
+                offset += PAGE
+        except Exception as e:
+            log.error(f"backfill_stock_history_30days fetch error: {e}")
+            break
+
+    if not all_rows:
+        log.error("stock_history backfill: no stock_full_history rows found, aborting")
+        return
+
+    nifty_prices = await load_index_history_from_db(session, "Nifty 50")
+    if not nifty_prices:
+        log.error("stock_history backfill: no Nifty 50 benchmark history found, aborting (RS-TV needs it)")
+        return
+
+    # Sector lookup — reuse the same SECTOR_MAP the live scan uses so
+    # historical rows have a sector too, not just bare symbols.
+    sym_to_sector = {}
+    for sector_name, syms in SECTOR_MAP.items():
+        for s in syms:
+            sym_to_sector[s] = sector_name
+
+    # Parse every stock's arrays once (JSON-string decoding, same gotcha
+    # the breadth backfills hit) and precompute its full raw-RS series
+    # once — the expensive O(n) part — so each of the 30 days only needs
+    # a cheap re-normalization over a slice, not a full recompute.
+    stock_data = {}
+    for row in all_rows:
+        sym = row.get('sym')
+        try:
+            dates   = json.loads(row['dates'])   if isinstance(row.get('dates'), str)   else (row.get('dates') or [])
+            prices  = json.loads(row['prices'])  if isinstance(row.get('prices'), str)  else (row.get('prices') or [])
+            volumes = json.loads(row['volumes']) if isinstance(row.get('volumes'), str) else (row.get('volumes') or [])
+            highs   = json.loads(row['highs'])   if isinstance(row.get('highs'), str)   else (row.get('highs') or [])
+            lows    = json.loads(row['lows'])    if isinstance(row.get('lows'), str)    else (row.get('lows') or [])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not sym or len(dates) < 260 or len(prices) != len(dates) or len(volumes) != len(dates):
+            continue
+        raw_rs_series = calc_raw_rs_series(prices, nifty_prices)
+        stock_data[sym] = {
+            'dates': dates, 'prices': prices, 'volumes': volumes,
+            'highs': highs if len(highs) == len(dates) else prices,
+            'lows':  lows  if len(lows)  == len(dates) else prices,
+            'raw_rs_series': raw_rs_series,
+        }
+
+    if not stock_data:
+        log.error("stock_history backfill: no stocks had enough history to compute RS-TV, aborting")
+        return
+
+    # Use whichever stock has the most days as the calendar reference —
+    # take its last `target_days` dates as the trading days to backfill.
+    ref_sym = max(stock_data, key=lambda s: len(stock_data[s]['dates']))
+    ref_dates = stock_data[ref_sym]['dates']
+    total_days = len(ref_dates)
+    backfill_indices = list(range(max(0, total_days - target_days), total_days))
+    backfill_indices.reverse()  # most recent day first — if this times out
+    # partway through, the recent (more useful) days are the ones that
+    # actually get saved, not the oldest ones.
+    log.info(f"  Reconstructing {len(backfill_indices)} trading days across {len(stock_data)} stocks "
+             f"(newest first: index {backfill_indices[0]} down to {backfill_indices[-1]} of {total_days})...")
+
+    days_saved = 0
+    for day_idx in backfill_indices:
+        snapshot_date = ref_dates[day_idx]
+        day_rows = []
+        for sym, d in stock_data.items():
+            n = len(d['dates'])
+            if day_idx >= n:
+                continue  # this stock doesn't have data that far back
+            idx = day_idx
+            prices_upto  = d['prices'][:idx+1]
+            volumes_upto = d['volumes'][:idx+1]
+            highs_upto   = d['highs'][:idx+1]
+            lows_upto    = d['lows'][:idx+1]
+            last = prices_upto[-1]
+
+            raw_series_upto = d['raw_rs_series'][:idx+1] if idx < len(d['raw_rs_series']) else d['raw_rs_series']
+            rs = normalize_rs(raw_series_upto) or 0
+            hist15 = tv_history_from_raw(raw_series_upto, days=15) if raw_series_upto else [None]*15
+            trend_data = rs_slope(hist15)
+
+            pp = detect_pp(prices_upto, volumes_upto)
+
+            yr_vols  = volumes_upto[-252:] if len(volumes_upto) >= 252 else volumes_upto
+            max_yr   = max(yr_vols) if yr_vols else 1
+            max_all  = max(volumes_upto) if volumes_upto else 1
+            chg_today = round((last - prices_upto[-2]) / prices_upto[-2] * 100, 2) if len(prices_upto) >= 2 and prices_upto[-2] else 0
+            hy_pct = round(volumes_upto[-1] / max_yr * 100, 1) if max_yr > 0 else 0
+            ht_pct = round(volumes_upto[-1] / max_all * 100, 1) if max_all > 0 else 0
+            is_hy = hy_pct >= 95 and chg_today > 0
+            is_ht = ht_pct >= 95 and chg_today > 0
+
+            ibv_signal = detect_ibv_signal(
+                volumes_upto[:-1], volumes_upto[-1],
+                highs_upto[-1], lows_upto[-1], last
+            )
+
+            p252 = prices_upto[-252:] if len(prices_upto) >= 252 else prices_upto
+            h52 = max(p252)
+            l52 = min(p252)
+            pct_from_h52 = round((last - h52) / h52 * 100, 1) if h52 else 0
+            weinstein_stage = calc_weinstein_stage(rs, trend_data['trend'], pct_from_h52, hist15)
+
+            day_rows.append({
+                'snapshot_date':  snapshot_date,
+                'sym':            sym,
+                'sector':         sym_to_sector.get(sym, 'Other'),
+                'last_price':     round(last, 2),
+                'chg_pct':        chg_today,
+                'rs':             rs,
+                'rs_tv':          rs,
+                'rs_hist':        hist15,
+                'rs_trend':       trend_data['trend'],
+                'is_pp':          pp['is_pp'],
+                'pp_hist':        pp['pp_hist'],
+                'pp_count_10d':   pp['pp_count_10d'],
+                'is_hy':          is_hy,
+                'hy_pct':         hy_pct,
+                'is_ht':          is_ht,
+                'ht_pct':         ht_pct,
+                'ibv_signal':     ibv_signal,
+                'weinstein_stage': weinstein_stage,
+                'high_52w':       round(h52, 2),
+                'low_52w':        round(l52, 2),
+            })
+
+        if day_rows:
+            await supabase_upsert(session, 'stock_history', day_rows, on_conflict='snapshot_date,sym')
+            days_saved += 1
+        if days_saved % 5 == 0:
+            log.info(f"  ...{days_saved}/{len(backfill_indices)} days reconstructed so far")
+
+    log.info(f"✅ stock_history 30-day backfill complete: {days_saved} trading days saved")
+
+
 async def backfill_ema_breadth_history(session: aiohttp.ClientSession):
     """
     One-time backfill of 'how many stocks are trading above their 9/21/
@@ -5200,6 +5408,14 @@ async def main():
             await asyncio.wait_for(backfill_ema_breadth_history(session), timeout=600)
         except Exception as e:
             log.warning(f"EMA breadth backfill error (non-fatal): {e}")
+
+        try:
+            await asyncio.wait_for(backfill_stock_history_30days(session), timeout=1500)
+        except asyncio.TimeoutError:
+            log.error("⏱ stock_history 30-day backfill exceeded 25 min — it should resume/skip completed "
+                      "days on next restart rather than starting over, since the guard checks total row count.")
+        except Exception as e:
+            log.warning(f"stock_history 30-day backfill error (non-fatal): {e}")
 
         # Step 3d: Load fundamentals — Supabase first, then a background
         # scrape for anything missing/stale (not blocking, since a full
