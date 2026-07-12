@@ -1059,6 +1059,17 @@ def get_sector(sym: str) -> str:
     for sector, stocks in SECTOR_MAP.items():
         if sym in stocks:
             return sector
+    # SECTOR_MAP is hand-curated and only covers a subset of the ~2,400
+    # tracked stocks — anything outside it used to just default straight
+    # to "Other", even when a real classification was sitting right in
+    # fundamentals_cache the whole time (the Upstox/Screener-fetched
+    # 'industry' field, populated separately per stock, not hand-
+    # maintained — see fetch_upstox_fundamentals/fetch_fundamentals_
+    # screener). Use that before giving up, since it scales to every
+    # stock automatically instead of needing manual curation.
+    auto = fundamentals_cache.get(sym, {}).get('industry')
+    if auto:
+        return auto
     return "Other"
 
 # ── Upstox API ────────────────────────────────────────────────────────
