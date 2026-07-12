@@ -3494,6 +3494,152 @@ async def fetch_full_history_for_symbols(session: aiohttp.ClientSession, symbols
     return done
 
 
+async def backfill_index_history_30days(session: aiohttp.ClientSession, target_days: int = 30):
+    """
+    Retroactively reconstructs index_history for the past ~30 trading
+    days. Unlike backfill_sector_history_30days (a pure rollup of
+    already-computed stock_history), this needs the same "recompute as
+    of day N" approach as backfill_stock_history_30days — index-level
+    RS-TV, %-change ranks, and Stage aren't precomputed anywhere, only
+    each index's raw price history is (index_history_cache, loaded at
+    startup). calc_rs_tv_normalized()'s built-in end_idx parameter makes
+    this the same trick as the stock backfill: truncate the raw RS
+    series to "as of day N" instead of writing new math.
+
+    Date alignment caveat: index_history_cache stores prices/volumes/
+    highs/lows as plain parallel arrays with NO date labels attached
+    (unlike stock_full_history, which does). This backfill assumes
+    index price arrays and stock_history's trading-calendar dates are
+    aligned by position counting backward from "today" — i.e. prices[-1]
+    is the same trading day as stock_history's most recent date,
+    prices[-2] the day before that, etc. Both ultimately reflect the
+    same NSE trading calendar, so this should hold, but there's no
+    direct date field to verify it against. If index dates ever look
+    off by one vs. sector/stock dates when compared side by side, this
+    alignment assumption is the first thing to check.
+    """
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/index_history?select=snapshot_date",
+            headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+        ) as r:
+            if r.status == 400:
+                log.error("❌ index_history table missing! Run the CREATE TABLE SQL first.")
+                return
+            distinct_dates = set()
+            if r.status in (200, 206):
+                for row in await r.json():
+                    if row.get('snapshot_date'):
+                        distinct_dates.add(row['snapshot_date'])
+            if len(distinct_dates) >= target_days - 2:
+                log.info(f"  index_history already has {len(distinct_dates)} distinct trading days "
+                         f"(target {target_days}) — skipping backfill")
+                return
+    except Exception as e:
+        log.warning(f"index_history backfill guard check failed: {e}")
+        return
+
+    # Trading-calendar dates come from stock_history (already has 30 real
+    # days) rather than any index-specific source, per the alignment
+    # caveat above.
+    dates = []
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/stock_history?select=snapshot_date&order=snapshot_date.desc&limit=2000",
+            headers=headers, timeout=aiohttp.ClientTimeout(total=30)
+        ) as r:
+            if r.status in (200, 206):
+                seen = {row['snapshot_date'] for row in await r.json() if row.get('snapshot_date')}
+                dates = sorted(seen)[-target_days:]
+    except Exception as e:
+        log.error(f"index_history backfill: failed to load trading dates from stock_history: {e}")
+        return
+
+    if not dates:
+        log.error("index_history backfill: no trading dates available (stock_history empty?), aborting")
+        return
+
+    nifty_prices = nifty_cache.get('prices', [])
+    if len(nifty_prices) < 252:
+        log.error("index_history backfill: Nifty benchmark history too short for RS-TV, aborting")
+        return
+
+    n_days = len(dates)
+    index_history_rows = []
+
+    for idx_name, idx_data in index_history_cache.items():
+        prices = idx_data['prices']
+        n = len(prices)
+        if n < 5:
+            continue
+        raw_rs_series = None if idx_name == 'Nifty 50' else calc_raw_rs_series(prices, nifty_prices)
+
+        # k = 0 is today (most recent), k = n_days-1 is the oldest day in
+        # this window — walking backward from the end of the price array.
+        for k in range(n_days):
+            end_idx = n - 1 - k
+            if end_idx < 4:
+                break  # ran out of this index's own history
+            date = dates[n_days - 1 - k]
+
+            last = prices[end_idx]
+            prev  = prices[end_idx-1]  if end_idx >= 1  else last
+            week  = prices[end_idx-5]  if end_idx >= 5  else prices[0]
+            month = prices[end_idx-21] if end_idx >= 21 else prices[0]
+            chg_d = round((last - prev) / prev * 100, 2) if prev else 0
+            chg_w = round((last - week) / week * 100, 2) if week else 0
+            chg_m = round((last - month) / month * 100, 2) if month else 0
+
+            rs_tv = None
+            if raw_rs_series is not None:
+                rs_tv = normalize_rs(raw_rs_series[:end_idx+1])
+
+            ma30 = sma(prices[:end_idx+1], min(30, end_idx+1))
+            ma10 = sma(prices[:end_idx+1], min(10, end_idx+1))
+            window252 = prices[max(0,end_idx-251):end_idx+1]
+            h52 = max(window252) if window252 else last
+            pct_from_high = round((last - h52) / h52 * 100, 1) if h52 else 0
+
+            if ma30 and last > ma30 and ma10 and ma10 >= ma30:
+                stage = 3 if pct_from_high >= -5 else 2
+            elif ma30 and last < ma30 and ma10 and ma10 <= ma30:
+                stage = 4
+            else:
+                stage = 1
+
+            index_history_rows.append({
+                'snapshot_date': date, 'name': idx_name,
+                'rs_tv': rs_tv, 'chg_d': chg_d, 'stage': stage,
+                '_chg_w': chg_w, '_chg_m': chg_m,  # used for ranking below, stripped before upsert
+            })
+
+    # Rank each day's indices by chg_d/chg_w/chg_m, same as the live
+    # index-dashboard block does — ranks are relative to that day's
+    # cohort, not comparable across days.
+    by_date = {}
+    for row in index_history_rows:
+        by_date.setdefault(row['snapshot_date'], []).append(row)
+    for date, rows in by_date.items():
+        for field, rank_field in (('chg_d', 'rank_d'), ('_chg_w', 'rank_w'), ('_chg_m', 'rank_m')):
+            ordered = sorted(rows, key=lambda r: r[field], reverse=True)
+            for i, r in enumerate(ordered):
+                r[rank_field] = i + 1
+
+    final_rows = [
+        {k: v for k, v in row.items() if not k.startswith('_')}
+        for row in index_history_rows
+    ]
+
+    if final_rows:
+        await supabase_upsert(session, 'index_history', final_rows, on_conflict='snapshot_date,name')
+        log.info(f"✅ index_history backfill complete: {len(by_date)} trading days, "
+                 f"{len(final_rows)} index-day rows saved")
+    else:
+        log.error("index_history backfill: computed zero rows, aborting")
+
+
 async def backfill_sector_history_30days(session: aiohttp.ClientSession, target_days: int = 30):
     """
     Retroactively reconstructs sector_history for the past ~30 trading
@@ -5797,6 +5943,14 @@ async def main():
                       "over already-fetched stock_history, should resume/skip on next restart regardless.")
         except Exception as e:
             log.warning(f"sector_history backfill error (non-fatal): {e}")
+
+        try:
+            await asyncio.wait_for(backfill_index_history_30days(session), timeout=300)
+        except asyncio.TimeoutError:
+            log.error("⏱ index_history backfill exceeded 5 min — should resume/skip completed "
+                      "days on next restart via the same distinct-date guard as the others.")
+        except Exception as e:
+            log.warning(f"index_history backfill error (non-fatal): {e}")
 
         # Step 3d: Load fundamentals — Supabase first, then a background
         # scrape for anything missing/stale (not blocking, since a full
