@@ -1589,6 +1589,35 @@ async def fetch_fundamentals_screener(session: aiohttp.ClientSession, sym: str, 
         result['eps']        = parse_number(extract_ratio('EPS', html))
         result['debt_eq']    = parse_number(extract_ratio('Debt to equity', html))
 
+        # Sector/Industry — Screener.in's page is already being fetched
+        # above for the ratios; this just extracts more from the same
+        # HTML already in hand, no extra request. Screener typically
+        # links to /market/sector-name/ style URLs near the peer
+        # comparison table or company header — tries several known
+        # patterns since the exact markup isn't verifiable from this
+        # environment (screener.in isn't reachable to test against
+        # directly). Logs what it found (or didn't) for the first few
+        # calls so this can be diagnosed against real output.
+        sector_industry_patterns = [
+            r'/market/sector/[^"]*"[^>]*>([^<]+)</a>',
+            r'/market/industry/[^"]*"[^>]*>([^<]+)</a>',
+            r'"industry"\s*:\s*"([^"]+)"',
+            r'"sector"\s*:\s*"([^"]+)"',
+            r'Sector\s*:?\s*</span>\s*<span[^>]*>([^<]+)</span>',
+            r'Industry\s*:?\s*</span>\s*<span[^>]*>([^<]+)</span>',
+        ]
+        for pat in sector_industry_patterns:
+            m = re.search(pat, html, re.IGNORECASE)
+            if m:
+                candidate = re.sub(r'<[^>]+>', '', m.group(1)).strip()
+                if candidate and len(candidate) < 60:  # sanity: real sector/industry names are short
+                    result['industry'] = candidate
+                    break
+        if (sym == 'TARSONS' or debug) and not result['industry']:
+            log.info(f"  🔍 {sym}: no sector/industry pattern matched Screener.in HTML — "
+                     f"page structure may have changed, none of the {len(sector_industry_patterns)} "
+                     f"candidate patterns hit")
+
         def extract_row_series(label: str, html: str) -> list:
             """Pull all data-cell values from a Screener table row (Quarterly
             Results / Shareholding Pattern), oldest-to-newest as Screener
@@ -1974,6 +2003,22 @@ async def load_fundamentals_batch(session: aiohttp.ClientSession, symbols: list)
             # this is a deliberate trade-off, not an oversight. Getting
             # those 3 fields from a different Upstox endpoint (company
             # profile / balance sheet) is a reasonable follow-up.
+            #
+            # industry is a partial exception: a successful Upstox call
+            # can still come back with industry=None (its fundamentals
+            # endpoints don't reliably expose a distinct industry field
+            # separate from sector — see fetch_upstox_fundamentals). The
+            # PREVIOUS version of this function only ever called
+            # Screener as a fallback when the WHOLE Upstox call failed,
+            # so this case — Upstox succeeds, industry specifically is
+            # just empty — never actually reached Screener at all, even
+            # after Screener's scraper was updated to extract it. Now
+            # specifically backfills just that one field, keeping every
+            # other successfully-fetched Upstox value as-is.
+            if not upstox_data.get('industry'):
+                screener_data = await fetch_fundamentals_screener(session, sym, debug=debug)
+                if screener_data.get('industry'):
+                    upstox_data['industry'] = screener_data['industry']
             return upstox_data
         return await fetch_fundamentals_screener(session, sym, debug=debug)
 
