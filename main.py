@@ -3494,6 +3494,122 @@ async def fetch_full_history_for_symbols(session: aiohttp.ClientSession, symbols
     return done
 
 
+async def backfill_sector_history_30days(session: aiohttp.ClientSession, target_days: int = 30):
+    """
+    Retroactively reconstructs sector_history for the past ~30 trading
+    days by aggregating stock_history — NOT by recomputing anything from
+    raw prices. sector_history was silently broken since it was built
+    (missing 'improving' column meant every single write 400'd — see the
+    2026-07-12 diagnosis), so unlike backfill_stock_history_30days this
+    isn't "reconstruct from scratch", it's "roll up data that was already
+    sitting there the whole time, just never aggregated".
+
+    Deliberately mirrors build_sector_rs()'s exact membership rule (only
+    symbols listed in SECTOR_MAP, ~20 sectors) rather than each stock's
+    broader get_sector()-derived sector field stored in stock_history —
+    matching that was a deliberate choice (see conversation: "leave
+    build_sector_rs as-is, 20 curated sectors only"), so backfilled days
+    and future live-written days show the same sector universe instead of
+    the count changing day to day depending on which code wrote it.
+    """
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/sector_history?select=snapshot_date",
+            headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+        ) as r:
+            distinct_dates = set()
+            if r.status in (200, 206):
+                for row in await r.json():
+                    if row.get('snapshot_date'):
+                        distinct_dates.add(row['snapshot_date'])
+            if len(distinct_dates) >= target_days - 2:
+                log.info(f"  sector_history already has {len(distinct_dates)} distinct trading days "
+                         f"(target {target_days}) — skipping backfill")
+                return
+    except Exception as e:
+        log.warning(f"sector_history backfill guard check failed: {e}")
+        return
+
+    # Pull only the columns needed for aggregation, paginated (stock_history
+    # can be 2000+ stocks × 30 days = 60k+ rows, well past PostgREST's
+    # default single-request cap).
+    all_rows = []
+    try:
+        offset = 0
+        while True:
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/stock_history?select=snapshot_date,sym,rs_tv,rs_trend,is_pp"
+                f"&order=snapshot_date.desc&limit=1000&offset={offset}",
+                headers=headers, timeout=aiohttp.ClientTimeout(total=30)
+            ) as r:
+                if r.status not in (200, 206):
+                    log.error(f"sector_history backfill: stock_history fetch failed: {r.status}")
+                    break
+                batch = await r.json()
+                if not batch:
+                    break
+                all_rows.extend(batch)
+                offset += 1000
+                if len(batch) < 1000:
+                    break
+    except Exception as e:
+        log.error(f"sector_history backfill: failed to load stock_history: {e}")
+        return
+
+    if not all_rows:
+        log.error("sector_history backfill: no stock_history rows found, aborting")
+        return
+
+    dates = sorted({r['snapshot_date'] for r in all_rows})[-target_days:]
+    date_set = set(dates)
+
+    by_date = {}
+    for row in all_rows:
+        d = row['snapshot_date']
+        if d not in date_set:
+            continue
+        by_date.setdefault(d, {})[row['sym']] = row
+
+    sector_history_rows = []
+    for d, sym_map in by_date.items():
+        sector_agg = {}
+        for sector_name, syms in SECTOR_MAP.items():
+            members = [sym_map[s] for s in syms if s in sym_map and sym_map[s].get('rs_tv') is not None]
+            if not members:
+                continue
+            avg_rs = round(sum(m['rs_tv'] for m in members) / len(members))
+            pp_count = sum(1 for m in members if m.get('is_pp'))
+            improving = sum(1 for m in members if m.get('rs_trend') == 'improving')
+            top = sorted(members, key=lambda m: m['rs_tv'], reverse=True)[:5]
+            sector_agg[sector_name] = {
+                'avg_rs': avg_rs, 'count': len(members),
+                'pp_count': pp_count, 'improving': improving,
+                'top_stocks': [m['sym'] for m in top],
+            }
+        ranked = sorted(sector_agg.items(), key=lambda kv: kv[1]['avg_rs'], reverse=True)
+        for i, (sector_name, agg) in enumerate(ranked):
+            sector_history_rows.append({
+                'snapshot_date': d,
+                'sector':        sector_name,
+                'avg_rs':        agg['avg_rs'],
+                'rank':          i + 1,
+                'count':         agg['count'],
+                'pp_count':      agg['pp_count'],
+                'improving':     agg['improving'],
+                'top_stocks':    json.dumps(agg['top_stocks']),
+            })
+
+    if sector_history_rows:
+        await supabase_upsert(session, 'sector_history', sector_history_rows, on_conflict='snapshot_date,sector')
+        log.info(f"✅ sector_history backfill complete: {len(by_date)} trading days, "
+                 f"{len(sector_history_rows)} sector-day rows saved")
+    else:
+        log.error("sector_history backfill: computed zero rows (no SECTOR_MAP symbols found in "
+                   "stock_history?), aborting")
+
+
 async def backfill_stock_history_30days(session: aiohttp.ClientSession, target_days: int = 30):
     """
     Retroactively reconstructs stock_history for the past ~30 trading
@@ -5673,6 +5789,14 @@ async def main():
                       "days on next restart rather than starting over, since the guard checks total row count.")
         except Exception as e:
             log.warning(f"stock_history 30-day backfill error (non-fatal): {e}")
+
+        try:
+            await asyncio.wait_for(backfill_sector_history_30days(session), timeout=120)
+        except asyncio.TimeoutError:
+            log.error("⏱ sector_history backfill exceeded 2 min — unexpected, it's a pure aggregation "
+                      "over already-fetched stock_history, should resume/skip on next restart regardless.")
+        except Exception as e:
+            log.warning(f"sector_history backfill error (non-fatal): {e}")
 
         # Step 3d: Load fundamentals — Supabase first, then a background
         # scrape for anything missing/stale (not blocking, since a full
