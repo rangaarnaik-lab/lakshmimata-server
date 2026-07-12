@@ -5436,6 +5436,53 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         except Exception as e:
             log.warning(f"Sector snapshot verification check failed: {e}")
 
+        # Same daily-snapshot pattern as sector_history above, for indices.
+        # index_dashboard only ever holds each index's CURRENT state
+        # (upserted on 'name'), so without this there was no way to see
+        # an index's RS-TV/rank history over time — needed for the Index
+        # scope of the rotation view, same as sector_history/stock_history
+        # already power the Sector and Watchlist scopes.
+        index_history_rows = [
+            {
+                'snapshot_date': snapshot_date,
+                'name':          r['name'],
+                'rs_tv':         r.get('rs_tv'),
+                'rank_d':        r.get('rank_d'),
+                'rank_w':        r.get('rank_w'),
+                'rank_m':        r.get('rank_m'),
+                'chg_d':         r.get('chg_d'),
+                'stage':         r.get('stage'),
+            }
+            for r in index_rows
+        ]
+        if index_history_rows:
+            await supabase_upsert(session, 'index_history', index_history_rows, on_conflict='snapshot_date,name')
+            try:
+                idx_verify_headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                                       "Prefer": "count=exact"}
+                async with session.get(
+                    f"{SUPABASE_URL}/rest/v1/index_history?select=name&snapshot_date=eq.{snapshot_date}",
+                    headers=idx_verify_headers, timeout=aiohttp.ClientTimeout(total=15)
+                ) as ivr:
+                    idx_saved = 0
+                    if ivr.status in (200, 206):
+                        cr = ivr.headers.get('content-range', '')
+                        if '/' in cr:
+                            idx_saved = int(cr.split('/')[-1])
+                    if idx_saved >= len(index_history_rows) * 0.9:
+                        log.info(f"  ✅ Index snapshot verified: {idx_saved} indices saved for {snapshot_date}")
+                    else:
+                        log.error(f"  ❌ Index snapshot for {snapshot_date} likely FAILED — only {idx_saved}/"
+                                   f"{len(index_history_rows)} rows found. If this persists, the index_history "
+                                   f"table may not exist yet — create it in Supabase:\n"
+                                   f"   create table if not exists public.index_history (\n"
+                                   f"     snapshot_date date not null, name text not null,\n"
+                                   f"     rs_tv int, rank_d int, rank_w int, rank_m int, chg_d numeric, stage int,\n"
+                                   f"     primary key (snapshot_date, name)\n"
+                                   f"   );")
+            except Exception as e:
+                log.warning(f"Index snapshot verification check failed: {e}")
+
         # Append today to the historical advance/decline line — the
         # one-time backfill at startup covers the past 2 years from
         # stored price history; this keeps it current going forward.
