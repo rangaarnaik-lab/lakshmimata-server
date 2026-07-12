@@ -2277,6 +2277,15 @@ def is_scan_time() -> bool:
 # Format: {sym: {'bb': bool, 'vcp': bool}}
 prev_squeeze_state: dict = {}
 
+# ── HY/HT volume-climax fire state tracking ──────────────────────────
+# Same "only alert on the transition into firing" pattern as squeeze
+# state above, tracked separately so a stock that stays HY/HT for
+# several scans in a row (common — these are daily volume-vs-history
+# ratios, not instantaneous events) only triggers one notification at
+# the moment it turns on, not every single scan while it's true.
+# Format: {sym: {'hy': bool, 'ht': bool}}
+prev_hy_ht_state: dict = {}
+
 
 historical_cache: dict = {}   # sym -> {prices, volumes, highs, lows}
 history_dates_cache: dict = {}  # sym -> [dates] — parallel to historical_cache,
@@ -5017,6 +5026,56 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         log.info(f"  🔥 {len(new_fires)} NEW squeeze fires: {[f['sym'] for f in new_fires]}")
         # Save to Supabase so frontend can poll and show notifications
         await supabase_upsert(session, 'squeeze_alerts', new_fires, on_conflict='sym,fired_at')
+
+    # Step 5.4b: Detect NEW HY/HT volume-climax fires, same state-transition
+    # pattern as squeeze/VCP above but tracked separately (see
+    # prev_hy_ht_state) — reuses the same squeeze_alerts table + frontend
+    # notification pipeline rather than a new one, since both are just
+    # "tell me the moment this signal turns on" alerts.
+    global prev_hy_ht_state
+    new_vol_fires = []
+    # fired_at is offset by 1 microsecond from the squeeze/VCP block above —
+    # both use the same fixed now_ist for this scan, and the on_conflict key
+    # is (sym, fired_at). Without this offset, a stock that fires BOTH a
+    # squeeze/VCP signal and an HY/HT signal in the same scan would collide
+    # on that key and the second upsert would silently overwrite the first
+    # alert instead of creating two.
+    hy_ht_fired_at = (now_ist + timedelta(microseconds=1)).isoformat()
+    for s in processed:
+        sym = s['sym']
+        hy_fired = s.get('is_hy', False)
+        ht_fired = s.get('is_ht', False)
+        prev = prev_hy_ht_state.get(sym, {'hy': False, 'ht': False})
+
+        new_hy = hy_fired and not prev['hy']
+        new_ht = ht_fired and not prev['ht']
+
+        if new_hy or new_ht:
+            fire_type = []
+            if new_hy: fire_type.append('HY')
+            if new_ht: fire_type.append('HT')
+            new_vol_fires.append({
+                'sym':        sym,
+                'fire_type':  ', '.join(fire_type),
+                'rs_tv':      s.get('rs_tv'),
+                'rs':         s.get('rs'),
+                'last_price': s.get('last_price'),
+                'chg_pct':    s.get('chg_pct'),
+                'sector':     s.get('sector'),
+                'fired_at':   hy_ht_fired_at,
+            })
+
+    prev_hy_ht_state = {
+        s['sym']: {
+            'hy': s.get('is_hy', False),
+            'ht': s.get('is_ht', False),
+        }
+        for s in processed
+    }
+
+    if new_vol_fires:
+        log.info(f"  🔊 {len(new_vol_fires)} NEW HY/HT fires: {[f['sym'] for f in new_vol_fires]}")
+        await supabase_upsert(session, 'squeeze_alerts', new_vol_fires, on_conflict='sym,fired_at')
 
     # Step 5.5: Market Breadth metrics
     # These give a pulse on overall market health
