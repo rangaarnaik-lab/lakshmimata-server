@@ -4170,6 +4170,49 @@ async def load_nifty_cache(session: aiohttp.ClientSession):
     except Exception as e:
         log.warning(f"Nifty cache load failed: {e}")
 
+def validate_hardcoded_symbol_lists():
+    """
+    Catches exactly the class of bug that made Mazagon Dock silently
+    invisible for as long as it was: a typo'd/wrong symbol in a
+    hand-maintained list (SECTOR_MAP, NIFTY50, MIDCAP, SMALLCAP,
+    MICROCAP) that doesn't match any real NSE symbol, so it never gets
+    matched to actual price/scan data — but doesn't error either, since
+    Python doesn't know "MAZAGON" isn't a real ticker, it's just a
+    string. The only way to actually catch this is to cross-check every
+    hardcoded symbol against the real, live instrument master this app
+    already loads at startup — which is exactly what this does, once,
+    right after that load finishes. Logs every mismatch loudly so it
+    shows up in Railway logs on every restart, instead of silently
+    doing nothing for months like this one did.
+    """
+    if not instrument_key_map:
+        log.warning("  Symbol validation skipped — instrument_key_map not populated yet")
+        return
+    named_lists = {
+        'NIFTY50': NIFTY50, 'MIDCAP': MIDCAP, 'SMALLCAP': SMALLCAP, 'MICROCAP': MICROCAP,
+    }
+    total_bad = 0
+    for list_name, syms in named_lists.items():
+        bad = [s for s in syms if s not in instrument_key_map]
+        if bad:
+            total_bad += len(bad)
+            log.warning(f"  ⚠️ {list_name} has {len(bad)} symbol(s) not found in the live instrument "
+                        f"master (likely typos, delisted, or renamed — will silently never get real "
+                        f"data): {bad}")
+    for sector_name, syms in SECTOR_MAP.items():
+        bad = [s for s in syms if s not in instrument_key_map]
+        if bad:
+            total_bad += len(bad)
+            log.warning(f"  ⚠️ SECTOR_MAP['{sector_name}'] has {len(bad)} symbol(s) not found in the "
+                        f"live instrument master: {bad}")
+    if total_bad == 0:
+        log.info("  ✅ All hardcoded symbol lists (SECTOR_MAP, NIFTY50/MIDCAP/SMALLCAP/MICROCAP) "
+                  "validated against the live instrument master — no bad symbols found")
+    else:
+        log.error(f"  ❌ {total_bad} bad symbol(s) found across hardcoded lists — see warnings above. "
+                  f"These stocks are silently invisible in the app until the symbol is corrected.")
+
+
 instrument_key_map: dict = {} # sym -> full instrument key (e.g. NSE_EQ|INE002A01018)
 
 async def load_instrument_master(session: aiohttp.ClientSession):
@@ -5380,6 +5423,11 @@ async def main():
 
         # Step 2: Load instrument master to get correct API keys
         await load_instrument_master(session)
+
+        # Step 2 (validate): catch typo'd/wrong symbols in hand-maintained
+        # lists NOW, loudly, instead of them silently never getting real
+        # data for months (see: MAZAGON vs the real MAZDOCK).
+        validate_hardcoded_symbol_lists()
 
         # Step 2a: Ensure all required DB columns exist
         await ensure_db_columns(session)
