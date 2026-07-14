@@ -5075,10 +5075,19 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         chg_w = round((last - prices[n-6])  / prices[n-6]  * 100, 2) if n >= 6  and prices[n-6]  else None
         chg_m = round((last - prices[n-22]) / prices[n-22] * 100, 2) if n >= 22 and prices[n-22] else None
 
-        if sym == 'RRKABEL':
-            log.info(f"  🔍 RRKABEL chg-calc: n={n}, dates_last3={dates_for_sym[-3:] if dates_for_sym else None}, "
+        # RRKABEL always logged (originally added for RS-TV debugging);
+        # ALSO log any stock with a suspiciously large daily move, since
+        # that's exactly the symptom of the stale-reference-price bug —
+        # this surfaces every affected stock in the next scan's logs
+        # instead of just the one hardcoded symbol, needed to tell
+        # whether the live-quote-first fix is actually taking effect or
+        # falling back to the local cache because live_ohlc_close simply
+        # isn't present in the quote for these symbols.
+        if sym == 'RRKABEL' or (chg is not None and abs(chg) > 20):
+            log.info(f"  🔍 {sym} chg-calc: n={n}, dates_last3={dates_for_sym[-3:] if dates_for_sym else None}, "
                      f"today_str={today_str}, prices_last_is_today={prices_last_is_today}, "
                      f"prices_last3={prices[-3:]}, true_prev_close={true_prev_close}, "
+                     f"live_ohlc_close={live_ohlc_close}, "
                      f"live_price={live_price}, last={last}, prev={prev}, chg={chg}")
 
         # PP — needs to trigger intraday, not just at EOD. detect_pp reads
