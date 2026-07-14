@@ -5029,9 +5029,23 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         else:
             true_prev_close = prices[n-1]  # prices[-1] is still yesterday — baseline as-is
 
+        # live.ohlc.close (when the quote API provides it) IS the broker's
+        # own previous-close reference — the same value every other broker
+        # app computes % change against, always fresh regardless of
+        # whether OUR locally-cached price history happens to be current.
+        # Previously this only got used as a fallback once the local array
+        # was >7 days stale (see the staleness-guard comment below), which
+        # missed cases where the local data was stale for other reasons
+        # (a data gap, a slow refresh, a corporate action) without being
+        # more than 7 days old — producing a wrong (sometimes wrong-signed)
+        # % change against a real, correctly-priced live quote. Now tried
+        # first; true_prev_close (the locally-cached fallback) is only used
+        # if the live quote genuinely doesn't include an ohlc close.
+        live_ohlc_close = live.get('ohlc', {}).get('close') if isinstance(live.get('ohlc'), dict) else None
+
         if live_price and live_price > 0:
             last = live_price
-            prev = true_prev_close
+            prev = live_ohlc_close if (live_ohlc_close and live_ohlc_close > 0) else true_prev_close
         else:
             # No live data (market closed / fetch failed) — show last completed
             # close vs the one before it, exactly like EOD.
