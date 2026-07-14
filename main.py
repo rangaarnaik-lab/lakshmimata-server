@@ -5029,23 +5029,21 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         else:
             true_prev_close = prices[n-1]  # prices[-1] is still yesterday — baseline as-is
 
-        # live.ohlc.close (when the quote API provides it) IS the broker's
-        # own previous-close reference — the same value every other broker
-        # app computes % change against, always fresh regardless of
-        # whether OUR locally-cached price history happens to be current.
-        # Previously this only got used as a fallback once the local array
-        # was >7 days stale (see the staleness-guard comment below), which
-        # missed cases where the local data was stale for other reasons
-        # (a data gap, a slow refresh, a corporate action) without being
-        # more than 7 days old — producing a wrong (sometimes wrong-signed)
-        # % change against a real, correctly-priced live quote. Now tried
-        # first; true_prev_close (the locally-cached fallback) is only used
-        # if the live quote genuinely doesn't include an ohlc close.
+        # REVERTED (see b92bee9 -> this commit): assumed live.ohlc.close was
+        # the broker's previous-day close reference, same as every broker
+        # app computes % change against. Log evidence proved that wrong —
+        # live_ohlc_close tracked live_price scan-to-scan (2343.0 -> 2344.0
+        # -> 2343.3 -> 2344.4, moving in lockstep with live_price each
+        # time), meaning it's the CURRENT session's running close, not a
+        # fixed prior-day reference — using it made prev == last, so chg
+        # came out to a flat 0.0% for every stock. Reverting to always
+        # trust the locally-cached array; still logged for visibility, just
+        # no longer used for the actual calculation.
         live_ohlc_close = live.get('ohlc', {}).get('close') if isinstance(live.get('ohlc'), dict) else None
 
         if live_price and live_price > 0:
             last = live_price
-            prev = live_ohlc_close if (live_ohlc_close and live_ohlc_close > 0) else true_prev_close
+            prev = true_prev_close
         else:
             # No live data (market closed / fetch failed) — show last completed
             # close vs the one before it, exactly like EOD.
@@ -5056,16 +5054,18 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         # Staleness guard — the ~72 Yahoo-failing symbols had prev closes
         # months old, producing absurd chg like +896% (live price vs a
         # pre-corporate-action stale close). If the last stored bar is
-        # over 7 calendar days old, the % against it is meaningless; use
-        # the live quote's own ohlc close (previous close) if available,
-        # else 0. The Upstox history fallback should eliminate most of
-        # these at the root once it backfills.
+        # over 7 calendar days old, the % against it is meaningless.
+        # Previously tried live.ohlc.close as a fallback here too, but
+        # that's now confirmed to track the CURRENT live price during
+        # market hours rather than a genuine previous-day close (see the
+        # revert note above) — using it would silently produce a
+        # near-zero chg instead of flagging that we genuinely don't have
+        # a trustworthy reference, which is worse than just saying 0.
         if dates_for_sym:
             try:
                 _age_days = (datetime.now(IST).date() - datetime.strptime(dates_for_sym[-1], '%Y-%m-%d').date()).days
                 if _age_days > 7:
-                    _live_prev = live.get('ohlc', {}).get('close')
-                    chg = round((last - _live_prev) / _live_prev * 100, 2) if _live_prev else 0
+                    chg = 0
             except Exception:
                 pass
         vol = live.get('volume') if live.get('volume') else (volumes[n-1] if volumes else 0)
