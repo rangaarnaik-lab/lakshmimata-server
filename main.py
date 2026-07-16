@@ -22,6 +22,8 @@ import random
 import asyncio
 import aiohttp
 import logging
+import boto3
+from botocore.config import Config as BotoConfig
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -42,6 +44,26 @@ TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 UPDATE_INTERVAL  = 60          # seconds between updates
 BATCH_SIZE       = 500         # Upstox supports 500 per bulk call
 IST              = timezone(timedelta(hours=5, minutes=30))
+
+# R2 (Cloudflare) — optional. All getenv() with empty defaults so the app
+# starts up and scans normally even before these are configured; the
+# upload function below just logs a warning once and skips itself if
+# they're missing, rather than crashing the whole scan loop.
+R2_ACCOUNT_ID        = os.getenv('R2_ACCOUNT_ID', '')
+R2_ACCESS_KEY_ID     = os.getenv('R2_ACCESS_KEY_ID', '')
+R2_SECRET_ACCESS_KEY = os.getenv('R2_SECRET_ACCESS_KEY', '')
+R2_BUCKET_NAME       = os.getenv('R2_BUCKET_NAME', '')
+_r2_client = None
+_r2_warned = False
+if R2_ACCOUNT_ID and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_BUCKET_NAME:
+    _r2_client = boto3.client(
+        's3',
+        endpoint_url=f'https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com',
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+        config=BotoConfig(signature_version='s3v4'),
+        region_name='auto',
+    )
 
 # ── Telegram Bot ─────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
@@ -2237,6 +2259,46 @@ async def supabase_upsert(session: aiohttp.ClientSession, table: str, rows: list
         async with sem:
             await upsert_chunk(chunk)
     await asyncio.gather(*[upsert_with_sem(c) for c in chunks])
+
+def _r2_put_object_sync(key: str, body: bytes, content_type: str, cache_seconds: int):
+    """The actual blocking boto3 call — only ever invoked inside
+    asyncio.to_thread() below, never directly on the event loop."""
+    _r2_client.put_object(
+        Bucket=R2_BUCKET_NAME,
+        Key=key,
+        Body=body,
+        ContentType=content_type,
+        CacheControl=f'public, max-age={cache_seconds}',
+    )
+
+async def upload_snapshot_to_r2(key: str, data, cache_seconds: int = 60):
+    """Uploads a JSON snapshot to R2 for the frontend to read directly
+    instead of querying Supabase — same data, but served from Cloudflare's
+    CDN cache to everyone requesting it within cache_seconds of each other,
+    instead of every single user triggering their own database read.
+
+    Deliberately best-effort: any failure here (R2 down, not configured
+    yet, network hiccup) only logs a warning and returns — it must NEVER
+    interrupt or fail the scan loop, since Supabase remains the real
+    source of truth regardless of whether this succeeds. The frontend
+    also falls back to querying Supabase directly if the R2 file is
+    missing or stale, so a failed upload here degrades gracefully rather
+    than breaking anything.
+    """
+    global _r2_warned
+    if _r2_client is None:
+        if not _r2_warned:
+            log.warning("⚠️ R2 not configured (R2_ACCOUNT_ID/R2_ACCESS_KEY_ID/"
+                        "R2_SECRET_ACCESS_KEY/R2_BUCKET_NAME) — skipping snapshot "
+                        "upload, frontend will keep reading from Supabase directly")
+            _r2_warned = True
+        return
+    try:
+        body = json.dumps(data, default=str).encode('utf-8')
+        await asyncio.to_thread(_r2_put_object_sync, key, body, 'application/json', cache_seconds)
+        log.info(f"  ☁️ Uploaded {key} to R2 ({len(body)/1024:.1f} KB)")
+    except Exception as e:
+        log.warning(f"⚠️ R2 upload failed for {key}: {e}")
 
 async def supabase_update_meta(session: aiohttp.ClientSession, meta: dict):
     """Update scan metadata."""
@@ -5605,6 +5667,11 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
     # Step 7: Save to Supabase
     log.info(f"  Saving {len(processed)} stocks to Supabase…")
     await supabase_upsert(session, 'stocks', processed)
+
+    # Also publish the same data to R2 for the frontend to read directly —
+    # see upload_snapshot_to_r2's docstring. Same processed list Supabase
+    # just got, so this is an exact mirror, not a different/trimmed shape.
+    await upload_snapshot_to_r2('stocks-snapshot.json', processed)
 
     # Week-over-week rank movement for sectors — same approach as the
     # Index Dashboard's rank_w_change: append today's rank once per day,
