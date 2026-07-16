@@ -1812,7 +1812,7 @@ async def fetch_fundamentals_screener(session: aiohttp.ClientSession, sym: str, 
 
 # Cache fundamentals to avoid re-fetching every minute
 fundamentals_cache: dict = {}  # sym -> {market_cap, pe, roe, eps, debt_eq, promoter, fetched_at}
-FUNDAMENTALS_TTL = 7 * 24 * 3600  # refresh weekly (data changes quarterly)
+FUNDAMENTALS_TTL = 30 * 24 * 3600  # refresh monthly (data changes quarterly; monthly is a safe margin without re-fetching on every restart)
 _fundamentals_debug_count = 0  # caps detailed per-request diagnostic logging
 _upstox_fundamentals_debug_count = 0  # caps raw-response logging for the new Upstox fundamentals API
 _upstox_shareholding_debug_count = 0  # separate budget so share-holdings isn't starved by key-ratios logging
