@@ -2026,6 +2026,13 @@ async def load_fundamentals_at_startup(session: aiohttp.ClientSession):
     over from zero. Runs as a background task (not awaited) since a full
     scrape can take 8-15+ minutes and fundamentals aren't as time-critical
     as price data.
+
+    SKIP_FUNDAMENTALS_ON_STARTUP=true temporarily disables the background
+    fetch entirely (still loads whatever's already cached in Supabase,
+    just doesn't kick off new Screener.in scraping) — useful while
+    verifying something else (e.g. the R2 upload) without 15+ minutes of
+    noisy fundamentals log lines burying the thing actually being
+    checked. Remove the env var to resume normal fetching.
     """
     table_ready = await ensure_fundamentals_table(session)
     if not table_ready:
@@ -2034,6 +2041,11 @@ async def load_fundamentals_at_startup(session: aiohttp.ClientSession):
         return
 
     stale_or_missing = await load_fundamentals_from_supabase(session)
+    if os.getenv('SKIP_FUNDAMENTALS_ON_STARTUP', '').lower() == 'true':
+        log.info(f"⏭️  SKIP_FUNDAMENTALS_ON_STARTUP is set — {len(stale_or_missing)} stocks need "
+                  f"fundamentals but background fetch is disabled for now. Remove the env var "
+                  f"to resume.")
+        return
     if stale_or_missing:
         log.info(f"📊 Starting background fundamentals fetch for {len(stale_or_missing)} stocks…")
         asyncio.create_task(load_fundamentals_batch(session, stale_or_missing))
@@ -4950,7 +4962,12 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
 
     # Fetch fundamentals only once per day at EOD — they change quarterly,
     # no point fetching every ~60-90s for as long as the market stays closed.
-    if is_first_eod_today:
+    # This call is awaited directly in the main scan flow (unlike the
+    # startup fetch, which is a background task) — meaning until it
+    # completes, the scan cannot reach Step 7 (Save to Supabase + R2
+    # upload) below. SKIP_FUNDAMENTALS_ON_STARTUP also bypasses this one,
+    # for the same reason as the startup version.
+    if is_first_eod_today and os.getenv('SKIP_FUNDAMENTALS_ON_STARTUP', '').lower() != 'true':
         all_syms = [s['sym'] for s in stocks_with_hist]
         await load_fundamentals_batch(session, all_syms)
 
