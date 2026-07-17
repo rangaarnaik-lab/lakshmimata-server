@@ -1835,6 +1835,148 @@ _fetch_error_counts: dict = {}  # exception-type name -> count, reset per load_f
 # aggregated (not logged per-call) so a systemic failure shows up as one
 # clear summary line instead of thousands of repeated log entries
 
+_NSE_ANNOUNCEMENTS_HEADER_SETS = [
+    {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.nseindia.com/companies-listing/corporate-filings-announcements",
+    },
+    {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+                      "(KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.nseindia.com/",
+    },
+]
+_nse_announcements_debug_count = 0  # caps raw-response logging while verifying the real field shape
+
+async def fetch_nse_announcements(session: aiohttp.ClientSession, debug: bool = False) -> list:
+    """
+    Fetch recent corporate announcements across ALL NSE-listed equities in
+    one call (not per-symbol — the endpoint already covers everything).
+
+    NSE's site blocks requests without a valid session cookie (same class
+    of bot-detection as Screener.in) — the documented workaround (used by
+    every established unofficial NSE API library) is to GET the main site
+    first to receive that cookie, then reuse it for the actual API call.
+
+    Field names below (symbol/desc/attchmntFile/an_dt) are based on the
+    documented shape from established open-source NSE API libraries, not
+    independently verified against a live response — this sandbox can't
+    reach nseindia.com to test directly (not in the allowed network
+    list). Defensively checks a few plausible name variants per field,
+    and logs the raw response shape for the first several calls so the
+    real shape can be confirmed/corrected from actual Railway logs.
+    """
+    global _nse_announcements_debug_count
+    headers = random.choice(_NSE_ANNOUNCEMENTS_HEADER_SETS)
+    try:
+        # Cookie-priming request — must happen first, same session object,
+        # so the cookies aiohttp receives here get sent automatically on
+        # the second request below.
+        async with session.get("https://www.nseindia.com/", headers=headers,
+                               timeout=aiohttp.ClientTimeout(total=15)) as r0:
+            if debug:
+                log.info(f"  🔍 NSE cookie-priming request: status={r0.status}")
+
+        async with session.get(
+            "https://www.nseindia.com/api/corporate-announcements?index=equities",
+            headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+        ) as r:
+            if r.status != 200:
+                key = f'nse_announcements_status_{r.status}'
+                _fetch_error_counts[key] = _fetch_error_counts.get(key, 0) + 1
+                if debug:
+                    log.info(f"  🔍 NSE announcements: non-200 status ({r.status})")
+                return []
+            data = await r.json()
+    except Exception as e:
+        _fetch_error_counts[f'nse_announcements_{type(e).__name__}'] = \
+            _fetch_error_counts.get(f'nse_announcements_{type(e).__name__}', 0) + 1
+        if debug:
+            log.info(f"  🔍 NSE announcements fetch exception: {type(e).__name__}: {e}")
+        return []
+
+    if _nse_announcements_debug_count < 3:
+        _nse_announcements_debug_count += 1
+        log.info(f"  🔍 NSE announcements raw response (first item): "
+                 f"{json.dumps(data[0] if isinstance(data, list) and data else data)[:1500]}")
+
+    items = data if isinstance(data, list) else data.get('data', []) if isinstance(data, dict) else []
+    results = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        symbol = item.get('symbol') or item.get('smbl')
+        subject = (item.get('desc') or item.get('subject') or item.get('smSubject')
+                   or item.get('attchmntText') or '')
+        attachment = item.get('attchmntFile') or item.get('attachmentFile') or item.get('fileUrl')
+        announced_at = (item.get('an_dt') or item.get('sort_date') or item.get('sortDate')
+                        or item.get('broadcastdate') or item.get('date'))
+        if not symbol or not subject:
+            continue
+        results.append({
+            'symbol': symbol.strip(),
+            'subject': subject.strip()[:500],
+            'attachment_url': attachment.strip() if attachment else None,
+            'announced_at': announced_at,
+        })
+    return results
+
+async def ensure_announcements_table(session: aiohttp.ClientSession,
+                                      retries: int = 6, delay: float = 10.0) -> bool:
+    """Same self-healing pattern as ensure_fundamentals_table — see that
+    function for why the retry loop is needed (PostgREST schema cache lag
+    after creating a table via the SQL Editor)."""
+    url = f"{SUPABASE_URL}/rest/v1/corporate_announcements?limit=1"
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    for attempt in range(retries):
+        try:
+            async with session.get(url, headers=headers,
+                                   timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status == 200:
+                    return True
+                if r.status == 404 and attempt < retries - 1:
+                    await asyncio.sleep(delay)
+                    continue
+                log.error(f"corporate_announcements table check failed: {r.status}")
+                return False
+        except Exception as e:
+            if attempt < retries - 1:
+                await asyncio.sleep(delay)
+                continue
+            log.error(f"corporate_announcements table check failed: {e}")
+            return False
+    return False
+
+async def save_announcements_to_db(session: aiohttp.ClientSession, rows: list):
+    """Upsert on (symbol, subject, announced_at) so re-fetching the same
+    announcement across polling cycles doesn't create duplicates."""
+    if not rows:
+        return
+    url = f"{SUPABASE_URL}/rest/v1/corporate_announcements"
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates",
+    }
+    try:
+        async with session.post(f"{url}?on_conflict=symbol,subject,announced_at",
+                                headers=headers, json=rows,
+                                timeout=aiohttp.ClientTimeout(total=20)) as r:
+            if r.status not in (200, 201):
+                body = await r.text()
+                log.warning(f"⚠️ Announcements upsert failed ({r.status}): {body[:300]}")
+            else:
+                log.info(f"  📢 Upserted {len(rows)} announcements to Supabase")
+    except Exception as e:
+        log.warning(f"⚠️ Announcements upsert exception: {e}")
+
+
 async def ensure_fundamentals_table(session: aiohttp.ClientSession,
                                      retries: int = 6, delay: float = 10.0) -> bool:
     """Same self-healing pattern as ensure_full_history_table — see that
@@ -5960,50 +6102,81 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
 # ── Main loop ─────────────────────────────────────────────────────────
 async def fundamentals_worker_main():
     """
-    Standalone fundamentals worker — SERVICE_MODE=fundamentals runs ONLY
-    this, never the live scan loop. Meant to run as a SEPARATE Railway
-    service (same repo, same codebase, different start command), so
-    fundamentals fetching can never again block the live scan no matter
-    how slow or rate-limited Screener.in/Upstox get — true process
-    isolation, not just a background task sharing the same event loop.
+    Standalone fundamentals + announcements worker — SERVICE_MODE=
+    fundamentals runs ONLY this, never the live scan loop. Meant to run
+    as a SEPARATE Railway service (same repo, same codebase, different
+    start command), so neither of these can ever block the live scan no
+    matter how slow or rate-limited Screener.in/Upstox/NSE get — true
+    process isolation, not just a background task sharing the same event
+    loop.
 
-    Reuses fetch_upstox_fundamentals / fetch_fundamentals_screener /
-    load_fundamentals_from_supabase / load_fundamentals_batch exactly as
-    they already exist — nothing duplicated, this is genuinely the same
-    code, just invoked from a different entry point in a different
-    process.
-
-    Loop: check for stale/missing fundamentals, fetch a batch if any
-    exist, sleep, repeat. Checking hourly is already far more often than
-    needed for data that changes quarterly — this isn't time-critical
-    the way the live scan is.
+    Runs two independent loops concurrently (via asyncio.gather), each
+    on its own cadence — announcements are more time-sensitive than
+    fundamentals (today's board meeting outcome matters; a slightly
+    stale P/E ratio doesn't), so they're checked far more often.
     """
     log.info("=" * 60)
-    log.info("  Fundamentals Worker — standalone process")
+    log.info("  Fundamentals + Announcements Worker — standalone process")
     log.info("  (SERVICE_MODE=fundamentals — live scan runs in a separate service)")
     log.info("=" * 60)
 
-    CHECK_INTERVAL = 3600  # 1 hour — fundamentals don't need checking more often than this
     connector = aiohttp.TCPConnector(limit=20, ssl=False)
     async with aiohttp.ClientSession(connector=connector) as session:
         await load_instrument_master(session)  # needed for ISIN lookups (Upstox fundamentals API)
-        table_ready = await ensure_fundamentals_table(session)
-        if not table_ready:
-            log.error("stock_fundamentals table unavailable — fundamentals worker cannot proceed.")
-            return
+        await asyncio.gather(
+            _fundamentals_loop(session),
+            _announcements_loop(session),
+        )
 
-        while True:
-            try:
-                stale_or_missing = await load_fundamentals_from_supabase(session)
-                if stale_or_missing:
-                    log.info(f"📊 Fetching fundamentals for {len(stale_or_missing)} stocks…")
-                    await load_fundamentals_batch(session, stale_or_missing)
-                else:
-                    log.info("✅ All fundamentals current — nothing to fetch this cycle.")
-            except Exception as e:
-                import traceback
-                log.error(f"Fundamentals worker cycle failed: {e}\n{traceback.format_exc()}")
-            await asyncio.sleep(CHECK_INTERVAL)
+async def _fundamentals_loop(session: aiohttp.ClientSession):
+    """Reuses fetch_upstox_fundamentals / fetch_fundamentals_screener /
+    load_fundamentals_from_supabase / load_fundamentals_batch exactly as
+    they already exist — nothing duplicated, this is genuinely the same
+    code, just invoked from a different entry point in a different
+    process. Checking hourly is already far more often than needed for
+    data that changes quarterly."""
+    CHECK_INTERVAL = 3600  # 1 hour
+    table_ready = await ensure_fundamentals_table(session)
+    if not table_ready:
+        log.error("stock_fundamentals table unavailable — fundamentals loop cannot proceed.")
+        return
+    while True:
+        try:
+            stale_or_missing = await load_fundamentals_from_supabase(session)
+            if stale_or_missing:
+                log.info(f"📊 Fetching fundamentals for {len(stale_or_missing)} stocks…")
+                await load_fundamentals_batch(session, stale_or_missing)
+            else:
+                log.info("✅ All fundamentals current — nothing to fetch this cycle.")
+        except Exception as e:
+            import traceback
+            log.error(f"Fundamentals loop cycle failed: {e}\n{traceback.format_exc()}")
+        await asyncio.sleep(CHECK_INTERVAL)
+
+async def _announcements_loop(session: aiohttp.ClientSession):
+    """Fetches NSE's corporate announcements feed (all equities in one
+    call) every 15 minutes and upserts new ones to Supabase. See
+    fetch_nse_announcements's docstring for the caveat about field names
+    not being independently verified yet — first several cycles log the
+    raw response shape for confirmation."""
+    CHECK_INTERVAL = 15 * 60  # 15 minutes — more time-sensitive than fundamentals
+    table_ready = await ensure_announcements_table(session)
+    if not table_ready:
+        log.error("corporate_announcements table unavailable — announcements loop cannot proceed.")
+        return
+    cycle = 0
+    while True:
+        try:
+            cycle += 1
+            rows = await fetch_nse_announcements(session, debug=(cycle <= 3))
+            if rows:
+                await save_announcements_to_db(session, rows)
+            else:
+                log.info("📢 No announcements fetched this cycle (empty result or fetch failed).")
+        except Exception as e:
+            import traceback
+            log.error(f"Announcements loop cycle failed: {e}\n{traceback.format_exc()}")
+        await asyncio.sleep(CHECK_INTERVAL)
 
 async def main():
     if os.getenv('SERVICE_MODE', '').lower() == 'fundamentals':
