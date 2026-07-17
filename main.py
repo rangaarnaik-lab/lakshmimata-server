@@ -2437,6 +2437,48 @@ def _r2_put_object_sync(key: str, body: bytes, content_type: str, cache_seconds:
         CacheControl=f'public, max-age={cache_seconds}',
     )
 
+# Exact set of fields the frontend's transformStockRow() actually reads
+# (src/lib/db.js) — cross-referenced directly from that function's body,
+# not guessed. The R2 snapshot was coming out ~5.5x larger than the
+# equivalent Supabase read (6.05MB vs ~1.1MB) because it was uploading
+# each stock's full internal `processed` dict as-is, including fields
+# the frontend never touches. R2's cost is $0 regardless of size, but a
+# smaller file still means a faster first-load for every user each time
+# the CDN cache needs refreshing.
+_R2_STOCK_FIELDS = frozenset({
+    'sym','rs','rs_tv','rs_nifty50','rs_midcap','rs_smallcap','rs_microcap','rs_sector',
+    'last_price','chg_pct','high_52w','sector','industry','chg_w_pct','chg_m_pct',
+    'in_nifty50','in_midcap','in_smallcap','in_microcap','rvol','ibv_signal',
+    'is_resistance_breakout','is_52wh_breakout','resistance_r1',
+    'is_cup_handle_breakout','has_cup_pattern','cup_depth_pct',
+    'is_guppy_bullish_crossover','is_guppy_bearish_crossover','is_guppy_compressed',
+    'vol_signal','rs_line_new_high','rs_line_trend','rs_line_value','is_s2_new_entry',
+    'market_cap','pe','roe','eps','debt_eq','promoter',
+    'eps_qoq','eps_yoy','sales_qoq','sales_yoy','opm_pct','opm_trend',
+    'eps_growth_streak','fii_pct','fii_trend','dii_pct','dii_trend',
+    'promoter_trend','peg_ratio',
+    'rs_hist','rs_trend','rs_slope',
+    'is_pp','pp_hist','pp_count_10d','pp_vol_ratio','ma10','ma50',
+    'is_hy','hy_pct','volume','hy_hist',
+    'is_ht','ht_pct','ht_hist','ibv_hist',
+    'near_ema9','ema9','pct_from_ema9',
+    'near_ema21','ema21','pct_from_ema21',
+    'near_ema50','ema50','pct_from_ema50',
+    'near_52wl','pct_from_52wl','low_52w','crossed_ema5','pp_volume_52wl',
+    'is_52wl_signal','ema5',
+    'is_weak_rs','weak_chg_1d','weak_chg_5d','weak_vol_spike',
+    'in_squeeze','squeeze_fired','bb_width_pct','squeeze_days',
+    'is_vcp','vcp_stage','vcp_fired','vcp_contractions',
+    'last_updated','scan_type',
+})
+
+def trim_for_r2(stocks: list) -> list:
+    """Filters each stock dict down to only _R2_STOCK_FIELDS before
+    uploading — the R2 copy is read-only display data for the frontend,
+    it doesn't need whatever extra internal-only fields the backend's
+    own processing carries that the Supabase table/frontend never use."""
+    return [{k: s[k] for k in _R2_STOCK_FIELDS if k in s} for s in stocks]
+
 async def upload_snapshot_to_r2(key: str, data, cache_seconds: int = 60):
     """Uploads a JSON snapshot to R2 for the frontend to read directly
     instead of querying Supabase — same data, but served from Cloudflare's
@@ -5841,9 +5883,11 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
     await supabase_upsert(session, 'stocks', processed)
 
     # Also publish the same data to R2 for the frontend to read directly —
-    # see upload_snapshot_to_r2's docstring. Same processed list Supabase
-    # just got, so this is an exact mirror, not a different/trimmed shape.
-    await upload_snapshot_to_r2('stocks-snapshot.json', processed)
+    # see upload_snapshot_to_r2's docstring. Trimmed to only the fields
+    # transformStockRow() actually reads (trim_for_r2, defined above) —
+    # unlike the Supabase write, this doesn't need the full processed
+    # dict, just what the frontend displays.
+    await upload_snapshot_to_r2('stocks-snapshot.json', trim_for_r2(processed))
 
     # Week-over-week rank movement for sectors — same approach as the
     # Index Dashboard's rank_w_change: append today's rank once per day,
