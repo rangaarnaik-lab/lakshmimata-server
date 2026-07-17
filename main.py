@@ -1813,6 +1813,18 @@ async def fetch_fundamentals_screener(session: aiohttp.ClientSession, sym: str, 
 # Cache fundamentals to avoid re-fetching every minute
 fundamentals_cache: dict = {}  # sym -> {market_cap, pe, roe, eps, debt_eq, promoter, fetched_at}
 FUNDAMENTALS_TTL = 30 * 24 * 3600  # refresh monthly (data changes quarterly; monthly is a safe margin without re-fetching on every restart)
+
+def scan_should_skip_fundamentals() -> bool:
+    """True if the live-scan process should never fetch fundamentals
+    itself — either because SERVICE_MODE=scan (a separate fundamentals
+    worker service is running and owns this job instead), or because
+    SKIP_FUNDAMENTALS_ON_STARTUP=true (a temporary manual bypass, e.g.
+    while diagnosing something else that doesn't need fundamentals)."""
+    if os.getenv('SERVICE_MODE', '').lower() == 'scan':
+        return True
+    if os.getenv('SKIP_FUNDAMENTALS_ON_STARTUP', '').lower() == 'true':
+        return True
+    return False
 _fundamentals_debug_count = 0  # caps detailed per-request diagnostic logging
 _upstox_fundamentals_debug_count = 0  # caps raw-response logging for the new Upstox fundamentals API
 _upstox_shareholding_debug_count = 0  # separate budget so share-holdings isn't starved by key-ratios logging
@@ -2027,12 +2039,12 @@ async def load_fundamentals_at_startup(session: aiohttp.ClientSession):
     scrape can take 8-15+ minutes and fundamentals aren't as time-critical
     as price data.
 
-    SKIP_FUNDAMENTALS_ON_STARTUP=true temporarily disables the background
-    fetch entirely (still loads whatever's already cached in Supabase,
-    just doesn't kick off new Screener.in scraping) — useful while
-    verifying something else (e.g. the R2 upload) without 15+ minutes of
-    noisy fundamentals log lines burying the thing actually being
-    checked. Remove the env var to resume normal fetching.
+    SERVICE_MODE=scan permanently disables this (a separate fundamentals
+    worker service owns the job instead — see fundamentals_worker_main).
+    SKIP_FUNDAMENTALS_ON_STARTUP=true does the same temporarily, for
+    manual bypass while diagnosing something unrelated. Either way this
+    still loads whatever's already cached in Supabase, just doesn't kick
+    off new Screener.in scraping itself.
     """
     table_ready = await ensure_fundamentals_table(session)
     if not table_ready:
@@ -2041,10 +2053,10 @@ async def load_fundamentals_at_startup(session: aiohttp.ClientSession):
         return
 
     stale_or_missing = await load_fundamentals_from_supabase(session)
-    if os.getenv('SKIP_FUNDAMENTALS_ON_STARTUP', '').lower() == 'true':
-        log.info(f"⏭️  SKIP_FUNDAMENTALS_ON_STARTUP is set — {len(stale_or_missing)} stocks need "
-                  f"fundamentals but background fetch is disabled for now. Remove the env var "
-                  f"to resume.")
+    if scan_should_skip_fundamentals():
+        log.info(f"⏭️  Fundamentals fetch skipped on this process (SERVICE_MODE=scan or "
+                  f"SKIP_FUNDAMENTALS_ON_STARTUP) — {len(stale_or_missing)} stocks need "
+                  f"fundamentals, handled elsewhere or later.")
         return
     if stale_or_missing:
         log.info(f"📊 Starting background fundamentals fetch for {len(stale_or_missing)} stocks…")
@@ -4965,9 +4977,10 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
     # This call is awaited directly in the main scan flow (unlike the
     # startup fetch, which is a background task) — meaning until it
     # completes, the scan cannot reach Step 7 (Save to Supabase + R2
-    # upload) below. SKIP_FUNDAMENTALS_ON_STARTUP also bypasses this one,
-    # for the same reason as the startup version.
-    if is_first_eod_today and os.getenv('SKIP_FUNDAMENTALS_ON_STARTUP', '').lower() != 'true':
+    # upload) below. scan_should_skip_fundamentals() covers both
+    # SERVICE_MODE=scan (permanent — a separate worker service owns this
+    # job) and SKIP_FUNDAMENTALS_ON_STARTUP (temporary manual bypass).
+    if is_first_eod_today and not scan_should_skip_fundamentals():
         all_syms = [s['sym'] for s in stocks_with_hist]
         await load_fundamentals_batch(session, all_syms)
 
@@ -5945,7 +5958,58 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
     return len(processed)
 
 # ── Main loop ─────────────────────────────────────────────────────────
+async def fundamentals_worker_main():
+    """
+    Standalone fundamentals worker — SERVICE_MODE=fundamentals runs ONLY
+    this, never the live scan loop. Meant to run as a SEPARATE Railway
+    service (same repo, same codebase, different start command), so
+    fundamentals fetching can never again block the live scan no matter
+    how slow or rate-limited Screener.in/Upstox get — true process
+    isolation, not just a background task sharing the same event loop.
+
+    Reuses fetch_upstox_fundamentals / fetch_fundamentals_screener /
+    load_fundamentals_from_supabase / load_fundamentals_batch exactly as
+    they already exist — nothing duplicated, this is genuinely the same
+    code, just invoked from a different entry point in a different
+    process.
+
+    Loop: check for stale/missing fundamentals, fetch a batch if any
+    exist, sleep, repeat. Checking hourly is already far more often than
+    needed for data that changes quarterly — this isn't time-critical
+    the way the live scan is.
+    """
+    log.info("=" * 60)
+    log.info("  Fundamentals Worker — standalone process")
+    log.info("  (SERVICE_MODE=fundamentals — live scan runs in a separate service)")
+    log.info("=" * 60)
+
+    CHECK_INTERVAL = 3600  # 1 hour — fundamentals don't need checking more often than this
+    connector = aiohttp.TCPConnector(limit=20, ssl=False)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        await load_instrument_master(session)  # needed for ISIN lookups (Upstox fundamentals API)
+        table_ready = await ensure_fundamentals_table(session)
+        if not table_ready:
+            log.error("stock_fundamentals table unavailable — fundamentals worker cannot proceed.")
+            return
+
+        while True:
+            try:
+                stale_or_missing = await load_fundamentals_from_supabase(session)
+                if stale_or_missing:
+                    log.info(f"📊 Fetching fundamentals for {len(stale_or_missing)} stocks…")
+                    await load_fundamentals_batch(session, stale_or_missing)
+                else:
+                    log.info("✅ All fundamentals current — nothing to fetch this cycle.")
+            except Exception as e:
+                import traceback
+                log.error(f"Fundamentals worker cycle failed: {e}\n{traceback.format_exc()}")
+            await asyncio.sleep(CHECK_INTERVAL)
+
 async def main():
+    if os.getenv('SERVICE_MODE', '').lower() == 'fundamentals':
+        await fundamentals_worker_main()
+        return
+
     global ALL_STOCKS, NIFTY50, MIDCAP, SMALLCAP, MICROCAP
 
     log.info("=" * 60)
