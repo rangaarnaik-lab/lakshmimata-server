@@ -2477,7 +2477,31 @@ def trim_for_r2(stocks: list) -> list:
     uploading — the R2 copy is read-only display data for the frontend,
     it doesn't need whatever extra internal-only fields the backend's
     own processing carries that the Supabase table/frontend never use."""
-    return [{k: s[k] for k in _R2_STOCK_FIELDS if k in s} for s in stocks]
+    trimmed = [{k: s[k] for k in _R2_STOCK_FIELDS if k in s} for s in stocks]
+
+    # One-time diagnostic: the trim only brought the file from ~6.05MB to
+    # ~5.6-5.9MB, far less than expected if extra internal-only fields
+    # were the dominant contributor — measuring actual per-field size
+    # directly instead of continuing to guess which field is actually
+    # large.
+    global _r2_size_diagnostic_logged
+    if not _r2_size_diagnostic_logged:
+        _r2_size_diagnostic_logged = True
+        field_sizes = {}
+        for field in _R2_STOCK_FIELDS:
+            total = 0
+            for s in trimmed:
+                if field in s:
+                    total += len(json.dumps(s[field], default=str))
+            field_sizes[field] = total
+        top20 = sorted(field_sizes.items(), key=lambda x: -x[1])[:20]
+        total_size = sum(field_sizes.values())
+        log.info(f"  🔍 R2 payload field-size breakdown (total ~{total_size/1024:.0f} KB across {len(trimmed)} stocks):")
+        for field, size in top20:
+            log.info(f"     {field}: {size/1024:.1f} KB ({size/max(total_size,1)*100:.1f}%)")
+
+    return trimmed
+_r2_size_diagnostic_logged = False
 
 async def upload_snapshot_to_r2(key: str, data, cache_seconds: int = 60):
     """Uploads a JSON snapshot to R2 for the frontend to read directly
