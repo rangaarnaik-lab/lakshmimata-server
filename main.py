@@ -1699,6 +1699,27 @@ async def fetch_fundamentals_screener(session: aiohttp.ClientSession, sym: str, 
                      f"page structure may have changed, none of the {len(sector_industry_patterns)} "
                      f"candidate patterns hit")
 
+        # Compare against the static CSV lookup whenever Screener's live
+        # scrape actually succeeds — not to auto-fix anything (learned the
+        # hard way this session that automated reclassification without
+        # verification can itself introduce new errors, e.g. genuine real-
+        # estate developers vs. generic EPC contractors sharing the same
+        # 'Construction' label), just to surface disagreements for human
+        # review. Loose case-insensitive substring check in either
+        # direction, since Screener's wording won't exactly match the
+        # CSV's (e.g. 'Realty' vs 'Real Estate') even when they agree.
+        if result['industry']:
+            static = SECTOR_INDUSTRY_LOOKUP.get(sym, {})
+            static_sector = (static.get('sector') or '').lower()
+            static_industry = (static.get('industry') or '').lower()
+            live = result['industry'].lower()
+            if static_sector or static_industry:
+                agrees = ((static_sector and (live in static_sector or static_sector in live)) or
+                          (static_industry and (live in static_industry or static_industry in live)))
+                if not agrees:
+                    log.info(f"  ⚖️  Sector disagreement — {sym}: CSV says sector={static.get('sector')!r} "
+                             f"industry={static.get('industry')!r}, Screener.in says {result['industry']!r}")
+
         def extract_row_series(label: str, html: str) -> list:
             """Pull all data-cell values from a Screener table row (Quarterly
             Results / Shareholding Pattern), oldest-to-newest as Screener
