@@ -4936,6 +4936,90 @@ async def load_instrument_master(session: aiohttp.ClientSession):
         instrument_key_map[sym] = f"NSE_EQ|{sym}"
     return False
 
+async def load_bse_only_stocks(session: aiohttp.ClientSession) -> int:
+    """
+    Adds BSE-only stocks (listed on BSE but NOT on NSE) on top of whatever
+    load_instrument_master already built from NSE — additive only, never
+    modifies or removes any existing NSE-sourced entry.
+
+    Most major Indian companies are dual-listed on both exchanges; this
+    is specifically for the ones that chose BSE only. Upstox's own
+    instrument-search docs confirm ISIN is the reliable way to match a
+    security across exchanges (their API explicitly supports "pass an
+    ISIN, get back both the NSE and BSE listings for it") — so this
+    collects every ISIN already covered by an NSE listing, then adds any
+    BSE equity whose ISIN ISN'T in that set. Deliberately uses the JSON
+    instrument files, not CSV — Upstox's own docs state the CSV format
+    is being deprecated in favor of JSON.
+
+    Deliberately best-effort: any failure here just means BSE-only
+    stocks aren't added this run. Never touches ALL_STOCKS or
+    instrument_key_map unless it has a real, non-empty NSE ISIN set to
+    dedupe against, to avoid the failure mode of accidentally treating
+    EVERY BSE stock as "BSE-only" because the dedupe set came back empty.
+    """
+    global instrument_key_map, ALL_STOCKS
+
+    nse_isins = set()
+    try:
+        url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=60),
+                               headers={"Accept-Encoding": "gzip"}) as r:
+            if r.status != 200:
+                log.warning(f"BSE-only stocks: NSE re-fetch for ISIN set failed ({r.status}), skipping")
+                return 0
+            content = await r.read()
+            try:
+                data = json.loads(gzip.decompress(content))
+            except Exception:
+                data = json.loads(content)
+            for item in data:
+                isin = item.get('isin', '')
+                if item.get('exchange') == 'NSE' and item.get('instrument_type') in ('EQ', 'ETF') and isin:
+                    nse_isins.add(isin)
+    except Exception as e:
+        log.warning(f"BSE-only stocks: couldn't build NSE ISIN set ({e}), skipping")
+        return 0
+
+    if not nse_isins:
+        log.warning("BSE-only stocks: NSE ISIN set came back empty, skipping to avoid false positives")
+        return 0
+
+    added_syms = []
+    try:
+        url2 = "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz"
+        async with session.get(url2, timeout=aiohttp.ClientTimeout(total=90),
+                               headers={"Accept-Encoding": "gzip"}) as r:
+            if r.status != 200:
+                log.warning(f"BSE-only stocks: complete instrument file fetch failed ({r.status})")
+                return 0
+            content = await r.read()
+            try:
+                data = json.loads(gzip.decompress(content))
+            except Exception:
+                data = json.loads(content)
+
+            for item in data:
+                if item.get('exchange') != 'BSE' or item.get('instrument_type') != 'EQ':
+                    continue
+                isin = item.get('isin', '')
+                if not isin or isin in nse_isins:
+                    continue  # dual-listed — already covered via the NSE side
+                sym = item.get('trading_symbol', '').strip()
+                key = item.get('instrument_key', '')
+                if not sym or not key or sym in instrument_key_map:
+                    continue  # missing data, or symbol collision — skip rather than risk overwriting
+                instrument_key_map[sym] = key
+                added_syms.append(sym)
+    except Exception as e:
+        log.warning(f"BSE-only stocks: fetch/parse failed ({e})")
+        return 0
+
+    if added_syms:
+        ALL_STOCKS = list(dict.fromkeys(ALL_STOCKS + added_syms))
+        log.info(f"✅ Added {len(added_syms)} BSE-only stocks — total universe now {len(ALL_STOCKS)}")
+    return len(added_syms)
+
 async def load_historical_cache(session: aiohttp.ClientSession):
     """Load historical data for all stocks at startup."""
     log.info(f"Loading historical data for {len(ALL_STOCKS)} stocks…")
@@ -6311,6 +6395,11 @@ async def main():
 
         # Step 2: Load instrument master to get correct API keys
         await load_instrument_master(session)
+
+        # Step 2b: Add BSE-only stocks (not dual-listed on NSE) on top of
+        # the NSE-based universe above. Best-effort/additive — see
+        # load_bse_only_stocks' docstring.
+        await load_bse_only_stocks(session)
 
         # Step 2 (validate): catch typo'd/wrong symbols in hand-maintained
         # lists NOW, loudly, instead of them silently never getting real
