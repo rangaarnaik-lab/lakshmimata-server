@@ -1839,16 +1839,17 @@ _NSE_ANNOUNCEMENTS_HEADER_SETS = [
     {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.nseindia.com/companies-listing/corporate-filings-announcements",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate",
+        "Referer": "https://www.nseindia.com/get-quotes/equity?symbol=HDFCBANK",
     },
     {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
-                      "(KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.nseindia.com/",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; rv:109.0) Gecko/20100101 Firefox/118.0",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate",
+        "Referer": "https://www.nseindia.com/get-quotes/equity?symbol=HDFCBANK",
     },
 ]
 _nse_announcements_debug_count = 0  # caps raw-response logging while verifying the real field shape
@@ -1859,14 +1860,19 @@ async def fetch_nse_announcements(session: aiohttp.ClientSession, debug: bool = 
     one call (not per-symbol — the endpoint already covers everything).
 
     NSE's site blocks requests without a valid session cookie (same class
-    of bot-detection as Screener.in) — the documented workaround (used by
-    every established unofficial NSE API library) is to GET the main site
-    first to receive that cookie, then reuse it for the actual API call.
+    of bot-detection as Screener.in). Cookie-priming URL, referer, and
+    headers below are NOT guessed — verified by directly installing and
+    reading the source of an established, actively-maintained open-source
+    NSE API library (135+ GitHub followers, several related projects by
+    the same author) rather than assuming: the priming request specifically
+    hits /option-chain (not the homepage), and the referer on the actual
+    data request is a specific equity quote page, not the announcements
+    page itself. Both differ from what an initial, untested guess used.
 
-    Field names below (symbol/desc/attchmntFile/an_dt) are based on the
-    documented shape from established open-source NSE API libraries, not
-    independently verified against a live response — this sandbox can't
-    reach nseindia.com to test directly (not in the allowed network
+    Field names below (symbol/desc/attchmntFile/an_dt) are still based on
+    the documented shape from established open-source NSE API libraries,
+    not independently verified against a live response — this sandbox
+    can't reach nseindia.com to test directly (not in the allowed network
     list). Defensively checks a few plausible name variants per field,
     and logs the raw response shape for the first several calls so the
     real shape can be confirmed/corrected from actual Railway logs.
@@ -1876,8 +1882,9 @@ async def fetch_nse_announcements(session: aiohttp.ClientSession, debug: bool = 
     try:
         # Cookie-priming request — must happen first, same session object,
         # so the cookies aiohttp receives here get sent automatically on
-        # the second request below.
-        async with session.get("https://www.nseindia.com/", headers=headers,
+        # the second request below. /option-chain specifically, verified
+        # against the reference library's source — not the homepage.
+        async with session.get("https://www.nseindia.com/option-chain", headers=headers,
                                timeout=aiohttp.ClientTimeout(total=15)) as r0:
             if debug:
                 log.info(f"  🔍 NSE cookie-priming request: status={r0.status}")
