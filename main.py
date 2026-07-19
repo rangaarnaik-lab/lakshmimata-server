@@ -2670,6 +2670,15 @@ INDEX_TRACKER = {
     "Tourism":            "NSE_INDEX|Nifty India Tourism",
     "Capital Markets":    "NSE_INDEX|Nifty Capital Markets",
     "Housing":            "NSE_INDEX|Nifty Housing",
+    "Railways":           "NSE_INDEX|Nifty India Railways PSU",
+    "Internet":           "NSE_INDEX|Nifty India Internet",
+    "Rural":              "NSE_INDEX|Nifty Rural",
+    "Services":           "NSE_INDEX|Nifty Services Sector",
+    "REITs & InvITs":     "NSE_INDEX|Nifty REITs & InvITs",
+    "Mobility":           "NSE_INDEX|Nifty Mobility",
+    "Infra & Logistics":  "NSE_INDEX|Nifty India Infrastructure & Logistics",
+    "Transport & Logistics": "NSE_INDEX|Nifty Transportation & Logistics",
+    "IPO":                "NSE_INDEX|Nifty IPO",
 }
 
 # Cache for all index historical data
@@ -2721,6 +2730,26 @@ async def load_index_cache(session: aiohttp.ClientSession):
         "Tourism":            ["NSE_INDEX|Nifty India Tourism", "NSE_INDEX|NIFTY INDIA TOURISM"],
         "Capital Markets":    ["NSE_INDEX|Nifty Capital Markets", "NSE_INDEX|NIFTY CAPITAL MARKETS"],
         "Housing":            ["NSE_INDEX|Nifty Housing", "NSE_INDEX|NIFTY HOUSING"],
+        # Newly added — confirmed real via NSE's own official current
+        # thematic index list, but exact Upstox instrument-key naming is
+        # unverified (can't reach Upstox/NSE directly from this sandbox
+        # to test), so each gets several plausible variants to try.
+        "Railways":           ["NSE_INDEX|Nifty India Railways PSU", "NSE_INDEX|NIFTY INDIA RAILWAYS PSU",
+                                "NSE_INDEX|Nifty Railways PSU", "NSE_INDEX|Nifty India Railways"],
+        "Internet":           ["NSE_INDEX|Nifty India Internet", "NSE_INDEX|NIFTY INDIA INTERNET"],
+        "Rural":              ["NSE_INDEX|Nifty Rural", "NSE_INDEX|NIFTY RURAL"],
+        "Services":           ["NSE_INDEX|Nifty Services Sector", "NSE_INDEX|Nifty Services",
+                                "NSE_INDEX|NIFTY SERVICES SECTOR"],
+        "REITs & InvITs":     ["NSE_INDEX|Nifty REITs & InvITs", "NSE_INDEX|Nifty REIT and InvIT",
+                                "NSE_INDEX|NIFTY REITS AND INVITS", "NSE_INDEX|Nifty REITs and InvITs"],
+        "Mobility":           ["NSE_INDEX|Nifty Mobility", "NSE_INDEX|NIFTY MOBILITY"],
+        "Infra & Logistics":  ["NSE_INDEX|Nifty India Infrastructure & Logistics",
+                                "NSE_INDEX|Nifty India Infra & Logistics",
+                                "NSE_INDEX|NIFTY INDIA INFRASTRUCTURE AND LOGISTICS"],
+        "Transport & Logistics": ["NSE_INDEX|Nifty Transportation & Logistics",
+                                   "NSE_INDEX|Nifty Transportation and Logistics",
+                                   "NSE_INDEX|NIFTY TRANSPORTATION AND LOGISTICS"],
+        "IPO":                ["NSE_INDEX|Nifty IPO", "NSE_INDEX|NIFTY IPO"],
     }
     for name, ikey in INDEX_TRACKER.items():
         # Try primary key, then alternatives
