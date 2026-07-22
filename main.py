@@ -13,6 +13,7 @@ Environment variables:
 """
 
 import os
+import gc
 import csv
 import sys
 import time
@@ -2076,12 +2077,26 @@ async def load_fundamentals_from_supabase(session: aiohttp.ClientSession) -> lis
     restart, forcing a full ~2385-stock re-scrape (at ~5 stocks/sec, that's
     8-15+ minutes) gated behind a once-per-day flag — so a restart mid-fetch
     meant most stocks never got fundamentals until the NEXT calendar day.
+
+    Streams page-by-page (same reasoning as load_all_history_from_supabase)
+    rather than accumulating every page before parsing any of it.
+
     Returns the list of symbols that are missing or past the TTL.
     """
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
-    all_rows: list = []
     PAGE = 1000
     offset = 0
+
+    now = time.time()
+    loaded = 0
+    blank = 0
+    stale_or_missing: list = []
+    found_syms: set = set()
+    DATA_FIELDS = ('market_cap', 'pe', 'roe', 'eps', 'debt_eq', 'promoter',
+                   'eps_qoq', 'eps_yoy', 'sales_qoq', 'sales_yoy', 'opm_pct',
+                   'opm_trend', 'eps_growth_streak', 'fii_pct', 'fii_trend',
+                   'dii_pct', 'dii_trend', 'promoter_trend', 'peg_ratio', 'industry')
+
     while True:
         try:
             page_headers = {**headers, "Range": f"{offset}-{offset + PAGE - 1}"}
@@ -2096,62 +2111,52 @@ async def load_fundamentals_from_supabase(session: aiohttp.ClientSession) -> lis
                     log.warning(f"load_fundamentals_from_supabase page failed: status={r.status}")
                     break
                 page = await r.json()
-                all_rows.extend(page)
-                if len(page) < PAGE:
-                    break
-                offset += PAGE
         except Exception as e:
             log.error(f"load_fundamentals_from_supabase error: {e}")
             break
 
-    now = time.time()
-    loaded = 0
-    blank = 0
-    stale_or_missing: list = []
-    found_syms: set = set()
-    DATA_FIELDS = ('market_cap', 'pe', 'roe', 'eps', 'debt_eq', 'promoter',
-                   'eps_qoq', 'eps_yoy', 'sales_qoq', 'sales_yoy', 'opm_pct',
-                   'opm_trend', 'eps_growth_streak', 'fii_pct', 'fii_trend',
-                   'dii_pct', 'dii_trend', 'promoter_trend', 'peg_ratio', 'industry')
+        for row in page:
+            sym = row.get('sym')
+            if not sym:
+                continue
+            found_syms.add(sym)
+            fetched_at_str = row.get('fetched_at')
+            fetched_at_ts = 0.0
+            if fetched_at_str:
+                try:
+                    fetched_at_ts = datetime.fromisoformat(fetched_at_str.replace('Z', '+00:00')).timestamp()
+                except Exception:
+                    fetched_at_ts = 0.0
+            fundamentals_cache[sym] = {
+                'market_cap': row.get('market_cap'), 'pe': row.get('pe'), 'roe': row.get('roe'),
+                'eps': row.get('eps'), 'debt_eq': row.get('debt_eq'), 'promoter': row.get('promoter'),
+                'eps_qoq': row.get('eps_qoq'), 'eps_yoy': row.get('eps_yoy'),
+                'sales_qoq': row.get('sales_qoq'), 'sales_yoy': row.get('sales_yoy'),
+                'opm_pct': row.get('opm_pct'), 'opm_trend': row.get('opm_trend'),
+                'eps_growth_streak': row.get('eps_growth_streak'),
+                'fii_pct': row.get('fii_pct'), 'fii_trend': row.get('fii_trend'),
+                'dii_pct': row.get('dii_pct'), 'dii_trend': row.get('dii_trend'),
+                'promoter_trend': row.get('promoter_trend'), 'peg_ratio': row.get('peg_ratio'),
+                'industry': row.get('industry'),
+                'fetched_at': fetched_at_ts,
+            }
+            loaded += 1
+            is_blank = all(row.get(f) is None for f in DATA_FIELDS)
+            if is_blank:
+                blank += 1
+            # A row that's entirely blank means the scrape failed to extract
+            # anything useful (Screener.in rate-limit/block, page structure
+            # mismatch, etc.) — that's fundamentally different from "we
+            # successfully confirmed this stock has no data," so retry it
+            # regardless of how fresh the fetched_at timestamp is. Without
+            # this, a stock unlucky enough to get blocked once stays blank
+            # for a full 7-day TTL window before ever being retried.
+            if is_blank or (now - fetched_at_ts) > FUNDAMENTALS_TTL:
+                stale_or_missing.append(sym)
 
-    for row in all_rows:
-        sym = row.get('sym')
-        if not sym:
-            continue
-        found_syms.add(sym)
-        fetched_at_str = row.get('fetched_at')
-        fetched_at_ts = 0.0
-        if fetched_at_str:
-            try:
-                fetched_at_ts = datetime.fromisoformat(fetched_at_str.replace('Z', '+00:00')).timestamp()
-            except Exception:
-                fetched_at_ts = 0.0
-        fundamentals_cache[sym] = {
-            'market_cap': row.get('market_cap'), 'pe': row.get('pe'), 'roe': row.get('roe'),
-            'eps': row.get('eps'), 'debt_eq': row.get('debt_eq'), 'promoter': row.get('promoter'),
-            'eps_qoq': row.get('eps_qoq'), 'eps_yoy': row.get('eps_yoy'),
-            'sales_qoq': row.get('sales_qoq'), 'sales_yoy': row.get('sales_yoy'),
-            'opm_pct': row.get('opm_pct'), 'opm_trend': row.get('opm_trend'),
-            'eps_growth_streak': row.get('eps_growth_streak'),
-            'fii_pct': row.get('fii_pct'), 'fii_trend': row.get('fii_trend'),
-            'dii_pct': row.get('dii_pct'), 'dii_trend': row.get('dii_trend'),
-            'promoter_trend': row.get('promoter_trend'), 'peg_ratio': row.get('peg_ratio'),
-            'industry': row.get('industry'),
-            'fetched_at': fetched_at_ts,
-        }
-        loaded += 1
-        is_blank = all(row.get(f) is None for f in DATA_FIELDS)
-        if is_blank:
-            blank += 1
-        # A row that's entirely blank means the scrape failed to extract
-        # anything useful (Screener.in rate-limit/block, page structure
-        # mismatch, etc.) — that's fundamentally different from "we
-        # successfully confirmed this stock has no data," so retry it
-        # regardless of how fresh the fetched_at timestamp is. Without
-        # this, a stock unlucky enough to get blocked once stays blank
-        # for a full 7-day TTL window before ever being retried.
-        if is_blank or (now - fetched_at_ts) > FUNDAMENTALS_TTL:
-            stale_or_missing.append(sym)
+        if len(page) < PAGE:
+            break
+        offset += PAGE
 
     missing_entirely = [s for s in ALL_STOCKS if s not in found_syms]
     stale_or_missing.extend(missing_entirely)
@@ -2160,6 +2165,7 @@ async def load_fundamentals_from_supabase(session: aiohttp.ClientSession) -> lis
              f"{blank} are blank (all fields None — scrape failed, will retry), "
              f"{len(stale_or_missing)} total need fetching (blank, missing, or "
              f">{FUNDAMENTALS_TTL//86400}d stale)")
+    gc.collect()
     return stale_or_missing
 
 
@@ -4160,10 +4166,18 @@ async def backfill_stock_history_30days(session: aiohttp.ClientSession, target_d
 
     log.info("📚 Backfilling stock_history for the past ~30 trading days (one-time, this takes a while)...")
 
-    # Fetch every stock's full OHLCV history in one pass.
-    all_rows: list = []
+    # Fetch every stock's full OHLCV history, processing each page as it
+    # arrives (see load_all_history_from_supabase for the full reasoning
+    # on why accumulating raw pages before parsing any of them roughly
+    # doubles peak memory during exactly this kind of startup-time load).
+    stock_data = {}
+    skip_reasons = {}  # reason -> [syms], so a skip is diagnosable instead of silent
     PAGE = 1000
     offset = 0
+    nifty_prices = await load_index_history_from_db(session, "Nifty 50")
+    if not nifty_prices:
+        log.error("stock_history backfill: no Nifty 50 benchmark history found, aborting (RS-TV needs it)")
+        return
     while True:
         try:
             page_headers = {**headers, "Range": f"{offset}-{offset + PAGE - 1}"}
@@ -4176,64 +4190,53 @@ async def backfill_stock_history_30days(session: aiohttp.ClientSession, target_d
                     log.error(f"stock_history backfill: fetch failed {r.status} {body[:200]}")
                     break
                 page = await r.json()
-                all_rows.extend(page)
-                if len(page) < PAGE:
-                    break
-                offset += PAGE
         except Exception as e:
             log.error(f"backfill_stock_history_30days fetch error: {e}")
             break
 
-    if not all_rows:
-        log.error("stock_history backfill: no stock_full_history rows found, aborting")
-        return
+        # Parse every stock's arrays once (JSON-string decoding, same gotcha
+        # the breadth backfills hit) and precompute its full raw-RS series
+        # once — the expensive O(n) part — so each of the 30 days only needs
+        # a cheap re-normalization over a slice, not a full recompute.
+        for row in page:
+            sym = row.get('sym')
+            try:
+                dates   = json.loads(row['dates'])   if isinstance(row.get('dates'), str)   else (row.get('dates') or [])
+                prices  = json.loads(row['prices'])  if isinstance(row.get('prices'), str)  else (row.get('prices') or [])
+                volumes = json.loads(row['volumes']) if isinstance(row.get('volumes'), str) else (row.get('volumes') or [])
+                highs   = json.loads(row['highs'])   if isinstance(row.get('highs'), str)   else (row.get('highs') or [])
+                lows    = json.loads(row['lows'])    if isinstance(row.get('lows'), str)    else (row.get('lows') or [])
+            except (json.JSONDecodeError, TypeError):
+                skip_reasons.setdefault('json_decode_error', []).append(sym or '?')
+                continue
+            if not sym:
+                continue
+            # Was `< 260` — but normalize_rs() degrades gracefully with fewer
+            # valid points (falls back to whatever window is available, only
+            # actually needs >=2), so requiring a near-full year here was
+            # excluding established, long-listed stocks whenever their stored
+            # history happened to be shorter than that for any reason —
+            # rather than giving them a shorter-but-real backfilled trail.
+            # >=35 just guarantees enough for target_days=30 plus a small
+            # margin, not "enough for a statistically ideal RS-TV window".
+            if len(dates) < 35:
+                skip_reasons.setdefault('too_few_dates', []).append(f"{sym}({len(dates)})")
+                continue
+            if len(prices) != len(dates) or len(volumes) != len(dates):
+                skip_reasons.setdefault('array_length_mismatch', []).append(
+                    f"{sym}(dates={len(dates)},prices={len(prices)},volumes={len(volumes)})")
+                continue
+            raw_rs_series = calc_raw_rs_series(prices, nifty_prices)
+            stock_data[sym] = {
+                'dates': dates, 'prices': prices, 'volumes': volumes,
+                'highs': highs if len(highs) == len(dates) else prices,
+                'lows':  lows  if len(lows)  == len(dates) else prices,
+                'raw_rs_series': raw_rs_series,
+            }
 
-    nifty_prices = await load_index_history_from_db(session, "Nifty 50")
-    if not nifty_prices:
-        log.error("stock_history backfill: no Nifty 50 benchmark history found, aborting (RS-TV needs it)")
-        return
-
-    # Parse every stock's arrays once (JSON-string decoding, same gotcha
-    # the breadth backfills hit) and precompute its full raw-RS series
-    # once — the expensive O(n) part — so each of the 30 days only needs
-    # a cheap re-normalization over a slice, not a full recompute.
-    stock_data = {}
-    skip_reasons = {}  # reason -> [syms], so a skip is diagnosable instead of silent
-    for row in all_rows:
-        sym = row.get('sym')
-        try:
-            dates   = json.loads(row['dates'])   if isinstance(row.get('dates'), str)   else (row.get('dates') or [])
-            prices  = json.loads(row['prices'])  if isinstance(row.get('prices'), str)  else (row.get('prices') or [])
-            volumes = json.loads(row['volumes']) if isinstance(row.get('volumes'), str) else (row.get('volumes') or [])
-            highs   = json.loads(row['highs'])   if isinstance(row.get('highs'), str)   else (row.get('highs') or [])
-            lows    = json.loads(row['lows'])    if isinstance(row.get('lows'), str)    else (row.get('lows') or [])
-        except (json.JSONDecodeError, TypeError):
-            skip_reasons.setdefault('json_decode_error', []).append(sym or '?')
-            continue
-        if not sym:
-            continue
-        # Was `< 260` — but normalize_rs() degrades gracefully with fewer
-        # valid points (falls back to whatever window is available, only
-        # actually needs >=2), so requiring a near-full year here was
-        # excluding established, long-listed stocks whenever their stored
-        # history happened to be shorter than that for any reason —
-        # rather than giving them a shorter-but-real backfilled trail.
-        # >=35 just guarantees enough for target_days=30 plus a small
-        # margin, not "enough for a statistically ideal RS-TV window".
-        if len(dates) < 35:
-            skip_reasons.setdefault('too_few_dates', []).append(f"{sym}({len(dates)})")
-            continue
-        if len(prices) != len(dates) or len(volumes) != len(dates):
-            skip_reasons.setdefault('array_length_mismatch', []).append(
-                f"{sym}(dates={len(dates)},prices={len(prices)},volumes={len(volumes)})")
-            continue
-        raw_rs_series = calc_raw_rs_series(prices, nifty_prices)
-        stock_data[sym] = {
-            'dates': dates, 'prices': prices, 'volumes': volumes,
-            'highs': highs if len(highs) == len(dates) else prices,
-            'lows':  lows  if len(lows)  == len(dates) else prices,
-            'raw_rs_series': raw_rs_series,
-        }
+        if len(page) < PAGE:
+            break
+        offset += PAGE
 
     if skip_reasons:
         for reason, syms in skip_reasons.items():
@@ -4334,6 +4337,7 @@ async def backfill_stock_history_30days(session: aiohttp.ClientSession, target_d
             log.info(f"  ...{days_saved}/{len(backfill_indices)} days reconstructed so far")
 
     log.info(f"✅ stock_history 30-day backfill complete: {days_saved} trading days saved")
+    gc.collect()
 
 
 async def backfill_ema_breadth_history(session: aiohttp.ClientSession):
@@ -4372,7 +4376,7 @@ async def backfill_ema_breadth_history(session: aiohttp.ClientSession):
         return
 
     log.info("📊 Backfilling EMA breadth history from stored price data (one-time)...")
-    all_rows: list = []
+    counts: dict = {}
     PAGE = 1000
     offset = 0
     while True:
@@ -4385,50 +4389,51 @@ async def backfill_ema_breadth_history(session: aiohttp.ClientSession):
                 if r.status not in (200, 206):
                     break
                 page = await r.json()
-                all_rows.extend(page)
-                if len(page) < PAGE:
-                    break
-                offset += PAGE
         except Exception as e:
             log.error(f"backfill_ema_breadth_history fetch error: {e}")
             break
 
-    # date -> [above_ema9, above_ema21, above_ema50, total]
-    counts: dict = {}
-    for row in all_rows:
-        # dates/prices are stored as JSON-encoded strings (json.dumps at
-        # write time), not native arrays — must be parsed back, or every
-        # row silently fails the length check below and gets skipped.
-        raw_dates = row.get('dates')
-        raw_prices = row.get('prices')
-        try:
-            dates = json.loads(raw_dates) if isinstance(raw_dates, str) else (raw_dates or [])
-            prices = json.loads(raw_prices) if isinstance(raw_prices, str) else (raw_prices or [])
-        except (json.JSONDecodeError, TypeError):
-            continue
-        if len(dates) < 55 or len(prices) != len(dates):
-            continue
-        ema9  = ema_arr(prices, 9)
-        ema21 = ema_arr(prices, 21)
-        ema50 = ema_arr(prices, 50)
-        for i in range(50, len(dates)):
-            d = dates[i]
-            if d not in counts:
-                counts[d] = [0, 0, 0, 0]
-            counts[d][3] += 1
-            if ema9[i] is not None and prices[i] > ema9[i]:
-                counts[d][0] += 1
-            if ema21[i] is not None and prices[i] > ema21[i]:
-                counts[d][1] += 1
-            if ema50[i] is not None and prices[i] > ema50[i]:
-                counts[d][2] += 1
+        # date -> [above_ema9, above_ema21, above_ema50, total], processed
+        # page-by-page rather than accumulating every stock's dates+prices
+        # into one list first (same reasoning as the other backfills above).
+        for row in page:
+            # dates/prices are stored as JSON-encoded strings (json.dumps at
+            # write time), not native arrays — must be parsed back, or every
+            # row silently fails the length check below and gets skipped.
+            raw_dates = row.get('dates')
+            raw_prices = row.get('prices')
+            try:
+                dates = json.loads(raw_dates) if isinstance(raw_dates, str) else (raw_dates or [])
+                prices = json.loads(raw_prices) if isinstance(raw_prices, str) else (raw_prices or [])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if len(dates) < 55 or len(prices) != len(dates):
+                continue
+            ema9  = ema_arr(prices, 9)
+            ema21 = ema_arr(prices, 21)
+            ema50 = ema_arr(prices, 50)
+            for i in range(50, len(dates)):
+                d = dates[i]
+                if d not in counts:
+                    counts[d] = [0, 0, 0, 0]
+                counts[d][3] += 1
+                if ema9[i] is not None and prices[i] > ema9[i]:
+                    counts[d][0] += 1
+                if ema21[i] is not None and prices[i] > ema21[i]:
+                    counts[d][1] += 1
+                if ema50[i] is not None and prices[i] > ema50[i]:
+                    counts[d][2] += 1
+
+        if len(page) < PAGE:
+            break
+        offset += PAGE
 
     rows_to_save = [
         {'date': d, 'above_ema9': a9, 'above_ema21': a21, 'above_ema50': a50, 'total': tot}
         for d, (a9, a21, a50, tot) in counts.items()
     ]
     rows_to_save.sort(key=lambda r: r['date'])
-    log.info(f"  Computed EMA breadth for {len(rows_to_save)} trading days from {len(all_rows)} stocks")
+    log.info(f"  Computed EMA breadth for {len(rows_to_save)} trading days")
 
     BATCH = 500
     for i in range(0, len(rows_to_save), BATCH):
@@ -4445,6 +4450,7 @@ async def backfill_ema_breadth_history(session: aiohttp.ClientSession):
         except Exception as e:
             log.warning(f"  EMA breadth backfill batch error: {e}")
     log.info(f"✅ EMA breadth backfill complete: {len(rows_to_save)} days saved")
+    gc.collect()
 
 
 async def backfill_market_breadth_history(session: aiohttp.ClientSession):
@@ -4482,7 +4488,7 @@ async def backfill_market_breadth_history(session: aiohttp.ClientSession):
         return
 
     log.info("📊 Backfilling market breadth history from stored price data (one-time)...")
-    all_rows: list = []
+    breadth: dict = {}  # date -> [advances, declines, unchanged]
     PAGE = 1000
     offset = 0
     while True:
@@ -4495,48 +4501,46 @@ async def backfill_market_breadth_history(session: aiohttp.ClientSession):
                 if r.status not in (200, 206):
                     break
                 page = await r.json()
-                all_rows.extend(page)
-                if len(page) < PAGE:
-                    break
-                offset += PAGE
         except Exception as e:
             log.error(f"backfill_market_breadth_history fetch error: {e}")
             break
 
-    # date -> [advances, declines, unchanged]
-    breadth: dict = {}
-    for row in all_rows:
-        # dates/prices are stored as JSON-encoded strings (json.dumps at
-        # write time), not native arrays — must be parsed back, or every
-        # row silently fails the length check below and gets skipped.
-        raw_dates = row.get('dates')
-        raw_prices = row.get('prices')
-        try:
-            dates = json.loads(raw_dates) if isinstance(raw_dates, str) else (raw_dates or [])
-            prices = json.loads(raw_prices) if isinstance(raw_prices, str) else (raw_prices or [])
-        except (json.JSONDecodeError, TypeError):
-            continue
-        if len(dates) < 2 or len(prices) != len(dates):
-            continue
-        for i in range(1, len(dates)):
-            d = dates[i]
-            if prices[i] is None or prices[i-1] is None:
+        for row in page:
+            # dates/prices are stored as JSON-encoded strings (json.dumps at
+            # write time), not native arrays — must be parsed back, or every
+            # row silently fails the length check below and gets skipped.
+            raw_dates = row.get('dates')
+            raw_prices = row.get('prices')
+            try:
+                dates = json.loads(raw_dates) if isinstance(raw_dates, str) else (raw_dates or [])
+                prices = json.loads(raw_prices) if isinstance(raw_prices, str) else (raw_prices or [])
+            except (json.JSONDecodeError, TypeError):
                 continue
-            if d not in breadth:
-                breadth[d] = [0, 0, 0]
-            if prices[i] > prices[i-1]:
-                breadth[d][0] += 1
-            elif prices[i] < prices[i-1]:
-                breadth[d][1] += 1
-            else:
-                breadth[d][2] += 1
+            if len(dates) < 2 or len(prices) != len(dates):
+                continue
+            for i in range(1, len(dates)):
+                d = dates[i]
+                if prices[i] is None or prices[i-1] is None:
+                    continue
+                if d not in breadth:
+                    breadth[d] = [0, 0, 0]
+                if prices[i] > prices[i-1]:
+                    breadth[d][0] += 1
+                elif prices[i] < prices[i-1]:
+                    breadth[d][1] += 1
+                else:
+                    breadth[d][2] += 1
+
+        if len(page) < PAGE:
+            break
+        offset += PAGE
 
     rows_to_save = [
         {'date': d, 'advances': a, 'declines': dec, 'unchanged': u, 'total': a+dec+u}
         for d, (a, dec, u) in breadth.items()
     ]
     rows_to_save.sort(key=lambda r: r['date'])
-    log.info(f"  Computed breadth for {len(rows_to_save)} trading days from {len(all_rows)} stocks")
+    log.info(f"  Computed breadth for {len(rows_to_save)} trading days")
 
     BATCH = 500
     for i in range(0, len(rows_to_save), BATCH):
@@ -4553,6 +4557,7 @@ async def backfill_market_breadth_history(session: aiohttp.ClientSession):
         except Exception as e:
             log.warning(f"  breadth backfill batch error: {e}")
     log.info(f"✅ Market breadth backfill complete: {len(rows_to_save)} days saved")
+    gc.collect()
 
 
 async def load_all_history_from_supabase(session: aiohttp.ClientSession) -> list:
@@ -4564,12 +4569,32 @@ async def load_all_history_from_supabase(session: aiohttp.ClientSession) -> list
     (the cause of the RRKABEL stale-data bug earlier). Now a restart just
     loads what's already stored, and Yahoo is only hit for symbols that
     are missing entirely or whose stored data has gone stale.
+
+    Processes each page as it arrives instead of accumulating every page
+    into one big list before parsing any of it — the old approach held
+    the full raw JSON for all ~2385 stocks AND the fully-parsed
+    historical_cache in memory at the same time, roughly doubling peak
+    memory during exactly this startup phase (which is where the
+    memory-driven crash-loop concentrates). Streaming page-by-page means
+    each page's raw JSON is released before the next page is even
+    fetched.
+
     Returns the list of symbols that need a Yahoo fetch (missing/stale).
     """
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
-    all_rows: list = []
     PAGE = 1000
     offset = 0
+
+    loaded = 0
+    stale_or_missing: list = []
+    found_syms: set = set()
+    today = datetime.now(IST).date()
+
+    def parse(v):
+        if v is None:
+            return []
+        return json.loads(v) if isinstance(v, str) else v
+
     while True:
         try:
             page_headers = {**headers, "Range": f"{offset}-{offset + PAGE - 1}"}
@@ -4582,65 +4607,60 @@ async def load_all_history_from_supabase(session: aiohttp.ClientSession) -> list
                     log.warning(f"load_all_history_from_supabase page failed: status={r.status}")
                     break
                 page = await r.json()
-                all_rows.extend(page)
-                if len(page) < PAGE:
-                    break
-                offset += PAGE
         except Exception as e:
             log.error(f"load_all_history_from_supabase error: {e}")
             break
 
-    loaded = 0
-    stale_or_missing: list = []
-    found_syms: set = set()
-    today = datetime.now(IST).date()
-
-    for row in all_rows:
-        sym = row.get('sym')
-        if not sym:
-            continue
-        found_syms.add(sym)
-        try:
-            def parse(v):
-                if v is None:
-                    return []
-                return json.loads(v) if isinstance(v, str) else v
-            dates   = parse(row.get('dates'))
-            prices  = parse(row.get('prices'))
-            volumes = parse(row.get('volumes'))
-            highs   = parse(row.get('highs'))
-            lows    = parse(row.get('lows'))
-            opens   = parse(row.get('opens'))
-
-            if len(prices) < 100:
-                stale_or_missing.append(sym)
+        # Process this page immediately — the raw `page` JSON goes out
+        # of scope (and becomes GC-eligible) as soon as this block ends,
+        # rather than living alongside every other page until the very
+        # end of the whole fetch.
+        for row in page:
+            sym = row.get('sym')
+            if not sym:
                 continue
+            found_syms.add(sym)
+            try:
+                dates   = parse(row.get('dates'))
+                prices  = parse(row.get('prices'))
+                volumes = parse(row.get('volumes'))
+                highs   = parse(row.get('highs'))
+                lows    = parse(row.get('lows'))
+                opens   = parse(row.get('opens'))
 
-            opens_cache[sym] = opens
+                if len(prices) < 100:
+                    stale_or_missing.append(sym)
+                    continue
 
-            historical_cache[sym] = {
-                'prices':  prices,
-                'volumes': [v if v is not None else 0 for v in volumes],
-                'highs':   [h if h is not None else p for h, p in zip(highs, prices)],
-                'lows':    [l if l is not None else p for l, p in zip(lows,  prices)],
-            }
-            history_dates_cache[sym] = dates
-            loaded += 1
+                opens_cache[sym] = opens
 
-            # Freshness check — allow up to 4 calendar days back so
-            # weekends/the odd market holiday don't falsely flag as stale.
-            last_date_str = dates[-1] if dates else None
-            is_stale = True
-            if last_date_str:
-                try:
-                    last_date = datetime.strptime(last_date_str, '%Y-%m-%d').date()
-                    is_stale = (today - last_date).days > 4
-                except Exception:
-                    is_stale = True
-            if is_stale:
+                historical_cache[sym] = {
+                    'prices':  prices,
+                    'volumes': [v if v is not None else 0 for v in volumes],
+                    'highs':   [h if h is not None else p for h, p in zip(highs, prices)],
+                    'lows':    [l if l is not None else p for l, p in zip(lows,  prices)],
+                }
+                history_dates_cache[sym] = dates
+                loaded += 1
+
+                # Freshness check — allow up to 4 calendar days back so
+                # weekends/the odd market holiday don't falsely flag as stale.
+                last_date_str = dates[-1] if dates else None
+                is_stale = True
+                if last_date_str:
+                    try:
+                        last_date = datetime.strptime(last_date_str, '%Y-%m-%d').date()
+                        is_stale = (today - last_date).days > 4
+                    except Exception:
+                        is_stale = True
+                if is_stale:
+                    stale_or_missing.append(sym)
+            except Exception:
                 stale_or_missing.append(sym)
-        except Exception:
-            stale_or_missing.append(sym)
+
+        if len(page) < PAGE:
+            break
+        offset += PAGE
 
     missing_entirely = [s for s in ALL_STOCKS if s not in found_syms]
     stale_or_missing.extend(missing_entirely)
@@ -4648,6 +4668,14 @@ async def load_all_history_from_supabase(session: aiohttp.ClientSession) -> list
     log.info(f"📦 Loaded {loaded} stocks from Supabase stock_full_history "
              f"(0 Yahoo calls) — {len(stale_or_missing)} need a Yahoo fetch "
              f"(missing or stale)")
+    # Explicit collect — this just finished allocating/parsing the single
+    # largest in-memory dataset in the process (full price/volume/high/low
+    # history for ~2385 stocks); prompting a collection here rather than
+    # waiting for Python's generational GC to get around to it reduces
+    # the peak memory this startup phase leaves behind for whatever runs
+    # next (which, per Railway's memory graph, is exactly where usage was
+    # cresting toward the OOM kill).
+    gc.collect()
     return stale_or_missing
 
 
