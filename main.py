@@ -455,6 +455,177 @@ def detect_vcp(prices: list, volumes: list, highs: list, lows: list) -> dict:
         'pct_from_high': round(pct_from_high, 1),
     }
 
+# ── Classic chart pattern detection ─────────────────────────────────
+# Heuristic, swing-point (fractal pivot) based — not exact textbook
+# geometry, but a reasonable, tunable approximation. Runs off the same
+# price history already in memory for every other signal here, so no
+# new data source is needed. Validated against synthetic price series
+# (double top/bottom, all three triangle types, head & shoulders, a
+# bullish flag) before being wired in — not yet checked against real
+# market data, so expect to tune the tolerance constants once real
+# results come in.
+def find_pivots(highs: list, lows: list, left: int = 3, right: int = 3):
+    """Fractal-style swing highs/lows: bar i is a pivot high if it's the
+    max within [i-left, i+right] (similarly for pivot lows). Adjacent
+    pivots of the same type within `left` bars of each other are merged,
+    keeping the more extreme one, to avoid near-duplicate noise pivots."""
+    n = len(highs)
+    piv_hi, piv_lo = [], []
+    for i in range(left, n - right):
+        window_h = highs[i-left:i+right+1]
+        window_l = lows[i-left:i+right+1]
+        if highs[i] == max(window_h):
+            piv_hi.append((i, highs[i]))
+        if lows[i] == min(window_l):
+            piv_lo.append((i, lows[i]))
+
+    def dedupe(pivots, keep_max):
+        if not pivots:
+            return pivots
+        out = [pivots[0]]
+        for idx, val in pivots[1:]:
+            pidx, pval = out[-1]
+            if idx - pidx <= left:
+                if (keep_max and val > pval) or (not keep_max and val < pval):
+                    out[-1] = (idx, val)
+            else:
+                out.append((idx, val))
+        return out
+
+    return dedupe(piv_hi, True), dedupe(piv_lo, False)
+
+def detect_chart_patterns(highs: list, lows: list, prices: list, volumes: list) -> dict:
+    """
+    Classic chart patterns from swing-point geometry over the trailing
+    ~120 daily bars:
+      - Head & Shoulders / Inverse — 3 swing extremes, middle one clearly
+        beyond the outer two (roughly symmetric), neckline break confirms.
+      - Double Top / Double Bottom — 2 comparable swing extremes with a
+        clear trough/peak between, neckline break confirms.
+      - Triangles — recent swing-high trend vs swing-low trend classified
+        as ascending / descending / symmetrical.
+      - Wedges — highs and lows trending the SAME direction but
+        converging (narrowing range) — rising or falling.
+      - Flags & Pennants — a strong directional "pole" move followed by a
+        tight consolidation (parallel = flag, converging = pennant).
+    """
+    result = {
+        'is_head_shoulders': False, 'is_inv_head_shoulders': False,
+        'is_double_top': False, 'is_double_bottom': False,
+        'triangle_type': None,      # 'ascending' | 'descending' | 'symmetrical' | None
+        'wedge_type': None,         # 'rising' | 'falling' | None
+        'is_flag_bullish': False, 'is_flag_bearish': False, 'is_pennant': False,
+        'pattern_fired': False,     # confirmed neckline/breakout break, for H&S/double top-bottom
+    }
+    n = len(prices)
+    if n < 40:
+        return result
+    last = prices[-1]
+
+    piv_hi, piv_lo = find_pivots(highs, lows, left=3, right=3)
+    RECENT = 120  # only "current" structure, not ancient swing history
+    cutoff = n - RECENT
+    piv_hi = [p for p in piv_hi if p[0] >= cutoff]
+    piv_lo = [p for p in piv_lo if p[0] >= cutoff]
+
+    def pct_diff(a, b):
+        return abs(a - b) / max(a, b) if max(a, b) else 0
+
+    # ── Double Top / Double Bottom ──────────────────────────────────
+    if len(piv_hi) >= 2:
+        p1i, p1 = piv_hi[-2]; p2i, p2 = piv_hi[-1]
+        troughs_between = [l for (li, l) in piv_lo if p1i < li < p2i]
+        if troughs_between and pct_diff(p1, p2) <= 0.03:
+            trough = min(troughs_between)
+            if trough <= min(p1, p2) * 0.97:
+                result['is_double_top'] = True
+                if last < trough:
+                    result['pattern_fired'] = True
+    if len(piv_lo) >= 2:
+        p1i, p1 = piv_lo[-2]; p2i, p2 = piv_lo[-1]
+        peaks_between = [h for (hi, h) in piv_hi if p1i < hi < p2i]
+        if peaks_between and pct_diff(p1, p2) <= 0.03:
+            peak = max(peaks_between)
+            if peak >= max(p1, p2) * 1.03:
+                result['is_double_bottom'] = True
+                if last > peak:
+                    result['pattern_fired'] = True
+
+    # ── Head & Shoulders / Inverse ──────────────────────────────────
+    if len(piv_hi) >= 3 and len(piv_lo) >= 2:
+        s1i, s1 = piv_hi[-3]; _, head = piv_hi[-2]; s2i, s2 = piv_hi[-1]
+        troughs = [(li, l) for (li, l) in piv_lo if s1i < li < s2i]
+        if head > s1 * 1.02 and head > s2 * 1.02 and pct_diff(s1, s2) <= 0.06 and len(troughs) >= 2:
+            t1, t2 = troughs[0][1], troughs[-1][1]
+            if pct_diff(t1, t2) <= 0.06:
+                result['is_head_shoulders'] = True
+                if last < min(t1, t2):
+                    result['pattern_fired'] = True
+    if len(piv_lo) >= 3 and len(piv_hi) >= 2:
+        s1i, s1 = piv_lo[-3]; _, head = piv_lo[-2]; s2i, s2 = piv_lo[-1]
+        peaks = [(hi, h) for (hi, h) in piv_hi if s1i < hi < s2i]
+        if head < s1 * 0.98 and head < s2 * 0.98 and pct_diff(s1, s2) <= 0.06 and len(peaks) >= 2:
+            t1, t2 = peaks[0][1], peaks[-1][1]
+            if pct_diff(t1, t2) <= 0.06:
+                result['is_inv_head_shoulders'] = True
+                if last > max(t1, t2):
+                    result['pattern_fired'] = True
+
+    # ── Triangles & Wedges — trend of recent swing highs vs recent ──
+    #    swing lows (simple two-point slope, since pivot counts here
+    #    are small — 2 to 4 points — a full regression buys nothing) ─
+    def slope_pct(pivots):
+        if len(pivots) < 2:
+            return None
+        (i1, v1), (i2, v2) = pivots[0], pivots[-1]
+        if i2 == i1 or v1 == 0:
+            return None
+        return ((v2 - v1) / v1) / (i2 - i1)
+
+    recent_hi = piv_hi[-4:]
+    recent_lo = piv_lo[-4:]
+    hi_slope = slope_pct(recent_hi)
+    lo_slope = slope_pct(recent_lo)
+    FLAT = 0.0006  # ~0.06%/bar treated as "flat" — tune after seeing real output
+
+    if hi_slope is not None and lo_slope is not None:
+        hi_flat = abs(hi_slope) <= FLAT
+        lo_flat = abs(lo_slope) <= FLAT
+        if hi_flat and lo_slope > FLAT:
+            result['triangle_type'] = 'ascending'
+        elif lo_flat and hi_slope < -FLAT:
+            result['triangle_type'] = 'descending'
+        elif hi_slope < -FLAT and lo_slope > FLAT:
+            result['triangle_type'] = 'symmetrical'
+        elif hi_slope > FLAT and lo_slope > FLAT and lo_slope > hi_slope:
+            result['wedge_type'] = 'rising'   # both rising, narrowing
+        elif hi_slope < -FLAT and lo_slope < -FLAT and hi_slope < lo_slope:
+            result['wedge_type'] = 'falling'  # both falling, narrowing
+
+    # ── Flags & Pennants — strong pole move, then a tight recent ─────
+    #    consolidation; converging = pennant, parallel = flag ────────
+    POLE_LOOKBACK, CONSOL_BARS = 15, 10
+    if n >= POLE_LOOKBACK + CONSOL_BARS:
+        pole_start = prices[-(POLE_LOOKBACK + CONSOL_BARS)]
+        pole_end   = prices[-CONSOL_BARS]
+        pole_chg   = (pole_end - pole_start) / pole_start if pole_start else 0
+        consol = prices[-CONSOL_BARS:]
+        consol_range = (max(consol) - min(consol)) / pole_end if pole_end else 1
+        if abs(pole_chg) >= 0.08 and consol_range <= 0.06 and len(consol) >= 6:
+            early, late = consol[:3], consol[-3:]
+            consol_hi_slope = (max(late) - max(early)) / max(early) if max(early) else 0
+            consol_lo_slope = (min(late) - min(early)) / min(early) if min(early) else 0
+            converging = (consol_hi_slope < 0 and consol_lo_slope > 0) if pole_chg > 0 \
+                else (consol_hi_slope > 0 and consol_lo_slope < 0)
+            if converging:
+                result['is_pennant'] = True
+            elif pole_chg > 0:
+                result['is_flag_bullish'] = True
+            else:
+                result['is_flag_bearish'] = True
+
+    return result
+
 def calc_rs_raw(prices: list, end_idx: int = None) -> Optional[float]:
     """Original IBD-style raw RS score — kept for RS history sparkline trend calc."""
     end = end_idx if end_idx is not None else len(prices) - 1
@@ -1940,8 +2111,14 @@ async def fetch_nse_announcements(session: aiohttp.ClientSession, debug: bool = 
         if not isinstance(item, dict):
             continue
         symbol = item.get('symbol') or item.get('smbl')
-        subject = (item.get('desc') or item.get('subject') or item.get('smSubject')
-                   or item.get('attchmntText') or '')
+        # NSE tags each announcement with a category separately from the
+        # free-text description (e.g. category="Financial Results" or
+        # "Award of Order / Receipt of Order", subject=the actual
+        # announcement text) — kept split so the frontend's category
+        # sub-tabs (Results/Concall/Order Book/etc.) can filter on the
+        # category instead of substring-matching a paragraph of prose.
+        category = item.get('desc') or item.get('smSubject') or ''
+        subject = (item.get('attchmntText') or item.get('subject') or category or '')
         attachment = item.get('attchmntFile') or item.get('attachmentFile') or item.get('fileUrl')
         announced_at = (item.get('an_dt') or item.get('sort_date') or item.get('sortDate')
                         or item.get('broadcastdate') or item.get('date'))
@@ -1949,6 +2126,7 @@ async def fetch_nse_announcements(session: aiohttp.ClientSession, debug: bool = 
             continue
         results.append({
             'symbol': symbol.strip(),
+            'category': category.strip()[:200] if category else None,
             'subject': subject.strip()[:500],
             'attachment_url': attachment.strip() if attachment else None,
             'announced_at': announced_at,
@@ -2895,6 +3073,34 @@ async def ensure_db_columns(session: aiohttp.ClientSession):
                 log.error("     add column if not exists chg_m_pct numeric;")
     except Exception as e:
         log.warning(f"DB column check error (chg_w_pct/chg_m_pct): {e}")
+
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/stocks?select=is_head_shoulders&limit=1",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ DB columns OK — is_head_shoulders (classic chart patterns) column exists")
+            elif r.status == 400:
+                log.error("❌ Classic chart pattern columns MISSING from stocks table! "
+                          "The ENTIRE per-scan stocks upsert has been failing (not just these "
+                          "fields) since these were added — PostgREST rejects the whole "
+                          "request when any field is unrecognized.")
+                log.error("   → Go to Supabase SQL Editor and run:")
+                log.error("   alter table public.stocks")
+                log.error("     add column if not exists is_head_shoulders boolean,")
+                log.error("     add column if not exists is_inv_head_shoulders boolean,")
+                log.error("     add column if not exists is_double_top boolean,")
+                log.error("     add column if not exists is_double_bottom boolean,")
+                log.error("     add column if not exists triangle_type text,")
+                log.error("     add column if not exists wedge_type text,")
+                log.error("     add column if not exists is_flag_bullish boolean,")
+                log.error("     add column if not exists is_flag_bearish boolean,")
+                log.error("     add column if not exists is_pennant boolean,")
+                log.error("     add column if not exists chart_pattern_fired boolean;")
+    except Exception as e:
+        log.warning(f"DB column check error (chart patterns): {e}")
 
     try:
         async with session.get(
@@ -5635,6 +5841,7 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         lows_arr  = s.get('lows', prices)
         squeeze = detect_bb_squeeze(prices, highs_arr, lows_arr)
         vcp     = detect_vcp(prices, volumes, highs_arr, lows_arr)
+        cp      = detect_chart_patterns(highs_arr, lows_arr, prices, volumes)
 
         # 52W high/low
         p252  = prices[-252:] if len(prices) >= 252 else prices
@@ -5730,6 +5937,16 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'vcp_stage':      vcp['vcp_stage'],
             'vcp_fired':      vcp['vcp_fired'],
             'vcp_contractions': json.dumps(vcp['contractions']),
+            'is_head_shoulders':     cp['is_head_shoulders'],
+            'is_inv_head_shoulders': cp['is_inv_head_shoulders'],
+            'is_double_top':         cp['is_double_top'],
+            'is_double_bottom':      cp['is_double_bottom'],
+            'triangle_type':         cp['triangle_type'],
+            'wedge_type':            cp['wedge_type'],
+            'is_flag_bullish':       cp['is_flag_bullish'],
+            'is_flag_bearish':       cp['is_flag_bearish'],
+            'is_pennant':            cp['is_pennant'],
+            'chart_pattern_fired':   cp['pattern_fired'],
             'sector':         get_sector(sym),
             'in_nifty50':     sym in NIFTY50,
             'in_midcap':      sym in MIDCAP,
