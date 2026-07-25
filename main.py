@@ -18,6 +18,7 @@ import csv
 import sys
 import time
 import json
+import re
 import math
 import random
 import asyncio
@@ -6567,6 +6568,74 @@ def enrich_announcement_row(row: dict) -> dict:
     row['market_cap'] = fundamentals_cache.get(sym, {}).get('market_cap') if sym else None
     return row
 
+_ANN_POSITIVE_PATTERNS = [
+    'award of order', 'work order', 'purchase order', 'order worth', 'order valued',
+    'bagged', 'secures order', 'secured order', 'wins order', 'won order', 'new order',
+    'letter of intent', 'contract awarded', 'awarded a contract', 'received an order',
+    'order received from', 'capacity expansion', 'commercial production', 'usfda',
+    'approval received', 'patent granted', 'buyback', 'bonus issue', 'stock split',
+    'reduced to nil', 'in favour of the company', 'in favor of the company',
+    'settled in favour', 'demand quashed', 'preferential allotment completed',
+]
+_ANN_NEGATIVE_PATTERNS = [
+    'resignation of', 'resigned', 'penalty', 'show cause', 'gst demand', 'tax demand',
+    'demand order', 'search and seizure', 'default', 'downgrade', 'fire at', 'accident at',
+    'plant shutdown', 'suspension of operations', 'insolvency', 'nclt admission',
+    'fraud', 'auditor has resigned', 'pledge of shares', 'shares pledged',
+    'disqualified', 'sebi order against', 'debarred',
+]
+
+def _extract_value_crore(text: str):
+    """Best-effort extraction of a monetary value in ₹ crore from filing
+    text — regex over the common Indian formats ('Rs. 450 crore',
+    '₹450Cr', 'INR 45,000 lakhs', '2.5 billion'). Returns the largest
+    value found (filings often mention the headline number alongside
+    smaller components), or None."""
+    pattern = re.compile(
+        r'(?:rs\.?|inr|₹)?\s*([\d,]+(?:\.\d+)?)\s*(crores?|cr\b|lakhs?|million|mn\b|billions?|bn\b)',
+        re.IGNORECASE)
+    best = None
+    for num, unit in pattern.findall(text or ''):
+        try:
+            v = float(num.replace(',', ''))
+        except ValueError:
+            continue
+        u = unit.lower()
+        if u.startswith('lakh'):
+            v *= 0.01
+        elif u.startswith(('million', 'mn')):
+            v *= 0.1
+        elif u.startswith(('billion', 'bn')):
+            v *= 100.0
+        if v > 0 and (best is None or v > best):
+            best = v
+    return best
+
+def rate_announcements_free(rows: list) -> list:
+    """Zero-cost rule-based fallback for when ANTHROPIC_API_KEY isn't
+    set: keyword rules for positive/negative/neutral, plus regex value
+    extraction with big/small judgement against market cap. Cruder than
+    the AI path (no real language understanding, no counterparty names)
+    but free, instant, and covers the common cases."""
+    for r in rows:
+        text = ((r.get('category') or '') + ' ' + (r.get('subject') or '')).lower()
+        if any(p in text for p in _ANN_NEGATIVE_PATTERNS):
+            r['ai_rating'] = 'negative'
+        elif any(p in text for p in _ANN_POSITIVE_PATTERNS):
+            r['ai_rating'] = 'positive'
+        else:
+            r['ai_rating'] = 'neutral'
+        val = _extract_value_crore(r.get('subject') or '')
+        if val and val >= 0.5:
+            mcap = r.get('market_cap')
+            if mcap and mcap > 0:
+                pct = val / mcap * 100
+                sig = 'large' if pct >= 10 else 'notable' if pct >= 2 else 'minor'
+                r['ai_summary'] = f"₹{val:,.0f} Cr mentioned — {sig} (~{pct:.1f}% of ₹{mcap:,.0f} Cr mcap)"
+            else:
+                r['ai_summary'] = f"₹{val:,.0f} Cr mentioned in filing"
+    return rows
+
 async def rate_announcements_with_ai(session: aiohttp.ClientSession, rows: list) -> list:
     """Tags each announcement with an AI sentiment rating ('positive' /
     'neutral' / 'negative') via one batched Anthropic API call per polling
@@ -6576,8 +6645,10 @@ async def rate_announcements_with_ai(session: aiohttp.ClientSession, rows: list)
     or dropped — the rating is decoration on top of the feed, never a
     gate in front of it."""
     api_key = os.getenv('ANTHROPIC_API_KEY', '')
-    if not api_key or not rows:
+    if not rows:
         return rows
+    if not api_key:
+        return rate_announcements_free(rows)
     listing = "\n".join(
         f"{i+1}. [{r.get('symbol')}, mcap ₹{int(r['market_cap']) if r.get('market_cap') else '?'} Cr] "
         f"{(r.get('category') or '')}: {(r.get('subject') or '')[:300]}"
@@ -6638,6 +6709,32 @@ async def rate_announcements_with_ai(session: aiohttp.ClientSession, rows: list)
         log.warning(f"⚠️ AI rating failed ({type(e).__name__}: {e}) — saving unrated")
     return rows
 
+_ORDER_WIN_PATTERNS = [
+    'award of order', 'work order', 'purchase order', 'order worth', 'order valued',
+    'bagged', 'secures order', 'secured order', 'wins order', 'won order', 'new order',
+    'letter of intent', 'contract awarded', 'awarded a contract', 'received an order',
+    'order received from',
+]
+
+def tag_order_size(rows: list) -> list:
+    """For business order-win announcements, tags order_size as
+    'big' (≥10% of market cap), 'medium' (2–10%), or 'small' (<2%) —
+    powering the Order Book tab's Big/Medium/Small sub-filters. Runs
+    after rating regardless of whether the AI or free path did the
+    rating, so the tag exists either way. Order-win detection reuses the
+    same phrase list as the frontend's Order Book tab, so a filing
+    tagged here is one that tab will actually show."""
+    for r in rows:
+        text = ((r.get('category') or '') + ' ' + (r.get('subject') or '')).lower()
+        if not any(p in text for p in _ORDER_WIN_PATTERNS):
+            continue
+        val = _extract_value_crore(r.get('subject') or '')
+        mcap = r.get('market_cap')
+        if val and mcap and mcap > 0:
+            pct = val / mcap * 100
+            r['order_size'] = 'big' if pct >= 10 else 'medium' if pct >= 2 else 'small'
+    return rows
+
 async def enrich_and_save_announcements(session: aiohttp.ClientSession, rows: list):
     """Wraps save_announcements_to_db with sector/industry/market_cap
     enrichment. Kept as a separate wrapper (rather than editing
@@ -6647,6 +6744,7 @@ async def enrich_and_save_announcements(session: aiohttp.ClientSession, rows: li
         return
     enriched = [enrich_announcement_row(dict(r)) for r in rows]
     enriched = await rate_announcements_with_ai(session, enriched)
+    enriched = tag_order_size(enriched)
     await save_announcements_to_db(session, enriched)
 
 async def fetch_nse_announcements_for_range(session: aiohttp.ClientSession, from_date: str,
