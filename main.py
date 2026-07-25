@@ -6745,6 +6745,16 @@ async def enrich_and_save_announcements(session: aiohttp.ClientSession, rows: li
     enriched = [enrich_announcement_row(dict(r)) for r in rows]
     enriched = await rate_announcements_with_ai(session, enriched)
     enriched = tag_order_size(enriched)
+    # PostgREST bulk upserts require every row in the request to have an
+    # identical key set (PGRST102 otherwise) — but ai_summary/order_size
+    # are only set on rows where a value could be extracted. Normalize:
+    # give every row every key, None where absent.
+    all_keys = set()
+    for r in enriched:
+        all_keys.update(r.keys())
+    for r in enriched:
+        for k in all_keys:
+            r.setdefault(k, None)
     await save_announcements_to_db(session, enriched)
 
 async def fetch_nse_announcements_for_range(session: aiohttp.ClientSession, from_date: str,
@@ -6828,6 +6838,118 @@ async def backfill_announcements_history(session: aiohttp.ClientSession, days: i
         await asyncio.sleep(2)  # polite pacing between days
     log.info(f"📚 Backfill complete: {total_saved} announcement-rows processed across {days} days")
 
+# ── NSE quarterly financial results (structured, no PDF parsing) ────────
+async def fetch_nse_financial_results(session: aiohttp.ClientSession, debug: bool = False) -> list:
+    """Latest quarterly financial results from NSE's structured
+    corporates-financial-results feed — the same Sales/PAT/EPS numbers
+    companies file (as XBRL) alongside the results PDF, so no PDF
+    parsing is needed. Field names below are best-effort guesses in the
+    same style that worked for announcements: the raw first item is
+    logged for the first few cycles so the mapping can be verified
+    against reality and corrected if needed."""
+    headers = random.choice(_NSE_ANNOUNCEMENTS_HEADER_SETS)
+    try:
+        async with session.get("https://www.nseindia.com/option-chain", headers=headers,
+                               timeout=aiohttp.ClientTimeout(total=15)) as r0:
+            pass
+        url = "https://www.nseindia.com/api/corporates-financial-results?index=equities&period=Quarterly"
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as r:
+            if r.status != 200:
+                _fetch_error_counts[f'nse_results_status_{r.status}'] = \
+                    _fetch_error_counts.get(f'nse_results_status_{r.status}', 0) + 1
+                if debug:
+                    log.info(f"  🔍 NSE financial-results fetch: non-200 status ({r.status})")
+                return []
+            data = await r.json()
+    except Exception as e:
+        _fetch_error_counts[f'nse_results_{type(e).__name__}'] = \
+            _fetch_error_counts.get(f'nse_results_{type(e).__name__}', 0) + 1
+        if debug:
+            log.info(f"  🔍 NSE financial-results fetch exception: {type(e).__name__}: {e}")
+        return []
+
+    items = data if isinstance(data, list) else data.get('data', []) if isinstance(data, dict) else []
+    if debug and items:
+        log.info(f"  🔍 NSE financial-results raw response (first item): {json.dumps(items[0])[:1200]}")
+
+    def _num(item, *keys):
+        for k in keys:
+            v = item.get(k)
+            if v in (None, '', '-', 'NA'):
+                continue
+            try:
+                return float(str(v).replace(',', ''))
+            except (ValueError, TypeError):
+                continue
+        return None
+
+    results = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        symbol = item.get('symbol') or item.get('smbl')
+        period = (item.get('toDate') or item.get('to_date') or item.get('relatingTo')
+                  or item.get('qe_Date') or item.get('period_ended') or '')
+        if not symbol or not period:
+            continue
+        results.append({
+            'symbol': str(symbol).strip(),
+            'period_ended': str(period).strip()[:40],
+            'result_type': str(item.get('consolidated') or item.get('audited') or '').strip()[:40],
+            'sales': _num(item, 're_net_sale', 'income', 'reIncome', 'net_sales', 'revenue', 'totalIncome'),
+            'pat': _num(item, 'proLossAftTax', 're_pro_loss_aft_tax', 'netProfitLoss', 'pat', 'profit'),
+            'eps': _num(item, 're_eps', 'eps', 'basicEPS', 'diluted_eps'),
+            'filed_at': (item.get('creation_Date') or item.get('broadCastDate')
+                         or item.get('exchdisstime') or item.get('an_dt')),
+            'attachment_url': item.get('xbrl') or item.get('attchmntFile') or item.get('fileName'),
+        })
+    return results
+
+async def save_financial_results_to_db(session: aiohttp.ClientSession, rows: list):
+    """Upserts structured quarterly results on (symbol, period_ended,
+    result_type). Key-normalized for PostgREST's all-keys-must-match
+    requirement, same as announcements."""
+    if not rows:
+        return
+    all_keys = set()
+    for r in rows:
+        all_keys.update(r.keys())
+    for r in rows:
+        for k in all_keys:
+            r.setdefault(k, None)
+    url = f"{SUPABASE_URL}/rest/v1/financial_results?on_conflict=symbol,period_ended,result_type"
+    headers = {
+        'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}',
+        'Content-Type': 'application/json', 'Prefer': 'resolution=merge-duplicates',
+    }
+    try:
+        async with session.post(url, headers=headers, json=rows,
+                                timeout=aiohttp.ClientTimeout(total=30)) as r:
+            if r.status in (200, 201, 204):
+                log.info(f"  📊 Upserted {len(rows)} financial results to Supabase")
+            else:
+                body = await r.text()
+                log.warning(f"⚠️ Financial results upsert failed ({r.status}): {body[:300]}")
+    except Exception as e:
+        log.warning(f"⚠️ Financial results upsert error: {type(e).__name__}: {e}")
+
+async def _results_loop(session: aiohttp.ClientSession):
+    """Polls NSE's structured financial-results feed every 30 min — new
+    results only land around filing bursts (post-board-meeting evenings
+    in results season), so this doesn't need the announcements loop's
+    5-min cadence."""
+    CHECK_INTERVAL = 30 * 60
+    cycle = 0
+    while True:
+        try:
+            rows = await fetch_nse_financial_results(session, debug=(cycle < 3))
+            if rows:
+                await save_financial_results_to_db(session, rows)
+            cycle += 1
+        except Exception as e:
+            log.error(f"Results loop error: {type(e).__name__}: {e}")
+        await asyncio.sleep(CHECK_INTERVAL)
+
 # ── Main loop ─────────────────────────────────────────────────────────
 async def fundamentals_worker_main():
     """
@@ -6861,6 +6983,7 @@ async def fundamentals_worker_main():
         await asyncio.gather(
             _fundamentals_loop(session),
             _announcements_loop(session),
+            _results_loop(session),
         )
 
 async def _fundamentals_loop(session: aiohttp.ClientSession):
