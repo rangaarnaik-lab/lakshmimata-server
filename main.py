@@ -6850,7 +6850,8 @@ async def backfill_announcements_history(session: aiohttp.ClientSession, days: i
     log.info(f"📚 Backfill complete: {total_saved} announcement-rows processed across {days} days")
 
 # ── NSE quarterly financial results (structured, no PDF parsing) ────────
-async def fetch_nse_financial_results(session: aiohttp.ClientSession, debug: bool = False) -> list:
+async def fetch_nse_financial_results(session: aiohttp.ClientSession, debug: bool = False,
+                                      from_date: str = None, to_date: str = None) -> list:
     """Latest quarterly financial results from NSE's structured
     corporates-financial-results feed — the same Sales/PAT/EPS numbers
     companies file (as XBRL) alongside the results PDF, so no PDF
@@ -6864,6 +6865,8 @@ async def fetch_nse_financial_results(session: aiohttp.ClientSession, debug: boo
                                timeout=aiohttp.ClientTimeout(total=15)) as r0:
             pass
         url = "https://www.nseindia.com/api/corporates-financial-results?index=equities&period=Quarterly"
+        if from_date and to_date:
+            url += f"&from_date={from_date}&to_date={to_date}"
         async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as r:
             if r.status != 200:
                 _fetch_error_counts[f'nse_results_status_{r.status}'] = \
@@ -6953,10 +6956,20 @@ async def fetch_nse_results_numbers(session: aiohttp.ClientSession, headers: dic
         p = str(item.get('to_date') or item.get('toDate') or item.get('qe_Date') or '').strip()
         if p and p != period_ended:
             continue
+        # Verified from raw response (VIDEOIND, 25-Jul log): fields are
+        # re_-prefixed and values are in ₹ LAKHS (re_con_pro_loss
+        # -248985.6 ≈ ₹-2,490 Cr matches Videocon's real losses), so
+        # sales/PAT divide by 100 to store crore. EPS is already
+        # per-share rupees — no conversion.
+        sales_l = _num(item, 're_net_sale', 're_tot_inc_frm_oprs', 're_rev_frm_opr',
+                       're_total_inc', 'income', 'net_sales', 'revenue', 'totalIncome')
+        pat_l = _num(item, 're_con_pro_loss', 're_pro_loss_aft_tax', 'proLossAftTax',
+                     'netProfitLoss', 'pat')
         return {
-            'sales': _num(item, 're_net_sale', 'income', 'net_sales', 'revenue', 'totalIncome', 're_total_inc'),
-            'pat': _num(item, 'proLossAftTax', 're_pro_loss_aft_tax', 'netProfitLoss', 're_con_pro_loss', 'pat'),
-            'eps': _num(item, 're_eps', 'eps', 'basicEPS', 're_basic_eps', 'diluted_eps'),
+            'sales': round(sales_l / 100.0, 2) if sales_l is not None else None,
+            'pat': round(pat_l / 100.0, 2) if pat_l is not None else None,
+            'eps': _num(item, 're_basic_eps', 're_basic_eps_for_cont_dic_opr', 'eps',
+                        'basicEPS', 're_dil_eps', 'diluted_eps'),
         }
     return {}
 
@@ -7022,6 +7035,43 @@ async def _results_loop(session: aiohttp.ClientSession):
             log.error(f"Results loop error: {type(e).__name__}: {e}")
         await asyncio.sleep(CHECK_INTERVAL)
 
+async def backfill_results_history(session: aiohttp.ClientSession, days: int = 30):
+    """One-time backfill of quarterly results filed in the last `days`
+    days, via the list feed's date-range params. Numbers require one
+    per-symbol request each, so they're fetched newest-first with polite
+    pacing and capped (RESULTS_NUMBERS_MAX, default 400) — rows past the
+    cap still save with period/type/link and get numbers organically if
+    they reappear in the live loop's window. Idempotent like the
+    announcements backfill: re-running just re-upserts."""
+    log.info(f"📚 Starting {days}-day results backfill…")
+    today = datetime.now(timezone.utc)
+    from_date = (today - timedelta(days=days)).strftime('%d-%m-%Y')
+    to_date = today.strftime('%d-%m-%Y')
+    rows = await fetch_nse_financial_results(session, debug=True,
+                                             from_date=from_date, to_date=to_date)
+    if not rows:
+        log.warning("📚 Results backfill: list fetch returned nothing")
+        return
+    rows = _dedupe_by_key(rows, ('symbol', 'period_ended', 'result_type'))
+    try:
+        rows.sort(key=lambda r: r.get('filed_at') or '', reverse=True)
+    except Exception:
+        pass
+    cap = int(os.getenv('RESULTS_NUMBERS_MAX', '400'))
+    headers = random.choice(_NSE_ANNOUNCEMENTS_HEADER_SETS)
+    filled = 0
+    for i, r in enumerate(rows[:cap]):
+        nums = await fetch_nse_results_numbers(session, headers, r['symbol'],
+                                               r['period_ended'], debug=(i < 2))
+        if nums:
+            r.update({k: v for k, v in nums.items() if v is not None})
+            filled += 1
+        await asyncio.sleep(1.2)
+        if (i + 1) % 50 == 0:
+            log.info(f"  📚 Results backfill numbers: {i+1}/{min(cap,len(rows))} fetched…")
+    await save_financial_results_to_db(session, rows)
+    log.info(f"📚 Results backfill complete: {len(rows)} filings saved, numbers filled for {filled}")
+
 # ── Main loop ─────────────────────────────────────────────────────────
 async def fundamentals_worker_main():
     """
@@ -7052,6 +7102,11 @@ async def fundamentals_worker_main():
                 await backfill_announcements_history(session, days=backfill_days)
             except Exception as e:
                 log.error(f"Announcements backfill failed: {e}")
+        if os.getenv('BACKFILL_RESULTS_DAYS'):
+            try:
+                await backfill_results_history(session, days=int(os.getenv('BACKFILL_RESULTS_DAYS')))
+            except Exception as e:
+                log.error(f"Results backfill failed: {e}")
         await asyncio.gather(
             _fundamentals_loop(session),
             _announcements_loop(session),
