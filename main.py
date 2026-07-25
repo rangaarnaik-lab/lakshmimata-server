@@ -6735,6 +6735,16 @@ def tag_order_size(rows: list) -> list:
             r['order_size'] = 'big' if pct >= 10 else 'medium' if pct >= 2 else 'small'
     return rows
 
+def _dedupe_by_key(rows: list, keys: tuple) -> list:
+    """NSE feeds sometimes contain the same item twice in one response;
+    Postgres rejects a bulk upsert that touches the same unique key twice
+    (error 21000). Keep the last occurrence of each key."""
+    seen = {}
+    for r in rows:
+        k = tuple(str(r.get(x) or '') for x in keys)
+        seen[k] = r
+    return list(seen.values())
+
 async def enrich_and_save_announcements(session: aiohttp.ClientSession, rows: list):
     """Wraps save_announcements_to_db with sector/industry/market_cap
     enrichment. Kept as a separate wrapper (rather than editing
@@ -6755,6 +6765,7 @@ async def enrich_and_save_announcements(session: aiohttp.ClientSession, rows: li
     for r in enriched:
         for k in all_keys:
             r.setdefault(k, None)
+    enriched = _dedupe_by_key(enriched, ('symbol', 'subject', 'announced_at'))
     await save_announcements_to_db(session, enriched)
 
 async def fetch_nse_announcements_for_range(session: aiohttp.ClientSession, from_date: str,
@@ -6872,6 +6883,59 @@ async def fetch_nse_financial_results(session: aiohttp.ClientSession, debug: boo
     if debug and items:
         log.info(f"  🔍 NSE financial-results raw response (first item): {json.dumps(items[0])[:1200]}")
 
+    results = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        symbol = item.get('symbol') or item.get('smbl')
+        period = (item.get('toDate') or item.get('to_date') or item.get('qe_Date')
+                  or item.get('period_ended') or '')
+        if not symbol or not period:
+            continue
+        results.append({
+            'symbol': str(symbol).strip(),
+            'period_ended': str(period).strip()[:40],
+            # Real feed shape (verified from raw log 25-Jul): 'consolidated'
+            # is "Consolidated"/"Non-Consolidated" and 'audited' is
+            # "Audited"/"Un-Audited" — combine both so revisions don't
+            # collide on the unique key.
+            'result_type': f"{item.get('consolidated') or ''}|{item.get('audited') or ''}"[:40],
+            'sales': None,  # numbers come from the per-symbol detail call below
+            'pat': None,
+            'eps': None,
+            'filed_at': (item.get('broadCastDate') or item.get('filingDate')
+                         or item.get('exchdisstime') or item.get('creation_Date')),
+            'attachment_url': item.get('xbrl') or item.get('attchmntFile') or item.get('fileName'),
+        })
+    return results
+
+async def fetch_nse_results_numbers(session: aiohttp.ClientSession, headers: dict,
+                                    symbol: str, period_ended: str, debug: bool = False) -> dict:
+    """The results LIST feed carries no numbers (verified from the raw
+    response) — Sales/PAT/EPS live behind NSE's per-symbol
+    results-comparision endpoint. Fetches that and picks the period
+    matching period_ended. Field names here are best-effort against
+    community-documented shapes (re_net_sale / proLossAftTax / re_eps
+    etc.); raw response is logged during debug cycles for verification,
+    same playbook as the announcements fields."""
+    try:
+        url = f"https://www.nseindia.com/api/results-comparision?symbol={symbol}"
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as r:
+            if r.status != 200:
+                if debug:
+                    log.info(f"  🔍 results-comparision {symbol}: status={r.status}")
+                return {}
+            data = await r.json()
+    except Exception as e:
+        if debug:
+            log.info(f"  🔍 results-comparision {symbol} exception: {type(e).__name__}: {e}")
+        return {}
+    items = (data.get('resCmpData') if isinstance(data, dict) else None) or \
+            (data.get('data') if isinstance(data, dict) else None) or \
+            (data if isinstance(data, list) else [])
+    if debug and items:
+        log.info(f"  🔍 results-comparision raw (first item, {symbol}): {json.dumps(items[0])[:1000]}")
+
     def _num(item, *keys):
         for k in keys:
             v = item.get(k)
@@ -6883,27 +6947,18 @@ async def fetch_nse_financial_results(session: aiohttp.ClientSession, debug: boo
                 continue
         return None
 
-    results = []
     for item in items:
         if not isinstance(item, dict):
             continue
-        symbol = item.get('symbol') or item.get('smbl')
-        period = (item.get('toDate') or item.get('to_date') or item.get('relatingTo')
-                  or item.get('qe_Date') or item.get('period_ended') or '')
-        if not symbol or not period:
+        p = str(item.get('to_date') or item.get('toDate') or item.get('qe_Date') or '').strip()
+        if p and p != period_ended:
             continue
-        results.append({
-            'symbol': str(symbol).strip(),
-            'period_ended': str(period).strip()[:40],
-            'result_type': str(item.get('consolidated') or item.get('audited') or '').strip()[:40],
-            'sales': _num(item, 're_net_sale', 'income', 'reIncome', 'net_sales', 'revenue', 'totalIncome'),
-            'pat': _num(item, 'proLossAftTax', 're_pro_loss_aft_tax', 'netProfitLoss', 'pat', 'profit'),
-            'eps': _num(item, 're_eps', 'eps', 'basicEPS', 'diluted_eps'),
-            'filed_at': (item.get('creation_Date') or item.get('broadCastDate')
-                         or item.get('exchdisstime') or item.get('an_dt')),
-            'attachment_url': item.get('xbrl') or item.get('attchmntFile') or item.get('fileName'),
-        })
-    return results
+        return {
+            'sales': _num(item, 're_net_sale', 'income', 'net_sales', 'revenue', 'totalIncome', 're_total_inc'),
+            'pat': _num(item, 'proLossAftTax', 're_pro_loss_aft_tax', 'netProfitLoss', 're_con_pro_loss', 'pat'),
+            'eps': _num(item, 're_eps', 'eps', 'basicEPS', 're_basic_eps', 'diluted_eps'),
+        }
+    return {}
 
 async def save_financial_results_to_db(session: aiohttp.ClientSession, rows: list):
     """Upserts structured quarterly results on (symbol, period_ended,
@@ -6911,6 +6966,7 @@ async def save_financial_results_to_db(session: aiohttp.ClientSession, rows: lis
     requirement, same as announcements."""
     if not rows:
         return
+    rows = _dedupe_by_key(rows, ('symbol', 'period_ended', 'result_type'))
     all_keys = set()
     for r in rows:
         all_keys.update(r.keys())
@@ -6940,10 +6996,26 @@ async def _results_loop(session: aiohttp.ClientSession):
     5-min cadence."""
     CHECK_INTERVAL = 30 * 60
     cycle = 0
+    fetched_numbers = set()  # (symbol, period_ended) already number-fetched this process
     while True:
         try:
-            rows = await fetch_nse_financial_results(session, debug=(cycle < 3))
+            debug = cycle < 3
+            rows = await fetch_nse_financial_results(session, debug=debug)
             if rows:
+                rows = _dedupe_by_key(rows, ('symbol', 'period_ended', 'result_type'))
+                # The list feed has no numbers — fill them from the
+                # per-symbol comparison endpoint, capped per cycle and
+                # paced with sleeps so a results-season burst doesn't
+                # turn into a request storm at NSE.
+                headers = random.choice(_NSE_ANNOUNCEMENTS_HEADER_SETS)
+                to_fill = [r for r in rows if (r['symbol'], r['period_ended']) not in fetched_numbers][:25]
+                for i, r in enumerate(to_fill):
+                    nums = await fetch_nse_results_numbers(
+                        session, headers, r['symbol'], r['period_ended'], debug=(debug and i < 2))
+                    if nums:
+                        r.update({k: v for k, v in nums.items() if v is not None})
+                    fetched_numbers.add((r['symbol'], r['period_ended']))
+                    await asyncio.sleep(1.5)
                 await save_financial_results_to_db(session, rows)
             cycle += 1
         except Exception as e:
