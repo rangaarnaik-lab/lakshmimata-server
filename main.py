@@ -6553,6 +6553,170 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
     log.info(f"✅ {scan_type} scan done: {len(processed)} stocks in {duration}s")
     return len(processed)
 
+# ── Announcement enrichment + 1-month history backfill ──────────────────
+def enrich_announcement_row(row: dict) -> dict:
+    """Stamps one announcement row with the stock's sector, industry, and
+    market cap (₹ Cr) so the frontend can filter the Announcements tab by
+    those, the same way the Sectors/Watchlist tabs already do — without
+    needing a live join against the stocks table on every page load.
+    Reuses the same SECTOR_INDUSTRY_LOOKUP / fundamentals_cache the live
+    scan already relies on, so no extra fetching here."""
+    sym = row.get('symbol')
+    row['sector'] = get_sector(sym) if sym else None
+    row['industry'] = get_industry(sym) if sym else None
+    row['market_cap'] = fundamentals_cache.get(sym, {}).get('market_cap') if sym else None
+    return row
+
+async def rate_announcements_with_ai(session: aiohttp.ClientSession, rows: list) -> list:
+    """Tags each announcement with an AI sentiment rating ('positive' /
+    'neutral' / 'negative') via one batched Anthropic API call per polling
+    cycle (~20 announcements/call, Haiku model — cheap and fast). Entirely
+    optional: if ANTHROPIC_API_KEY isn't set, or the call fails for any
+    reason, announcements save without a rating rather than being delayed
+    or dropped — the rating is decoration on top of the feed, never a
+    gate in front of it."""
+    api_key = os.getenv('ANTHROPIC_API_KEY', '')
+    if not api_key or not rows:
+        return rows
+    listing = "\n".join(
+        f"{i+1}. [{r.get('symbol')}] {(r.get('category') or '')}: {(r.get('subject') or '')[:220]}"
+        for i, r in enumerate(rows)
+    )
+    prompt = (
+        "You are rating Indian stock-exchange corporate announcements for retail investors. "
+        "For each numbered announcement below, rate the likely near-term impact on that stock as "
+        "exactly one of: positive, negative, neutral. Use 'neutral' for routine/procedural filings "
+        "(certificates, compliance intimations, trading-window closures, record-date notices). "
+        "Respond ONLY with a JSON array like [{\"n\":1,\"r\":\"neutral\"}, ...] — no other text.\n\n"
+        + listing
+    )
+    try:
+        async with session.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5",
+                "max_tokens": 1000,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as r:
+            if r.status != 200:
+                body = await r.text()
+                log.warning(f"⚠️ AI rating call failed ({r.status}): {body[:200]} — saving unrated")
+                return rows
+            data = await r.json()
+        text = "".join(b.get('text', '') for b in data.get('content', []) if b.get('type') == 'text')
+        text = text.replace('```json', '').replace('```', '').strip()
+        ratings = json.loads(text)
+        valid = {'positive', 'negative', 'neutral'}
+        for item in ratings:
+            idx = item.get('n')
+            rating = (item.get('r') or '').lower().strip()
+            if isinstance(idx, int) and 1 <= idx <= len(rows) and rating in valid:
+                rows[idx - 1]['ai_rating'] = rating
+        rated = sum(1 for r in rows if r.get('ai_rating'))
+        log.info(f"  🤖 AI-rated {rated}/{len(rows)} announcements")
+    except Exception as e:
+        log.warning(f"⚠️ AI rating failed ({type(e).__name__}: {e}) — saving unrated")
+    return rows
+
+async def enrich_and_save_announcements(session: aiohttp.ClientSession, rows: list):
+    """Wraps save_announcements_to_db with sector/industry/market_cap
+    enrichment. Kept as a separate wrapper (rather than editing
+    save_announcements_to_db directly) so the original upsert function
+    stays untouched and easy to reason about."""
+    if not rows:
+        return
+    enriched = [enrich_announcement_row(dict(r)) for r in rows]
+    enriched = await rate_announcements_with_ai(session, enriched)
+    await save_announcements_to_db(session, enriched)
+
+async def fetch_nse_announcements_for_range(session: aiohttp.ClientSession, from_date: str,
+                                             to_date: str, debug: bool = False) -> list:
+    """Same NSE corporate-announcements endpoint as fetch_nse_announcements,
+    but with an explicit from_date/to_date window (DD-MM-YYYY, per NSE's
+    documented date-range format) for one-time historical backfills —
+    kept as its own function rather than adding params to
+    fetch_nse_announcements so the always-on 15-min polling path is
+    never at risk of an accidental regression from this."""
+    headers = random.choice(_NSE_ANNOUNCEMENTS_HEADER_SETS)
+    try:
+        async with session.get("https://www.nseindia.com/option-chain", headers=headers,
+                               timeout=aiohttp.ClientTimeout(total=15)) as r0:
+            if debug:
+                log.info(f"  🔍 NSE cookie-priming (range {from_date}→{to_date}): status={r0.status}")
+
+        url = (f"https://www.nseindia.com/api/corporate-announcements?index=equities"
+               f"&from_date={from_date}&to_date={to_date}")
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as r:
+            if r.status != 200:
+                key = f'nse_announcements_range_status_{r.status}'
+                _fetch_error_counts[key] = _fetch_error_counts.get(key, 0) + 1
+                if debug:
+                    log.info(f"  🔍 NSE announcements range fetch: non-200 status ({r.status})")
+                return []
+            data = await r.json()
+    except Exception as e:
+        _fetch_error_counts[f'nse_announcements_range_{type(e).__name__}'] = \
+            _fetch_error_counts.get(f'nse_announcements_range_{type(e).__name__}', 0) + 1
+        if debug:
+            log.info(f"  🔍 NSE announcements range fetch exception: {type(e).__name__}: {e}")
+        return []
+
+    items = data if isinstance(data, list) else data.get('data', []) if isinstance(data, dict) else []
+    results = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        symbol = item.get('symbol') or item.get('smbl')
+        category = item.get('desc') or item.get('smSubject') or ''
+        subject = (item.get('attchmntText') or item.get('subject') or category or '')
+        attachment = item.get('attchmntFile') or item.get('attachmentFile') or item.get('fileUrl')
+        announced_at = (item.get('an_dt') or item.get('sort_date') or item.get('sortDate')
+                        or item.get('broadcastdate') or item.get('date'))
+        if not symbol or not subject:
+            continue
+        results.append({
+            'symbol': symbol.strip(),
+            'category': category.strip()[:200] if category else None,
+            'subject': subject.strip()[:500],
+            'attachment_url': attachment.strip() if attachment else None,
+            'announced_at': announced_at,
+        })
+    return results
+
+async def backfill_announcements_history(session: aiohttp.ClientSession, days: int = 30):
+    """One-time backfill of the last `days` days of NSE announcements,
+    looped one day at a time (rather than a single wide date-range
+    request) so each request stays a reasonable size and NSE doesn't see
+    one big burst — a short sleep between requests keeps this polite.
+    Safe to run more than once: everything downstream still upserts on
+    (symbol, subject, announced_at), so re-running just re-saves the same
+    rows rather than duplicating them."""
+    log.info(f"📚 Starting {days}-day announcements backfill…")
+    today = datetime.now(timezone.utc)
+    total_saved = 0
+    for i in range(days):
+        day = today - timedelta(days=i)
+        date_str = day.strftime('%d-%m-%Y')
+        try:
+            rows = await fetch_nse_announcements_for_range(session, date_str, date_str, debug=(i < 2))
+            if rows:
+                await enrich_and_save_announcements(session, rows)
+                total_saved += len(rows)
+                log.info(f"  📚 Backfilled {date_str}: {len(rows)} announcements")
+            else:
+                log.info(f"  📚 Backfilled {date_str}: 0 announcements")
+        except Exception as e:
+            log.warning(f"  ⚠️ Backfill failed for {date_str}: {e}")
+        await asyncio.sleep(2)  # polite pacing between days
+    log.info(f"📚 Backfill complete: {total_saved} announcement-rows processed across {days} days")
+
 # ── Main loop ─────────────────────────────────────────────────────────
 async def fundamentals_worker_main():
     """
@@ -6577,6 +6741,12 @@ async def fundamentals_worker_main():
     connector = aiohttp.TCPConnector(limit=20, ssl=False)
     async with aiohttp.ClientSession(connector=connector) as session:
         await load_instrument_master(session)  # needed for ISIN lookups (Upstox fundamentals API)
+        if os.getenv('BACKFILL_ANNOUNCEMENTS_DAYS'):
+            try:
+                backfill_days = int(os.getenv('BACKFILL_ANNOUNCEMENTS_DAYS'))
+                await backfill_announcements_history(session, days=backfill_days)
+            except Exception as e:
+                log.error(f"Announcements backfill failed: {e}")
         await asyncio.gather(
             _fundamentals_loop(session),
             _announcements_loop(session),
@@ -6587,9 +6757,9 @@ async def _fundamentals_loop(session: aiohttp.ClientSession):
     load_fundamentals_from_supabase / load_fundamentals_batch exactly as
     they already exist — nothing duplicated, this is genuinely the same
     code, just invoked from a different entry point in a different
-    process. Checking hourly is already far more often than needed for
+    process. Checking once daily is already far more often than needed for
     data that changes quarterly."""
-    CHECK_INTERVAL = 3600  # 1 hour
+    CHECK_INTERVAL = 86400  # 24 hours — fundamentals data changes quarterly at most, daily check is plenty
     table_ready = await ensure_fundamentals_table(session)
     if not table_ready:
         log.error("stock_fundamentals table unavailable — fundamentals loop cannot proceed.")
@@ -6613,7 +6783,7 @@ async def _announcements_loop(session: aiohttp.ClientSession):
     fetch_nse_announcements's docstring for the caveat about field names
     not being independently verified yet — first several cycles log the
     raw response shape for confirmation."""
-    CHECK_INTERVAL = 15 * 60  # 15 minutes — more time-sensitive than fundamentals
+    CHECK_INTERVAL = 5 * 60  # 5 minutes — near-real-time for watchlist alerts, while staying polite to NSE (faster polling risks an IP block, after which the feed goes silent entirely)
     table_ready = await ensure_announcements_table(session)
     if not table_ready:
         log.error("corporate_announcements table unavailable — announcements loop cannot proceed.")
@@ -6624,7 +6794,7 @@ async def _announcements_loop(session: aiohttp.ClientSession):
             cycle += 1
             rows = await fetch_nse_announcements(session, debug=(cycle <= 3))
             if rows:
-                await save_announcements_to_db(session, rows)
+                await enrich_and_save_announcements(session, rows)
             else:
                 log.info("📢 No announcements fetched this cycle (empty result or fetch failed).")
         except Exception as e:
