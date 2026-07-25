@@ -6579,15 +6579,25 @@ async def rate_announcements_with_ai(session: aiohttp.ClientSession, rows: list)
     if not api_key or not rows:
         return rows
     listing = "\n".join(
-        f"{i+1}. [{r.get('symbol')}] {(r.get('category') or '')}: {(r.get('subject') or '')[:220]}"
+        f"{i+1}. [{r.get('symbol')}, mcap ₹{int(r['market_cap']) if r.get('market_cap') else '?'} Cr] "
+        f"{(r.get('category') or '')}: {(r.get('subject') or '')[:300]}"
         for i, r in enumerate(rows)
     )
     prompt = (
-        "You are rating Indian stock-exchange corporate announcements for retail investors. "
-        "For each numbered announcement below, rate the likely near-term impact on that stock as "
-        "exactly one of: positive, negative, neutral. Use 'neutral' for routine/procedural filings "
-        "(certificates, compliance intimations, trading-window closures, record-date notices). "
-        "Respond ONLY with a JSON array like [{\"n\":1,\"r\":\"neutral\"}, ...] — no other text.\n\n"
+        "You are analyzing Indian stock-exchange corporate announcements for retail investors. "
+        "Each numbered line shows the stock's market cap in ₹ crore (or ? if unknown), then the filing text. "
+        "For each, return:\n"
+        "- r: rating — exactly one of positive, negative, neutral. Use neutral for routine/procedural "
+        "filings (certificates, compliance intimations, trading-window closures, record dates, AGM notices, "
+        "newspaper-publication copies). Tax/regulatory orders AGAINST the company are negative unless the "
+        "outcome favors the company (e.g. demand reduced to NIL — that's positive).\n"
+        "- s: a crisp summary of max 110 characters extracting the key facts: order/contract value in ₹ Cr, "
+        "number of projects/units, counterparty, and — when both an order value and market cap are known — "
+        "significance, e.g. 'large vs ₹850Cr mcap' or 'minor (~0.5% of mcap)'. If the filing has no such "
+        "specifics, omit s entirely.\n"
+        "Respond ONLY with a JSON array like "
+        "[{\"n\":1,\"r\":\"neutral\"},{\"n\":2,\"r\":\"positive\",\"s\":\"₹450Cr NHAI road order — large vs ₹2,100Cr mcap\"}] "
+        "— no other text.\n\n"
         + listing
     )
     try:
@@ -6600,7 +6610,7 @@ async def rate_announcements_with_ai(session: aiohttp.ClientSession, rows: list)
             },
             json={
                 "model": "claude-haiku-4-5",
-                "max_tokens": 1000,
+                "max_tokens": 2000,
                 "messages": [{"role": "user", "content": prompt}],
             },
             timeout=aiohttp.ClientTimeout(total=30),
@@ -6617,8 +6627,11 @@ async def rate_announcements_with_ai(session: aiohttp.ClientSession, rows: list)
         for item in ratings:
             idx = item.get('n')
             rating = (item.get('r') or '').lower().strip()
+            summary = (item.get('s') or '').strip()
             if isinstance(idx, int) and 1 <= idx <= len(rows) and rating in valid:
                 rows[idx - 1]['ai_rating'] = rating
+                if summary:
+                    rows[idx - 1]['ai_summary'] = summary[:160]
         rated = sum(1 for r in rows if r.get('ai_rating'))
         log.info(f"  🤖 AI-rated {rated}/{len(rows)} announcements")
     except Exception as e:
