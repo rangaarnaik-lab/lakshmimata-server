@@ -7539,15 +7539,23 @@ async def _results_loop(session: aiohttp.ClientSession):
     in results season), so this doesn't need the announcements loop's
     5-min cadence.
 
-    IMPORTANT: calling fetch_nse_financial_results with NO date range
+    IMPORTANT #1: calling fetch_nse_financial_results with NO date range
     does NOT return "latest first" as might be assumed — confirmed via
     raw logs that a bare call kept returning the same old items (e.g. a
     Dec-2024-quarter Videocon filing) run after run, hours apart, while
-    same-day real filings (seen independently in the Announcements feed)
-    never appeared in this feed's response at all. Only the one-time
-    backfill function ever passed an explicit from_date/to_date, which
-    is why backfill worked but this ongoing loop silently never picked
-    up new filings. Fix: always pass an explicit recent rolling window."""
+    same-day real filings never appeared in this feed's response at all.
+
+    IMPORTANT #2: a genuine multi-day range (from_date != to_date) was
+    tried next and confirmed via production logs to reliably return
+    'got 0 item(s)' — five separate cycles over 1h40m, all zero, despite
+    real filings existing in that window (independently confirmed via
+    the Announcements feed same-day). The ONLY range shape anywhere in
+    this codebase that's actually confirmed working is the announcements
+    backfill's day-by-day loop, where from_date always equals to_date —
+    a genuine range was never empirically verified for either endpoint,
+    it was an untested assumption. Matching that exact proven shape
+    here: loop over the last few days individually instead of one wide
+    range call."""
     CHECK_INTERVAL = 30 * 60
     cycle = 0
     fetched_numbers = set()  # (symbol, period_ended) already number-fetched this process
@@ -7555,10 +7563,14 @@ async def _results_loop(session: aiohttp.ClientSession):
         try:
             debug = cycle < 3
             today = datetime.now(timezone.utc)
-            from_date = (today - timedelta(days=10)).strftime('%d-%m-%Y')
-            to_date = today.strftime('%d-%m-%Y')
-            rows = await fetch_nse_financial_results(session, debug=debug,
-                                                      from_date=from_date, to_date=to_date)
+            rows = []
+            for days_back in range(5):  # today + previous 4 days, one call each
+                day_str = (today - timedelta(days=days_back)).strftime('%d-%m-%Y')
+                day_rows = await fetch_nse_financial_results(
+                    session, debug=(debug and days_back < 2), from_date=day_str, to_date=day_str)
+                if day_rows:
+                    rows.extend(day_rows)
+                await asyncio.sleep(0.5)
             if rows:
 
                 rows = _dedupe_by_key(rows, ('symbol', 'period_ended', 'result_type'))
@@ -7583,7 +7595,12 @@ async def _results_loop(session: aiohttp.ClientSession):
 
 async def backfill_results_history(session: aiohttp.ClientSession, days: int = 30):
     """One-time backfill of quarterly results filed in the last `days`
-    days, via the list feed's date-range params. Numbers require one
+    days, via the list feed's date-range params. Day-by-day calls
+    (from_date==to_date each time) rather than one wide-range call — see
+    _results_loop's docstring for why: a genuine multi-day range was an
+    untested assumption that production logs later confirmed reliably
+    returns 0 items, while day-by-day is the one shape actually proven
+    to work (matching the announcements backfill). Numbers require one
     per-symbol request each, so they're fetched newest-first with polite
     pacing and capped (RESULTS_NUMBERS_MAX, default 400) — rows past the
     cap still save with period/type/link and get numbers organically if
@@ -7591,10 +7608,15 @@ async def backfill_results_history(session: aiohttp.ClientSession, days: int = 3
     announcements backfill: re-running just re-upserts."""
     log.info(f"📚 Starting {days}-day results backfill…")
     today = datetime.now(timezone.utc)
-    from_date = (today - timedelta(days=days)).strftime('%d-%m-%Y')
-    to_date = today.strftime('%d-%m-%Y')
-    rows = await fetch_nse_financial_results(session, debug=True,
-                                             from_date=from_date, to_date=to_date)
+    rows = []
+    for days_back in range(days):
+        day_str = (today - timedelta(days=days_back)).strftime('%d-%m-%Y')
+        day_rows = await fetch_nse_financial_results(
+            session, debug=(days_back < 3), from_date=day_str, to_date=day_str)
+        if day_rows:
+            rows.extend(day_rows)
+            log.info(f"  📚 Results list {day_str}: {len(day_rows)} filing(s)")
+        await asyncio.sleep(0.5)
     if not rows:
         log.warning("📚 Results backfill: list fetch returned nothing")
         return
