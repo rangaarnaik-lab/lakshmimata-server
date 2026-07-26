@@ -2330,7 +2330,18 @@ async def load_fundamentals_from_supabase(session: aiohttp.ClientSession) -> lis
             # regardless of how fresh the fetched_at timestamp is. Without
             # this, a stock unlucky enough to get blocked once stays blank
             # for a full 7-day TTL window before ever being retried.
-            if is_blank or (now - fetched_at_ts) > FUNDAMENTALS_TTL:
+            #
+            # Separately: a row can be non-blank (has pe/roe from Upstox)
+            # but still missing market_cap specifically — that was the
+            # norm for most stocks before fetch_one_fundamentals started
+            # falling back to Screener.in for market_cap too. Without this
+            # check, those rows look "fresh" (they have SOME data) and
+            # would sit with a blank market_cap for up to the full 30-day
+            # TTL before ever being retried under the fixed logic. This is
+            # a one-time catch-up condition — once market_cap is filled,
+            # the row no longer matches it.
+            missing_mcap = (not is_blank) and row.get('market_cap') is None
+            if is_blank or missing_mcap or (now - fetched_at_ts) > FUNDAMENTALS_TTL:
                 stale_or_missing.append(sym)
 
         if len(page) < PAGE:
@@ -2430,10 +2441,19 @@ async def load_fundamentals_batch(session: aiohttp.ClientSession, symbols: list)
         c = fundamentals_cache.get(sym)
         return c is not None and all(c.get(f) is None for f in DATA_FIELDS)
 
+    def missing_mcap_cache(sym):
+        # Same one-time catch-up as load_fundamentals_from_supabase — a
+        # cached row that has SOME data but no market_cap predates the
+        # Screener.in fallback for that field and would otherwise wait
+        # out the full 30-day TTL.
+        c = fundamentals_cache.get(sym)
+        return c is not None and c.get('market_cap') is None and not is_blank_cache(sym)
+
     to_fetch = [
         sym for sym in symbols
         if sym not in fundamentals_cache
         or is_blank_cache(sym)  # scrape failed last time — don't wait out the TTL
+        or missing_mcap_cache(sym)
         or (now - fundamentals_cache[sym].get('fetched_at', 0)) > FUNDAMENTALS_TTL
     ]
     if not to_fetch:
