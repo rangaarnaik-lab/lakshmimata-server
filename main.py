@@ -2062,6 +2062,31 @@ _NSE_ANNOUNCEMENTS_HEADER_SETS = [
 ]
 _nse_announcements_debug_count = 0  # caps raw-response logging while verifying the real field shape
 
+def _nse_local_to_utc_iso(raw) -> str:
+    """NSE's timestamp fields (an_dt, broadCastDate, filingDate, etc.)
+    are always India-local wall-clock time with NO timezone marker
+    attached — e.g. '26-Jul-2026 18:15:00' genuinely means 18:15 IST,
+    not 18:15 UTC. Stored into a `timestamptz` column as that bare
+    string, Postgres has no way to know it's IST and silently assumes
+    UTC, shifting every displayed time by 5:30 hours once the frontend
+    converts it back to IST for display — exactly the 'time looks wrong'
+    symptom reported against a live announcement. This explicitly parses
+    the known NSE formats AS India time and returns a proper
+    timezone-aware ISO string, so there's no ambiguity left for Postgres
+    to guess wrong on. Returns the input unchanged if it doesn't match
+    any known format, rather than silently corrupting it."""
+    if not raw:
+        return raw
+    raw = str(raw).strip()
+    for fmt in ('%d-%b-%Y %H:%M:%S', '%d-%b-%Y %H:%M', '%d-%m-%Y %H:%M:%S',
+                '%d-%m-%Y %H:%M', '%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S'):
+        try:
+            dt = datetime.strptime(raw, fmt).replace(tzinfo=IST)
+            return dt.isoformat()
+        except ValueError:
+            continue
+    return raw
+
 async def fetch_nse_announcements(session: aiohttp.ClientSession, debug: bool = False) -> list:
     """
     Fetch recent corporate announcements across ALL NSE-listed equities in
@@ -2144,7 +2169,7 @@ async def fetch_nse_announcements(session: aiohttp.ClientSession, debug: bool = 
             'category': category.strip()[:200] if category else None,
             'subject': subject.strip()[:500],
             'attachment_url': attachment.strip() if attachment else None,
-            'announced_at': announced_at,
+            'announced_at': _nse_local_to_utc_iso(announced_at),
         })
     return results
 
@@ -7290,7 +7315,7 @@ async def fetch_nse_announcements_for_range(session: aiohttp.ClientSession, from
             'category': category.strip()[:200] if category else None,
             'subject': subject.strip()[:500],
             'attachment_url': attachment.strip() if attachment else None,
-            'announced_at': announced_at,
+            'announced_at': _nse_local_to_utc_iso(announced_at),
         })
     return results
 
@@ -7355,6 +7380,8 @@ async def fetch_nse_financial_results(session: aiohttp.ClientSession, debug: boo
         return []
 
     items = data if isinstance(data, list) else data.get('data', []) if isinstance(data, dict) else []
+    if debug:
+        log.info(f"  🔍 NSE financial-results fetch: url={url}, got {len(items)} item(s)")
     if debug and items:
         log.info(f"  🔍 NSE financial-results raw response (first item): {json.dumps(items[0])[:1200]}")
 
@@ -7378,7 +7405,7 @@ async def fetch_nse_financial_results(session: aiohttp.ClientSession, debug: boo
             'sales': None,  # numbers come from the per-symbol detail call below
             'pat': None,
             'eps': None,
-            'filed_at': (item.get('broadCastDate') or item.get('filingDate')
+            'filed_at': _nse_local_to_utc_iso(item.get('broadCastDate') or item.get('filingDate')
                          or item.get('exchdisstime') or item.get('creation_Date')),
             'attachment_url': item.get('xbrl') or item.get('attchmntFile') or item.get('fileName'),
         })
@@ -7518,7 +7545,7 @@ async def _results_loop(session: aiohttp.ClientSession):
         try:
             debug = cycle < 3
             today = datetime.now(timezone.utc)
-            from_date = (today - timedelta(days=4)).strftime('%d-%m-%Y')
+            from_date = (today - timedelta(days=10)).strftime('%d-%m-%Y')
             to_date = today.strftime('%d-%m-%Y')
             rows = await fetch_nse_financial_results(session, debug=debug,
                                                       from_date=from_date, to_date=to_date)
