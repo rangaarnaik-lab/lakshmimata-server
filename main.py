@@ -7236,10 +7236,29 @@ def tag_order_size(rows: list) -> list:
         if any(p in text for p in _ORDER_CANCEL_PATTERNS):
             continue
         val = _extract_value_crore(r.get('subject') or '')
+        if not val:
+            # No ₹ figure anywhere in the text — there's no way to size
+            # this at all, with or without market cap (e.g. "...has
+            # informed the Exchange about Bagging/Receiving of orders"
+            # with no amount stated). Stays untagged, correctly shows
+            # only in "All Sizes", never Big/Medium/Small — this is a
+            # real limitation of the source data, not something any
+            # amount of code can work around.
+            continue
         mcap = r.get('market_cap')
-        if val and mcap and mcap > 0:
+        if mcap and mcap > 0:
             pct = val / mcap * 100
             r['order_size'] = 'big' if pct >= 10 else 'medium' if pct >= 2 else 'small'
+        else:
+            # Market cap not known for this stock yet — fall back to
+            # absolute ₹ value thresholds so the filing still gets SOME
+            # size tag instead of silently never appearing in
+            # Big/Medium/Small. Less precise than %-of-mcap (₹50 Cr is
+            # huge for a micro-cap, trivial for a giant), but far better
+            # than excluding every stock whose market cap hasn't been
+            # fetched yet — which was most stocks for a lot of this
+            # session before the market-cap fixes.
+            r['order_size'] = 'big' if val >= 500 else 'medium' if val >= 50 else 'small'
     return rows
 
 def _dedupe_by_key(rows: list, keys: tuple) -> list:
