@@ -1228,13 +1228,13 @@ def build_sector_rs(processed: list, sector_map: dict) -> list:
 
 # ── Sector map ────────────────────────────────────────────────────────
 SECTOR_MAP = {
-    "IT":            ["TCS","INFOSYS","WIPRO","HCLTECH","TECHM","MPHASIS","PERSISTENT","COFORGE","LTTS","KPITTECH","TATAELXSI"],
+    "IT":            ["TCS","INFY","WIPRO","HCLTECH","TECHM","MPHASIS","PERSISTENT","COFORGE","LTTS","KPITTECH","TATAELXSI"],
     "Private Bank":  ["HDFCBANK","ICICIBANK","KOTAKBANK","AXISBANK","INDUSINDBK","BANDHANBNK","FEDERALBNK","IDFCFIRSTB","RBLBANK","AUBANK","YESBANK"],
     "PSU Bank":      ["SBIN","PNB","CANBK","BANKBARODA","UNIONBANK","BANKINDIA"],
     "Defence":       ["HAL","BEL","BDL","MAZDOCK","COCHINSHIP","BEML","MIDHANI","GRSE",
                        "DATAPATTNS","PARAS","ZENTEC","APOLLO"],
     "NBFC":          ["BAJFINANCE","BAJAJFINSV","CHOLAFIN","MUTHOOTFIN","MANAPPURAM","AAVAS","HOMEFIRST","LICHSGFIN","PNBHOUSING","CANFINHOME"],
-    "Auto":          ["MARUTI","TATAMOTORS","M&M","BAJAJ-AUTO","HEROMOTOCO","TVSMOTOR","EICHERMOT","BOSCHLTD","MOTHERSON","ESCORTS"],
+    "Auto":          ["MARUTI","TMPV","M&M","BAJAJ-AUTO","HEROMOTOCO","TVSMOTOR","EICHERMOT","BOSCHLTD","MOTHERSON","ESCORTS"],
     "Pharma":        ["SUNPHARMA","DRREDDY","CIPLA","DIVISLAB","LUPIN","AUROPHARMA","BIOCON","ALKEM","GLENMARK","IPCALAB","MANKIND","JUBLPHARMA"],
     "FMCG":          ["HINDUNILVR","ITC","NESTLEIND","DABUR","MARICO","COLPAL","EMAMILTD","GODREJCP","TATACONSUM"],
     "Energy":        ["RELIANCE","ONGC","BPCL","IOC","HINDPETRO","GAIL","PETRONET","IGL","MGL","ATGL"],
@@ -1244,9 +1244,9 @@ SECTOR_MAP = {
     "Consumer":      ["TITAN","ASIANPAINT","BERGEPAINT","PIDILITIND","VOLTAS","CROMPTON"],
     "Telecom":       ["BHARTIARTL","IDEA","TATACOMM","RAILTEL","HFCL","STLTECH"],
     "Realty":        ["DLF","GODREJPROP","OBEROIRLTY","PRESTIGE","BRIGADE","PHOENIXLTD","SOBHA","LODHA"],
-    "Healthcare":    ["APOLLOHOSP","FORTIS","MAXHEALTH","METROPOLIS","THYROCARE","LALPATHLAB","NARAYANA","ASTER"],
+    "Healthcare":    ["APOLLOHOSP","FORTIS","MAXHEALTH","METROPOLIS","THYROCARE","LALPATHLAB","NH","ASTERDM"],
     "Insurance":     ["SBILIFE","HDFCLIFE","ICICIPRULI","LICI","GICRE","STARHEALTH"],
-    "Internet":      ["ZOMATO","NYKAA","PAYTM","POLICYBZR","INDIAMART","JUSTDIAL","RATEGAIN","IXIGO"],
+    "Internet":      ["ETERNAL","NYKAA","PAYTM","POLICYBZR","INDIAMART","JUSTDIAL","RATEGAIN","IXIGO"],
     "Travel":        ["IRCTC","EASEMYTRIP","THOMASCOOK"],
     "Exchange":      ["BSE","CDSL","CAMS","MCX","ANGELONE"],
 }
@@ -1315,8 +1315,8 @@ def get_industry(sym: str) -> Optional[str]:
     return SECTOR_INDUSTRY_LOOKUP.get(sym, {}).get('industry')
 
 # ── Upstox API ────────────────────────────────────────────────────────
-NIFTY50   = ["RELIANCE","TCS","HDFCBANK","BHARTIARTL","ICICIBANK","INFOSYS","SBIN","HINDUNILVR","ITC","LT","KOTAKBANK","HCLTECH","AXISBANK","BAJFINANCE","MARUTI","ASIANPAINT","SUNPHARMA","TITAN","ULTRACEMCO","NESTLEIND","WIPRO","NTPC","POWERGRID","TECHM","TATAMOTORS","ADANIENT","ADANIPORTS","ONGC","BAJAJFINSV","JSWSTEEL","TATASTEEL","COALINDIA","HINDALCO","M&M","DRREDDY","CIPLA","EICHERMOT","DIVISLAB","BPCL","GRASIM","INDUSINDBK","APOLLOHOSP","BAJAJ-AUTO","HEROMOTOCO","TVSMOTOR","SHREECEM","BRITANNIA","VEDL","BEL","NTPC"]
-MIDCAP    = ["MPHASIS","PERSISTENT","COFORGE","LTTS","TATAELXSI","BANDHANBNK","FEDERALBNK","IDFCFIRSTB","RBLBANK","AUBANK","CHOLAFIN","MUTHOOTFIN","MANAPPURAM","AAVAS","ESCORTS","AUROPHARMA","LUPIN","BIOCON","ALKEM","GLENMARK","IPCALAB","EMAMILTD","GODREJCP","NMDC","MOIL","PRESTIGE","BRIGADE","PHOENIXLTD","SOBHA","LODHA","METROPOLIS","THYROCARE","LALPATHLAB","NARAYANA","ASTER","STARHEALTH","MCX","ANGELONE","EASEMYTRIP","RATEGAIN"]
+NIFTY50   = ["RELIANCE","TCS","HDFCBANK","BHARTIARTL","ICICIBANK","INFY","SBIN","HINDUNILVR","ITC","LT","KOTAKBANK","HCLTECH","AXISBANK","BAJFINANCE","MARUTI","ASIANPAINT","SUNPHARMA","TITAN","ULTRACEMCO","NESTLEIND","WIPRO","NTPC","POWERGRID","TECHM","TMPV","ADANIENT","ADANIPORTS","ONGC","BAJAJFINSV","JSWSTEEL","TATASTEEL","COALINDIA","HINDALCO","M&M","DRREDDY","CIPLA","EICHERMOT","DIVISLAB","BPCL","GRASIM","INDUSINDBK","APOLLOHOSP","BAJAJ-AUTO","HEROMOTOCO","TVSMOTOR","SHREECEM","BRITANNIA","VEDL","BEL","NTPC"]
+MIDCAP    = ["MPHASIS","PERSISTENT","COFORGE","LTTS","TATAELXSI","BANDHANBNK","FEDERALBNK","IDFCFIRSTB","RBLBANK","AUBANK","CHOLAFIN","MUTHOOTFIN","MANAPPURAM","AAVAS","ESCORTS","AUROPHARMA","LUPIN","BIOCON","ALKEM","GLENMARK","IPCALAB","EMAMILTD","GODREJCP","NMDC","MOIL","PRESTIGE","BRIGADE","PHOENIXLTD","SOBHA","LODHA","METROPOLIS","THYROCARE","LALPATHLAB","NH","ASTERDM","STARHEALTH","MCX","ANGELONE","EASEMYTRIP","RATEGAIN"]
 SMALLCAP  = ["DELTACORP","GMRINFRA","IDEA","SUZLON","UNITECH","DISHTV","JPASSOCIAT","PVR","INDIABULL","KOLTEPATIL","LEMONTREE","THOMASCOOK","JUSTDIAL","IXIGO","ALOKTEXT","RADICO","HEIDELBERG","BIRLACORPN","JKCEMENT","RAMCOCEM","HFCL","STLTECH","TEJAS","ROUTE","RAILTEL","NSDL","CANFINHOME","APTUS","HOMEFIRST","REPCO","SPANDANA","CREDITACC","SATIN"]
 
 MICROCAP = [
@@ -5307,16 +5307,26 @@ async def load_bse_only_stocks(session: aiohttp.ClientSession) -> int:
     nse_isins = set()
     try:
         url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=60),
-                               headers={"Accept-Encoding": "gzip"}) as r:
+        # No explicit Accept-Encoding here — this URL is a static .gz FILE
+        # (compression baked into the file itself, not an HTTP transport
+        # negotiation), so forcing Accept-Encoding:gzip risked some CDNs
+        # double-wrapping the response in transport-level gzip on top of
+        # the file's own gzip, which aiohttp's auto-decompression would
+        # only unwrap one layer of — leaving `content` still gzip-magic-
+        # byte-prefixed by the time it reached json.loads. Let aiohttp's
+        # own default negotiation handle transport compression, and
+        # explicitly check the file's own gzip magic bytes below.
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as r:
             if r.status != 200:
                 log.warning(f"BSE-only stocks: NSE re-fetch for ISIN set failed ({r.status}), skipping")
                 return 0
             content = await r.read()
             try:
-                data = json.loads(gzip.decompress(content))
-            except Exception:
-                data = json.loads(content)
+                data = json.loads(gzip.decompress(content) if content[:2] == b'\x1f\x8b' else content)
+            except Exception as decode_err:
+                log.warning(f"BSE-only stocks: ISIN set response decode failed "
+                            f"({type(decode_err).__name__}: {decode_err}), skipping")
+                return 0
             for item in data:
                 isin = item.get('isin', '')
                 if item.get('exchange') == 'NSE' and item.get('instrument_type') in ('EQ', 'ETF') and isin:
