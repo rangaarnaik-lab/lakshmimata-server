@@ -7269,11 +7269,33 @@ async def fetch_nse_results_numbers(session: aiohttp.ClientSession, headers: dic
                 continue
         return None
 
+    def _norm_date(s):
+        """NSE's two endpoints format the same date differently — the
+        results LIST feed gives 'toDate' as e.g. '31-Dec-2024' (title-case
+        month) while this per-symbol endpoint gives 'to_date' as e.g.
+        '01-OCT-2024' (upper-case month). A plain string compare between
+        the two silently fails almost every time even for the exact same
+        date, which is why sales/pat/eps were coming back empty for
+        nearly every row despite the loop reporting success. Parse both
+        into a canonical YYYY-MM-DD before comparing; datetime.strptime's
+        %b is case-insensitive so this handles both cases, with a couple
+        of fallback formats in case NSE varies it further."""
+        s = (s or '').strip()
+        if not s:
+            return ''
+        for fmt in ('%d-%b-%Y', '%d-%m-%Y', '%Y-%m-%d', '%d/%m/%Y'):
+            try:
+                return datetime.strptime(s, fmt).strftime('%Y-%m-%d')
+            except ValueError:
+                continue
+        return s.upper()  # last resort — at least case-insensitive
+
+    target_period = _norm_date(period_ended)
     for item in items:
         if not isinstance(item, dict):
             continue
         p = str(item.get('to_date') or item.get('toDate') or item.get('qe_Date') or '').strip()
-        if p and p != period_ended:
+        if p and target_period and _norm_date(p) != target_period:
             continue
         # Verified from raw response (VIDEOIND, 25-Jul log): fields are
         # re_-prefixed and values are in ₹ LAKHS (re_con_pro_loss
