@@ -7252,6 +7252,90 @@ def _dedupe_by_key(rows: list, keys: tuple) -> list:
         seen[k] = r
     return list(seen.values())
 
+def _dedupe_by_key(rows: list, keys: tuple) -> list:
+    """NSE feeds sometimes contain the same item twice in one response;
+    Postgres rejects a bulk upsert that touches the same unique key twice
+    (error 21000). Keep the last occurrence of each key."""
+    seen = {}
+    for r in rows:
+        k = tuple(str(r.get(x) or '') for x in keys)
+        seen[k] = r
+    return list(seen.values())
+
+# ── Results-from-announcement: the actual intent here is "when a
+# results-type announcement lands, go read that stock's numbers" —
+# not a separate scheduled poll against NSE's results-list feed, which
+# turned out to only reliably support single-day queries and made
+# discovery unnecessarily fragile. Announcements already carry the
+# reporting period in plain English ("...for the quarter ended June
+# 30, 2026"), and the announcements feed itself has been reliable all
+# session, so use it as the trigger and only call the per-symbol
+# numbers endpoint (which was never the broken part) directly.
+_RESULTS_ANN_KEYWORDS = ['financial result', 'quarterly result', 'results for the quarter',
+                         'unaudited results', 'audited results']
+_RESULTS_ANN_EXCLUDE = ['newspaper publication', 'newspaper advertisement', 'transcript']
+_MONTH_NAMES = {
+    'jan': 1, 'january': 1, 'feb': 2, 'february': 2, 'mar': 3, 'march': 3,
+    'apr': 4, 'april': 4, 'may': 5, 'jun': 6, 'june': 6, 'jul': 7, 'july': 7,
+    'aug': 8, 'august': 8, 'sep': 9, 'sept': 9, 'september': 9,
+    'oct': 10, 'october': 10, 'nov': 11, 'november': 11, 'dec': 12, 'december': 12,
+}
+
+def _extract_period_ended_from_text(text: str):
+    """Pull the reporting quarter's end date straight out of an
+    announcement's own subject — e.g. '...for the period ended Jun 30,
+    2026' or '...quarter ended June 30, 2026'. This is what makes
+    triggering off the announcement itself possible: NSE's separate
+    results-list feed isn't needed to learn the period at all, the
+    announcement already says it in plain English. Returns a
+    'DD-Mon-YYYY' string (a format _norm_date already parses) or None."""
+    if not text:
+        return None
+    m = re.search(r'(?:period|quarter|year)\s+ended\s+([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})',
+                  text, re.IGNORECASE)
+    if not m:
+        return None
+    month_num = _MONTH_NAMES.get(m.group(1).lower())
+    if not month_num:
+        return None
+    try:
+        return datetime(int(m.group(3)), month_num, int(m.group(2))).strftime('%d-%b-%Y')
+    except ValueError:
+        return None
+
+def _is_results_announcement(row: dict) -> bool:
+    """Same category/subject matching the frontend's Results tab uses,
+    kept in sync deliberately so 'what counts as a results filing' is
+    identical on both ends."""
+    text = ((row.get('category') or '') + ' ' + (row.get('subject') or '')).lower()
+    if any(x in text for x in _RESULTS_ANN_EXCLUDE):
+        return False
+    return any(x in text for x in _RESULTS_ANN_KEYWORDS)
+
+async def fetch_and_save_result_for_announcement(session: aiohttp.ClientSession, headers: dict,
+                                                  row: dict, debug: bool = False) -> bool:
+    """Given ONE results-type announcement, fetch that stock's numbers
+    from NSE's per-symbol results-comparision endpoint and save them.
+    Returns False (and saves nothing) if the period can't be parsed out
+    of the subject text — better to skip than guess wrong."""
+    period_ended = _extract_period_ended_from_text(row.get('subject') or '')
+    symbol = row.get('symbol')
+    if not period_ended or not symbol:
+        return False
+    nums = await fetch_nse_results_numbers(session, headers, symbol, period_ended, debug=debug)
+    result_row = {
+        'symbol': symbol,
+        'period_ended': period_ended,
+        'result_type': 'Consolidated',
+        'sales': None, 'pat': None, 'eps': None,
+        'filed_at': row.get('announced_at'),
+        'attachment_url': row.get('attachment_url'),
+    }
+    if nums:
+        result_row.update({k: v for k, v in nums.items() if v is not None})
+    await save_financial_results_to_db(session, [result_row])
+    return bool(nums)
+
 async def enrich_and_save_announcements(session: aiohttp.ClientSession, rows: list):
     """Wraps save_announcements_to_db with sector/industry/market_cap
     enrichment. Kept as a separate wrapper (rather than editing
@@ -7274,6 +7358,27 @@ async def enrich_and_save_announcements(session: aiohttp.ClientSession, rows: li
             r.setdefault(k, None)
     enriched = _dedupe_by_key(enriched, ('symbol', 'subject', 'announced_at'))
     await save_announcements_to_db(session, enriched)
+
+    # Results numbers are triggered directly off results-type
+    # announcements landing here, rather than a separate scheduled poll
+    # against NSE's results-list feed — see this section's header
+    # comment above for why. Capped per call to stay polite to NSE
+    # during results-season bursts (a single day can have 600+
+    # announcements, only a handful of which are results filings, but
+    # worth a ceiling regardless).
+    results_rows = [r for r in enriched if _is_results_announcement(r)]
+    if results_rows:
+        headers = random.choice(_NSE_ANNOUNCEMENTS_HEADER_SETS)
+        filled = 0
+        for i, r in enumerate(results_rows[:20]):
+            try:
+                if await fetch_and_save_result_for_announcement(session, headers, r, debug=(i < 2)):
+                    filled += 1
+            except Exception as e:
+                log.warning(f"⚠️ Results-from-announcement fetch failed for {r.get('symbol')}: {e}")
+            await asyncio.sleep(1.2)
+        log.info(f"  📊 Results-from-announcement: {filled}/{min(len(results_rows),20)} numbers filled "
+                 f"({len(results_rows)} results-type announcement(s) this batch)")
 
 async def fetch_nse_announcements_for_range(session: aiohttp.ClientSession, from_date: str,
                                              to_date: str, debug: bool = False) -> list:
