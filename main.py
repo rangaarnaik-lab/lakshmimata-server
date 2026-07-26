@@ -1577,6 +1577,7 @@ async def fetch_upstox_fundamentals(session: aiohttp.ClientSession, sym: str, is
         'opm_pct': None, 'opm_trend': None, 'eps_growth_streak': None,
         'fii_pct': None, 'fii_trend': None, 'dii_pct': None, 'dii_trend': None,
         'promoter_trend': None, 'peg_ratio': None, 'industry': None,
+        'shares_outstanding': None,
     }
     got_any = False
 
@@ -1786,6 +1787,7 @@ async def fetch_fundamentals_screener(session: aiohttp.ClientSession, sym: str, 
         'opm_pct': None, 'opm_trend': None, 'eps_growth_streak': None,
         'fii_pct': None, 'fii_trend': None, 'dii_pct': None, 'dii_trend': None,
         'promoter_trend': None, 'peg_ratio': None, 'industry': None,
+        'shares_outstanding': None,
     }
     try:
         async with session.get(url, headers=headers,
@@ -1842,6 +1844,18 @@ async def fetch_fundamentals_screener(session: aiohttp.ClientSession, sym: str, 
         result['roe']        = parse_number(extract_ratio('ROE', html))
         result['eps']        = parse_number(extract_ratio('EPS', html))
         result['debt_eq']    = parse_number(extract_ratio('Debt to equity', html))
+
+        # Shares outstanding = market cap ÷ Screener's own "Current Price"
+        # snapshot at scrape time. This is the key to keeping market cap
+        # and P/E fresh WITHOUT re-scraping daily: shares outstanding
+        # barely changes (only on a fresh issue/buyback), so once known,
+        # run_scan can recompute market_cap = shares_outstanding × TODAY's
+        # live price every single cycle — effectively daily-fresh, at
+        # zero extra Screener.in requests. Only re-derived when this
+        # monthly scrape actually runs.
+        scrape_price = parse_number(extract_ratio('Current Price', html))
+        if result['market_cap'] and scrape_price and scrape_price > 0:
+            result['shares_outstanding'] = round(result['market_cap'] / scrape_price, 6)
 
         # Sector/Industry — Screener.in's page is already being fetched
         # above for the ratios; this just extracts more from the same
@@ -2283,7 +2297,7 @@ async def load_fundamentals_from_supabase(session: aiohttp.ClientSession) -> lis
                 f"{SUPABASE_URL}/rest/v1/stock_fundamentals"
                 f"?select=sym,market_cap,pe,roe,eps,debt_eq,promoter,"
                 f"eps_qoq,eps_yoy,sales_qoq,sales_yoy,opm_pct,opm_trend,eps_growth_streak,industry,"
-                f"fii_pct,fii_trend,dii_pct,dii_trend,promoter_trend,peg_ratio,fetched_at",
+                f"fii_pct,fii_trend,dii_pct,dii_trend,promoter_trend,peg_ratio,shares_outstanding,fetched_at",
                 headers=page_headers, timeout=aiohttp.ClientTimeout(total=30)
             ) as r:
                 if r.status not in (200, 206):
@@ -2317,6 +2331,7 @@ async def load_fundamentals_from_supabase(session: aiohttp.ClientSession) -> lis
                 'dii_pct': row.get('dii_pct'), 'dii_trend': row.get('dii_trend'),
                 'promoter_trend': row.get('promoter_trend'), 'peg_ratio': row.get('peg_ratio'),
                 'industry': row.get('industry'),
+                'shares_outstanding': row.get('shares_outstanding'),
                 'fetched_at': fetched_at_ts,
             }
             loaded += 1
@@ -2494,7 +2509,7 @@ async def load_fundamentals_batch(session: aiohttp.ClientSession, symbols: list)
                 screener_data = await fetch_fundamentals_screener(session, sym, debug=debug)
                 if screener_data.get('industry') and not upstox_data.get('industry'):
                     upstox_data['industry'] = screener_data['industry']
-                for f in ('market_cap', 'eps', 'debt_eq'):
+                for f in ('market_cap', 'eps', 'debt_eq', 'shares_outstanding'):
                     if upstox_data.get(f) is None and screener_data.get(f) is not None:
                         upstox_data[f] = screener_data[f]
             return upstox_data
@@ -5646,6 +5661,101 @@ async def save_best_picks(session: aiohttp.ClientSession, top_rows: list, reason
         log.warning(f"⚠️ Best picks save exception: {e}")
 
 
+async def ensure_best_picks_history_table(session: aiohttp.ClientSession,
+                                           retries: int = 6, delay: float = 10.0) -> bool:
+    """Same self-healing pattern as ensure_best_picks_table."""
+    url = f"{SUPABASE_URL}/rest/v1/best_picks_history?limit=1"
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    for attempt in range(retries):
+        try:
+            async with session.get(url, headers=headers,
+                                   timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status == 200:
+                    return True
+                if r.status == 404 and attempt < retries - 1:
+                    await asyncio.sleep(delay)
+                    continue
+                log.error(f"best_picks_history table check failed: {r.status}")
+                return False
+        except Exception as e:
+            if attempt < retries - 1:
+                await asyncio.sleep(delay)
+                continue
+            log.error(f"best_picks_history table check failed: {e}")
+            return False
+    return False
+
+
+async def save_best_picks_history(session: aiohttp.ClientSession, top_rows: list, reasoning: dict):
+    """Append-only track record, unlike save_best_picks' full-replace
+    snapshot. Upserts on (symbol, picked_date) — the FIRST time a symbol
+    is picked on a given calendar day, this creates its permanent
+    history row with today's price; every subsequent hourly refresh
+    that same day just updates rank/score/reasoning on that SAME row
+    (price_at_pick stays whatever it was at the day's first pick, not
+    overwritten), so 'did it go up since being picked' has a stable
+    baseline. A new calendar day always creates fresh rows rather than
+    touching previous days — that's what makes this a real history
+    instead of another snapshot."""
+    if not top_rows:
+        return
+    picked_date = datetime.now(IST).strftime('%Y-%m-%d')
+    now_iso = datetime.now(timezone.utc).isoformat()
+    payload = [{
+        'symbol': r['sym'],
+        'picked_date': picked_date,
+        'rank': i + 1,
+        'score': r.get('best_pick_score'),
+        'reasoning': reasoning.get(r['sym']),
+        'price_at_pick': r.get('last_price'),
+        'sector': r.get('sector'),
+        'market_cap': r.get('market_cap'),
+        'generated_at': now_iso,
+    } for i, r in enumerate(top_rows)]
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        # merge-duplicates on (symbol,picked_date) would normally
+        # overwrite price_at_pick too on every hourly refresh — instead
+        # this uses ignore-duplicates so the FIRST insert of the day
+        # wins for price_at_pick, then a separate lightweight PATCH
+        # below updates just rank/score/reasoning on top of it.
+        "Prefer": "resolution=ignore-duplicates",
+    }
+    try:
+        async with session.post(
+            f"{SUPABASE_URL}/rest/v1/best_picks_history?on_conflict=symbol,picked_date",
+            headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=20)
+        ) as r:
+            if r.status not in (200, 201):
+                body = await r.text()
+                log.warning(f"⚠️ Best picks history insert failed ({r.status}): {body[:300]}")
+                return
+        # Refresh rank/score/reasoning on today's existing rows (the
+        # ignore-duplicates insert above skips rows that already exist
+        # today, so this PATCH is what keeps rank/reasoning current
+        # through the day without touching price_at_pick).
+        patch_headers = {**headers, "Prefer": "return=minimal"}
+        for r in top_rows:
+            async with session.patch(
+                f"{SUPABASE_URL}/rest/v1/best_picks_history",
+                headers=patch_headers,
+                params={"symbol": f"eq.{r['sym']}", "picked_date": f"eq.{picked_date}"},
+                json={
+                    'rank': top_rows.index(r) + 1,
+                    'score': r.get('best_pick_score'),
+                    'reasoning': reasoning.get(r['sym']),
+                },
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as pr:
+                if pr.status not in (200, 204):
+                    log.warning(f"  Failed to refresh history row for {r['sym']}: {pr.status}")
+        log.info(f"  📜 Saved/updated {len(payload)} best-picks-history rows for {picked_date}")
+    except Exception as e:
+        log.warning(f"⚠️ Best picks history save exception: {e}")
+
+
 async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> int:
     start = time.time()
     now_ist = datetime.now(IST)
@@ -6154,6 +6264,24 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         # this genuinely detects "just broke out", not an ongoing state.
         is_52wh_breakout = bool(h52 and prices[-1] <= h52 and last > h52)
 
+        # Live market cap / P/E — recomputed every scan cycle from TODAY's
+        # live price × the shares-outstanding/EPS captured at the last
+        # monthly fundamentals fetch, instead of just replaying that
+        # month-old snapshot untouched. Shares outstanding and EPS barely
+        # move (only a fresh issue/buyback or a new quarterly result
+        # changes them), so this keeps market cap and P/E effectively
+        # daily-fresh at zero extra Screener.in/Upstox requests. Falls
+        # back to the cached snapshot value when shares_outstanding isn't
+        # known yet (e.g. this stock hasn't been through the fallback
+        # path that derives it).
+        _fc = fundamentals_cache.get(sym, {})
+        _shares_out = _fc.get('shares_outstanding')
+        _cached_eps = _fc.get('eps')
+        _live_mcap = (round(_shares_out * last, 2)
+                      if _shares_out and last else _fc.get('market_cap'))
+        _live_pe = (round(last / _cached_eps, 2)
+                    if _cached_eps and last else _fc.get('pe'))
+
         processed.append({
             'sym':            sym,
             'weinstein_stage': weinstein_stage,
@@ -6251,9 +6379,12 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'in_midcap':      sym in MIDCAP,
             'in_smallcap':    sym in SMALLCAP,
             'in_microcap':    sym in MICROCAP,
-            # Fundamentals from Upstox API (Screener.in fallback), cached weekly
-            'market_cap':     fundamentals_cache.get(sym, {}).get('market_cap'),
-            'pe':             fundamentals_cache.get(sym, {}).get('pe'),
+            # Fundamentals from Upstox API (Screener.in fallback), cached
+            # monthly — market_cap/pe are recomputed live above using
+            # today's price, everything else refreshes on its normal
+            # monthly cadence since it doesn't move daily.
+            'market_cap':     _live_mcap,
+            'pe':             _live_pe,
             'roe':            fundamentals_cache.get(sym, {}).get('roe'),
             'eps':            fundamentals_cache.get(sym, {}).get('eps'),
             'debt_eq':        fundamentals_cache.get(sym, {}).get('debt_eq'),
@@ -6291,6 +6422,7 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             top_picks = sorted(processed, key=lambda r: r.get('best_pick_score') or 0, reverse=True)[:_AI_PICKS_TOP_N]
             reasoning = await generate_ai_picks_reasoning(session, top_picks)
             await save_best_picks(session, top_picks, reasoning)
+            await save_best_picks_history(session, top_picks, reasoning)
             _LAST_AI_PICKS_TS = time.time()
         except Exception as e:
             log.warning(f"⚠️ Best Picks scan step failed: {e}")
@@ -7366,15 +7498,30 @@ async def _results_loop(session: aiohttp.ClientSession):
     """Polls NSE's structured financial-results feed every 30 min — new
     results only land around filing bursts (post-board-meeting evenings
     in results season), so this doesn't need the announcements loop's
-    5-min cadence."""
+    5-min cadence.
+
+    IMPORTANT: calling fetch_nse_financial_results with NO date range
+    does NOT return "latest first" as might be assumed — confirmed via
+    raw logs that a bare call kept returning the same old items (e.g. a
+    Dec-2024-quarter Videocon filing) run after run, hours apart, while
+    same-day real filings (seen independently in the Announcements feed)
+    never appeared in this feed's response at all. Only the one-time
+    backfill function ever passed an explicit from_date/to_date, which
+    is why backfill worked but this ongoing loop silently never picked
+    up new filings. Fix: always pass an explicit recent rolling window."""
     CHECK_INTERVAL = 30 * 60
     cycle = 0
     fetched_numbers = set()  # (symbol, period_ended) already number-fetched this process
     while True:
         try:
             debug = cycle < 3
-            rows = await fetch_nse_financial_results(session, debug=debug)
+            today = datetime.now(timezone.utc)
+            from_date = (today - timedelta(days=4)).strftime('%d-%m-%Y')
+            to_date = today.strftime('%d-%m-%Y')
+            rows = await fetch_nse_financial_results(session, debug=debug,
+                                                      from_date=from_date, to_date=to_date)
             if rows:
+
                 rows = _dedupe_by_key(rows, ('symbol', 'period_ended', 'result_type'))
                 # The list feed has no numbers — fill them from the
                 # per-symbol comparison endpoint, capped per cycle and
@@ -7599,6 +7746,7 @@ async def main():
         # worker, since `processed` already has technicals+fundamentals
         # merged here).
         await ensure_best_picks_table(session)
+        await ensure_best_picks_history_table(session)
         # Step 2b: Load Nifty 50 + all index histories
         await load_nifty_cache(session)
         await load_index_cache(session)
