@@ -5348,6 +5348,285 @@ async def load_historical_cache(session: aiohttp.ClientSession):
     log.info(f"✅ Historical cache loaded: {loaded} stocks")
 
 # ── Main scan function ────────────────────────────────────────────────
+# ============================================================
+# AI Best Picks — composite technical+fundamental scoring, with an
+# AI-generated (or free templated) rationale for the top candidates.
+# Recomputed at most once per _AI_PICKS_REFRESH_INTERVAL_SEC from
+# inside run_scan, since `processed` already has every technical AND
+# fundamental field merged per stock by the time that function
+# finishes — no extra fetching needed here.
+# ============================================================
+_LAST_AI_PICKS_TS = 0.0
+_AI_PICKS_REFRESH_INTERVAL_SEC = 3600  # ranking + rationale refresh at most hourly
+_AI_PICKS_TOP_N = 30
+
+def compute_best_pick_score(row: dict) -> float:
+    """Weighted composite score (0-100) from signals already computed
+    during the scan (technical) plus fundamentals_cache (fundamental) —
+    both already merged into `row`. This is a confluence score to
+    surface candidates for the AI rationale pass to explain in plain
+    English, not a prediction or a recommendation. Weighted toward
+    technical strength (this is a momentum scanner), with fundamentals
+    acting as a confirming or penalizing factor."""
+    score = 0.0
+
+    # --- Technical (up to ~64 pts) ---
+    if row.get('weinstein_stage') == 2:
+        score += 15
+    if row.get('vcp_fired'):
+        score += 10
+    if row.get('is_resistance_breakout'):
+        score += 8
+    if row.get('is_cup_handle_breakout'):
+        score += 8
+    if row.get('is_guppy_bullish_crossover'):
+        score += 5
+    if row.get('is_52wh_breakout'):
+        score += 5
+    rs = row.get('rs_tv') if row.get('rs_tv') is not None else row.get('rs')
+    if isinstance(rs, (int, float)):
+        score += min(rs, 99) * 0.15  # up to ~15 pts at RS 99
+    rvol = row.get('rvol')
+    if isinstance(rvol, (int, float)):
+        if rvol >= 2:
+            score += 6
+        elif rvol >= 1.3:
+            score += 3
+
+    # --- Fundamentals (up to ~35 pts, confirming/penalizing) ---
+    eps_qoq, eps_yoy = row.get('eps_qoq'), row.get('eps_yoy')
+    if isinstance(eps_qoq, (int, float)) and isinstance(eps_yoy, (int, float)) and eps_qoq > 0 and eps_yoy > 0:
+        score += 8
+    streak = row.get('eps_growth_streak')
+    if isinstance(streak, (int, float)) and streak >= 2:
+        score += 4
+    sales_qoq, sales_yoy = row.get('sales_qoq'), row.get('sales_yoy')
+    if isinstance(sales_qoq, (int, float)) and isinstance(sales_yoy, (int, float)) and sales_qoq > 0 and sales_yoy > 0:
+        score += 6
+    roe = row.get('roe')
+    if isinstance(roe, (int, float)) and roe >= 15:
+        score += 5
+    debt_eq = row.get('debt_eq')
+    if isinstance(debt_eq, (int, float)):
+        if debt_eq < 1:
+            score += 4
+        elif debt_eq > 2:
+            score -= 5
+    if row.get('promoter_trend') == 'increasing':
+        score += 4
+    elif row.get('promoter_trend') == 'decreasing':
+        score -= 5
+    if row.get('fii_trend') == 'increasing' or row.get('dii_trend') == 'increasing':
+        score += 4
+    peg = row.get('peg_ratio')
+    if isinstance(peg, (int, float)) and 0 < peg <= 1.5:
+        score += 4
+
+    # --- Penalties ---
+    if row.get('is_weak_rs'):
+        score -= 12
+
+    return round(max(0.0, min(100.0, score)), 1)
+
+
+async def ensure_best_picks_table(session: aiohttp.ClientSession,
+                                   retries: int = 6, delay: float = 10.0) -> bool:
+    """Same self-healing pattern as ensure_fundamentals_table — see that
+    function for why the retry loop is needed (PostgREST schema cache
+    lag after creating a table via the SQL Editor)."""
+    url = f"{SUPABASE_URL}/rest/v1/best_picks?limit=1"
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    for attempt in range(retries):
+        try:
+            async with session.get(url, headers=headers,
+                                   timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status == 200:
+                    return True
+                if r.status == 404 and attempt < retries - 1:
+                    await asyncio.sleep(delay)
+                    continue
+                log.error(f"best_picks table check failed: {r.status}")
+                return False
+        except Exception as e:
+            if attempt < retries - 1:
+                await asyncio.sleep(delay)
+                continue
+            log.error(f"best_picks table check failed: {e}")
+            return False
+    return False
+
+
+def _template_pick_reasoning(r: dict) -> str:
+    """Zero-cost fallback rationale when ANTHROPIC_API_KEY isn't set —
+    lists whichever strong signals actually fired. Plain and mechanical
+    rather than natural language, but still informative."""
+    bits = []
+    if r.get('weinstein_stage') == 2:
+        bits.append('Stage-2 uptrend')
+    if r.get('vcp_fired'):
+        bits.append('VCP breakout')
+    if r.get('is_resistance_breakout'):
+        bits.append('resistance breakout')
+    if r.get('is_cup_handle_breakout'):
+        bits.append('cup & handle breakout')
+    rs = r.get('rs_tv') or r.get('rs')
+    if isinstance(rs, (int, float)) and rs >= 80:
+        bits.append(f'RS {int(rs)}')
+    if isinstance(r.get('rvol'), (int, float)) and r['rvol'] >= 1.5:
+        bits.append(f"{r['rvol']:.1f}x volume")
+    eps_qoq, eps_yoy = r.get('eps_qoq'), r.get('eps_yoy')
+    if isinstance(eps_qoq, (int, float)) and isinstance(eps_yoy, (int, float)) and eps_qoq > 0 and eps_yoy > 0:
+        bits.append('EPS growing QoQ & YoY')
+    if r.get('promoter_trend') == 'increasing':
+        bits.append('promoter buying')
+    if not bits:
+        bits.append('high composite score across signals')
+    return ' + '.join(bits[:3])
+
+
+async def generate_ai_picks_reasoning(session: aiohttp.ClientSession, top_rows: list) -> dict:
+    """One batched Anthropic call (or the free templated fallback) that
+    turns each top pick's raw signals into a short plain-English
+    rationale. Returns {symbol: reasoning_text}. Same cost-optional
+    pattern as rate_announcements_with_ai: if ANTHROPIC_API_KEY isn't
+    set, or the call fails for any reason, falls back to a templated
+    sentence built from whichever signals actually fired rather than
+    skipping the field."""
+    api_key = os.getenv('ANTHROPIC_API_KEY', '')
+    if not top_rows:
+        return {}
+    if not api_key:
+        return {r['sym']: _template_pick_reasoning(r) for r in top_rows}
+
+    listing = "\n".join(
+        f"{i+1}. {r['sym']} (sector: {r.get('sector') or '?'}, mcap ₹{int(r['market_cap']) if r.get('market_cap') else '?'} Cr, "
+        f"score {r.get('best_pick_score')}/100) — "
+        f"stage {r.get('weinstein_stage')}, RS {r.get('rs_tv') or r.get('rs')}, "
+        f"VCP={'Y' if r.get('vcp_fired') else 'N'}, "
+        f"breakout={'Y' if r.get('is_resistance_breakout') or r.get('is_cup_handle_breakout') else 'N'}, "
+        f"RVOL={r.get('rvol')}, EPS QoQ/YoY={r.get('eps_qoq')}/{r.get('eps_yoy')}, "
+        f"Sales QoQ/YoY={r.get('sales_qoq')}/{r.get('sales_yoy')}, ROE={r.get('roe')}, "
+        f"D/E={r.get('debt_eq')}, promoter trend={r.get('promoter_trend')}, "
+        f"FII/DII trend={r.get('fii_trend')}/{r.get('dii_trend')}"
+        for i, r in enumerate(top_rows)
+    )
+    prompt = (
+        "You are a technical+fundamental analyst writing one-line rationales for a stock "
+        "scanner's 'Best Picks' list, for Indian retail investors on the NSE. Each numbered "
+        "line below gives one stock's confluence of signals that already qualified it for "
+        "this list. Write a crisp reason (max 100 characters) explaining IN YOUR OWN PLAIN "
+        "WORDS why this stock stands out — reference the 2-3 strongest signals only, don't "
+        "just restate every field. This is analysis of already-public scan data, not a buy "
+        "recommendation — never use words like 'buy', 'target', or promise returns.\n"
+        "Respond ONLY with a JSON array like "
+        "[{\"n\":1,\"reason\":\"Stage-2 breakout on rising RVOL with 3 straight qtrs of EPS growth\"}] "
+        "— no other text.\n\n"
+        + listing
+    )
+    try:
+        async with session.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5",
+                "max_tokens": 2500,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as r:
+            if r.status != 200:
+                body = await r.text()
+                log.warning(f"⚠️ AI picks reasoning call failed ({r.status}): {body[:200]} — using templated fallback")
+                return {r2['sym']: _template_pick_reasoning(r2) for r2 in top_rows}
+            data = await r.json()
+        text = "".join(b.get('text', '') for b in data.get('content', []) if b.get('type') == 'text')
+        text = text.replace('```json', '').replace('```', '').strip()
+        items = json.loads(text)
+        out = {}
+        for item in items:
+            idx = item.get('n')
+            reason = (item.get('reason') or '').strip()
+            if isinstance(idx, int) and 1 <= idx <= len(top_rows) and reason:
+                out[top_rows[idx - 1]['sym']] = reason[:160]
+        for r in top_rows:
+            out.setdefault(r['sym'], _template_pick_reasoning(r))
+        log.info(f"  🧠 AI-rationaled {len(out)}/{len(top_rows)} best picks")
+        return out
+    except Exception as e:
+        log.warning(f"⚠️ AI picks reasoning failed ({type(e).__name__}: {e}) — using templated fallback")
+        return {r['sym']: _template_pick_reasoning(r) for r in top_rows}
+
+
+async def save_best_picks(session: aiohttp.ClientSession, top_rows: list, reasoning: dict):
+    """Full-replace semantics: today's top N fully overwrite the table.
+    Best Picks is a point-in-time snapshot, not a growing history — a
+    symbol that fell out of the top N shouldn't linger in the table."""
+    if not top_rows:
+        return
+    now_iso = datetime.now(timezone.utc).isoformat()
+    payload = []
+    for i, r in enumerate(top_rows):
+        payload.append({
+            'symbol': r['sym'],
+            'rank': i + 1,
+            'score': r.get('best_pick_score'),
+            'reasoning': reasoning.get(r['sym']),
+            'last_price': r.get('last_price'),
+            'chg_pct': r.get('chg_pct'),
+            'sector': r.get('sector'),
+            'industry': r.get('industry'),
+            'market_cap': r.get('market_cap'),
+            'rs_tv': r.get('rs_tv') or r.get('rs'),
+            'weinstein_stage': r.get('weinstein_stage'),
+            'vcp_fired': r.get('vcp_fired'),
+            'is_resistance_breakout': r.get('is_resistance_breakout'),
+            'is_cup_handle_breakout': r.get('is_cup_handle_breakout'),
+            'eps_yoy': r.get('eps_yoy'),
+            'sales_yoy': r.get('sales_yoy'),
+            'roe': r.get('roe'),
+            'promoter_trend': r.get('promoter_trend'),
+            'generated_at': now_iso,
+        })
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates",
+    }
+    try:
+        async with session.post(f"{SUPABASE_URL}/rest/v1/best_picks?on_conflict=symbol",
+                                headers=headers, json=payload,
+                                timeout=aiohttp.ClientTimeout(total=20)) as r:
+            if r.status not in (200, 201):
+                body = await r.text()
+                log.warning(f"⚠️ Best picks upsert failed ({r.status}): {body[:300]}")
+                return
+        # Remove any symbol no longer in today's top N (full-replace).
+        current_syms = {r['sym'] for r in top_rows}
+        plain_headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+        async with session.get(f"{SUPABASE_URL}/rest/v1/best_picks?select=symbol",
+                               headers=plain_headers, timeout=aiohttp.ClientTimeout(total=15)) as r2:
+            if r2.status == 200:
+                existing = {row['symbol'] for row in await r2.json()}
+                stale = existing - current_syms
+                for sym in stale:
+                    async with session.delete(
+                        f"{SUPABASE_URL}/rest/v1/best_picks",
+                        headers=plain_headers,
+                        params={"symbol": f"eq.{sym}"},
+                        timeout=aiohttp.ClientTimeout(total=15)
+                    ) as dr:
+                        if dr.status not in (200, 204):
+                            log.warning(f"  Failed to delete stale best_pick '{sym}': {dr.status}")
+        log.info(f"  🏆 Saved {len(payload)} best picks to Supabase")
+    except Exception as e:
+        log.warning(f"⚠️ Best picks save exception: {e}")
+
+
 async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> int:
     start = time.time()
     now_ist = datetime.now(IST)
@@ -5980,6 +6259,23 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'scan_type':      scan_type,
         })
 
+    # Step 5.35: AI Best Picks — composite score + AI rationale for the
+    # top candidates, recomputed at most once per hour (ranking doesn't
+    # need to be fresher than that, and this keeps ANTHROPIC_API_KEY
+    # usage cheap even when it's set). `processed` already has every
+    # technical AND fundamental field merged per stock at this point.
+    global _LAST_AI_PICKS_TS
+    if time.time() - _LAST_AI_PICKS_TS > _AI_PICKS_REFRESH_INTERVAL_SEC:
+        try:
+            for row in processed:
+                row['best_pick_score'] = compute_best_pick_score(row)
+            top_picks = sorted(processed, key=lambda r: r.get('best_pick_score') or 0, reverse=True)[:_AI_PICKS_TOP_N]
+            reasoning = await generate_ai_picks_reasoning(session, top_picks)
+            await save_best_picks(session, top_picks, reasoning)
+            _LAST_AI_PICKS_TS = time.time()
+        except Exception as e:
+            log.warning(f"⚠️ Best Picks scan step failed: {e}")
+
     # Step 5.4: Detect NEW squeeze/VCP fires (state change from last scan)
     global prev_squeeze_state
     new_fires = []
@@ -6583,6 +6879,27 @@ _ANN_NEGATIVE_PATTERNS = [
     'plant shutdown', 'suspension of operations', 'insolvency', 'nclt admission',
     'fraud', 'auditor has resigned', 'pledge of shares', 'shares pledged',
     'disqualified', 'sebi order against', 'debarred',
+    'cancellation of order', 'cancellation of work order', 'cancellation of purchase order',
+    'order cancelled', 'work order cancelled', 'purchase order cancelled',
+    'cancellation of contract', 'contract cancelled', 'termination of contract',
+    'contract terminated', 'termination of work order', 'work order terminated',
+    'rescission of', 'order rescinded', 'contract rescinded', 'order withdrawn',
+    'withdrawal of order', 'loss of order', 'order lost', 'annulment of',
+]
+# Order-win phrases (_ORDER_WIN_PATTERNS below) can appear inside the text of
+# an order CANCELLATION too — e.g. "Cancellation of Work Order by Reliance
+# Industries Limited" contains "work order". Any row matching one of these
+# cancel/termination phrases must never be treated as an order win, no matter
+# what else it contains. Kept in sync with _ANN_NEGATIVE_PATTERNS' cancel
+# terms above (a superset — this one doesn't need the resignation/penalty/etc
+# entries that are irrelevant to order-win detection).
+_ORDER_CANCEL_PATTERNS = [
+    'cancellation of order', 'cancellation of work order', 'cancellation of purchase order',
+    'order cancelled', 'work order cancelled', 'purchase order cancelled',
+    'cancellation of contract', 'contract cancelled', 'termination of contract',
+    'contract terminated', 'termination of work order', 'work order terminated',
+    'rescission of', 'order rescinded', 'contract rescinded', 'order withdrawn',
+    'withdrawal of order', 'loss of order', 'order lost', 'annulment of',
 ]
 
 def _extract_value_crore(text: str):
@@ -6727,6 +7044,8 @@ def tag_order_size(rows: list) -> list:
     for r in rows:
         text = ((r.get('category') or '') + ' ' + (r.get('subject') or '')).lower()
         if not any(p in text for p in _ORDER_WIN_PATTERNS):
+            continue
+        if any(p in text for p in _ORDER_CANCEL_PATTERNS):
             continue
         val = _extract_value_crore(r.get('subject') or '')
         mcap = r.get('market_cap')
@@ -7234,6 +7553,11 @@ async def main():
 
         # Step 2a: Ensure all required DB columns exist
         await ensure_db_columns(session)
+        # Step 2a-2: Ensure the best_picks table exists (AI Best Picks
+        # runs from inside run_scan on this service, not the fundamentals
+        # worker, since `processed` already has technicals+fundamentals
+        # merged here).
+        await ensure_best_picks_table(session)
         # Step 2b: Load Nifty 50 + all index histories
         await load_nifty_cache(session)
         await load_index_cache(session)
