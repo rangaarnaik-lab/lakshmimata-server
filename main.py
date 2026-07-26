@@ -2454,33 +2454,32 @@ async def load_fundamentals_batch(session: aiohttp.ClientSession, symbols: list)
         isin = isin_for(sym)
         upstox_data = await fetch_upstox_fundamentals(session, sym, isin, debug=debug) if isin else None
         if upstox_data is not None:
-            # Upstox succeeded — use it as-is. Note key-ratios doesn't
-            # include Market Cap/EPS/Debt-Equity (confirmed against real
-            # responses), so those stay None here. Falling back to
-            # Screener.in for just those 3 fields would mean scraping
-            # EVERY stock again (since they're always missing from
-            # Upstox), defeating the point of moving off scraping — so
-            # this is a deliberate trade-off, not an oversight. Getting
-            # those 3 fields from a different Upstox endpoint (company
-            # profile / balance sheet) is a reasonable follow-up.
-            #
-            # industry is a partial exception: a successful Upstox call
-            # can still come back with industry=None (its fundamentals
-            # endpoints don't reliably expose a distinct industry field
-            # separate from sector — see fetch_upstox_fundamentals). The
-            # PREVIOUS version of this function only ever called
-            # Screener as a fallback when the WHOLE Upstox call failed,
-            # so this case — Upstox succeeds, industry specifically is
-            # just empty — never actually reached Screener at all, even
-            # after Screener's scraper was updated to extract it. Now
-            # specifically backfills just that one field, keeping every
-            # other successfully-fetched Upstox value as-is.
-            if not upstox_data.get('industry'):
+            # Upstox's key-ratios endpoint NEVER returns Market Cap, EPS,
+            # or Debt-Equity (confirmed against real responses) — those
+            # three fields are always None here regardless of how
+            # successful the Upstox call was. A previous version of this
+            # function deliberately skipped the Screener.in fallback for
+            # just these 3 fields (to reduce scraping load), but since
+            # Upstox succeeds for most stocks, that meant Market Cap was
+            # blank for the MAJORITY of the scanner, not a rare edge case
+            # — confirmed via a live screenshot showing ~80% of rows with
+            # a populated P/E (from Upstox) but no Market Cap. Market Cap
+            # in particular is used throughout the app (filters, order-
+            # size tagging, Best Picks scoring), so it's worth the extra
+            # Screener.in call whenever it's the one still missing —
+            # same scraping load the app already ran before that
+            # optimization, just re-enabled for the fields Upstox can't
+            # provide at all.
+            if not upstox_data.get('industry') or upstox_data.get('market_cap') is None:
                 screener_data = await fetch_fundamentals_screener(session, sym, debug=debug)
-                if screener_data.get('industry'):
+                if screener_data.get('industry') and not upstox_data.get('industry'):
                     upstox_data['industry'] = screener_data['industry']
+                for f in ('market_cap', 'eps', 'debt_eq'):
+                    if upstox_data.get(f) is None and screener_data.get(f) is not None:
+                        upstox_data[f] = screener_data[f]
             return upstox_data
         return await fetch_fundamentals_screener(session, sym, debug=debug)
+
 
     global _fundamentals_debug_count
     # Confirmed via the error-type summary: BATCH=20 (x2 endpoints per
