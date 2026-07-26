@@ -7017,7 +7017,8 @@ def enrich_announcement_row(row: dict) -> dict:
 
 _ANN_POSITIVE_PATTERNS = [
     'award of order', 'work order', 'purchase order', 'order worth', 'order valued',
-    'bagged', 'secures order', 'secured order', 'wins order', 'won order', 'new order',
+    'bagged', 'bagging', 'receiving of order', 'receipt of order', 'receiving of contract',
+    'receipt of contract', 'secures order', 'secured order', 'wins order', 'won order', 'new order',
     'letter of intent', 'contract awarded', 'awarded a contract', 'received an order',
     'order received from', 'capacity expansion', 'commercial production', 'usfda',
     'approval received', 'patent granted', 'buyback', 'bonus issue', 'stock split',
@@ -7179,7 +7180,8 @@ async def rate_announcements_with_ai(session: aiohttp.ClientSession, rows: list)
 
 _ORDER_WIN_PATTERNS = [
     'award of order', 'work order', 'purchase order', 'order worth', 'order valued',
-    'bagged', 'secures order', 'secured order', 'wins order', 'won order', 'new order',
+    'bagged', 'bagging', 'receiving of order', 'receipt of order', 'receiving of contract',
+    'receipt of contract', 'secures order', 'secured order', 'wins order', 'won order', 'new order',
     'letter of intent', 'contract awarded', 'awarded a contract', 'received an order',
     'order received from',
 ]
