@@ -7801,9 +7801,50 @@ async def fundamentals_worker_main():
                 log.error(f"Results backfill failed: {e}")
         await asyncio.gather(
             _fundamentals_loop(session),
+            _market_cap_catchup_loop(session),
             _announcements_loop(session),
             _results_loop(session),
         )
+
+async def _market_cap_catchup_loop(session: aiohttp.ClientSession):
+    """Runs hourly, separate from the once-daily FULL fundamentals
+    refresh (_fundamentals_loop below) — re-attempts ONLY stocks still
+    missing market_cap, a much smaller and shrinking list rather than
+    the full ~2400-stock universe. Screener.in/Upstox rate-limiting
+    means a single daily attempt often isn't enough to clear the whole
+    backlog in one pass (confirmed via logs: heavy 429s/timeouts,
+    <500/1300 succeeding some cycles) — checking back hourly for just
+    the still-missing subset closes that gap faster.
+
+    Deliberately capped modest (100/hour, not higher) and kept
+    completely separate from the daily loop's cadence — the tradeoff
+    here is real: more frequent retries mean faster coverage, but also
+    more requests per hour to sites that are already rate-limiting
+    heavily under the current load. If 429s get noticeably worse after
+    this ships, lowering MAX_PER_CYCLE or CHECK_INTERVAL further is the
+    first thing to try, not reverting outright — some retry cadence is
+    still better than waiting a full day."""
+    CHECK_INTERVAL = 3600  # 1 hour
+    MAX_PER_CYCLE = 100
+    while True:
+        try:
+            headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+            url = (f"{SUPABASE_URL}/rest/v1/stock_fundamentals"
+                   f"?select=sym&market_cap=is.null&limit={MAX_PER_CYCLE}")
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as r:
+                if r.status == 200:
+                    missing = [row['sym'] for row in await r.json()]
+                else:
+                    missing = []
+                    log.warning(f"Market cap catchup: symbol query failed ({r.status})")
+            if missing:
+                log.info(f"💰 Market cap catchup: retrying {len(missing)} stocks still missing market cap…")
+                await load_fundamentals_batch(session, missing)
+            else:
+                log.info("💰 Market cap catchup: nothing missing — all caught up.")
+        except Exception as e:
+            log.error(f"Market cap catchup loop failed: {type(e).__name__}: {e}")
+        await asyncio.sleep(CHECK_INTERVAL)
 
 async def _fundamentals_loop(session: aiohttp.ClientSession):
     """Reuses fetch_upstox_fundamentals / fetch_fundamentals_screener /
