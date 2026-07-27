@@ -7929,7 +7929,11 @@ async def _market_cap_catchup_loop(session: aiohttp.ClientSession):
     first thing to try, not reverting outright — some retry cadence is
     still better than waiting a full day."""
     CHECK_INTERVAL = 3600  # 1 hour
-    MAX_PER_CYCLE = 100
+    MAX_PER_CYCLE = 200  # bumped from 100 given a confirmed large backlog
+                          # (1087/2411 stocks missing market cap) — if the
+                          # 📋 Fetch outcome breakdown log shows 429s
+                          # climbing noticeably after this, dial back to
+                          # 100-150 rather than push further.
     while True:
         try:
             headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
