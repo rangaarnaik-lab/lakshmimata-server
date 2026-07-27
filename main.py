@@ -2024,15 +2024,32 @@ FUNDAMENTALS_TTL = 30 * 24 * 3600  # refresh monthly (data changes quarterly; mo
 
 def scan_should_skip_fundamentals() -> bool:
     """True if the live-scan process should never fetch fundamentals
-    itself — either because SERVICE_MODE=scan (a separate fundamentals
-    worker service is running and owns this job instead), or because
-    SKIP_FUNDAMENTALS_ON_STARTUP=true (a temporary manual bypass, e.g.
-    while diagnosing something else that doesn't need fundamentals)."""
-    if os.getenv('SERVICE_MODE', '').lower() == 'scan':
-        return True
-    if os.getenv('SKIP_FUNDAMENTALS_ON_STARTUP', '').lower() == 'true':
-        return True
-    return False
+    itself. Was previously gated on SERVICE_MODE=='scan' — a mode
+    angelic-strength never actually runs with (it has no SERVICE_MODE
+    set at all), so this always returned False there and the live-scan
+    process DID do its own heavy Screener.in/Upstox fetching. That was a
+    tolerable redundancy back when the fetch list was small, but became
+    a real problem once the missing-market-cap catch-up condition (see
+    load_fundamentals_from_supabase/load_fundamentals_batch) made that
+    list balloon to 700+ stocks — confirmed via production log showing
+    the live scan blocked long enough to hit its own 900s watchdog
+    timeout and abort before ever finishing a single scan cycle.
+
+    Now that worthy-simplicity owns ALL fundamentals scraping (daily
+    full refresh + hourly market-cap-only catchup) and angelic-strength
+    has its own hourly Supabase-only sync to absorb that work for free,
+    angelic-strength doing its own scraping is pure redundancy with a
+    real cost, not a useful safety net — so this now always returns
+    True. FORCE_FUNDAMENTALS_ON_SCAN=true is an escape hatch for running
+    this as a single standalone service without the separate worker."""
+    if os.getenv('FORCE_FUNDAMENTALS_ON_SCAN', '').lower() == 'true':
+        return False
+    # worthy-simplicity (SERVICE_MODE=fundamentals) is the one process
+    # whose entire job is fetching this — never skip there, only for
+    # the live-scan process (angelic-strength, no SERVICE_MODE set).
+    if os.getenv('SERVICE_MODE', '').lower() == 'fundamentals':
+        return False
+    return True
 _fundamentals_debug_count = 0  # caps detailed per-request diagnostic logging
 _upstox_fundamentals_debug_count = 0  # caps raw-response logging for the new Upstox fundamentals API
 _upstox_shareholding_debug_count = 0  # separate budget so share-holdings isn't starved by key-ratios logging
@@ -2460,9 +2477,9 @@ async def load_fundamentals_at_startup(session: aiohttp.ClientSession):
 
     stale_or_missing = await load_fundamentals_from_supabase(session)
     if scan_should_skip_fundamentals():
-        log.info(f"⏭️  Fundamentals fetch skipped on this process (SERVICE_MODE=scan or "
-                  f"SKIP_FUNDAMENTALS_ON_STARTUP) — {len(stale_or_missing)} stocks need "
-                  f"fundamentals, handled elsewhere or later.")
+        log.info(f"⏭️  Fundamentals fetch skipped on this process (that's worthy-simplicity's "
+                  f"job now, plus the hourly Supabase-only sync) — {len(stale_or_missing)} stocks "
+                  f"need fundamentals, handled elsewhere.")
         return
     if stale_or_missing:
         log.info(f"📊 Starting background fundamentals fetch for {len(stale_or_missing)} stocks…")
@@ -6080,9 +6097,12 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
     # This call is awaited directly in the main scan flow (unlike the
     # startup fetch, which is a background task) — meaning until it
     # completes, the scan cannot reach Step 7 (Save to Supabase + R2
-    # upload) below. scan_should_skip_fundamentals() covers both
-    # SERVICE_MODE=scan (permanent — a separate worker service owns this
-    # job) and SKIP_FUNDAMENTALS_ON_STARTUP (temporary manual bypass).
+    # upload) below. THIS is what caused a confirmed 900s scan timeout in
+    # production once the missing-market-cap catch-up condition made the
+    # fetch list balloon to 700+ stocks — a single blocking call that
+    # used to be quick became slow enough to break the entire scan cycle.
+    # scan_should_skip_fundamentals() now returns True here unconditionally
+    # (worthy-simplicity owns this job full-time instead).
     if is_first_eod_today and not scan_should_skip_fundamentals():
         all_syms = [s['sym'] for s in stocks_with_hist]
         await load_fundamentals_batch(session, all_syms)
