@@ -7985,7 +7985,15 @@ async def _market_cap_catchup_loop(session: aiohttp.ClientSession):
     heavily under the current load. If 429s get noticeably worse after
     this ships, lowering MAX_PER_CYCLE or CHECK_INTERVAL further is the
     first thing to try, not reverting outright — some retry cadence is
-    still better than waiting a full day."""
+    still better than waiting a full day.
+
+    Runs ONLY while the market is closed — Screener.in/Upstox scraping
+    is heavy enough (many concurrent requests, occasional multi-second
+    stalls) that doing it during trading hours risks competing for the
+    same network/rate-limit budget as the live-scan service's own price
+    fetching, right when price freshness matters most. Checks every
+    5 min while open so it starts promptly the moment the market shuts,
+    rather than waiting for its own full hourly cadence to roll around."""
     CHECK_INTERVAL = 3600  # 1 hour
     MAX_PER_CYCLE = 200  # bumped from 100 given a confirmed large backlog
                           # (1087/2411 stocks missing market cap) — if the
@@ -7993,6 +8001,9 @@ async def _market_cap_catchup_loop(session: aiohttp.ClientSession):
                           # climbing noticeably after this, dial back to
                           # 100-150 rather than push further.
     while True:
+        if is_market_open():
+            await asyncio.sleep(300)  # check back every 5 min while open
+            continue
         try:
             headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
             url = (f"{SUPABASE_URL}/rest/v1/stock_fundamentals"
@@ -8018,13 +8029,20 @@ async def _fundamentals_loop(session: aiohttp.ClientSession):
     they already exist — nothing duplicated, this is genuinely the same
     code, just invoked from a different entry point in a different
     process. Checking once daily is already far more often than needed for
-    data that changes quarterly."""
+    data that changes quarterly.
+
+    Like _market_cap_catchup_loop, only actually fetches while the
+    market is closed — same reasoning: don't compete with the live-scan
+    service's own network/rate-limit budget during trading hours."""
     CHECK_INTERVAL = 86400  # 24 hours — fundamentals data changes quarterly at most, daily check is plenty
     table_ready = await ensure_fundamentals_table(session)
     if not table_ready:
         log.error("stock_fundamentals table unavailable — fundamentals loop cannot proceed.")
         return
     while True:
+        if is_market_open():
+            await asyncio.sleep(300)
+            continue
         try:
             stale_or_missing = await load_fundamentals_from_supabase(session)
             if stale_or_missing:
