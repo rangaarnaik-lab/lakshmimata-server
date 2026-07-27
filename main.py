@@ -5427,6 +5427,7 @@ async def load_historical_cache(session: aiohttp.ClientSession):
 # finishes — no extra fetching needed here.
 # ============================================================
 _LAST_AI_PICKS_TS = 0.0
+_zero_chg_debug_count = 0  # reset each run_scan cycle — caps zero-chg diagnostic logging
 _LAST_FUNDAMENTALS_SYNC_TS = 0.0
 _AI_PICKS_REFRESH_INTERVAL_SEC = 3600  # ranking + rationale refresh at most hourly
 _AI_PICKS_TOP_N = 30
@@ -5868,6 +5869,8 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
     start = time.time()
     now_ist = datetime.now(IST)
     log.info(f"🔄 Starting {scan_type} scan at {now_ist.strftime('%H:%M:%S IST')}")
+    global _zero_chg_debug_count
+    _zero_chg_debug_count = 0
 
     # Step 1: Fetch live prices for all stocks (bulk OHLC — 500 per call)
     # Use correct instrument keys from master map
@@ -6275,7 +6278,10 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         # whether the live-quote-first fix is actually taking effect or
         # falling back to the local cache because live_ohlc_close simply
         # isn't present in the quote for these symbols.
-        if sym == 'RRKABEL' or (chg is not None and abs(chg) > 20):
+        if sym in ('RRKABEL', 'GRSE') or (chg is not None and abs(chg) > 20) or \
+           (chg == 0 and _zero_chg_debug_count < 8):
+            if chg == 0:
+                _zero_chg_debug_count += 1
             log.info(f"  🔍 {sym} chg-calc: n={n}, dates_last3={dates_for_sym[-3:] if dates_for_sym else None}, "
                      f"today_str={today_str}, prices_last_is_today={prices_last_is_today}, "
                      f"prices_last3={prices[-3:]}, true_prev_close={true_prev_close}, "
