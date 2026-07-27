@@ -2729,6 +2729,7 @@ _R2_STOCK_FIELDS = frozenset({
     'eps_qoq','eps_yoy','sales_qoq','sales_yoy','opm_pct','opm_trend',
     'eps_growth_streak','fii_pct','fii_trend','dii_pct','dii_trend',
     'promoter_trend','peg_ratio',
+    'fundamental_score','fundamental_label',
     'rs_hist','rs_trend','rs_slope',
     'is_pp','pp_hist','pp_count_10d','pp_vol_ratio','ma10','ma50',
     'is_hy','hy_pct','volume','hy_hist',
@@ -5430,6 +5431,77 @@ _LAST_FUNDAMENTALS_SYNC_TS = 0.0
 _AI_PICKS_REFRESH_INTERVAL_SEC = 3600  # ranking + rationale refresh at most hourly
 _AI_PICKS_TOP_N = 30
 
+def compute_fundamental_score(row: dict) -> float:
+    """Pure fundamentals quality score (0-100) — deliberately separate
+    from compute_best_pick_score, which mixes in technical/momentum
+    signals. This one only looks at business quality: profitability
+    (ROE), growth (EPS/Sales QoQ+YoY), leverage (D/E), valuation
+    sanity (PEG), and ownership signals (promoter/FII/DII trend).
+    This is a QUALITY score, not a price target or fair-value estimate
+    — those need real DCF/comparable-multiple modeling this doesn't
+    attempt, and a fake-precise price number would be worse than no
+    number at all."""
+    score = 0.0
+    roe = row.get('roe')
+    if isinstance(roe, (int, float)):
+        if roe >= 20: score += 20
+        elif roe >= 15: score += 15
+        elif roe >= 10: score += 8
+        elif roe < 0: score -= 15
+
+    eps_qoq, eps_yoy = row.get('eps_qoq'), row.get('eps_yoy')
+    if isinstance(eps_qoq, (int, float)) and isinstance(eps_yoy, (int, float)):
+        if eps_qoq > 0 and eps_yoy > 0: score += 18
+        elif eps_yoy > 0: score += 8
+        elif eps_yoy < -10: score -= 12
+
+    sales_qoq, sales_yoy = row.get('sales_qoq'), row.get('sales_yoy')
+    if isinstance(sales_qoq, (int, float)) and isinstance(sales_yoy, (int, float)):
+        if sales_qoq > 0 and sales_yoy > 0: score += 14
+        elif sales_yoy > 0: score += 6
+        elif sales_yoy < -10: score -= 10
+
+    debt_eq = row.get('debt_eq')
+    if isinstance(debt_eq, (int, float)):
+        if debt_eq < 0.3: score += 12
+        elif debt_eq < 1: score += 6
+        elif debt_eq > 2: score -= 15
+        elif debt_eq > 1.5: score -= 8
+
+    opm_trend = row.get('opm_trend')
+    if opm_trend == 'increasing': score += 10
+    elif opm_trend == 'decreasing': score -= 8
+
+    promoter_trend = row.get('promoter_trend')
+    if promoter_trend == 'increasing': score += 8
+    elif promoter_trend == 'decreasing': score -= 12  # weighted heavier — a real red flag in India specifically
+
+    if row.get('fii_trend') == 'increasing' or row.get('dii_trend') == 'increasing':
+        score += 6
+
+    peg = row.get('peg_ratio')
+    if isinstance(peg, (int, float)):
+        if 0 < peg <= 1: score += 8
+        elif peg > 3: score -= 6
+
+    eps_streak = row.get('eps_growth_streak')
+    if isinstance(eps_streak, (int, float)) and eps_streak >= 3:
+        score += 4
+
+    return round(max(0.0, min(100.0, score + 50)), 1)  # centered at 50 so an all-neutral/unknown stock lands "Fair", not "Poor"
+
+
+def fundamental_score_label(score) -> str:
+    """Excellent / Good / Fair / Poor — deliberately worded as a
+    quality assessment, never as 'buy'/'sell'/'target' language."""
+    if score is None:
+        return None
+    if score >= 75: return 'Excellent'
+    if score >= 58: return 'Good'
+    if score >= 40: return 'Fair'
+    return 'Poor'
+
+
 def compute_best_pick_score(row: dict) -> float:
     """Weighted composite score (0-100) from signals already computed
     during the scan (technical) plus fundamentals_cache (fundamental) —
@@ -6444,6 +6516,14 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'last_updated':   now_ist.isoformat(),
             'scan_type':      scan_type,
         })
+
+    # Step 5.25: Fundamental quality score/label for every stock (not
+    # gated hourly like Best Picks — this is pure arithmetic on data
+    # already in `processed`, cheap to redo every cycle so it stays as
+    # fresh as everything else here).
+    for row in processed:
+        row['fundamental_score'] = compute_fundamental_score(row)
+        row['fundamental_label'] = fundamental_score_label(row['fundamental_score'])
 
     # Step 5.3: Periodic fundamentals-cache sync from Supabase — NOT a
     # rescrape, just a cheap read. This live-scan process only ever
