@@ -5426,6 +5426,7 @@ async def load_historical_cache(session: aiohttp.ClientSession):
 # finishes — no extra fetching needed here.
 # ============================================================
 _LAST_AI_PICKS_TS = 0.0
+_LAST_FUNDAMENTALS_SYNC_TS = 0.0
 _AI_PICKS_REFRESH_INTERVAL_SEC = 3600  # ranking + rationale refresh at most hourly
 _AI_PICKS_TOP_N = 30
 
@@ -6443,6 +6444,29 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'last_updated':   now_ist.isoformat(),
             'scan_type':      scan_type,
         })
+
+    # Step 5.3: Periodic fundamentals-cache sync from Supabase — NOT a
+    # rescrape, just a cheap read. This live-scan process only ever
+    # loaded fundamentals_cache from Supabase once, at its own startup
+    # (see load_fundamentals_at_startup) — without this, it would never
+    # see market_cap/PE/etc. filled in by the SEPARATE fundamentals
+    # worker service's ongoing work (daily full refresh + hourly
+    # market-cap-only catchup) unless this process also restarts. Real
+    # gap this closes: worthy-simplicity can successfully fill market
+    # cap into Supabase all day, but angelic-strength (which is what
+    # actually computes/displays it via the live-price recompute) would
+    # keep showing stale/blank values until its own next restart.
+    # load_fundamentals_from_supabase() makes no Screener.in/Upstox
+    # calls of its own, so syncing hourly costs nothing at the API
+    # level — it just keeps this process's in-memory view current.
+    global _LAST_FUNDAMENTALS_SYNC_TS
+    if time.time() - _LAST_FUNDAMENTALS_SYNC_TS > 3600:
+        try:
+            await load_fundamentals_from_supabase(session)
+            _LAST_FUNDAMENTALS_SYNC_TS = time.time()
+            log.info("  🔄 Fundamentals cache synced from Supabase")
+        except Exception as e:
+            log.warning(f"⚠️ Fundamentals cache sync failed: {e}")
 
     # Step 5.35: AI Best Picks — composite score + AI rationale for the
     # top candidates, recomputed at most once per hour (ranking doesn't
