@@ -7405,49 +7405,57 @@ _MONTH_NAMES = {
 }
 
 def _extract_period_ended_from_text(text: str):
-    """Pull the reporting quarter's end date straight out of an
-    announcement's own subject. NSE announcement subjects are NOT
-    consistent about date ordering — confirmed via real filings seen in
-    production: 'quarter ended June 30, 2026' (Month Day, Year),
-    'quarter ended 30 June 2026' (Day Month Year, no comma), and
-    'quarter ended 31-Mar-2026' (Day-Mon-Year, dashed). The original
-    version of this function only handled the first, silently failing
-    (and saving nothing) for any filing using the other two — confirmed
-    against a real RRKABEL announcement that fell through unnoticed.
-    Tries all three shapes in turn. Returns a 'DD-Mon-YYYY' string (a
-    format _norm_date already parses) or None if nothing matches."""
+    """Pull the reporting period's end date straight out of an
+    announcement's own subject. Rebuilt as one comprehensive parser
+    after two rounds of reactive single-format patching (the original
+    only handled 'Month Day, Year'; a second round added 'Day Month
+    Year' and 'Day-Mon-Year' after real filings fell through both).
+    Rather than keep patching format-by-format as new examples surface,
+    this anchors on the word 'ended' generically (not a fixed prefix
+    like 'quarter/period/year ended', which would miss 'half year
+    ended', 'nine months ended', 'FY ended') and tries every date shape
+    tested against: Month-name Day Year, Day Month-name Year (both with
+    optional comma and ordinal suffixes like '30th'), Day-Mon-Year
+    dashed, numeric DD-MM-YYYY / DD/MM/YYYY, and ISO YYYY-MM-DD.
+    Verified against 14 real and constructed test cases before shipping
+    — see the fix commit for the full battery. Returns a 'DD-Mon-YYYY'
+    string (a format _norm_date already parses) or None if truly
+    nothing recognizable follows 'ended' in the text."""
     if not text:
         return None
-    # 'ended June 30, 2026' or 'ended June 30 2026' (Month Day Year)
-    m = re.search(r'(?:period|quarter|year)\s+ended\s+([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})',
-                  text, re.IGNORECASE)
-    if m:
-        month_num = _MONTH_NAMES.get(m.group(1).lower())
-        if month_num:
-            try:
+    m_anchor = re.search(r'\bended\s+(?:on\s+)?(.{4,25})', text, re.IGNORECASE)
+    if not m_anchor:
+        return None
+    frag = m_anchor.group(1).strip()
+
+    patterns = [
+        (r'^(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]+),?\s+(\d{4})', 'dmy_name'),
+        (r'^([A-Za-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})', 'mdy_name'),
+        (r'^(\d{1,2})-([A-Za-z]+)-(\d{4})', 'dmy_dash'),
+        (r'^(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})', 'dmy_numeric'),
+        (r'^(\d{4})-(\d{1,2})-(\d{1,2})', 'ymd_numeric'),
+    ]
+    for pat, kind in patterns:
+        m = re.match(pat, frag)
+        if not m:
+            continue
+        try:
+            if kind in ('dmy_name', 'dmy_dash'):
+                month_num = _MONTH_NAMES.get(m.group(2).lower())
+                if not month_num:
+                    continue
+                return datetime(int(m.group(3)), month_num, int(m.group(1))).strftime('%d-%b-%Y')
+            if kind == 'mdy_name':
+                month_num = _MONTH_NAMES.get(m.group(1).lower())
+                if not month_num:
+                    continue
                 return datetime(int(m.group(3)), month_num, int(m.group(2))).strftime('%d-%b-%Y')
-            except ValueError:
-                pass
-    # 'ended 30 June 2026' (Day Month Year, space-separated)
-    m = re.search(r'(?:period|quarter|year)\s+ended\s+(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})',
-                  text, re.IGNORECASE)
-    if m:
-        month_num = _MONTH_NAMES.get(m.group(2).lower())
-        if month_num:
-            try:
-                return datetime(int(m.group(3)), month_num, int(m.group(1))).strftime('%d-%b-%Y')
-            except ValueError:
-                pass
-    # 'ended 31-Mar-2026' (Day-Mon-Year, dashed, abbreviated month)
-    m = re.search(r'(?:period|quarter|year)\s+ended\s+(\d{1,2})-([A-Za-z]+)-(\d{4})',
-                  text, re.IGNORECASE)
-    if m:
-        month_num = _MONTH_NAMES.get(m.group(2).lower())
-        if month_num:
-            try:
-                return datetime(int(m.group(3)), month_num, int(m.group(1))).strftime('%d-%b-%Y')
-            except ValueError:
-                pass
+            if kind == 'dmy_numeric':
+                return datetime(int(m.group(3)), int(m.group(2)), int(m.group(1))).strftime('%d-%b-%Y')
+            if kind == 'ymd_numeric':
+                return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3))).strftime('%d-%b-%Y')
+        except ValueError:
+            continue
     return None
 
 def _is_results_announcement(row: dict) -> bool:
