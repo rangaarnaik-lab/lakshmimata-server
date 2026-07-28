@@ -25,6 +25,7 @@ import asyncio
 import aiohttp
 import logging
 import boto3
+import xml.etree.ElementTree as ET
 from botocore.config import Config as BotoConfig
 from datetime import datetime, timezone, timedelta
 from typing import Optional
@@ -7500,17 +7501,155 @@ def _is_results_announcement(row: dict) -> bool:
         return False
     return any(x in text for x in _RESULTS_ANN_KEYWORDS)
 
+def _norm_date(s):
+    """NSE's two endpoints format the same date differently — the
+    results LIST feed gives 'toDate' as e.g. '31-Dec-2024' (title-case
+    month) while the per-symbol comparison endpoint gives 'to_date' as
+    e.g. '01-OCT-2024' (upper-case month). A plain string compare
+    between the two silently fails almost every time even for the exact
+    same date, which is why sales/pat/eps were coming back empty for
+    nearly every row despite the loop reporting success. Parse both
+    into a canonical YYYY-MM-DD before comparing; datetime.strptime's
+    %b is case-insensitive so this handles both cases, with a couple of
+    fallback formats in case NSE varies it further. Module-level (not
+    nested in fetch_nse_results_numbers, where this originally lived)
+    since fetch_xbrl_url_for_symbol needs it too."""
+    s = (s or '').strip()
+    if not s:
+        return ''
+    for fmt in ('%d-%b-%Y', '%d-%m-%Y', '%Y-%m-%d', '%d/%m/%Y'):
+        try:
+            return datetime.strptime(s, fmt).strftime('%Y-%m-%d')
+        except ValueError:
+            continue
+    return s.upper()  # last resort — at least case-insensitive
+
+# ── Direct XBRL parsing — a company's real filed numbers, structured,
+# available the moment the filing lands, rather than waiting on NSE's
+# separate results-comparision API to sync (confirmed via production
+# log: that sync can lag many hours behind the public announcement —
+# COFORGE's June-2026 numbers stayed unavailable there for 7+ hours
+# after the press release went public with the same figures). The
+# announcements feed only gives a hasXbrl boolean and the PDF link, not
+# the XBRL file itself — the real link lives in the results-LIST feed's
+# 'xbrl' field (see fetch_nse_financial_results), so this cross-
+# references that feed by symbol+period first.
+async def fetch_xbrl_url_for_symbol(session: aiohttp.ClientSession, symbol: str,
+                                     period_ended: str, debug: bool = False) -> str:
+    """Searches the last few days of the results-LIST feed (day-by-day
+    calls — a genuine multi-day range is confirmed broken on this
+    endpoint, see _results_loop's docstring) for this symbol+period's
+    real XBRL file URL."""
+    today = datetime.now(timezone.utc)
+    target_norm = _norm_date(period_ended)
+    for days_back in range(3):
+        day_str = (today - timedelta(days=days_back)).strftime('%d-%m-%Y')
+        rows = await fetch_nse_financial_results(session, debug=False, from_date=day_str, to_date=day_str)
+        for r in rows:
+            if (r.get('symbol') == symbol and r.get('xbrl_url')
+                    and _norm_date(r.get('period_ended') or '') == target_norm):
+                if debug:
+                    log.info(f"  📄 Found XBRL URL for {symbol} ({period_ended}): {r['xbrl_url']}")
+                return r['xbrl_url']
+        await asyncio.sleep(0.3)
+    return None
+
+# Candidate XBRL element local-names (namespace-agnostic — matched by
+# tag name only, ignoring the namespace prefix, since different filers
+# can use different taxonomy namespaces for conceptually the same
+# concept). These are best-effort guesses at standard Ind-AS/SEBI XBRL
+# taxonomy names; logged verbatim on first use so they can be
+# verified/corrected against a real filing, same pattern used for
+# every other NSE field-mapping in this file.
+_XBRL_SALES_TAGS = ['RevenueFromOperations', 'Revenue', 'TotalIncome', 'IncomeFromOperations']
+_XBRL_PAT_TAGS = ['ProfitLossForPeriod', 'ProfitLoss', 'NetProfitLoss',
+                  'ProfitLossForPeriodFromContinuingOperations']
+_XBRL_EPS_TAGS = ['BasicEarningsLossPerShareFromContinuingAndDiscontinuedOperations',
+                  'BasicEarningsPerShare', 'BasicEPS']
+
+async def fetch_and_parse_xbrl(session: aiohttp.ClientSession, url: str, debug: bool = False) -> dict:
+    """Downloads and parses an NSE XBRL filing directly — structured
+    XML, no AI/PDF-OCR needed. Matches purely on local element name,
+    ignoring namespace, for robustness across different filer
+    taxonomies. Logs every distinct tag name found on debug calls so
+    the candidate lists above can be corrected against reality."""
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
+            if r.status != 200:
+                if debug:
+                    log.info(f"  📄 XBRL fetch failed: status {r.status} for {url}")
+                return {}
+            content = await r.read()
+    except Exception as e:
+        if debug:
+            log.info(f"  📄 XBRL fetch exception: {type(e).__name__}: {e}")
+        return {}
+
+    try:
+        root = ET.fromstring(content)
+    except Exception as e:
+        if debug:
+            log.info(f"  📄 XBRL parse exception: {type(e).__name__}: {e}")
+        return {}
+
+    def local_name(tag):
+        return tag.split('}')[-1] if '}' in tag else tag
+
+    all_tags = {}
+    for el in root.iter():
+        name = local_name(el.tag)
+        text = (el.text or '').strip()
+        if text:
+            all_tags.setdefault(name, []).append(text)
+
+    if debug:
+        sample = {k: v[0] for k, v in list(all_tags.items())[:40]}
+        log.info(f"  📄 XBRL tags found ({len(all_tags)} distinct): {json.dumps(sample)[:1500]}")
+
+    def first_matching(candidates):
+        for c in candidates:
+            if c in all_tags and all_tags[c]:
+                try:
+                    return float(all_tags[c][0].replace(',', ''))
+                except ValueError:
+                    continue
+        return None
+
+    sales, pat, eps = first_matching(_XBRL_SALES_TAGS), first_matching(_XBRL_PAT_TAGS), first_matching(_XBRL_EPS_TAGS)
+    # XBRL reports raw currency units (INR), not crore — divide by 1e7
+    # to match the rest of the app's crore-based fields. EPS is already
+    # a per-share rupee value, no scaling needed.
+    result = {}
+    if sales is not None:
+        result['sales'] = round(sales / 1e7, 2)
+    if pat is not None:
+        result['pat'] = round(pat / 1e7, 2)
+    if eps is not None:
+        result['eps'] = round(eps, 2)
+    return result
+
 async def fetch_and_save_result_for_announcement(session: aiohttp.ClientSession, headers: dict,
                                                   row: dict, debug: bool = False) -> bool:
     """Given ONE results-type announcement, fetch that stock's numbers
-    from NSE's per-symbol results-comparision endpoint and save them.
-    Returns False (and saves nothing) if the period can't be parsed out
-    of the subject text — better to skip than guess wrong."""
+    and save them. Tries direct XBRL parsing FIRST (available
+    immediately when filed, structured, no sync lag) — only falls back
+    to the results-comparision endpoint (confirmed to lag NSE's own
+    public announcements by hours in some cases) if no XBRL is found or
+    parsing yields nothing useful. Returns False (and saves nothing) if
+    the period can't be parsed out of the subject text at all — better
+    to skip than guess wrong."""
     period_ended = _extract_period_ended_from_text(row.get('subject') or '')
     symbol = row.get('symbol')
     if not period_ended or not symbol:
         return False
-    nums = await fetch_nse_results_numbers(session, headers, symbol, period_ended, debug=debug)
+
+    nums = {}
+    xbrl_url = await fetch_xbrl_url_for_symbol(session, symbol, period_ended, debug=debug)
+    if xbrl_url:
+        nums = await fetch_and_parse_xbrl(session, xbrl_url, debug=debug)
+    if not nums:
+        nums = await fetch_nse_results_numbers(session, headers, symbol, period_ended, debug=debug)
+
     result_row = {
         'symbol': symbol,
         'period_ended': period_ended,
@@ -7732,6 +7871,10 @@ async def fetch_nse_financial_results(session: aiohttp.ClientSession, debug: boo
             'filed_at': _nse_local_to_utc_iso(item.get('broadCastDate') or item.get('filingDate')
                          or item.get('exchdisstime') or item.get('creation_Date')),
             'attachment_url': item.get('xbrl') or item.get('attchmntFile') or item.get('fileName'),
+            'xbrl_url': item.get('xbrl'),  # None unless NSE actually has a real XBRL file for
+                                            # this filing — kept separate from attachment_url's
+                                            # PDF fallback so the XBRL-first parsing path below
+                                            # can tell "no XBRL" apart from "has a PDF instead".
         })
     return results
 
@@ -7772,27 +7915,6 @@ async def fetch_nse_results_numbers(session: aiohttp.ClientSession, headers: dic
             except (ValueError, TypeError):
                 continue
         return None
-
-    def _norm_date(s):
-        """NSE's two endpoints format the same date differently — the
-        results LIST feed gives 'toDate' as e.g. '31-Dec-2024' (title-case
-        month) while this per-symbol endpoint gives 'to_date' as e.g.
-        '01-OCT-2024' (upper-case month). A plain string compare between
-        the two silently fails almost every time even for the exact same
-        date, which is why sales/pat/eps were coming back empty for
-        nearly every row despite the loop reporting success. Parse both
-        into a canonical YYYY-MM-DD before comparing; datetime.strptime's
-        %b is case-insensitive so this handles both cases, with a couple
-        of fallback formats in case NSE varies it further."""
-        s = (s or '').strip()
-        if not s:
-            return ''
-        for fmt in ('%d-%b-%Y', '%d-%m-%Y', '%Y-%m-%d', '%d/%m/%Y'):
-            try:
-                return datetime.strptime(s, fmt).strftime('%Y-%m-%d')
-            except ValueError:
-                continue
-        return s.upper()  # last resort — at least case-insensitive
 
     target_period = _norm_date(period_ended)
     available_periods = []
