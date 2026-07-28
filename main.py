@@ -7420,6 +7420,13 @@ def _dedupe_by_key(rows: list, keys: tuple) -> list:
 # 30, 2026"), and the announcements feed itself has been reliable all
 # session, so use it as the trigger and only call the per-symbol
 # numbers endpoint (which was never the broken part) directly.
+_results_attempt_times = {}  # (symbol, period_ended) -> unix timestamp of last attempt,
+                              # shared between this announcement-driven trigger and
+                              # _results_loop below so neither re-attempts a fetch the
+                              # other just tried. Confirmed necessary via production log:
+                              # without it, a still-unpublished quarter's numbers get
+                              # re-requested every single 5-min cycle indefinitely.
+_RESULTS_ATTEMPT_COOLDOWN_SEC = 1800  # 30 min between retries of the same (symbol, period)
 _RESULTS_ANN_KEYWORDS = ['financial result', 'quarterly result', 'results for the quarter',
                          'unaudited results', 'audited results']
 _RESULTS_ANN_EXCLUDE = ['newspaper publication', 'newspaper advertisement', 'transcript']
@@ -7547,19 +7554,40 @@ async def enrich_and_save_announcements(session: aiohttp.ClientSession, rows: li
     # during results-season bursts (a single day can have 600+
     # announcements, only a handful of which are results filings, but
     # worth a ceiling regardless).
+    #
+    # Cooldown check: confirmed via production log that without this,
+    # the SAME (symbol, period) gets re-attempted every single 5-min
+    # cycle for as long as the announcement stays in the 'recent' window
+    # — one case ran 18+ identical attempts over 3 hours, all returning
+    # the same stale prior-quarter data because NSE simply hadn't
+    # published that specific quarter's numbers yet. Not a bug in the
+    # fetch itself, just missing backoff. _results_attempt_times is
+    # shared with _results_loop below so neither path duplicates the
+    # other's work.
     results_rows = [r for r in enriched if _is_results_announcement(r)]
     if results_rows:
         headers = random.choice(_NSE_ANNOUNCEMENTS_HEADER_SETS)
         filled = 0
-        for i, r in enumerate(results_rows[:20]):
+        attempted = 0
+        now_ts = time.time()
+        for r in results_rows:
+            period_ended = _extract_period_ended_from_text(r.get('subject') or '')
+            key = (r.get('symbol'), period_ended)
+            if period_ended and now_ts - _results_attempt_times.get(key, 0) < _RESULTS_ATTEMPT_COOLDOWN_SEC:
+                continue
+            if attempted >= 20:
+                break
             try:
-                if await fetch_and_save_result_for_announcement(session, headers, r, debug=(i < 2)):
+                _results_attempt_times[key] = now_ts
+                if await fetch_and_save_result_for_announcement(session, headers, r, debug=(attempted < 2)):
                     filled += 1
             except Exception as e:
                 log.warning(f"⚠️ Results-from-announcement fetch failed for {r.get('symbol')}: {e}")
+            attempted += 1
             await asyncio.sleep(1.2)
-        log.info(f"  📊 Results-from-announcement: {filled}/{min(len(results_rows),20)} numbers filled "
-                 f"({len(results_rows)} results-type announcement(s) this batch)")
+        log.info(f"  📊 Results-from-announcement: {filled}/{attempted} numbers filled "
+                 f"({len(results_rows)} results-type announcement(s) this batch, "
+                 f"{len(results_rows)-attempted} skipped via cooldown)")
 
 async def fetch_nse_announcements_for_range(session: aiohttp.ClientSession, from_date: str,
                                              to_date: str, debug: bool = False) -> list:
@@ -7844,7 +7872,6 @@ async def _results_loop(session: aiohttp.ClientSession):
     range call."""
     CHECK_INTERVAL = 30 * 60
     cycle = 0
-    fetched_numbers = set()  # (symbol, period_ended) already number-fetched this process
     while True:
         try:
             debug = cycle < 3
@@ -7863,15 +7890,21 @@ async def _results_loop(session: aiohttp.ClientSession):
                 # The list feed has no numbers — fill them from the
                 # per-symbol comparison endpoint, capped per cycle and
                 # paced with sleeps so a results-season burst doesn't
-                # turn into a request storm at NSE.
+                # turn into a request storm at NSE. Shares
+                # _results_attempt_times with the announcement-driven
+                # trigger above — same cooldown reasoning, see its
+                # comment for the production evidence.
                 headers = random.choice(_NSE_ANNOUNCEMENTS_HEADER_SETS)
-                to_fill = [r for r in rows if (r['symbol'], r['period_ended']) not in fetched_numbers][:25]
+                now_ts = time.time()
+                to_fill = [r for r in rows
+                          if now_ts - _results_attempt_times.get((r['symbol'], r['period_ended']), 0)
+                             >= _RESULTS_ATTEMPT_COOLDOWN_SEC][:25]
                 for i, r in enumerate(to_fill):
+                    _results_attempt_times[(r['symbol'], r['period_ended'])] = now_ts
                     nums = await fetch_nse_results_numbers(
                         session, headers, r['symbol'], r['period_ended'], debug=(debug and i < 2))
                     if nums:
                         r.update({k: v for k, v in nums.items() if v is not None})
-                    fetched_numbers.add((r['symbol'], r['period_ended']))
                     await asyncio.sleep(1.5)
                 await save_financial_results_to_db(session, rows)
             cycle += 1
