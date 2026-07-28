@@ -4434,6 +4434,12 @@ async def backfill_stock_history_30days(session: aiohttp.ClientSession, target_d
     # skipped as "done" on the next restart instead of resuming. Queries
     # the available_history_dates view (distinct dates already) rather
     # than fetching every stock_history row just to dedupe client-side.
+    # NOTE: no early skip based on raw count here anymore — a count alone
+    # can't tell us WHICH specific day(s) are missing (confirmed: July 27
+    # went missing while the aggregate count still looked "close enough"
+    # to satisfy the old threshold). distinct_dates is kept and compared
+    # against the real reference date list further down, once stock_data
+    # is loaded, for a precise per-day check instead.
     try:
         async with session.get(
             f"{SUPABASE_URL}/rest/v1/available_history_dates?select=snapshot_date",
@@ -4448,12 +4454,8 @@ async def backfill_stock_history_30days(session: aiohttp.ClientSession, target_d
                 for row in await r.json():
                     if row.get('snapshot_date'):
                         distinct_dates.add(row['snapshot_date'])
-            if len(distinct_dates) >= target_days - 2:  # small buffer for holidays etc
-                log.info(f"  stock_history already has {len(distinct_dates)} distinct trading days "
-                         f"(target {target_days}) — skipping backfill")
-                return
-            log.info(f"  stock_history has {len(distinct_dates)}/{target_days} distinct days so far — "
-                     f"running backfill (re-upserting existing days is harmless, on_conflict handles it)")
+            log.info(f"  stock_history has {len(distinct_dates)} distinct days on record — "
+                     f"checking for specific gaps in the last {target_days} trading days...")
     except Exception as e:
         log.warning(f"stock_history backfill guard check failed: {e}")
         return
@@ -4548,16 +4550,29 @@ async def backfill_stock_history_30days(session: aiohttp.ClientSession, target_d
     sym_to_sector = {sym: get_sector(sym) for sym in stock_data}
 
     # Use whichever stock has the most days as the calendar reference —
-    # take its last `target_days` dates as the trading days to backfill.
+    # take its last `target_days` dates as the trading days to consider.
     ref_sym = max(stock_data, key=lambda s: len(stock_data[s]['dates']))
     ref_dates = stock_data[ref_sym]['dates']
     total_days = len(ref_dates)
-    backfill_indices = list(range(max(0, total_days - target_days), total_days))
+    candidate_indices = list(range(max(0, total_days - target_days), total_days))
+    # Only reconstruct dates NOT already in stock_history — `distinct_dates`
+    # was already fetched above for the skip-guard, reused here so this
+    # is self-healing on every run instead of redoing the whole window
+    # every time (confirmed wasteful: forcing target_days 30->35 to patch
+    # one missing day meant re-upserting ~35 days x ~2400 stocks just to
+    # fix a single day's gap). A restart from here on will automatically
+    # find and fill whatever specific day(s) are missing, no manual
+    # target_days bump needed.
+    backfill_indices = [i for i in candidate_indices if ref_dates[i] not in distinct_dates]
+    if not backfill_indices:
+        log.info(f"  stock_history: all {len(candidate_indices)} recent trading days already present, nothing to backfill")
+        return
     backfill_indices.reverse()  # most recent day first — if this times out
     # partway through, the recent (more useful) days are the ones that
     # actually get saved, not the oldest ones.
-    log.info(f"  Reconstructing {len(backfill_indices)} trading days across {len(stock_data)} stocks "
-             f"(newest first: index {backfill_indices[0]} down to {backfill_indices[-1]} of {total_days})...")
+    log.info(f"  Reconstructing {len(backfill_indices)} missing trading day(s) (of {len(candidate_indices)} "
+             f"in the last {target_days}) across {len(stock_data)} stocks: "
+             f"{[ref_dates[i] for i in backfill_indices]}")
 
     days_saved = 0
     for day_idx in backfill_indices:
@@ -7144,7 +7159,7 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         # skip") and self-healing on an abnormal one — no manual restart
         # ever needed again for this class of issue.
         try:
-            await asyncio.wait_for(backfill_stock_history_30days(session, target_days=35), timeout=1500)
+            await asyncio.wait_for(backfill_stock_history_30days(session), timeout=1500)
         except Exception as e:
             log.warning(f"Daily stock_history backfill retry error (non-fatal): {e}")
         try:
@@ -8407,7 +8422,7 @@ async def main():
             log.warning(f"EMA breadth backfill error (non-fatal): {e}")
 
         try:
-            await asyncio.wait_for(backfill_stock_history_30days(session, target_days=35), timeout=1500)
+            await asyncio.wait_for(backfill_stock_history_30days(session), timeout=1500)
         except asyncio.TimeoutError:
             log.error("⏱ stock_history 30-day backfill exceeded 25 min — it should resume/skip completed "
                       "days on next restart rather than starting over, since the guard checks total row count.")
