@@ -4528,6 +4528,17 @@ async def backfill_stock_history_30days(session: aiohttp.ClientSession, target_d
                 'highs': highs if len(highs) == len(dates) else prices,
                 'lows':  lows  if len(lows)  == len(dates) else prices,
                 'raw_rs_series': raw_rs_series,
+                # Maps calendar date -> this stock's OWN index for that
+                # date, used below instead of a shared numeric position
+                # across all stocks. Confirmed necessary: 2,389/2,415
+                # stocks genuinely had 2026-07-27 in their own `dates`
+                # array, but the old shared-index approach (assuming
+                # every stock's array is identically aligned/gap-free)
+                # only produced 498 rows for that day — most stocks'
+                # OWN array position for that date didn't match the
+                # reference stock's position for the same date, so they
+                # were silently skipped or matched to the wrong day.
+                'date_to_idx': {dt: i for i, dt in enumerate(dates)},
             }
 
         if len(page) < PAGE:
@@ -4579,10 +4590,9 @@ async def backfill_stock_history_30days(session: aiohttp.ClientSession, target_d
         snapshot_date = ref_dates[day_idx]
         day_rows = []
         for sym, d in stock_data.items():
-            n = len(d['dates'])
-            if day_idx >= n:
-                continue  # this stock doesn't have data that far back
-            idx = day_idx
+            idx = d['date_to_idx'].get(snapshot_date)
+            if idx is None:
+                continue  # this stock's own history genuinely doesn't have this date
             prices_upto  = d['prices'][:idx+1]
             volumes_upto = d['volumes'][:idx+1]
             highs_upto   = d['highs'][:idx+1]
