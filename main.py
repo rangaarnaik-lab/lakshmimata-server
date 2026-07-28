@@ -4446,7 +4446,18 @@ async def backfill_stock_history_30days(session: aiohttp.ClientSession, target_d
     try:
         cutoff_date = (datetime.now(IST) - timedelta(days=target_days + 5)).strftime('%Y-%m-%d')
         offset = 0
-        PAGE_SZ = 10000
+        PAGE_SZ = 1000  # Supabase/PostgREST caps responses at 1000 rows by
+                         # default REGARDLESS of what a larger Range header
+                         # requests — the previous version assumed getting
+                         # fewer than the requested size meant "last page,"
+                         # which is wrong when the server silently caps
+                         # below that. Confirmed via production log: only
+                         # 1000 rows ever got fetched total (one page),
+                         # missing ~71000 of the real ~72000 rows, which
+                         # made date_counts nearly empty and caused EVERY
+                         # day to look incomplete. Now advances by the
+                         # ACTUAL number of rows received each call and
+                         # only stops on a genuinely empty page.
         while True:
             async with session.get(
                 f"{SUPABASE_URL}/rest/v1/stock_history?select=snapshot_date&snapshot_date=gte.{cutoff_date}",
@@ -4460,15 +4471,18 @@ async def backfill_stock_history_30days(session: aiohttp.ClientSession, target_d
                     log.warning(f"stock_history backfill guard check failed: status {r.status}")
                     return
                 page = await r.json()
+            if not page:
+                break
             for row in page:
                 dt = row.get('snapshot_date')
                 if dt:
                     date_counts[dt] = date_counts.get(dt, 0) + 1
+            offset += len(page)
             if len(page) < PAGE_SZ:
-                break
-            offset += PAGE_SZ
+                break  # a real short page — genuinely no more rows
         log.info(f"  stock_history has {len(date_counts)} distinct days on record in the recent window "
-                 f"(row counts range {min(date_counts.values()) if date_counts else 0}-"
+                 f"({offset} total rows fetched; per-day counts range "
+                 f"{min(date_counts.values()) if date_counts else 0}-"
                  f"{max(date_counts.values()) if date_counts else 0}) — checking for gaps/incomplete "
                  f"days in the last {target_days} trading days...")
     except Exception as e:
