@@ -7795,10 +7795,13 @@ async def fetch_nse_results_numbers(session: aiohttp.ClientSession, headers: dic
         return s.upper()  # last resort — at least case-insensitive
 
     target_period = _norm_date(period_ended)
+    available_periods = []
     for item in items:
         if not isinstance(item, dict):
             continue
         p = str(item.get('to_date') or item.get('toDate') or item.get('qe_Date') or '').strip()
+        if p:
+            available_periods.append(p)
         if p and target_period and _norm_date(p) != target_period:
             continue
         # Verified from raw response (VIDEOIND, 25-Jul log): fields are
@@ -7816,6 +7819,16 @@ async def fetch_nse_results_numbers(session: aiohttp.ClientSession, headers: dic
             'eps': _num(item, 're_basic_eps', 're_basic_eps_for_cont_dic_opr', 'eps',
                         'basicEPS', 're_dil_eps', 'diluted_eps'),
         }
+    if debug:
+        # No match found across the WHOLE array, not just item[0] — this
+        # is the answer to "is it really not published yet, or did we
+        # just miss it": if target_period genuinely isn't among
+        # available_periods, NSE hasn't published this quarter's
+        # comparison data yet. If it IS in the list but still didn't
+        # match, that's a real bug in the date-normalization worth
+        # revisiting, not a data-availability issue.
+        log.info(f"  🔍 results-comparision {symbol}: no match for target={target_period} "
+                 f"among {len(items)} item(s), available periods={sorted(set(available_periods))}")
     return {}
 
 async def save_financial_results_to_db(session: aiohttp.ClientSession, rows: list):
