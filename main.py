@@ -4434,28 +4434,43 @@ async def backfill_stock_history_30days(session: aiohttp.ClientSession, target_d
     # skipped as "done" on the next restart instead of resuming. Queries
     # the available_history_dates view (distinct dates already) rather
     # than fetching every stock_history row just to dedupe client-side.
-    # NOTE: no early skip based on raw count here anymore — a count alone
-    # can't tell us WHICH specific day(s) are missing (confirmed: July 27
-    # went missing while the aggregate count still looked "close enough"
-    # to satisfy the old threshold). distinct_dates is kept and compared
-    # against the real reference date list further down, once stock_data
-    # is loaded, for a precise per-day check instead.
+    # NOTE: checks per-date ROW COUNTS, not just distinct presence — a
+    # date with SOME rows already (e.g. 498 of ~2400 stocks, from the
+    # index-alignment bug fixed alongside this) would otherwise look
+    # "already present" and get silently skipped forever, never actually
+    # getting completed. Queries stock_history directly (not the
+    # available_history_dates view, which only exposes distinct dates,
+    # not counts) for a recent window, counting occurrences per date
+    # client-side.
+    date_counts = {}
     try:
-        async with session.get(
-            f"{SUPABASE_URL}/rest/v1/available_history_dates?select=snapshot_date",
-            headers=headers,
-            timeout=aiohttp.ClientTimeout(total=15)
-        ) as r:
-            if r.status == 400:
-                log.error("❌ available_history_dates view missing! Check Supabase.")
-                return
-            distinct_dates = set()
-            if r.status in (200, 206):
-                for row in await r.json():
-                    if row.get('snapshot_date'):
-                        distinct_dates.add(row['snapshot_date'])
-            log.info(f"  stock_history has {len(distinct_dates)} distinct days on record — "
-                     f"checking for specific gaps in the last {target_days} trading days...")
+        cutoff_date = (datetime.now(IST) - timedelta(days=target_days + 5)).strftime('%Y-%m-%d')
+        offset = 0
+        PAGE_SZ = 10000
+        while True:
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/stock_history?select=snapshot_date&snapshot_date=gte.{cutoff_date}",
+                headers={**headers, "Range": f"{offset}-{offset+PAGE_SZ-1}"},
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as r:
+                if r.status == 400:
+                    log.error("❌ stock_history table/query issue! Check Supabase.")
+                    return
+                if r.status not in (200, 206):
+                    log.warning(f"stock_history backfill guard check failed: status {r.status}")
+                    return
+                page = await r.json()
+            for row in page:
+                dt = row.get('snapshot_date')
+                if dt:
+                    date_counts[dt] = date_counts.get(dt, 0) + 1
+            if len(page) < PAGE_SZ:
+                break
+            offset += PAGE_SZ
+        log.info(f"  stock_history has {len(date_counts)} distinct days on record in the recent window "
+                 f"(row counts range {min(date_counts.values()) if date_counts else 0}-"
+                 f"{max(date_counts.values()) if date_counts else 0}) — checking for gaps/incomplete "
+                 f"days in the last {target_days} trading days...")
     except Exception as e:
         log.warning(f"stock_history backfill guard check failed: {e}")
         return
@@ -4566,23 +4581,29 @@ async def backfill_stock_history_30days(session: aiohttp.ClientSession, target_d
     ref_dates = stock_data[ref_sym]['dates']
     total_days = len(ref_dates)
     candidate_indices = list(range(max(0, total_days - target_days), total_days))
-    # Only reconstruct dates NOT already in stock_history — `distinct_dates`
-    # was already fetched above for the skip-guard, reused here so this
-    # is self-healing on every run instead of redoing the whole window
-    # every time (confirmed wasteful: forcing target_days 30->35 to patch
-    # one missing day meant re-upserting ~35 days x ~2400 stocks just to
-    # fix a single day's gap). A restart from here on will automatically
-    # find and fill whatever specific day(s) are missing, no manual
-    # target_days bump needed.
-    backfill_indices = [i for i in candidate_indices if ref_dates[i] not in distinct_dates]
+    # Reconstruct any date that's either fully missing OR only partially
+    # populated — checked via actual row count vs how many stocks we
+    # have data for now, not just binary presence. Confirmed necessary:
+    # after fixing the index-alignment bug alone, July 27 still had
+    # exactly 498 rows and the count DIDN'T change on the next run,
+    # because a binary "is this date in stock_history at all" check
+    # saw 498 existing rows and considered the date already done,
+    # skipping it forever instead of ever completing the remaining
+    # ~1900 stocks. 90% threshold leaves room for stocks that
+    # legitimately don't have data that far back (newly listed, etc.)
+    # without being fooled by a large-but-incomplete day.
+    completeness_threshold = len(stock_data) * 0.9
+    backfill_indices = [i for i in candidate_indices
+                        if date_counts.get(ref_dates[i], 0) < completeness_threshold]
     if not backfill_indices:
-        log.info(f"  stock_history: all {len(candidate_indices)} recent trading days already present, nothing to backfill")
+        log.info(f"  stock_history: all {len(candidate_indices)} recent trading days already "
+                 f"sufficiently complete (>=90% of {len(stock_data)} stocks), nothing to backfill")
         return
     backfill_indices.reverse()  # most recent day first — if this times out
     # partway through, the recent (more useful) days are the ones that
     # actually get saved, not the oldest ones.
-    log.info(f"  Reconstructing {len(backfill_indices)} missing trading day(s) (of {len(candidate_indices)} "
-             f"in the last {target_days}) across {len(stock_data)} stocks: "
+    log.info(f"  Reconstructing {len(backfill_indices)} missing/incomplete trading day(s) (of "
+             f"{len(candidate_indices)} in the last {target_days}) across {len(stock_data)} stocks: "
              f"{[ref_dates[i] for i in backfill_indices]}")
 
     days_saved = 0
