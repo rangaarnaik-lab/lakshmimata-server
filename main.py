@@ -4415,6 +4415,15 @@ async def backfill_stock_history_30days(session: aiohttp.ClientSession, target_d
 
     Self-guards to skip if stock_history already has enough recent rows
     (checked via a distinct-date count within the target window).
+
+    target_days temporarily bumped 30->35 (both call sites) to force a
+    fresh backfill pass after confirming 2026-07-27 was missing entirely
+    (0 rows) despite the aggregate distinct-date count already being
+    high enough to satisfy the old guard threshold — a single missing
+    day among ~30 mostly-present ones doesn't necessarily drop the total
+    below that threshold, so a plain restart wouldn't have re-triggered
+    this on its own. Safe to run again even for already-correct days —
+    upserts, doesn't duplicate.
     """
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
 
@@ -7135,7 +7144,7 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         # skip") and self-healing on an abnormal one — no manual restart
         # ever needed again for this class of issue.
         try:
-            await asyncio.wait_for(backfill_stock_history_30days(session), timeout=1500)
+            await asyncio.wait_for(backfill_stock_history_30days(session, target_days=35), timeout=1500)
         except Exception as e:
             log.warning(f"Daily stock_history backfill retry error (non-fatal): {e}")
         try:
@@ -8398,7 +8407,7 @@ async def main():
             log.warning(f"EMA breadth backfill error (non-fatal): {e}")
 
         try:
-            await asyncio.wait_for(backfill_stock_history_30days(session), timeout=1500)
+            await asyncio.wait_for(backfill_stock_history_30days(session, target_days=35), timeout=1500)
         except asyncio.TimeoutError:
             log.error("⏱ stock_history 30-day backfill exceeded 25 min — it should resume/skip completed "
                       "days on next restart rather than starting over, since the guard checks total row count.")
