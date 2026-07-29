@@ -7611,16 +7611,27 @@ async def fetch_xbrl_url_for_symbol(session: aiohttp.ClientSession, symbol: str,
     real XBRL file URL."""
     today = datetime.now(timezone.utc)
     target_norm = _norm_date(period_ended)
+    any_symbol_match = False
     for days_back in range(3):
         day_str = (today - timedelta(days=days_back)).strftime('%d-%m-%Y')
         rows = await fetch_nse_financial_results(session, debug=False, from_date=day_str, to_date=day_str)
         for r in rows:
-            if (r.get('symbol') == symbol and r.get('xbrl_url')
-                    and _norm_date(r.get('period_ended') or '') == target_norm):
+            if r.get('symbol') != symbol:
+                continue
+            any_symbol_match = True
+            if debug:
+                log.info(f"  📄 {symbol} found in results-list feed ({day_str}): "
+                         f"xbrl_url={'yes' if r.get('xbrl_url') else 'NONE'}, "
+                         f"period_ended={r.get('period_ended')!r} (norm={_norm_date(r.get('period_ended') or '')!r}) "
+                         f"vs target={period_ended!r} (norm={target_norm!r})")
+            if r.get('xbrl_url') and _norm_date(r.get('period_ended') or '') == target_norm:
                 if debug:
                     log.info(f"  📄 Found XBRL URL for {symbol} ({period_ended}): {r['xbrl_url']}")
                 return r['xbrl_url']
         await asyncio.sleep(0.3)
+    if debug and not any_symbol_match:
+        log.info(f"  📄 {symbol} not found in results-list feed at all across the last 3 days — "
+                 f"either it hasn't synced there yet, or this filing type isn't in that feed.")
     return None
 
 # Candidate XBRL element local-names (namespace-agnostic — matched by
