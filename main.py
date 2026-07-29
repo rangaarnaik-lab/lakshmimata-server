@@ -7053,7 +7053,22 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
 
         history_rows = []
         for p in processed:
-            row = {k: v for k, v in p.items() if k not in ('last_updated', 'scan_type')}
+            # Exclude fields added to `processed` AFTER stock_history's
+            # schema was created (best_pick_score/fundamental_score/
+            # fundamental_label, from the AI Best Picks and Fundamental
+            # Rating features) — confirmed via production log that their
+            # presence here breaks the ENTIRE upsert (PostgREST rejects
+            # the whole batch if even one column doesn't exist in the
+            # target table), silently failing today's EOD archive
+            # (0/2380 rows) even though everything else about the scan
+            # succeeded. These are daily-recomputed "current state"
+            # outputs, not core historical data worth preserving anyway
+            # — simplest fix is excluding them here rather than growing
+            # stock_history's schema every time a new field is added to
+            # the live scanner.
+            row = {k: v for k, v in p.items()
+                   if k not in ('last_updated', 'scan_type', 'best_pick_score',
+                                'fundamental_score', 'fundamental_label')}
             row['snapshot_date'] = snapshot_date
             history_rows.append(row)
         await supabase_upsert(session, 'stock_history', history_rows, on_conflict='snapshot_date,sym')
