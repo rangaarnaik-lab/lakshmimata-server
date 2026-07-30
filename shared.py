@@ -1318,7 +1318,7 @@ def is_market_open() -> bool:
 async def load_fundamentals_batch(session: aiohttp.ClientSession, symbols: list):
     """Fetch fundamentals for a batch of symbols, respecting TTL cache."""
     global _fetch_error_counts
-    _fetch_error_counts = {}  # reset so this run's summary isn't polluted by a previous run's counts
+    _fetch_error_counts.clear()  # in-place (not reassignment) so cross-file readers via 'from shared import *' see the reset too
     now = time.time()
     DATA_FIELDS = ('market_cap', 'pe', 'roe', 'eps', 'debt_eq', 'promoter',
                    'eps_qoq', 'eps_yoy', 'sales_qoq', 'sales_yoy', 'opm_pct',
@@ -1611,7 +1611,7 @@ async def load_instrument_master(session: aiohttp.ClientSession):
 
                 # Update ALL_STOCKS to only include stocks we have keys for
                 if len(instrument_key_map) > 100:
-                    ALL_STOCKS = list(instrument_key_map.keys())
+                    ALL_STOCKS[:] = list(instrument_key_map.keys())  # in-place: from-import-* copies in live_scan.py/fundamentals_worker.py only see mutations, not reassignments
                     log.info(f"📊 Updated stock list: {len(ALL_STOCKS)} stocks")
                 return True
     except Exception as e:
@@ -1633,7 +1633,7 @@ async def load_instrument_master(session: aiohttp.ClientSession):
                             instrument_key_map[sym] = key
                 log.info(f"✅ CSV master loaded: {len(instrument_key_map)} EQ+ETF instruments")
                 if len(instrument_key_map) > 100:
-                    ALL_STOCKS = list(instrument_key_map.keys())
+                    ALL_STOCKS[:] = list(instrument_key_map.keys())  # in-place: from-import-* copies in live_scan.py/fundamentals_worker.py only see mutations, not reassignments
                 return True
     except Exception as e:
         log.warning(f"CSV master also failed: {e} — using symbol-based keys")
