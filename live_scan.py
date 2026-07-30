@@ -29,43 +29,6 @@ def _r2_put_object_sync(key: str, body: bytes, content_type: str, cache_seconds:
         CacheControl=f'public, max-age={cache_seconds}',
     )
 
-# Exact set of fields the frontend's transformStockRow() actually reads
-# (src/lib/db.js) — cross-referenced directly from that function's body,
-# not guessed. The R2 snapshot was coming out ~5.5x larger than the
-# equivalent Supabase read (6.05MB vs ~1.1MB) because it was uploading
-# each stock's full internal `processed` dict as-is, including fields
-# the frontend never touches. R2's cost is $0 regardless of size, but a
-# smaller file still means a faster first-load for every user each time
-# the CDN cache needs refreshing.
-_R2_STOCK_FIELDS = frozenset({
-    'sym','rs','rs_tv','rs_nifty50','rs_midcap','rs_smallcap','rs_microcap','rs_sector',
-    'last_price','chg_pct','high_52w','sector','industry','chg_w_pct','chg_m_pct',
-    'in_nifty50','in_midcap','in_smallcap','in_microcap','rvol','ibv_signal',
-    'is_resistance_breakout','is_52wh_breakout','resistance_r1',
-    'is_cup_handle_breakout','has_cup_pattern','cup_depth_pct',
-    'is_guppy_bullish_crossover','is_guppy_bearish_crossover','is_guppy_compressed',
-    'vol_signal','rs_line_new_high','rs_line_trend','rs_line_value','is_s2_new_entry',
-    'market_cap','pe','roe','eps','debt_eq','promoter',
-    'eps_qoq','eps_yoy','sales_qoq','sales_yoy','opm_pct','opm_trend',
-    'eps_growth_streak','fii_pct','fii_trend','dii_pct','dii_trend',
-    'promoter_trend','peg_ratio',
-    'fundamental_score','fundamental_label',
-    'rs_hist','rs_trend','rs_slope',
-    'is_pp','pp_hist','pp_count_10d','pp_vol_ratio','ma10','ma50',
-    'is_hy','hy_pct','volume','hy_hist',
-    'is_ht','ht_pct','ht_hist','ibv_hist',
-    'near_ema9','ema9','pct_from_ema9',
-    'near_ema21','ema21','pct_from_ema21',
-    'near_ema50','ema50','pct_from_ema50',
-    'near_52wl','pct_from_52wl','low_52w','crossed_ema5','pp_volume_52wl',
-    'is_52wl_signal','ema5',
-    'is_weak_rs','weak_chg_1d','weak_chg_5d','weak_vol_spike',
-    'in_squeeze','squeeze_fired','bb_width_pct','squeeze_days',
-    'is_vcp','vcp_stage','vcp_fired','vcp_contractions',
-    'last_updated','scan_type',
-})
-
-
 def _template_pick_reasoning(r: dict) -> str:
     """Zero-cost fallback rationale when ANTHROPIC_API_KEY isn't set —
     lists whichever strong signals actually fired. Plain and mechanical
@@ -93,14 +56,11 @@ def _template_pick_reasoning(r: dict) -> str:
         bits.append('high composite score across signals')
     return ' + '.join(bits[:3])
 
-
-
 def atr(highs: list, lows: list, closes: list, n: int = 20) -> Optional[float]:
     if len(closes) < n + 1:
         return None
     tr = true_range_series(highs, lows, closes)
     return sum(tr[-n:]) / n
-
 
 async def backfill_ema_breadth_history(session: aiohttp.ClientSession):
     """
@@ -213,8 +173,6 @@ async def backfill_ema_breadth_history(session: aiohttp.ClientSession):
             log.warning(f"  EMA breadth backfill batch error: {e}")
     log.info(f"✅ EMA breadth backfill complete: {len(rows_to_save)} days saved")
     gc.collect()
-
-
 
 async def backfill_index_history_30days(session: aiohttp.ClientSession, target_days: int = 30):
     """
@@ -361,8 +319,6 @@ async def backfill_index_history_30days(session: aiohttp.ClientSession, target_d
     else:
         log.error("index_history backfill: computed zero rows, aborting")
 
-
-
 async def backfill_market_breadth_history(session: aiohttp.ClientSession):
     """
     One-time backfill of daily market breadth (how many stocks advanced
@@ -468,8 +424,6 @@ async def backfill_market_breadth_history(session: aiohttp.ClientSession):
             log.warning(f"  breadth backfill batch error: {e}")
     log.info(f"✅ Market breadth backfill complete: {len(rows_to_save)} days saved")
     gc.collect()
-
-
 
 async def backfill_sector_history_30days(session: aiohttp.ClientSession, target_days: int = 30):
     """
@@ -585,8 +539,6 @@ async def backfill_sector_history_30days(session: aiohttp.ClientSession, target_
     else:
         log.error("sector_history backfill: computed zero rows (no SECTOR_MAP symbols found in "
                    "stock_history?), aborting")
-
-
 
 async def backfill_stock_history_30days(session: aiohttp.ClientSession, target_days: int = 30):
     """
@@ -883,8 +835,6 @@ async def backfill_stock_history_30days(session: aiohttp.ClientSession, target_d
     log.info(f"✅ stock_history 30-day backfill complete: {days_saved} trading days saved")
     gc.collect()
 
-
-
 def build_sector_rs(processed: list, sector_map: dict) -> list:
     sectors = []
     for sector, syms in sector_map.items():
@@ -923,32 +873,6 @@ def build_sector_rs(processed: list, sector_map: dict) -> list:
         s['rank'] = i + 1
     return sectors
 
-# ── Sector map ────────────────────────────────────────────────────────
-SECTOR_MAP = {
-    "IT":            ["TCS","INFY","WIPRO","HCLTECH","TECHM","MPHASIS","PERSISTENT","COFORGE","LTTS","KPITTECH","TATAELXSI"],
-    "Private Bank":  ["HDFCBANK","ICICIBANK","KOTAKBANK","AXISBANK","INDUSINDBK","BANDHANBNK","FEDERALBNK","IDFCFIRSTB","RBLBANK","AUBANK","YESBANK"],
-    "PSU Bank":      ["SBIN","PNB","CANBK","BANKBARODA","UNIONBANK","BANKINDIA"],
-    "Defence":       ["HAL","BEL","BDL","MAZDOCK","COCHINSHIP","BEML","MIDHANI","GRSE",
-                       "DATAPATTNS","PARAS","ZENTEC","APOLLO"],
-    "NBFC":          ["BAJFINANCE","BAJAJFINSV","CHOLAFIN","MUTHOOTFIN","MANAPPURAM","AAVAS","HOMEFIRST","LICHSGFIN","PNBHOUSING","CANFINHOME"],
-    "Auto":          ["MARUTI","TMPV","M&M","BAJAJ-AUTO","HEROMOTOCO","TVSMOTOR","EICHERMOT","BOSCHLTD","MOTHERSON","ESCORTS"],
-    "Pharma":        ["SUNPHARMA","DRREDDY","CIPLA","DIVISLAB","LUPIN","AUROPHARMA","BIOCON","ALKEM","GLENMARK","IPCALAB","MANKIND","JUBLPHARMA"],
-    "FMCG":          ["HINDUNILVR","ITC","NESTLEIND","DABUR","MARICO","COLPAL","EMAMILTD","GODREJCP","TATACONSUM"],
-    "Energy":        ["RELIANCE","ONGC","BPCL","IOC","HINDPETRO","GAIL","PETRONET","IGL","MGL","ATGL"],
-    "Metals":        ["JSWSTEEL","TATASTEEL","HINDALCO","COALINDIA","VEDL","NMDC","MOIL"],
-    "Infra/Capital": ["LT","SIEMENS","ABB","BHEL","CUMMINSIND","THERMAX","HAVELLS"],
-    "Cement":        ["ULTRACEMCO","GRASIM","SHREECEM","AMBUJACEM","ACC","JKCEMENT","RAMCOCEM"],
-    "Consumer":      ["TITAN","ASIANPAINT","BERGEPAINT","PIDILITIND","VOLTAS","CROMPTON"],
-    "Telecom":       ["BHARTIARTL","IDEA","TATACOMM","RAILTEL","HFCL","STLTECH"],
-    "Realty":        ["DLF","GODREJPROP","OBEROIRLTY","PRESTIGE","BRIGADE","PHOENIXLTD","SOBHA","LODHA"],
-    "Healthcare":    ["APOLLOHOSP","FORTIS","MAXHEALTH","METROPOLIS","THYROCARE","LALPATHLAB","NH","ASTERDM"],
-    "Insurance":     ["SBILIFE","HDFCLIFE","ICICIPRULI","LICI","GICRE","STARHEALTH"],
-    "Internet":      ["ETERNAL","NYKAA","PAYTM","POLICYBZR","INDIAMART","JUSTDIAL","RATEGAIN","IXIGO"],
-    "Travel":        ["IRCTC","EASEMYTRIP","THOMASCOOK"],
-    "Exchange":      ["BSE","CDSL","CAMS","MCX","ANGELONE"],
-}
-
-
 def build_synthetic_index(symbols: list, cache: dict, min_stocks: int = 20) -> dict:
     """
     Build synthetic index from constituent stocks.
@@ -981,58 +905,6 @@ def build_synthetic_index(symbols: list, cache: dict, min_stocks: int = 20) -> d
     ]
     return {'prices': prices}
 
-NIFTY_INSTRUMENT_KEY = "NSE_INDEX|Nifty 50"  # Upstox key for Nifty 50 index
-
-# All indices to track on the Index Dashboard page
-# Key = display name, value = Upstox instrument key
-INDEX_TRACKER = {
-    "Nifty 50":       "NSE_INDEX|Nifty 50",
-    "Nifty Next 50":  "NSE_INDEX|Nifty Next 50",
-    "Nifty 500":      "NSE_INDEX|Nifty 500",
-    "Bank Nifty":     "NSE_INDEX|Nifty Bank",
-    "IT":             "NSE_INDEX|Nifty IT",
-    "Pharma":         "NSE_INDEX|Nifty Pharma",
-    "Auto":           "NSE_INDEX|Nifty Auto",
-    "FMCG":           "NSE_INDEX|Nifty FMCG",
-    "Metal":          "NSE_INDEX|Nifty Metal",
-    "Realty":         "NSE_INDEX|Nifty Realty",
-    "Energy":         "NSE_INDEX|Nifty Energy",
-    "Defence":            "NSE_INDEX|Nifty India Defence",
-    "Financial Services": "NSE_INDEX|Nifty Fin Service",
-    "PSU Bank":           "NSE_INDEX|Nifty PSU Bank",
-    "Private Bank":       "NSE_INDEX|Nifty Pvt Bank",
-    "PSE":                "NSE_INDEX|Nifty PSE",
-    "Media":              "NSE_INDEX|Nifty Media",
-    "Infrastructure":     "NSE_INDEX|Nifty Infra",
-    "Healthcare":         "NSE_INDEX|Nifty Healthcare",
-    "Consumer Durables":  "NSE_INDEX|Nifty Consr Durable",
-    "Oil & Gas":          "NSE_INDEX|Nifty Oil & Gas",
-    "Chemicals":          "NSE_INDEX|Nifty Chemicals",
-    "Commodities":        "NSE_INDEX|Nifty Commodities",
-    "MNC":                "NSE_INDEX|Nifty MNC",
-    "Consumption":        "NSE_INDEX|Nifty India Consumption",
-    "Manufacturing":      "NSE_INDEX|Nifty India Manufacturing",
-    "CPSE":               "NSE_INDEX|Nifty CPSE",
-    "Digital":            "NSE_INDEX|Nifty India Digital",
-    "EV & New Age Auto":  "NSE_INDEX|Nifty EV & New Age Automotive",
-    "Tourism":            "NSE_INDEX|Nifty India Tourism",
-    "Capital Markets":    "NSE_INDEX|Nifty Capital Markets",
-    "Housing":            "NSE_INDEX|Nifty Housing",
-    "Railways":           "NSE_INDEX|Nifty India Railways PSU",
-    "Internet":           "NSE_INDEX|Nifty India Internet",
-    "Rural":              "NSE_INDEX|Nifty Rural",
-    "Services":           "NSE_INDEX|Nifty Services Sector",
-    "REITs & InvITs":     "NSE_INDEX|Nifty REITs & InvITs",
-    "Mobility":           "NSE_INDEX|Nifty Mobility",
-    "Infra & Logistics":  "NSE_INDEX|Nifty India Infrastructure & Logistics",
-    "Transport & Logistics": "NSE_INDEX|Nifty Transportation & Logistics",
-    "IPO":                "NSE_INDEX|Nifty IPO",
-}
-
-# Cache for all index historical data
-index_history_cache: dict = {}  # name -> {prices, volumes}
-
-
 def calc_live_raw_rs_today(prices: list, bench_prices: list,
                             live_price: float, live_bench_price: float) -> Optional[float]:
     """
@@ -1064,8 +936,6 @@ def calc_live_raw_rs_today(prices: list, bench_prices: list,
     if None in (r3, br3, r6, br6, r9, br9, r12, br12):
         return None
     return (r3-br3)*0.4 + (r6-br6)*0.2 + (r9-br9)*0.2 + (r12-br12)*0.2
-
-
 
 def calc_raw_rs_series(prices: list, bench_prices: list) -> list:
     """
@@ -1102,8 +972,6 @@ def calc_raw_rs_series(prices: list, bench_prices: list) -> list:
             result.append((r3-br3)*0.4 + (r6-br6)*0.2 + (r9-br9)*0.2 + (r12-br12)*0.2)
     return result
 
-
-
 def calc_rs_line(prices: list, bench_prices: list) -> dict:
     """
     RS Line = stock price / Nifty price * 100.
@@ -1139,15 +1007,12 @@ def calc_rs_line(prices: list, bench_prices: list) -> dict:
         'rs_line_value': round(current, 2),
     }
 
-
 def calc_rs_tv_normalized(prices: list, bench_prices: list, end_idx: int = None) -> Optional[int]:
     """Convenience wrapper — computes full series then normalizes."""
     raw = calc_raw_rs_series(prices, bench_prices)
     if end_idx is not None:
         raw = raw[:end_idx+1]
     return normalize_rs(raw)
-
-
 
 def calc_rvol(volumes: list, today_vol: int = None) -> dict:
     """
@@ -1169,7 +1034,6 @@ def calc_rvol(volumes: list, today_vol: int = None) -> dict:
                       'dry'    if rvol else 'unknown'
     }
 
-
 def calc_stage2_new_entry(prices: list, prev_stage: int = None) -> bool:
     """
     Stage 2 New Entry = stock just entered Stage 2 this scan
@@ -1185,7 +1049,6 @@ def calc_stage2_new_entry(prices: list, prev_stage: int = None) -> bool:
     # Crossed above MA30 in last 3 days
     recently_crossed = (ma30_3d and prices[-4] < ma30_3d and last_price > ma30_now)
     return bool(recently_crossed and last_price > ma30_now)
-
 
 def calc_weinstein_stage(rs: float, trend: str, pct_from_high: float, hist: list) -> int:
     """
@@ -1210,8 +1073,6 @@ def calc_weinstein_stage(rs: float, trend: str, pct_from_high: float, hist: list
     if 50 <= rs < 70:
         return 2
     return 1
-
-
 
 def compute_best_pick_score(row: dict) -> float:
     """Weighted composite score (0-100) from signals already computed
@@ -1281,8 +1142,6 @@ def compute_best_pick_score(row: dict) -> float:
 
     return round(max(0.0, min(100.0, score)), 1)
 
-
-
 def compute_fundamental_score(row: dict) -> float:
     """Pure fundamentals quality score (0-100) — deliberately separate
     from compute_best_pick_score, which mixes in technical/momentum
@@ -1342,8 +1201,6 @@ def compute_fundamental_score(row: dict) -> float:
 
     return round(max(0.0, min(100.0, score + 50)), 1)  # centered at 50 so an all-neutral/unknown stock lands "Fair", not "Poor"
 
-
-
 def compute_hy_ht_history(prices: list, volumes: list) -> dict:
     """
     Last-10-day history for HY (volume near 52-week max) and HT (volume
@@ -1368,7 +1225,6 @@ def compute_hy_ht_history(prices: list, volumes: list) -> dict:
         hy_hist.append(bool(max_yr  > 0 and volumes[idx] >= 0.95 * max_yr  and day_chg > 0))
         ht_hist.append(bool(max_all > 0 and volumes[idx] >= 0.95 * max_all and day_chg > 0))
     return {'hy_hist': hy_hist, 'ht_hist': ht_hist}
-
 
 def compute_ibv_history(prices: list, volumes: list, highs: list = None, lows: list = None) -> dict:
     """
@@ -1398,7 +1254,6 @@ def compute_ibv_history(prices: list, volumes: list, highs: list = None, lows: l
             continue
         ibv_hist.append(bool((prices[idx] - l[idx]) / day_range * 100 > 50))
     return {'ibv_hist': ibv_hist}
-
 
 def detect_52wl(prices: list, volumes: list) -> dict:
     n = len(prices)
@@ -1433,7 +1288,6 @@ def detect_52wl(prices: list, volumes: list) -> dict:
         'ema5':        e5t,
         'is_signal':   near and crossed and pp_vol,
     }
-
 
 def detect_bb_squeeze(prices: list, highs: list, lows: list, n: int = 20) -> dict:
     """
@@ -1507,7 +1361,6 @@ def detect_bb_squeeze(prices: list, highs: list, lows: list, n: int = 20) -> dic
         'bb_width_pct': bb_width_pct,
         'squeeze_days': squeeze_days,
     }
-
 
 def detect_chart_patterns(highs: list, lows: list, prices: list, volumes: list) -> dict:
     """
@@ -1641,7 +1494,6 @@ def detect_chart_patterns(highs: list, lows: list, prices: list, volumes: list) 
 
     return result
 
-
 def detect_cup_handle_breakout(prices: list, live_price: float = None, lookback: int = 130) -> dict:
     """
     Same Cup & Handle heuristic the chart already draws (detectCupAndHandle
@@ -1699,8 +1551,6 @@ def detect_cup_handle_breakout(prices: list, live_price: float = None, lookback:
 
     return {'is_breakout': is_breakout, 'has_cup': True, 'depth_pct': round(depth_pct)}
 
-
-
 def detect_guppy_crossover(prices: list, live_price: float = None) -> dict:
     """
     Guppy Crossover — simplified to EMA9 crossing EMA50 (a classic golden-
@@ -1736,8 +1586,6 @@ def detect_guppy_crossover(prices: list, live_price: float = None) -> dict:
 
     return {'is_bullish_crossover': bool(bullish), 'is_bearish_crossover': bool(bearish), 'is_compressed': bool(compressed)}
 
-
-
 def detect_ibv_signal(volumes: list, live_vol, live_high, live_low, live_close) -> bool:
     if not volumes or len(volumes) < 10 or not live_vol or not live_high or not live_low or not live_close:
         return False
@@ -1748,8 +1596,6 @@ def detect_ibv_signal(volumes: list, live_vol, live_high, live_low, live_close) 
     if day_range <= 0:
         return False
     return (live_close - live_low) / day_range * 100 > 50
-
-
 
 def detect_pp(prices: list, volumes: list) -> dict:
     n = len(prices)
@@ -1794,8 +1640,6 @@ def detect_pp(prices: list, volumes: list) -> dict:
         max_down = sum(v10) / len(v10) if v10 else 1
     result['vol_ratio'] = round(volumes[n-1] / max_down, 2) if max_down > 0 else 0.0
     return result
-
-
 
 def detect_resistance_breakout(prices: list, live_price: float = None) -> dict:
     """
@@ -1842,8 +1686,6 @@ def detect_resistance_breakout(prices: list, live_price: float = None) -> dict:
         if yesterday_price <= level < today_price:
             return {'is_breakout': True, 'r1': round(level, 2)}
     return {'is_breakout': False, 'r1': round(max(candidates), 2) if candidates else None}
-
-
 
 def detect_vcp(prices: list, volumes: list, highs: list, lows: list) -> dict:
     """
@@ -1931,16 +1773,6 @@ def detect_vcp(prices: list, volumes: list, highs: list, lows: list) -> dict:
         'pct_from_high': round(pct_from_high, 1),
     }
 
-# ── Classic chart pattern detection ─────────────────────────────────
-# Heuristic, swing-point (fractal pivot) based — not exact textbook
-# geometry, but a reasonable, tunable approximation. Runs off the same
-# price history already in memory for every other signal here, so no
-# new data source is needed. Validated against synthetic price series
-# (double top/bottom, all three triangle types, head & shoulders, a
-# bullish flag) before being wired in — not yet checked against real
-# market data, so expect to tune the tolerance constants once real
-# results come in.
-
 def detect_weak_rs(prices: list, volumes: list, rs: int, threshold: float = 8.0) -> dict:
     n = len(prices)
     if n < 6:
@@ -1959,7 +1791,6 @@ def detect_weak_rs(prices: list, volumes: list, rs: int, threshold: float = 8.0)
         'vol_spike':   spike,
     }
 
-
 def ema(prices: list, n: int) -> Optional[float]:
     if len(prices) < n:
         return None
@@ -1968,7 +1799,6 @@ def ema(prices: list, n: int) -> Optional[float]:
     for p in prices[n:]:
         e = p * k + e * (1 - k)
     return round(e, 2)
-
 
 def ema_arr(prices: list, n: int) -> list:
     result = [None] * len(prices)
@@ -1981,7 +1811,6 @@ def ema_arr(prices: list, n: int) -> list:
         e = prices[i] * k + e * (1 - k)
         result[i] = round(e, 2)
     return result
-
 
 async def ensure_best_picks_history_table(session: aiohttp.ClientSession,
                                            retries: int = 6, delay: float = 10.0) -> bool:
@@ -2006,8 +1835,6 @@ async def ensure_best_picks_history_table(session: aiohttp.ClientSession,
             log.error(f"best_picks_history table check failed: {e}")
             return False
     return False
-
-
 
 async def ensure_best_picks_table(session: aiohttp.ClientSession,
                                    retries: int = 6, delay: float = 10.0) -> bool:
@@ -2034,8 +1861,6 @@ async def ensure_best_picks_table(session: aiohttp.ClientSession,
             log.error(f"best_picks table check failed: {e}")
             return False
     return False
-
-
 
 async def ensure_db_columns(session: aiohttp.ClientSession):
     """Verify rs_tv and eps_qoq columns exist by doing test queries.
@@ -2409,11 +2234,6 @@ async def ensure_db_columns(session: aiohttp.ClientSession):
     except Exception as e:
         log.warning(f"DB column check error (sector breadth): {e}")
 
-
-
-
-
-
 async def ensure_full_history_table(session: aiohttp.ClientSession,
                                      retries: int = 6, delay: float = 10.0) -> bool:
     """
@@ -2466,8 +2286,6 @@ async def ensure_full_history_table(session: aiohttp.ClientSession,
     log.error("   );")
     return False
 
-
-
 async def fetch_bulk_ohlc(session: aiohttp.ClientSession, instrument_keys: list) -> dict:
     """
     Fetch live quotes for instruments in one call.
@@ -2509,7 +2327,6 @@ async def fetch_bulk_ohlc(session: aiohttp.ClientSession, instrument_keys: list)
     except Exception as e:
         log.error(f"Quotes fetch error: {e}")
         return {}
-
 
 async def fetch_full_history_for_symbols(session: aiohttp.ClientSession, symbols: list,
                                           label: str = "full") -> int:
@@ -2642,8 +2459,6 @@ async def fetch_full_history_for_symbols(session: aiohttp.ClientSession, symbols
     log.info(f"✅ Yahoo history fetch ({label}) complete: {done} ok, {failed} failed out of {total}")
     return done
 
-
-
 async def fetch_full_nifty_history(session: aiohttp.ClientSession) -> dict:
     """
     One-time fetch of 5yr Nifty/Midcap/Smallcap history.
@@ -2738,8 +2553,6 @@ async def fetch_full_nifty_history(session: aiohttp.ClientSession) -> dict:
 
     return results
 
-
-
 async def fetch_historical(session: aiohttp.ClientSession, sym: str,
                            instrument_key: str = None) -> dict:
     """Fetch 15 months of daily historical data for one stock."""
@@ -2770,8 +2583,6 @@ async def fetch_historical(session: aiohttp.ClientSession, sym: str,
             }
     except Exception as e:
         return {}
-
-# ── Supabase client ───────────────────────────────────────────────────
 
 async def fetch_index_csv(session: aiohttp.ClientSession, url: str) -> list:
     """Download an NSE index constituent CSV and return list of trading symbols."""
@@ -2806,7 +2617,6 @@ async def fetch_index_csv(session: aiohttp.ClientSession, url: str) -> list:
     except Exception as e:
         log.warning(f"Index CSV fetch error ({url}): {e}")
         return []
-
 
 async def fetch_upstox_full_ohlcv(session: aiohttp.ClientSession, sym: str,
                                    days: int = 730) -> Optional[dict]:
@@ -2854,8 +2664,6 @@ async def fetch_upstox_full_ohlcv(session: aiohttp.ClientSession, sym: str,
         if _debug_this:
             log.info(f"  🔍 {sym} Upstox historical-candle exception: {type(e).__name__}: {e}")
         return None
-
-
 
 async def fetch_yahoo_full_ohlcv(session: aiohttp.ClientSession, sym: str,
                                   range_period: str = "2y", min_points: int = 100) -> Optional[dict]:
@@ -2912,8 +2720,6 @@ async def fetch_yahoo_full_ohlcv(session: aiohttp.ClientSession, sym: str,
             pass
     return None
 
-
-
 def find_pivots(highs: list, lows: list, left: int = 3, right: int = 3):
     """Fractal-style swing highs/lows: bar i is a pivot high if it's the
     max within [i-left, i+right] (similarly for pivot lows). Adjacent
@@ -2944,7 +2750,6 @@ def find_pivots(highs: list, lows: list, left: int = 3, right: int = 3):
 
     return dedupe(piv_hi, True), dedupe(piv_lo, False)
 
-
 def fundamental_score_label(score) -> str:
     """Excellent / Good / Fair / Poor — deliberately worded as a
     quality assessment, never as 'buy'/'sell'/'target' language."""
@@ -2954,8 +2759,6 @@ def fundamental_score_label(score) -> str:
     if score >= 58: return 'Good'
     if score >= 40: return 'Fair'
     return 'Poor'
-
-
 
 async def generate_ai_picks_reasoning(session: aiohttp.ClientSession, top_rows: list) -> dict:
     """One batched Anthropic call (or the free templated fallback) that
@@ -3032,8 +2835,6 @@ async def generate_ai_picks_reasoning(session: aiohttp.ClientSession, top_rows: 
     except Exception as e:
         log.warning(f"⚠️ AI picks reasoning failed ({type(e).__name__}: {e}) — using templated fallback")
         return {r['sym']: _template_pick_reasoning(r) for r in top_rows}
-
-
 
 async def incremental_eod_update(session: aiohttp.ClientSession):
     """
@@ -3133,8 +2934,6 @@ async def incremental_eod_update(session: aiohttp.ClientSession):
 
     log.info(f"✅ EOD incremental update complete: {done} ok, {failed} failed out of {total}")
 
-
-
 def is_scan_time() -> bool:
     """Run scan during market hours + 30 min before/after."""
     now = datetime.now(IST)
@@ -3143,35 +2942,6 @@ def is_scan_time() -> bool:
     open_time  = now.replace(hour=MARKET_OPEN_H,  minute=MARKET_OPEN_M,  second=0, microsecond=0) - timedelta(minutes=30)
     close_time = now.replace(hour=MARKET_CLOSE_H, minute=MARKET_CLOSE_M, second=0, microsecond=0) + timedelta(minutes=30)
     return open_time <= now <= close_time
-
-# ── Squeeze fire state tracking ──────────────────────────────────────
-# Track which stocks were firing last scan — only alert on NEW fires
-# Format: {sym: {'bb': bool, 'vcp': bool}}
-prev_squeeze_state: dict = {}
-
-# ── HY/HT volume-climax fire state tracking ──────────────────────────
-# Same "only alert on the transition into firing" pattern as squeeze
-# state above, tracked separately so a stock that stays HY/HT for
-# several scans in a row (common — these are daily volume-vs-history
-# ratios, not instantaneous events) only triggers one notification at
-# the moment it turns on, not every single scan while it's true.
-# Format: {sym: {'hy': bool, 'ht': bool}}
-prev_hy_ht_state: dict = {}
-
-
-historical_cache: dict = {}   # sym -> {prices, volumes, highs, lows}
-history_dates_cache: dict = {}  # sym -> [dates] — parallel to historical_cache,
-# tracked separately since RS calc doesn't need dates but incremental merges do
-opens_cache: dict = {}  # sym -> [opens] — parallel to historical_cache, tracked
-# separately since RS/PP/signal calc doesn't need Open prices, only the
-# persisted stock_full_history table (for candlestick charts) does
-last_eod_refresh_date: Optional[str] = None  # IST date string — ensures the
-# expensive EOD refresh (full Yahoo re-fetch + fundamentals) runs only ONCE
-# per day, not on every single scan cycle while the market stays closed.
-nifty_cache: dict = {}        # {'prices': [...]} — Nifty index daily closes for TV RS calc
-midcap_cache: dict = {}       # {'prices': [...]} — synthetic Midcap 150 index
-smallcap_cache: dict = {}     # {'prices': [...]} — synthetic Smallcap 250 index
-
 
 async def load_all_history_from_supabase(session: aiohttp.ClientSession) -> list:
     """
@@ -3291,8 +3061,6 @@ async def load_all_history_from_supabase(session: aiohttp.ClientSession) -> list
     gc.collect()
     return stale_or_missing
 
-
-
 async def load_bse_only_stocks(session: aiohttp.ClientSession) -> int:
     """
     Adds BSE-only stocks (listed on BSE but NOT on NSE) on top of whatever
@@ -3387,7 +3155,6 @@ async def load_bse_only_stocks(session: aiohttp.ClientSession) -> int:
         log.info(f"✅ Added {len(added_syms)} BSE-only stocks — total universe now {len(ALL_STOCKS)}")
     return len(added_syms)
 
-
 async def load_full_history_once(session: aiohttp.ClientSession):
     """
     Check if we already have 2yr history in DB.
@@ -3440,8 +3207,6 @@ async def load_full_history_once(session: aiohttp.ClientSession):
         smallcap_cache = {"prices": results["Smallcap 250"]}
     log.info("✅ Full history loaded!")
 
-
-
 async def load_fundamentals_at_startup(session: aiohttp.ClientSession):
     """
     Startup: load fundamentals from Supabase first (fast, free), then
@@ -3474,7 +3239,6 @@ async def load_fundamentals_at_startup(session: aiohttp.ClientSession):
     if stale_or_missing:
         log.info(f"📊 Starting background fundamentals fetch for {len(stale_or_missing)} stocks…")
         asyncio.create_task(load_fundamentals_batch(session, stale_or_missing))
-
 
 async def load_historical_cache(session: aiohttp.ClientSession):
     """Load historical data for all stocks at startup."""
@@ -3518,22 +3282,6 @@ async def load_historical_cache(session: aiohttp.ClientSession):
 
     log.info(f"✅ Historical cache loaded: {loaded} stocks")
 
-# ── Main scan function ────────────────────────────────────────────────
-# ============================================================
-# AI Best Picks — composite technical+fundamental scoring, with an
-# AI-generated (or free templated) rationale for the top candidates.
-# Recomputed at most once per _AI_PICKS_REFRESH_INTERVAL_SEC from
-# inside run_scan, since `processed` already has every technical AND
-# fundamental field merged per stock by the time that function
-# finishes — no extra fetching needed here.
-# ============================================================
-_LAST_AI_PICKS_TS = 0.0
-_zero_chg_debug_count = 0  # reset each run_scan cycle — caps zero-chg diagnostic logging
-_LAST_FUNDAMENTALS_SYNC_TS = 0.0
-_AI_PICKS_REFRESH_INTERVAL_SEC = 3600  # ranking + rationale refresh at most hourly
-_AI_PICKS_TOP_N = 30
-
-
 async def load_history_at_startup(session: aiohttp.ClientSession):
     """
     Startup replacement for the old 'always re-fetch all ~2385 stocks from
@@ -3553,8 +3301,6 @@ async def load_history_at_startup(session: aiohttp.ClientSession):
     stale_or_missing = await load_all_history_from_supabase(session)
     if stale_or_missing:
         await fetch_full_history_for_symbols(session, stale_or_missing, label="startup-backfill")
-
-
 
 async def load_index_cache(session: aiohttp.ClientSession):
     """Fetch historical data for all tracked indices."""
@@ -3660,8 +3406,6 @@ async def load_index_cache(session: aiohttp.ClientSession):
             log.warning(f"⚠️ Index {name}: all key formats failed — MID/SML RS will use Nifty as fallback")
     log.info(f"✅ Index cache loaded: {loaded}/{len(INDEX_TRACKER)} indices")
 
-
-
 async def load_index_history_from_db(session: aiohttp.ClientSession, name: str) -> list:
     """Load index price history from Supabase."""
     import json as _json
@@ -3687,8 +3431,6 @@ async def load_index_history_from_db(session: aiohttp.ClientSession, name: str) 
     except Exception as e:
         log.warning(f"  Load index history failed: {e}")
     return []
-
-
 
 async def load_index_rank_history(session: aiohttp.ClientSession) -> dict:
     """Load each index's existing rank_w_history from Supabase in one
@@ -3716,8 +3458,6 @@ async def load_index_rank_history(session: aiohttp.ClientSession) -> dict:
     except Exception as e:
         log.warning(f"  Load index rank history error: {e}")
     return result
-
-
 
 async def load_nifty_cache(session: aiohttp.ClientSession):
     """Fetch Nifty 50 daily close history needed for TradingView-style RS calculation."""
@@ -3761,7 +3501,6 @@ async def load_nifty_cache(session: aiohttp.ClientSession):
             await save_index_history_to_db(session, "Nifty 50", merged)
     except Exception as e:
         log.warning(f"Nifty cache load failed: {e}")
-
 
 async def load_official_index_lists(session: aiohttp.ClientSession):
     """
@@ -3810,31 +3549,6 @@ async def load_official_index_lists(session: aiohttp.ClientSession):
     # Rebuild ALL_STOCKS to include any official-list stocks not already covered
     # (ALL_STOCKS itself is later overwritten by the Upstox instrument master in
     # main(), so this just ensures the index membership flags stay consistent)
-    
-# Popular NSE stocks not in major indices — PSU, Defence, Mid/Small caps
-EXTRA_STOCKS = [
-    # Defence PSU
-    "GRSE","BDL","HAL","BEL","MIDHANI","BEML","COCHINSHIP","MAZAGON",
-    # PSU Banks/Finance  
-    "BANKBARODA","PNB","UNIONBANK","CANARABANK","INDIANB","IOB","CENTRALBK",
-    # PSU Energy/Infra
-    "NHPC","SJVN","IRFC","RVNL","IRCON","NBCC","HUDCO","RAILTEL",
-    # Popular midcap/smallcap
-    "SHAKTIPUMP","ELECON","GPIL","JYOTICNC","PNCINFRA","KNRCON",
-    "HGINFRA","AHLUCONT","CAPACITE","WELCORP","RAMCOCEM","DALBHARAT",
-    "JKCEMENT","NUVOCO","HEIDELBERG","BIRLACORPN","ORIENTCEM",
-    # Auto ancillary
-    "SUPRAJIT","LUMAXTECH","SANDHAR","ENDURANCE","SUBROS","UCALFUEL",
-    # Chemicals
-    "DEEPAKFERT","GNFC","GSFC","RASHTRIYA","CHAMBAL","COROMANDEL",
-    # Textiles  
-    "GRASIM","VARDHMAN","RAYMOND","ARVIND","WELSPUNIND","TRIDENT",
-    # Pharma
-    "IPCALAB","AJANTPHARM","NATCOPHARM","GRANULES","SOLARA","AARTI",
-]
-
-ALL_STOCKS = list(dict.fromkeys(NIFTY50 + MIDCAP + SMALLCAP + MICROCAP + EXTRA_STOCKS))
-
 
 async def load_sector_rank_history(session: aiohttp.ClientSession) -> dict:
     """Same idea as load_index_rank_history, for sectors — loads each
@@ -3861,13 +3575,6 @@ async def load_sector_rank_history(session: aiohttp.ClientSession) -> dict:
     except Exception as e:
         log.warning(f"  Load sector rank history error: {e}")
     return result
-
-
-
-# ── Seeded Nifty 50 history (2020-2025, 1492 days) ────────────────────
-# Uploaded from NSE bhavcopy CSVs — used to bootstrap RS accuracy
-NIFTY50_SEED_PRICES = [12182.5, 12282.2, 12226.65, 11993.05, 12052.95, 12025.35, 12215.9, 12256.8, 12329.55, 12362.3, 12343.3, 12355.5, 12352.35, 12224.55, 12169.85, 12106.9, 12180.35, 12248.25, 12119.0, 12055.8, 12129.5, 12035.8, 11962.1, 11661.85, 11707.9, 11979.65, 12089.15, 12137.95, 12098.35, 12031.5, 12107.9, 12201.2, 12174.65, 12113.45, 12045.8, 11992.5, 12125.9, 12080.85, 11829.4, 11797.9, 11678.5, 11633.3, 11201.75, 11132.75, 11303.3, 11251.0, 11269.0, 10989.45, 10451.45, 10458.4, 9590.15, 9955.2, 9197.4, 8967.05, 8468.8, 8263.45, 8745.45, 7610.25, 7801.05, 8317.85, 8641.45, 8660.25, 8281.1, 8597.75, 8253.8, 8083.8, 8792.2, 8748.75, 9111.9, 8993.85, 8925.3, 8992.8, 9266.75, 9261.85, 8981.45, 9187.3, 9313.9, 9154.4, 9282.3, 9380.9, 9553.35, 9859.9, 9293.5, 9205.6, 9270.9, 9199.05, 9251.5, 9239.2, 9196.55, 9383.55, 9142.75, 9136.85, 8823.25, 8879.1, 9066.55, 9106.25, 9039.25, 9029.05, 9314.95, 9490.1, 9580.3, 9826.15, 9979.1, 10061.55, 10029.1, 10142.15, 10167.45, 10046.65, 10116.15, 9902.0, 9972.9, 9813.7, 9914.0, 9881.15, 10091.65, 10244.4, 10311.2, 10471.0, 10305.3, 10288.9, 10383.0, 10312.4, 10302.1, 10430.05, 10551.7, 10607.35, 10763.65, 10799.65, 10705.75, 10813.45, 10768.05, 10802.7, 10607.35, 10618.2, 10739.95, 10901.7, 11022.2, 11162.25, 11132.6, 11215.45, 11194.15, 11131.8, 11300.55, 11202.85, 11102.15, 11073.45, 10891.6, 11095.25, 11101.65, 11200.15, 11214.05, 11270.15, 11322.5, 11308.4, 11300.45, 11178.4, 11247.1, 11385.35, 11408.4, 11312.2, 11371.6, 11466.45, 11472.25, 11549.6, 11559.25, 11647.6, 11387.5, 11470.25, 11535.0, 11527.45, 11333.85, 11355.05, 11317.35, 11278.0, 11449.25, 11464.45, 11440.05, 11521.8, 11604.55, 11516.1, 11504.95, 11250.55, 11153.65, 11131.85, 10805.55, 11050.25, 11227.55, 11222.4, 11247.55, 11416.95, 11503.35, 11662.4, 11738.85, 11834.6, 11914.2, 11930.95, 11934.5, 11971.05, 11680.35, 11762.45, 11873.05, 11896.8, 11937.65, 11896.45, 11930.35, 11767.75, 11889.4, 11729.6, 11670.8, 11642.4, 11669.15, 11813.5, 11908.5, 12120.3, 12263.55, 12461.05, 12631.1, 12749.15, 12690.8, 12719.95, 12780.25, 12874.2, 12938.25, 12771.7, 12859.05, 12926.45, 13055.15, 12858.4, 12987.0, 12968.95, 13109.05, 13113.75, 13133.9, 13258.55, 13355.75, 13392.95, 13529.1, 13478.3, 13513.85, 13558.15, 13567.85, 13682.7, 13740.7, 13760.55, 13328.4, 13466.3, 13601.1, 13749.25, 13873.2, 13932.6, 13981.95, 13981.75, 14018.5, 14132.9, 14199.5, 14146.25, 14137.35, 14347.25, 14484.75, 14563.45, 14564.85, 14595.6, 14433.7, 14281.3, 14521.15, 14644.7, 14590.35, 14371.9, 14238.9, 13967.5, 13817.55, 13634.6, 14281.2, 14647.85, 14789.95, 14895.65, 14924.25, 15115.8, 15109.3, 15106.5, 15173.3, 15163.3, 15314.7, 15313.45, 15208.9, 15118.95, 14981.75, 14675.7, 14707.8, 14982.0, 15097.35, 14529.15, 14761.55, 14919.1, 15245.6, 15080.75, 14938.1, 14956.2, 15098.4, 15174.8, 15030.95, 14929.5, 14910.45, 14721.3, 14557.85, 14744.0, 14736.4, 14814.75, 14549.4, 14324.9, 14507.3, 14845.1, 14690.7, 14867.35, 14637.8, 14683.5, 14819.05, 14873.8, 14834.85, 14310.8, 14504.8, 14581.45, 14617.85, 14359.45, 14296.4, 14406.15, 14341.35, 14485.0, 14653.05, 14864.55, 14894.9, 14631.1, 14634.15, 14496.5, 14617.85, 14724.8, 14823.15, 14942.35, 14850.75, 14696.5, 14677.8, 14923.15, 15108.1, 15030.15, 14906.05, 15175.3, 15197.7, 15208.45, 15301.45, 15337.85, 15435.65, 15582.8, 15574.85, 15576.2, 15690.35, 15670.25, 15751.65, 15740.1, 15635.35, 15737.75, 15799.35, 15811.85, 15869.25, 15767.55, 15691.4, 15683.35, 15746.5, 15772.75, 15686.95, 15790.45, 15860.35, 15814.7, 15748.45, 15721.5, 15680.0, 15722.2, 15834.35, 15818.25, 15879.65, 15727.9, 15689.8, 15692.6, 15812.35, 15853.95, 15924.2, 15923.4, 15752.4, 15632.1, 15824.05, 15856.05, 15824.45, 15746.45, 15709.4, 15778.45, 15763.05, 15885.15, 16130.75, 16258.8, 16294.6, 16238.2, 16258.25, 16280.1, 16282.25, 16364.4, 16529.1, 16563.05, 16614.6, 16568.85, 16450.5, 16496.45, 16624.6, 16634.65, 16636.9, 16705.2, 16931.05, 17132.2, 17076.25, 17234.15, 17323.6, 17377.8, 17362.1, 17353.5, 17369.25, 17355.3, 17380.0, 17519.45, 17629.5, 17585.15, 17396.9, 17562.0, 17546.65, 17822.95, 17853.2, 17855.1, 17748.6, 17711.3, 17618.15, 17532.05, 17691.25, 17822.3, 17646.0, 17790.35, 17895.2, 17945.95, 17991.95, 18161.75, 18338.55, 18477.05, 18418.75, 18266.6, 18178.1, 18114.9, 18125.4, 18268.4, 18210.95, 17857.25, 17671.65, 17929.65, 17888.95, 17829.2, 17916.8, 18068.55, 18044.25, 18017.2, 17873.6, 18102.75, 18109.45, 17999.2, 17898.65, 17764.8, 17416.55, 17503.35, 17415.05, 17536.25, 17026.45, 17053.95, 16983.2, 17166.9, 17401.65, 17196.7, 16912.25, 17176.7, 17469.75, 17516.85, 17511.3, 17368.25, 17324.9, 17221.4, 17248.4, 16985.2, 16614.2, 16770.85, 16955.45, 17072.6, 17003.75, 17086.25, 17233.25, 17213.6, 17203.95, 17354.05, 17625.7, 17805.25, 17925.25, 17745.9, 17812.7, 18003.3, 18055.75, 18212.35, 18257.8, 18255.75, 18308.1, 18113.05, 17938.4, 17757.0, 17617.15, 17149.1, 17277.95, 17110.15, 17101.95, 17339.85, 17576.85, 17780.0, 17560.2, 17516.3, 17213.6, 17266.75, 17463.8, 17605.85, 17374.75, 16842.8, 17352.45, 17322.2, 17304.6, 17276.3, 17206.65, 17092.2, 17063.25, 16247.95, 16658.4, 16793.9, 16605.95, 16498.05, 16245.35, 15863.15, 16013.45, 16345.35, 16594.9, 16630.45, 16871.3, 16663.0, 16975.35, 17287.05, 17117.6, 17315.5, 17245.65, 17222.75, 17153.0, 17222.0, 17325.3, 17498.25, 17464.75, 17670.45, 18053.4, 17957.4, 17807.65, 17639.55, 17784.35, 17674.95, 17530.3, 17475.65, 17173.65, 16958.65, 17136.55, 17392.6, 17171.95, 16953.95, 17200.8, 17038.4, 17245.05, 17102.55, 17069.1, 16677.6, 16682.65, 16411.25, 16301.85, 16240.05, 16167.1, 15808.0, 15782.15, 15842.3, 16259.3, 16240.3, 15809.4, 16266.15, 16214.7, 16125.15, 16025.8, 16170.15, 16352.45, 16661.4, 16584.55, 16522.75, 16628.0, 16584.3, 16569.55, 16416.35, 16356.25, 16478.1, 16201.8, 15774.4, 15732.1, 15692.15, 15360.6, 15293.5, 15350.15, 15638.8, 15413.3, 15556.65, 15699.25, 15832.05, 15850.2, 15799.1, 15780.25, 15752.05, 15835.35, 15810.85, 15989.8, 16132.9, 16220.6, 16216.0, 16058.3, 15966.65, 15938.65, 16049.2, 16278.5, 16340.55, 16520.85, 16605.25, 16719.45, 16631.0, 16483.85, 16641.8, 16929.6, 17158.25, 17340.05, 17345.45, 17388.15, 17382.0, 17397.5, 17525.1, 17534.75, 17659.0, 17698.15, 17825.25, 17944.25, 17956.5, 17758.45, 17490.7, 17577.5, 17604.95, 17522.45, 17558.9, 17312.9, 17759.3, 17542.8, 17539.45, 17665.8, 17655.6, 17624.4, 17798.75, 17833.35, 17936.35, 18070.05, 18003.75, 17877.4, 17530.85, 17622.25, 17816.25, 17718.35, 17629.8, 17327.35, 17016.3, 17007.4, 16858.6, 16818.1, 17094.35, 16887.35, 17274.3, 17331.8, 17314.65, 17241.0, 16983.55, 17123.6, 17014.35, 17185.7, 17311.8, 17486.95, 17512.25, 17563.95, 17576.3, 17730.75, 17656.35, 17736.95, 17786.8, 18012.2, 18145.4, 18082.85, 18052.7, 18117.15, 18202.8, 18157.0, 18028.2, 18349.7, 18329.15, 18403.4, 18409.65, 18343.9, 18307.65, 18159.95, 18244.2, 18267.25, 18484.1, 18512.75, 18562.75, 18618.05, 18758.35, 18812.5, 18696.1, 18701.05, 18642.75, 18560.5, 18609.35, 18496.6, 18497.15, 18608.0, 18660.3, 18414.9, 18269.0, 18420.45, 18385.3, 18199.1, 18127.35, 17806.8, 18014.6, 18132.3, 18122.5, 18191.0, 18105.3, 18197.45, 18232.55, 18042.95, 17992.15, 17859.45, 18101.2, 17914.15, 17895.7, 17858.2, 17956.6, 17894.85, 18053.3, 18165.35, 18107.85, 18027.65, 18118.55, 18118.3, 17891.95, 17604.35, 17648.95, 17662.15, 17616.3, 17610.4, 17854.05, 17764.6, 17721.5, 17871.7, 17893.45, 17856.5, 17770.9, 17929.85, 18015.85, 18035.85, 17944.2, 17844.6, 17826.7, 17554.3, 17511.25, 17465.8, 17392.7, 17303.95, 17450.9, 17321.9, 17594.35, 17711.45, 17754.4, 17589.6, 17412.9, 17154.3, 17043.3, 16972.15, 16985.6, 17100.05, 16988.4, 17107.5, 17151.9, 17076.9, 16945.05, 16985.7, 16951.7, 17080.7, 17359.75, 17398.05, 17557.05, 17599.15, 17624.05, 17722.3, 17812.4, 17828.0, 17706.85, 17660.15, 17618.75, 17624.45, 17624.05, 17743.4, 17769.25, 17813.6, 17915.05, 18065.0, 18147.65, 18089.85, 18255.8, 18069.0, 18264.4, 18265.95, 18315.1, 18297.0, 18314.8, 18398.85, 18286.5, 18181.75, 18129.95, 18203.4, 18314.4, 18348.0, 18285.4, 18321.15, 18499.35, 18598.65, 18633.85, 18534.4, 18487.75, 18534.1, 18593.85, 18599.0, 18726.4, 18634.55, 18563.4, 18601.5, 18716.15, 18755.9, 18688.1, 18826.0, 18755.45, 18816.7, 18856.85, 18771.25, 18665.5, 18691.2, 18817.4, 18972.1, 19189.05, 19322.55, 19389.0, 19398.5, 19497.3, 19331.8, 19355.9, 19439.4, 19384.3, 19413.75, 19564.5, 19711.45, 19749.25, 19833.15, 19979.15, 19745.0, 19672.35, 19680.6, 19778.3, 19659.9, 19646.05, 19753.8, 19733.55, 19526.55, 19381.65, 19517.0, 19597.3, 19570.85, 19632.55, 19543.1, 19428.3, 19434.55, 19465.0, 19365.25, 19310.15, 19393.6, 19396.45, 19444.0, 19386.7, 19265.8, 19306.05, 19342.65, 19347.45, 19253.8, 19435.3, 19528.8, 19574.9, 19611.05, 19727.05, 19819.95, 19996.35, 19993.2, 20070.0, 20103.1, 20192.35, 20133.3, 19901.4, 19742.35, 19674.25, 19674.55, 19664.7, 19716.45, 19523.55, 19638.3, 19528.75, 19436.1, 19545.75, 19653.5, 19512.35, 19689.85, 19811.35, 19794.0, 19751.05, 19731.75, 19811.5, 19671.1, 19624.7, 19542.65, 19281.75, 19122.15, 18857.25, 19047.25, 19140.9, 19079.6, 18989.15, 19133.25, 19230.6, 19411.75, 19406.7, 19443.5, 19395.3, 19425.35, 19525.55, 19443.55, 19675.45, 19765.2, 19731.8, 19694.0, 19783.4, 19811.85, 19802.0, 19794.7, 19889.7, 20096.6, 20133.15, 20267.9, 20686.8, 20855.1, 20937.7, 20901.15, 20969.4, 20997.1, 20906.4, 20926.35, 21182.7, 21456.65, 21418.65, 21453.1, 21150.15, 21255.05, 21349.4, 21441.35, 21654.75, 21778.7, 21731.4, 21741.9, 21665.8, 21517.35, 21658.6, 21710.8, 21513.0, 21544.85, 21618.7, 21647.2, 21894.55, 22097.45, 22032.3, 21571.95, 21462.25, 21622.4, 21571.8, 21238.8, 21453.95, 21352.6, 21737.6, 21522.1, 21725.7, 21697.45, 21853.8, 21771.7, 21929.4, 21930.5, 21717.95, 21782.5, 21616.05, 21743.25, 21840.05, 21910.75, 22040.7, 22122.25, 22196.95, 22055.05, 22217.45, 22212.7, 22122.05, 22198.35, 21951.15, 21982.8, 22338.75, 22378.4, 22405.6, 22356.3, 22474.05, 22493.55, 22332.65, 22335.7, 21997.7, 22146.65, 22023.35, 22055.7, 21817.45, 21839.1, 22011.95, 22096.75, 22004.7, 22123.65, 22326.9, 22462.0, 22453.3, 22434.65, 22514.65, 22513.7, 22666.3, 22642.75, 22753.8, 22519.4, 22272.5, 22147.9, 21995.85, 22147.0, 22336.4, 22368.0, 22402.4, 22570.35, 22419.95, 22643.4, 22604.85, 22648.2, 22475.85, 22442.7, 22302.5, 22302.5, 21957.5, 22055.2, 22104.05, 22217.85, 22200.55, 22403.85, 22466.1, 22502.0, 22529.05, 22597.8, 22967.65, 22957.1, 22932.45, 22888.15, 22704.7, 22488.65, 22530.7, 23263.9, 21884.5, 22620.35, 22821.4, 23290.15, 23259.2, 23264.85, 23322.95, 23398.9, 23465.6, 23557.9, 23516.0, 23567.0, 23501.1, 23537.85, 23721.3, 23868.8, 24044.5, 24010.6, 24141.95, 24123.85, 24286.5, 24302.15, 24323.85, 24320.55, 24433.2, 24324.45, 24315.95, 24502.15, 24586.7, 24613.0, 24800.85, 24530.9, 24509.25, 24479.05, 24413.5, 24406.1, 24834.85, 24836.1, 24857.3, 24951.15, 25010.9, 24717.7, 24055.6, 23992.55, 24297.5, 24117.0, 24367.5, 24347.0, 24139.0, 24143.75, 24541.15, 24572.65, 24698.85, 24770.2, 24811.5, 24823.15, 25010.6, 25017.75, 25052.35, 25151.95, 25235.9, 25278.7, 25279.85, 25198.7, 25145.1, 24852.15, 24936.4, 25041.1, 24918.45, 25388.9, 25356.5, 25383.75, 25418.55, 25377.55, 25415.8, 25790.95, 25939.05, 25940.4, 26004.15, 26216.05, 26178.95, 25810.85, 25796.9, 25250.1, 25014.6, 24795.75, 25013.15, 24981.95, 24998.45, 24964.25, 25127.95, 25057.35, 24971.3, 24749.85, 24854.05, 24781.1, 24472.1, 24435.5, 24399.4, 24180.8, 24339.15, 24466.85, 24340.85, 24205.35, 24304.35, 23995.35, 24213.3, 24484.05, 24199.35, 24148.2, 24141.3, 23883.45, 23559.05, 23532.7, 23453.8, 23518.5, 23349.9, 23907.25, 24221.9, 24194.5, 24274.9, 23914.15, 24131.1, 24276.05, 24457.15, 24467.45, 24708.4, 24677.8, 24619.0, 24610.05, 24641.8, 24548.7, 24768.3, 24668.25, 24336.0, 24198.85, 23951.7, 23587.5, 23753.45, 23727.65, 23750.2, 23813.4, 23644.9, 23644.8, 23742.9, 24188.65, 24004.75, 23616.05, 23707.9, 23688.95, 23526.5, 23431.5, 23085.95, 23176.05, 23213.2, 23311.8, 23203.2, 23344.75, 23024.65, 23155.35, 23205.35, 23092.2, 22829.15, 22957.25, 23163.1, 23249.5, 23508.4, 23482.15, 23361.05, 23739.25, 23696.3, 23603.35, 23559.95, 23381.6, 23071.8, 23045.25, 23031.4, 22929.25, 22959.5, 22945.3, 22932.9, 22913.15, 22795.9, 22553.35, 22547.55, 22545.05, 22124.7, 22119.3, 22082.65, 22337.3, 22544.7, 22552.5, 22460.3, 22497.9, 22470.5, 22397.2, 22508.75, 22834.3, 22907.6, 23190.65, 23350.4, 23658.35, 23668.65, 23486.85, 23591.95, 23519.35, 23165.7, 23332.35, 23250.1, 22904.45, 22161.6, 22535.85, 22399.15, 22828.55, 23328.55, 23437.2, 23851.65, 24125.55, 24167.25, 24328.95, 24246.7, 24039.35, 24328.5, 24335.95, 24334.2, 24346.7, 24461.15, 24379.6, 24414.4, 24273.8, 24008.0, 24924.7, 24578.35, 24666.9, 25062.1, 25019.8, 24945.45, 24683.9, 24813.45, 24609.7, 24853.15, 25001.15, 24826.2, 24752.45, 24833.6, 24750.7, 24716.6, 24542.5, 24620.2, 24750.9, 25003.05, 25103.2, 25104.25, 25141.4, 24888.2, 24718.6, 24946.5, 24853.4, 24812.05, 24793.25, 25112.4, 24971.9, 25044.35, 25244.75, 25549.0, 25637.8, 25517.05, 25541.8, 25453.4, 25405.3, 25461.0, 25461.3, 25522.5, 25476.1, 25355.25, 25149.85, 25082.3, 25195.8, 25212.05, 25111.45, 24968.4, 25090.7, 25060.9, 25219.9, 25062.1, 24837.0, 24680.9, 24821.1, 24855.05, 24768.35, 24565.35, 24722.75, 24649.55, 24574.2, 24596.15, 24363.3, 24585.05, 24487.4, 24619.35, 24631.3, 24876.95, 24980.65, 25050.55, 25083.75, 24870.1, 24967.75, 24712.05, 24500.9, 24426.85, 24625.05, 24579.6, 24715.05, 24734.3, 24741.0, 24773.15, 24868.6, 24973.1, 25005.5, 25114.0, 25069.2, 25239.1, 25330.25, 25423.6, 25327.05, 25202.35, 25169.5, 25056.9, 24890.85, 24654.7, 24634.9, 24611.1, 24836.3, 24894.25, 25077.65, 25108.3, 25046.15, 25181.8, 25285.35, 25227.35, 25145.5, 25323.55, 25585.3, 25709.85, 25843.15, 25868.6, 25891.4, 25795.15, 25966.05, 25936.2, 26053.9, 25877.85, 25722.1, 25763.35, 25597.65, 25509.7, 25492.3, 25574.35, 25694.95, 25875.8, 25879.15, 25910.05, 26013.45, 25910.05, 26052.65, 26192.15, 26068.15, 25959.5, 25884.8, 26205.3, 26215.55, 26202.95, 26175.75, 26032.2, 25986.0, 26033.75, 26186.45, 25960.55, 25839.65, 25758.0, 25898.55, 26046.95, 26027.3, 25860.1, 25818.55, 25815.55, 25966.4, 26172.4, 26177.15, 26142.1, 26042.3, 25942.1, 25938.85, 26129.6]
-
 
 def merge_incremental_days(existing_dates: list, existing_prices: list, existing_volumes: list,
                             existing_highs: list, existing_lows: list, existing_opens: list = None,
@@ -3925,8 +3632,6 @@ def merge_incremental_days(existing_dates: list, existing_prices: list, existing
 
     return {'dates': dates, 'prices': prices, 'volumes': volumes, 'highs': highs, 'lows': lows, 'opens': opens}
 
-
-
 def normalize_rs(raw_series: list) -> Optional[int]:
     """
     Self-normalized RS matching Pine Script exactly.
@@ -3948,8 +3653,6 @@ def normalize_rs(raw_series: list) -> Optional[int]:
         return 50
     return max(1, min(99, round(((current - lo) / (hi - lo)) * 98 + 1)))
 
-
-
 def rs_slope(hist: list) -> dict:
     valid = [v for v in hist if v is not None]
     if len(valid) < 4:
@@ -3962,7 +3665,6 @@ def rs_slope(hist: list) -> dict:
     slope = round(num / den, 2) if den else 0.0
     trend = 'improving' if slope > 1.5 else 'declining' if slope < -1.5 else 'flat'
     return {'trend': trend, 'slope': slope}
-
 
 async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> int:
     start = time.time()
@@ -5263,8 +4965,6 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
     log.info(f"✅ {scan_type} scan done: {len(processed)} stocks in {duration}s")
     return len(processed)
 
-# ── Announcement enrichment + 1-month history backfill ──────────────────
-
 async def save_best_picks(session: aiohttp.ClientSession, top_rows: list, reasoning: dict):
     """Full-replace semantics: today's top N fully overwrite the table.
     Best Picks is a point-in-time snapshot, not a growing history — a
@@ -5329,8 +5029,6 @@ async def save_best_picks(session: aiohttp.ClientSession, top_rows: list, reason
         log.info(f"  🏆 Saved {len(payload)} best picks to Supabase")
     except Exception as e:
         log.warning(f"⚠️ Best picks save exception: {e}")
-
-
 
 async def save_best_picks_history(session: aiohttp.ClientSession, top_rows: list, reasoning: dict):
     """Append-only track record, unlike save_best_picks' full-replace
@@ -5401,8 +5099,6 @@ async def save_best_picks_history(session: aiohttp.ClientSession, top_rows: list
     except Exception as e:
         log.warning(f"⚠️ Best picks history save exception: {e}")
 
-
-
 async def save_full_history_batch_to_db(session: aiohttp.ClientSession, rows: list):
     """Upsert full-history rows into Supabase in small chunks (payload per
     row is large — full 2yr OHLCV — so chunks are kept smaller than the
@@ -5449,8 +5145,6 @@ async def save_full_history_batch_to_db(session: aiohttp.ClientSession, rows: li
     await asyncio.gather(*[upload(c) for c in chunks])
     log.info(f"  💾 Uploaded {uploaded}/{len(rows)} full-history rows to Supabase")
 
-
-
 async def save_index_history_to_db(session: aiohttp.ClientSession, name: str, prices: list):
     """Save index price history to Supabase for persistence across restarts."""
     import json as _json
@@ -5477,8 +5171,6 @@ async def save_index_history_to_db(session: aiohttp.ClientSession, name: str, pr
                 log.warning(f"  Save {name} failed: {r.status} — {body[:200]}")
     except Exception as e:
         log.warning(f"  Save index history failed: {e}")
-
-
 
 def scan_should_skip_fundamentals() -> bool:
     """True if the live-scan process should never fetch fundamentals
@@ -5508,35 +5200,6 @@ def scan_should_skip_fundamentals() -> bool:
     if os.getenv('SERVICE_MODE', '').lower() == 'fundamentals':
         return False
     return True
-_fundamentals_debug_count = 0  # caps detailed per-request diagnostic logging
-_upstox_fundamentals_debug_count = 0  # caps raw-response logging for the new Upstox fundamentals API
-_upstox_shareholding_debug_count = 0  # separate budget so share-holdings isn't starved by key-ratios logging
-_live_nifty_debug_count = 0  # caps raw-response logging for the live Nifty price fetch
-_live_index_debug_count = 0  # caps raw-response logging for the live all-indices price fetch
-_industry_endpoint_path = None  # remembered once a working fundamentals industry path is found
-_fetch_error_counts: dict = {}  # exception-type name -> count, reset per load_fundamentals_batch call,
-# aggregated (not logged per-call) so a systemic failure shows up as one
-# clear summary line instead of thousands of repeated log entries
-
-_NSE_ANNOUNCEMENTS_HEADER_SETS = [
-    {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.5",
-        "Accept-Encoding": "gzip, deflate",
-        "Referer": "https://www.nseindia.com/get-quotes/equity?symbol=HDFCBANK",
-    },
-    {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; rv:109.0) Gecko/20100101 Firefox/118.0",
-        "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.5",
-        "Accept-Encoding": "gzip, deflate",
-        "Referer": "https://www.nseindia.com/get-quotes/equity?symbol=HDFCBANK",
-    },
-]
-_nse_announcements_debug_count = 0  # caps raw-response logging while verifying the real field shape
-
 
 async def seed_index_history_if_needed(session: aiohttp.ClientSession):
     """
@@ -5562,7 +5225,6 @@ async def seed_index_history_if_needed(session: aiohttp.ClientSession):
     await save_index_history_to_db(session, "Nifty 50", merged)
     nifty_cache = {'prices': merged, 'volumes': nifty_cache.get('volumes', [])}
     log.info(f"✅ Seeded Nifty 50: {len(merged)} days saved to DB!")
-
 
 async def send_daily_digest(session, processed: list, breadth: dict):
     """Send EOD digest to Telegram."""
@@ -5609,13 +5271,6 @@ async def send_daily_digest(session, processed: list, breadth: dict):
     await send_telegram(session, msg)
     log.info("Daily digest sent to Telegram")
 
-
-# Market hours IST
-MARKET_OPEN_H, MARKET_OPEN_M   = 9, 15
-MARKET_CLOSE_H, MARKET_CLOSE_M = 15, 30
-
-# ── Math functions ────────────────────────────────────────────────────
-
 async def send_telegram(session, message: str):
     """Send a message via Telegram bot."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -5633,12 +5288,10 @@ async def send_telegram(session, message: str):
     except Exception as e:
         log.warning(f"Telegram error: {e}")
 
-
 def sma(prices: list, n: int) -> Optional[float]:
     if len(prices) < n:
         return None
     return sum(prices[-n:]) / n
-
 
 def std_dev(prices: list, n: int) -> Optional[float]:
     if len(prices) < n:
@@ -5647,7 +5300,6 @@ def std_dev(prices: list, n: int) -> Optional[float]:
     mean = sum(vals) / n
     variance = sum((p - mean) ** 2 for p in vals) / n
     return variance ** 0.5
-
 
 async def supabase_update_meta(session: aiohttp.ClientSession, meta: dict):
     """Update scan metadata."""
@@ -5664,8 +5316,6 @@ async def supabase_update_meta(session: aiohttp.ClientSession, meta: dict):
             pass
     except Exception as e:
         log.error(f"Meta update error: {e}")
-
-# ── Market hours check ────────────────────────────────────────────────
 
 async def supabase_upsert(session: aiohttp.ClientSession, table: str, rows: list, on_conflict: str = None):
     """Upsert rows into Supabase table in parallel chunks for speed."""
@@ -5700,7 +5350,6 @@ async def supabase_upsert(session: aiohttp.ClientSession, table: str, rows: list
             await upsert_chunk(chunk)
     await asyncio.gather(*[upsert_with_sem(c) for c in chunks])
 
-
 def trim_for_r2(stocks: list) -> list:
     """Filters each stock dict down to only _R2_STOCK_FIELDS before
     uploading — the R2 copy is read-only display data for the frontend,
@@ -5730,8 +5379,6 @@ def trim_for_r2(stocks: list) -> list:
             log.info(f"     {field}: {size/1024:.1f} KB ({size/max(total_size,1)*100:.1f}%)")
 
     return trimmed
-_r2_size_diagnostic_logged = False
-
 
 def true_range_series(highs: list, lows: list, closes: list) -> list:
     tr = []
@@ -5746,7 +5393,6 @@ def true_range_series(highs: list, lows: list, closes: list) -> list:
             ))
     return tr
 
-
 def tv_history_from_raw(raw_series: list, days: int = 15) -> list:
     """
     Build a day-by-day TV-style (self-normalized) RS history from an
@@ -5760,7 +5406,6 @@ def tv_history_from_raw(raw_series: list, days: int = 15) -> list:
         end_idx = n - 1 - d
         hist.append(normalize_rs(raw_series[:end_idx + 1]) if end_idx >= 0 else None)
     return hist
-
 
 async def upload_snapshot_to_r2(key: str, data, cache_seconds: int = 60):
     """Uploads a JSON snapshot to R2 for the frontend to read directly
@@ -5790,7 +5435,6 @@ async def upload_snapshot_to_r2(key: str, data, cache_seconds: int = 60):
         log.info(f"  ☁️ Uploaded {key} to R2 ({len(body)/1024:.1f} KB)")
     except Exception as e:
         log.warning(f"⚠️ R2 upload failed for {key}: {e}")
-
 
 def validate_hardcoded_symbol_lists():
     """
@@ -5834,10 +5478,6 @@ def validate_hardcoded_symbol_lists():
         log.error(f"  ❌ {total_bad} bad symbol(s) found across hardcoded lists — see warnings above. "
                   f"These stocks are silently invisible in the app until the symbol is corrected.")
 
-
-instrument_key_map: dict = {} # sym -> full instrument key (e.g. NSE_EQ|INE002A01018)
-
-
 def was_in_squeeze_yesterday(closes, highs, lows, n=20) -> bool:
     if len(closes) < n + 21:
         return False
@@ -5852,7 +5492,6 @@ def was_in_squeeze_yesterday(closes, highs, lows, n=20) -> bool:
     ub, lb = m + 2*s, m - 2*s
     uk, lk = m + 1.5*a, m - 1.5*a
     return ub < uk and lb > lk
-
 
 
 # ══ SERVICE ENTRY POINT ══

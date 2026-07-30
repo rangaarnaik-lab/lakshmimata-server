@@ -87,7 +87,6 @@ __all__ = [
     '_XBRL_EPS_TAGS',
     '_XBRL_PAT_TAGS',
     '_XBRL_SALES_TAGS',
-    '__all__',
     '_fetch_error_counts',
     '_fundamentals_debug_count',
     '_industry_endpoint_path',
@@ -663,6 +662,36 @@ if __name__ == '__main__':
 
 # ══ SHARED FUNCTIONS (used by both services) ══
 
+def _load_sector_industry_lookup() -> dict:
+    """One-time load of the static sector/industry lookup table (built
+    from a broad market-cap sweep, ~2,355 symbols after dropping indices/
+    ETFs) into memory at import time. This is a far more reliable source
+    than fetch_fundamentals_screener()'s live scrape — that scraper has a
+    documented ~98% blank-response rate (Railway IP rate-limiting) and,
+    as of the last review, its sector/industry regex patterns don't even
+    match screener.in's current markup, so it was never actually
+    populating 'industry' in practice. This file needs periodic manual
+    refreshes (sector/industry classifications drift slowly, so this
+    doesn't need to be live), but the coverage is dramatically better
+    than SECTOR_MAP's ~150 hand-curated symbols, and it's zero extra API
+    calls or scraping.
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'sector_industry_lookup.csv')
+    lookup = {}
+    try:
+        with open(path, newline='', encoding='utf-8') as f:
+            for row in csv.DictReader(f):
+                sym = (row.get('symbol') or '').strip()
+                if sym:
+                    lookup[sym] = {
+                        'industry': (row.get('industry') or '').strip() or None,
+                        'sector':   (row.get('sector') or '').strip() or None,
+                    }
+        log.info(f"✅ Loaded sector/industry lookup: {len(lookup)} symbols from {path}")
+    except Exception as e:
+        log.warning(f"Sector/industry lookup load failed ({path}): {e} — falling back to SECTOR_MAP + live fetch only")
+    return lookup
+
 async def ensure_fundamentals_table(session: aiohttp.ClientSession,
                                      retries: int = 6, delay: float = 10.0) -> bool:
     """Same self-healing pattern as ensure_full_history_table — see that
@@ -724,8 +753,6 @@ async def ensure_fundamentals_table(session: aiohttp.ClientSession,
     log.error("     add column if not exists promoter_trend numeric,")
     log.error("     add column if not exists peg_ratio numeric;")
     return False
-
-
 
 async def fetch_fundamentals_screener(session: aiohttp.ClientSession, sym: str, debug: bool = False) -> dict:
     """
@@ -985,11 +1012,6 @@ async def fetch_fundamentals_screener(session: aiohttp.ClientSession, sym: str, 
             log.info(f"  🔍 {sym} fetch raised exception: {type(e).__name__}: {e}")
     return result
 
-# Cache fundamentals to avoid re-fetching every minute
-fundamentals_cache: dict = {}  # sym -> {market_cap, pe, roe, eps, debt_eq, promoter, fetched_at}
-FUNDAMENTALS_TTL = 30 * 24 * 3600  # refresh monthly (data changes quarterly; monthly is a safe margin without re-fetching on every restart)
-
-
 async def fetch_upstox_fundamentals(session: aiohttp.ClientSession, sym: str, isin: str,
                                      debug: bool = False) -> Optional[dict]:
     """
@@ -1202,8 +1224,6 @@ async def fetch_upstox_fundamentals(session: aiohttp.ClientSession, sym: str, is
 
     return result if got_any else None
 
-
-
 def get_industry(sym: str) -> Optional[str]:
     """Distinct 'Industry' value (finer-grained than Sector) shown
     alongside Sector in the Index/Sector tables. Prefers the live
@@ -1214,76 +1234,6 @@ def get_industry(sym: str) -> Optional[str]:
     if live:
         return live
     return SECTOR_INDUSTRY_LOOKUP.get(sym, {}).get('industry')
-
-# ── Upstox API ────────────────────────────────────────────────────────
-NIFTY50   = ["RELIANCE","TCS","HDFCBANK","BHARTIARTL","ICICIBANK","INFY","SBIN","HINDUNILVR","ITC","LT","KOTAKBANK","HCLTECH","AXISBANK","BAJFINANCE","MARUTI","ASIANPAINT","SUNPHARMA","TITAN","ULTRACEMCO","NESTLEIND","WIPRO","NTPC","POWERGRID","TECHM","TMPV","ADANIENT","ADANIPORTS","ONGC","BAJAJFINSV","JSWSTEEL","TATASTEEL","COALINDIA","HINDALCO","M&M","DRREDDY","CIPLA","EICHERMOT","DIVISLAB","BPCL","GRASIM","INDUSINDBK","APOLLOHOSP","BAJAJ-AUTO","HEROMOTOCO","TVSMOTOR","SHREECEM","BRITANNIA","VEDL","BEL","NTPC"]
-MIDCAP    = ["MPHASIS","PERSISTENT","COFORGE","LTTS","TATAELXSI","BANDHANBNK","FEDERALBNK","IDFCFIRSTB","RBLBANK","AUBANK","CHOLAFIN","MUTHOOTFIN","MANAPPURAM","AAVAS","ESCORTS","AUROPHARMA","LUPIN","BIOCON","ALKEM","GLENMARK","IPCALAB","EMAMILTD","GODREJCP","NMDC","MOIL","PRESTIGE","BRIGADE","PHOENIXLTD","SOBHA","LODHA","METROPOLIS","THYROCARE","LALPATHLAB","NH","ASTERDM","STARHEALTH","MCX","ANGELONE","EASEMYTRIP","RATEGAIN"]
-SMALLCAP  = ["DELTACORP","GMRINFRA","IDEA","SUZLON","UNITECH","DISHTV","JPASSOCIAT","PVR","INDIABULL","KOLTEPATIL","LEMONTREE","THOMASCOOK","JUSTDIAL","IXIGO","ALOKTEXT","RADICO","HEIDELBERG","BIRLACORPN","JKCEMENT","RAMCOCEM","HFCL","STLTECH","TEJAS","ROUTE","RAILTEL","NSDL","CANFINHOME","APTUS","HOMEFIRST","REPCO","SPANDANA","CREDITACC","SATIN"]
-
-MICROCAP = [
-  "MTAR","TDPOWERSYS","STLTECH","SANSERA","ASTRAMICRO","SOUTHBANK","UJJIVANSFB",
-  "KTKBANK","SURYODAY","ESAFSFB","SAFARI","ANANTRAJ","HIKAL","KPIL","NUVOCO",
-  "ORIENTELEC","POLYMED","RAJRATAN","SBFC","SENCO","SHOPERSTOP","SMLISUZU",
-  "STOVEKRAFT","SUPRAJIT","IPCALAB","FLUOROCHEM","GABRIEL","GHCL","GNFC",
-  "GRINDWELL","GSFC","HARDWYN","HATSUN","HINDCOPPER","HOEC","HONASA","IGPL",
-  "INTELLECT","IRCON","IRFC","ISEC","JUBLFOOD","JYOTHYLAB","KALYANKJIL",
-  "KANSAINER","KARURVYSYA","KRBL","LUXIND","MAYURUNIQ","MIDHANI","MINDAIND",
-  "MOLDTKPAC","MONTECARLO","MPSLTD","MRPL","NAVINFLUOR","NOCIL","NUCLEUS",
-  "OLECTRA","OMAXE","PAISALO","PCJEWELLER","PIIND","POLYCAB","POWERMECH",
-  "PRINCEPIPE","PRSMJOHNSN","PURVA","QUICKHEAL","RAJESHEXPO","RAYMOND",
-  "REDINGTON","RELAXO","REPCO","RITES","ROSSARI","RUPA","RVNL","SADBHAV",
-  "SAKSOFT","SANDHAR","SAREGAMA","SASKEN","SEQUENT","SHAKTIPUMP","SHILPAMED",
-  "SHOPERSTOP","SHREDIGIT","SKIPPER","SNOWMAN","SOLARA","SONACOMS","SOTL",
-  "SPANDANA","SPENCERS","STAR","STCINDIA","STEELCITY","SUDARSCHEM","SUMICHEM",
-  "SUNTV","SUPRAJIT","SUPREMEIND","SYNCOMF","TALBROAUTO","TARSONS","TASTYBITE",
-  "TEAMLEASE","TEXRAIL","THANGAMAYL","TIRUMALCHM","TITAGARH","TMVFINANCE",
-  "TORNTPOWER","TRIGYN","TRIVENI","TTKHLTCARE","TTKPRESTIG","TVTODAY","UFLEX",
-  "UNIENTER","UTTAMSUGAR","V2RETAIL","VAIBHAVGBL","VARROC","VENKEYS","VESUVIUS",
-  "VGUARD","VIMTALABS","VINDHYATEL","VIPIND","VOLTAMP","VRLLOG","VSTIND",
-  "VSTL","WABCOINDIA","WEIZMANIND","WELCORP","WONDERLA","XCHANGING","ZENTEC",
-  "ZEEMEDIA","ZYDUSLIFE","NRBBEARING","NILKAMAL","NESCO","NETWORK18","NELCO",
-  "NDTV","NCLIND","NOCIL","NAUKRI","NAGAFERT","MTNL","MONARCH","METROBRAND",
-  "MEDANTA","MASTEK","MARATHON","MASFIN","MANINFRA","MAHASTEEL","LGBBROSLTD"
-]
-
-
-# Popular NSE stocks not in major indices — PSU, Defence, Mid/Small caps
-EXTRA_STOCKS = [
-    # Defence PSU
-    "GRSE","BDL","HAL","BEL","MIDHANI","BEML","COCHINSHIP","MAZAGON",
-    # PSU Banks/Finance  
-    "BANKBARODA","PNB","UNIONBANK","CANARABANK","INDIANB","IOB","CENTRALBK",
-    # PSU Energy/Infra
-    "NHPC","SJVN","IRFC","RVNL","IRCON","NBCC","HUDCO","RAILTEL",
-    # Popular midcap/smallcap
-    "SHAKTIPUMP","ELECON","GPIL","JYOTICNC","PNCINFRA","KNRCON",
-    "HGINFRA","AHLUCONT","CAPACITE","WELCORP","RAMCOCEM","DALBHARAT",
-    "JKCEMENT","NUVOCO","HEIDELBERG","BIRLACORPN","ORIENTCEM",
-    # Auto ancillary
-    "SUPRAJIT","LUMAXTECH","SANDHAR","ENDURANCE","SUBROS","UCALFUEL",
-    # Chemicals
-    "DEEPAKFERT","GNFC","GSFC","RASHTRIYA","CHAMBAL","COROMANDEL",
-    # Textiles  
-    "GRASIM","VARDHMAN","RAYMOND","ARVIND","WELSPUNIND","TRIDENT",
-    # Pharma
-    "IPCALAB","AJANTPHARM","NATCOPHARM","GRANULES","SOLARA","AARTI",
-]
-
-ALL_STOCKS = list(dict.fromkeys(NIFTY50 + MIDCAP + SMALLCAP + MICROCAP + EXTRA_STOCKS))
-
-# ── Official index constituent lists (fetched live at startup) ────────
-# The hardcoded NIFTY50/MIDCAP/SMALLCAP/MICROCAP arrays above are small
-# fallback samples. At startup we replace them with the real, current
-# official lists published by niftyindices.com. If that fetch fails for
-# any reason, we silently keep using the hardcoded fallback so the app
-# never breaks.
-NIFTY_INDEX_CSV_URLS = {
-    'NIFTY50':   'https://niftyindices.com/IndexConstituent/ind_nifty50list.csv',
-    'MIDCAP150': 'https://niftyindices.com/IndexConstituent/ind_niftymidcap150list.csv',
-    'SMALLCAP250': 'https://niftyindices.com/IndexConstituent/ind_niftysmallcap250list.csv',
-    'MICROCAP250': 'https://niftyindices.com/IndexConstituent/ind_niftymicrocap250_list.csv',
-}
-
 
 def get_sector(sym: str) -> str:
     for sector, stocks in SECTOR_MAP.items():
@@ -1305,7 +1255,6 @@ def get_sector(sym: str) -> str:
         return auto
     return "Other"
 
-
 def is_market_open() -> bool:
     now = datetime.now(IST)
     if now.weekday() >= 5:  # Saturday/Sunday
@@ -1313,7 +1262,6 @@ def is_market_open() -> bool:
     open_time  = now.replace(hour=MARKET_OPEN_H,  minute=MARKET_OPEN_M,  second=0, microsecond=0)
     close_time = now.replace(hour=MARKET_CLOSE_H, minute=MARKET_CLOSE_M, second=0, microsecond=0)
     return open_time <= now <= close_time
-
 
 async def load_fundamentals_batch(session: aiohttp.ClientSession, symbols: list):
     """Fetch fundamentals for a batch of symbols, respecting TTL cache."""
@@ -1437,8 +1385,6 @@ async def load_fundamentals_batch(session: aiohttp.ClientSession, symbols: list)
         summary = ', '.join(f"{k}={v}" for k, v in sorted(_fetch_error_counts.items(), key=lambda x: -x[1]))
         log.info(f"  📋 Fetch outcome breakdown: {summary}")
 
-
-
 async def load_fundamentals_from_supabase(session: aiohttp.ClientSession) -> list:
     """
     Load previously-fetched fundamentals straight from Supabase — zero
@@ -1550,8 +1496,6 @@ async def load_fundamentals_from_supabase(session: aiohttp.ClientSession) -> lis
     gc.collect()
     return stale_or_missing
 
-
-
 async def load_instrument_master(session: aiohttp.ClientSession):
     """Fetch Upstox instrument master to get correct instrument keys."""
     global instrument_key_map, ALL_STOCKS
@@ -1643,7 +1587,6 @@ async def load_instrument_master(session: aiohttp.ClientSession):
     for sym in ALL_STOCKS:
         instrument_key_map[sym] = f"NSE_EQ|{sym}"
     return False
-
 
 async def save_fundamentals_batch_to_db(session: aiohttp.ClientSession, rows: list):
     """Upsert fundamentals rows into Supabase — same chunked pattern as
