@@ -5538,7 +5538,19 @@ async def run_live_scan_service():
                     nse_eq = list(dict.fromkeys(nse_eq))
                     log.info(f"✅ Fetched {len(nse_eq)} NSE equity stocks from Upstox")
                     if len(nse_eq) > 100:
-                        ALL_STOCKS = nse_eq
+                        # in-place, not reassignment — load_instrument_master
+                        # (Step 2, right below) is the authoritative source and
+                        # ALSO fixed to use in-place mutation; if THIS line used
+                        # plain '=' instead, it would rebind ALL_STOCKS to a
+                        # brand-new list object BEFORE Step 2 even runs,
+                        # permanently disconnecting live_scan.py from
+                        # shared.py's object — confirmed via production log
+                        # this was the actual, full explanation for the
+                        # 298/321-stock bug (in the original single-file
+                        # code this was harmless, since Step 2's reassignment
+                        # ran in the same namespace and simply overwrote it;
+                        # splitting the file exposed the object-identity gap).
+                        ALL_STOCKS[:] = nse_eq
                     else:
                         log.warning("Too few instruments fetched — using hardcoded list")
                 else:
