@@ -1,0 +1,6121 @@
+#!/usr/bin/env python3
+"""
+PocketRS Pro — Live Scan Service (angelic-strength)
+"""
+import os
+import gc
+import sys
+import time
+import json
+import asyncio
+import aiohttp
+import logging
+from datetime import datetime, timezone, timedelta
+
+from shared import *
+
+log = logging.getLogger('pocketrs')
+
+# ══ LIVE-SCAN-ONLY FUNCTIONS ══
+
+def _r2_put_object_sync(key: str, body: bytes, content_type: str, cache_seconds: int):
+    """The actual blocking boto3 call — only ever invoked inside
+    asyncio.to_thread() below, never directly on the event loop."""
+    _r2_client.put_object(
+        Bucket=R2_BUCKET_NAME,
+        Key=key,
+        Body=body,
+        ContentType=content_type,
+        CacheControl=f'public, max-age={cache_seconds}',
+    )
+
+# Exact set of fields the frontend's transformStockRow() actually reads
+# (src/lib/db.js) — cross-referenced directly from that function's body,
+# not guessed. The R2 snapshot was coming out ~5.5x larger than the
+# equivalent Supabase read (6.05MB vs ~1.1MB) because it was uploading
+# each stock's full internal `processed` dict as-is, including fields
+# the frontend never touches. R2's cost is $0 regardless of size, but a
+# smaller file still means a faster first-load for every user each time
+# the CDN cache needs refreshing.
+_R2_STOCK_FIELDS = frozenset({
+    'sym','rs','rs_tv','rs_nifty50','rs_midcap','rs_smallcap','rs_microcap','rs_sector',
+    'last_price','chg_pct','high_52w','sector','industry','chg_w_pct','chg_m_pct',
+    'in_nifty50','in_midcap','in_smallcap','in_microcap','rvol','ibv_signal',
+    'is_resistance_breakout','is_52wh_breakout','resistance_r1',
+    'is_cup_handle_breakout','has_cup_pattern','cup_depth_pct',
+    'is_guppy_bullish_crossover','is_guppy_bearish_crossover','is_guppy_compressed',
+    'vol_signal','rs_line_new_high','rs_line_trend','rs_line_value','is_s2_new_entry',
+    'market_cap','pe','roe','eps','debt_eq','promoter',
+    'eps_qoq','eps_yoy','sales_qoq','sales_yoy','opm_pct','opm_trend',
+    'eps_growth_streak','fii_pct','fii_trend','dii_pct','dii_trend',
+    'promoter_trend','peg_ratio',
+    'fundamental_score','fundamental_label',
+    'rs_hist','rs_trend','rs_slope',
+    'is_pp','pp_hist','pp_count_10d','pp_vol_ratio','ma10','ma50',
+    'is_hy','hy_pct','volume','hy_hist',
+    'is_ht','ht_pct','ht_hist','ibv_hist',
+    'near_ema9','ema9','pct_from_ema9',
+    'near_ema21','ema21','pct_from_ema21',
+    'near_ema50','ema50','pct_from_ema50',
+    'near_52wl','pct_from_52wl','low_52w','crossed_ema5','pp_volume_52wl',
+    'is_52wl_signal','ema5',
+    'is_weak_rs','weak_chg_1d','weak_chg_5d','weak_vol_spike',
+    'in_squeeze','squeeze_fired','bb_width_pct','squeeze_days',
+    'is_vcp','vcp_stage','vcp_fired','vcp_contractions',
+    'last_updated','scan_type',
+})
+
+
+def _template_pick_reasoning(r: dict) -> str:
+    """Zero-cost fallback rationale when ANTHROPIC_API_KEY isn't set —
+    lists whichever strong signals actually fired. Plain and mechanical
+    rather than natural language, but still informative."""
+    bits = []
+    if r.get('weinstein_stage') == 2:
+        bits.append('Stage-2 uptrend')
+    if r.get('vcp_fired'):
+        bits.append('VCP breakout')
+    if r.get('is_resistance_breakout'):
+        bits.append('resistance breakout')
+    if r.get('is_cup_handle_breakout'):
+        bits.append('cup & handle breakout')
+    rs = r.get('rs_tv') or r.get('rs')
+    if isinstance(rs, (int, float)) and rs >= 80:
+        bits.append(f'RS {int(rs)}')
+    if isinstance(r.get('rvol'), (int, float)) and r['rvol'] >= 1.5:
+        bits.append(f"{r['rvol']:.1f}x volume")
+    eps_qoq, eps_yoy = r.get('eps_qoq'), r.get('eps_yoy')
+    if isinstance(eps_qoq, (int, float)) and isinstance(eps_yoy, (int, float)) and eps_qoq > 0 and eps_yoy > 0:
+        bits.append('EPS growing QoQ & YoY')
+    if r.get('promoter_trend') == 'increasing':
+        bits.append('promoter buying')
+    if not bits:
+        bits.append('high composite score across signals')
+    return ' + '.join(bits[:3])
+
+
+
+def atr(highs: list, lows: list, closes: list, n: int = 20) -> Optional[float]:
+    if len(closes) < n + 1:
+        return None
+    tr = true_range_series(highs, lows, closes)
+    return sum(tr[-n:]) / n
+
+
+async def backfill_ema_breadth_history(session: aiohttp.ClientSession):
+    """
+    One-time backfill of 'how many stocks are trading above their 9/21/
+    50-day EMA' for every available trading day (same full-history
+    approach as backfill_market_breadth_history — was previously capped
+    at ~35 days, extended so the frontend's 1M/3M/6M/1Y/2Y range picker
+    has real data to show beyond the most recent month). Unlike Stage 2
+    (which needs the cross-market RS-TV comparison and can't be
+    reconstructed after the fact), EMA-above is purely a function of
+    each stock's own price series, so this can be backfilled the same
+    way market breadth was. Self-guards to only run once.
+    """
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/ema_breadth_history?select=date",
+            headers={**headers, "Prefer": "count=exact"},
+            timeout=aiohttp.ClientTimeout(total=15)
+        ) as r:
+            existing_count = 0
+            if r.status in (200, 206):
+                content_range = r.headers.get('content-range', '')
+                if '/' in content_range:
+                    existing_count = int(content_range.split('/')[-1])
+            if existing_count >= 100:
+                log.info(f"  ema_breadth_history already has {existing_count} rows — skipping backfill")
+                return
+            if r.status == 400:
+                log.error("❌ ema_breadth_history table missing! Run the SQL to create it, then restart.")
+                return
+            log.info(f"  ema_breadth_history has only {existing_count} row(s) — running real backfill")
+    except Exception as e:
+        log.warning(f"ema_breadth_history check failed: {e}")
+        return
+
+    log.info("📊 Backfilling EMA breadth history from stored price data (one-time)...")
+    counts: dict = {}
+    PAGE = 1000
+    offset = 0
+    while True:
+        try:
+            page_headers = {**headers, "Range": f"{offset}-{offset + PAGE - 1}"}
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/stock_full_history?select=sym,dates,prices",
+                headers=page_headers, timeout=aiohttp.ClientTimeout(total=30)
+            ) as r:
+                if r.status not in (200, 206):
+                    break
+                page = await r.json()
+        except Exception as e:
+            log.error(f"backfill_ema_breadth_history fetch error: {e}")
+            break
+
+        # date -> [above_ema9, above_ema21, above_ema50, total], processed
+        # page-by-page rather than accumulating every stock's dates+prices
+        # into one list first (same reasoning as the other backfills above).
+        for row in page:
+            # dates/prices are stored as JSON-encoded strings (json.dumps at
+            # write time), not native arrays — must be parsed back, or every
+            # row silently fails the length check below and gets skipped.
+            raw_dates = row.get('dates')
+            raw_prices = row.get('prices')
+            try:
+                dates = json.loads(raw_dates) if isinstance(raw_dates, str) else (raw_dates or [])
+                prices = json.loads(raw_prices) if isinstance(raw_prices, str) else (raw_prices or [])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if len(dates) < 55 or len(prices) != len(dates):
+                continue
+            ema9  = ema_arr(prices, 9)
+            ema21 = ema_arr(prices, 21)
+            ema50 = ema_arr(prices, 50)
+            for i in range(50, len(dates)):
+                d = dates[i]
+                if d not in counts:
+                    counts[d] = [0, 0, 0, 0]
+                counts[d][3] += 1
+                if ema9[i] is not None and prices[i] > ema9[i]:
+                    counts[d][0] += 1
+                if ema21[i] is not None and prices[i] > ema21[i]:
+                    counts[d][1] += 1
+                if ema50[i] is not None and prices[i] > ema50[i]:
+                    counts[d][2] += 1
+
+        if len(page) < PAGE:
+            break
+        offset += PAGE
+
+    rows_to_save = [
+        {'date': d, 'above_ema9': a9, 'above_ema21': a21, 'above_ema50': a50, 'total': tot}
+        for d, (a9, a21, a50, tot) in counts.items()
+    ]
+    rows_to_save.sort(key=lambda r: r['date'])
+    log.info(f"  Computed EMA breadth for {len(rows_to_save)} trading days")
+
+    BATCH = 500
+    for i in range(0, len(rows_to_save), BATCH):
+        batch = rows_to_save[i:i+BATCH]
+        try:
+            async with session.post(
+                f"{SUPABASE_URL}/rest/v1/ema_breadth_history",
+                headers={**headers, "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates"},
+                json=batch, timeout=aiohttp.ClientTimeout(total=30)
+            ) as r:
+                if r.status not in (200, 201, 204):
+                    body = await r.text()
+                    log.warning(f"  EMA breadth backfill batch failed: status={r.status} body={body[:200]}")
+        except Exception as e:
+            log.warning(f"  EMA breadth backfill batch error: {e}")
+    log.info(f"✅ EMA breadth backfill complete: {len(rows_to_save)} days saved")
+    gc.collect()
+
+
+
+async def backfill_index_history_30days(session: aiohttp.ClientSession, target_days: int = 30):
+    """
+    Retroactively reconstructs index_history for the past ~30 trading
+    days. Unlike backfill_sector_history_30days (a pure rollup of
+    already-computed stock_history), this needs the same "recompute as
+    of day N" approach as backfill_stock_history_30days — index-level
+    RS-TV, %-change ranks, and Stage aren't precomputed anywhere, only
+    each index's raw price history is (index_history_cache, loaded at
+    startup). calc_rs_tv_normalized()'s built-in end_idx parameter makes
+    this the same trick as the stock backfill: truncate the raw RS
+    series to "as of day N" instead of writing new math.
+
+    Date alignment caveat: index_history_cache stores prices/volumes/
+    highs/lows as plain parallel arrays with NO date labels attached
+    (unlike stock_full_history, which does). This backfill assumes
+    index price arrays and stock_history's trading-calendar dates are
+    aligned by position counting backward from "today" — i.e. prices[-1]
+    is the same trading day as stock_history's most recent date,
+    prices[-2] the day before that, etc. Both ultimately reflect the
+    same NSE trading calendar, so this should hold, but there's no
+    direct date field to verify it against. If index dates ever look
+    off by one vs. sector/stock dates when compared side by side, this
+    alignment assumption is the first thing to check.
+    """
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/index_history?select=snapshot_date",
+            headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+        ) as r:
+            if r.status == 400:
+                log.error("❌ index_history table missing! Run the CREATE TABLE SQL first.")
+                return
+            distinct_dates = set()
+            if r.status in (200, 206):
+                for row in await r.json():
+                    if row.get('snapshot_date'):
+                        distinct_dates.add(row['snapshot_date'])
+            if len(distinct_dates) >= target_days - 2:
+                log.info(f"  index_history already has {len(distinct_dates)} distinct trading days "
+                         f"(target {target_days}) — skipping backfill")
+                return
+    except Exception as e:
+        log.warning(f"index_history backfill guard check failed: {e}")
+        return
+
+    # Trading-calendar dates come from stock_history (already has 30 real
+    # days) rather than any index-specific source, per the alignment
+    # caveat above.
+    dates = []
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/stock_history?select=snapshot_date&order=snapshot_date.desc&limit=2000",
+            headers=headers, timeout=aiohttp.ClientTimeout(total=30)
+        ) as r:
+            if r.status in (200, 206):
+                seen = {row['snapshot_date'] for row in await r.json() if row.get('snapshot_date')}
+                dates = sorted(seen)[-target_days:]
+    except Exception as e:
+        log.error(f"index_history backfill: failed to load trading dates from stock_history: {e}")
+        return
+
+    if not dates:
+        log.error("index_history backfill: no trading dates available (stock_history empty?), aborting")
+        return
+
+    nifty_prices = nifty_cache.get('prices', [])
+    if len(nifty_prices) < 252:
+        log.error("index_history backfill: Nifty benchmark history too short for RS-TV, aborting")
+        return
+
+    n_days = len(dates)
+    index_history_rows = []
+
+    for idx_name, idx_data in index_history_cache.items():
+        prices = idx_data['prices']
+        n = len(prices)
+        if n < 5:
+            continue
+        raw_rs_series = None if idx_name == 'Nifty 50' else calc_raw_rs_series(prices, nifty_prices)
+
+        # k = 0 is today (most recent), k = n_days-1 is the oldest day in
+        # this window — walking backward from the end of the price array.
+        for k in range(n_days):
+            end_idx = n - 1 - k
+            if end_idx < 4:
+                break  # ran out of this index's own history
+            date = dates[n_days - 1 - k]
+
+            last = prices[end_idx]
+            prev  = prices[end_idx-1]  if end_idx >= 1  else last
+            week  = prices[end_idx-5]  if end_idx >= 5  else prices[0]
+            month = prices[end_idx-21] if end_idx >= 21 else prices[0]
+            chg_d = round((last - prev) / prev * 100, 2) if prev else 0
+            chg_w = round((last - week) / week * 100, 2) if week else 0
+            chg_m = round((last - month) / month * 100, 2) if month else 0
+
+            rs_tv = None
+            if raw_rs_series is not None:
+                rs_tv = normalize_rs(raw_rs_series[:end_idx+1])
+
+            ma30 = sma(prices[:end_idx+1], min(30, end_idx+1))
+            ma10 = sma(prices[:end_idx+1], min(10, end_idx+1))
+            window252 = prices[max(0,end_idx-251):end_idx+1]
+            h52 = max(window252) if window252 else last
+            pct_from_high = round((last - h52) / h52 * 100, 1) if h52 else 0
+
+            if ma30 and last > ma30 and ma10 and ma10 >= ma30:
+                stage = 3 if pct_from_high >= -5 else 2
+            elif ma30 and last < ma30 and ma10 and ma10 <= ma30:
+                stage = 4
+            else:
+                stage = 1
+
+            index_history_rows.append({
+                'snapshot_date': date, 'name': idx_name,
+                'rs_tv': rs_tv, 'chg_d': chg_d, 'stage': stage,
+                '_chg_w': chg_w, '_chg_m': chg_m,  # used for ranking below, stripped before upsert
+            })
+
+    # Rank each day's indices by chg_d/chg_w/chg_m, same as the live
+    # index-dashboard block does — ranks are relative to that day's
+    # cohort, not comparable across days.
+    by_date = {}
+    for row in index_history_rows:
+        by_date.setdefault(row['snapshot_date'], []).append(row)
+    for date, rows in by_date.items():
+        for field, rank_field in (('chg_d', 'rank_d'), ('_chg_w', 'rank_w'), ('_chg_m', 'rank_m')):
+            ordered = sorted(rows, key=lambda r: r[field], reverse=True)
+            for i, r in enumerate(ordered):
+                r[rank_field] = i + 1
+
+    final_rows = [
+        {k: v for k, v in row.items() if not k.startswith('_')}
+        for row in index_history_rows
+    ]
+
+    if final_rows:
+        await supabase_upsert(session, 'index_history', final_rows, on_conflict='snapshot_date,name')
+        log.info(f"✅ index_history backfill complete: {len(by_date)} trading days, "
+                 f"{len(final_rows)} index-day rows saved")
+    else:
+        log.error("index_history backfill: computed zero rows, aborting")
+
+
+
+async def backfill_market_breadth_history(session: aiohttp.ClientSession):
+    """
+    One-time backfill of daily market breadth (how many stocks advanced
+    vs declined each day) using the 2 years of price history already
+    stored per stock in stock_full_history — so this doesn't have to
+    start from zero and only accumulate going forward. Guarded to skip
+    only once a REAL backfill has run (>=20 rows) — not just "any row
+    exists", since the daily EOD step adds one row per day regardless,
+    and checking for "any data" meant that single daily row permanently
+    blocked the real backfill from ever running on subsequent restarts.
+    """
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/market_breadth_history?select=date",
+            headers={**headers, "Prefer": "count=exact"},
+            timeout=aiohttp.ClientTimeout(total=15)
+        ) as r:
+            existing_count = 0
+            if r.status in (200, 206):
+                content_range = r.headers.get('content-range', '')
+                if '/' in content_range:
+                    existing_count = int(content_range.split('/')[-1])
+            if existing_count >= 20:
+                log.info(f"  market_breadth_history already has {existing_count} rows — skipping backfill")
+                return
+            if r.status == 400:
+                log.error("❌ market_breadth_history table missing! Run the SQL to create it, then restart.")
+                return
+            log.info(f"  market_breadth_history has only {existing_count} row(s) — running real backfill")
+    except Exception as e:
+        log.warning(f"market_breadth_history check failed: {e}")
+        return
+
+    log.info("📊 Backfilling market breadth history from stored price data (one-time)...")
+    breadth: dict = {}  # date -> [advances, declines, unchanged]
+    PAGE = 1000
+    offset = 0
+    while True:
+        try:
+            page_headers = {**headers, "Range": f"{offset}-{offset + PAGE - 1}"}
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/stock_full_history?select=sym,dates,prices",
+                headers=page_headers, timeout=aiohttp.ClientTimeout(total=30)
+            ) as r:
+                if r.status not in (200, 206):
+                    break
+                page = await r.json()
+        except Exception as e:
+            log.error(f"backfill_market_breadth_history fetch error: {e}")
+            break
+
+        for row in page:
+            # dates/prices are stored as JSON-encoded strings (json.dumps at
+            # write time), not native arrays — must be parsed back, or every
+            # row silently fails the length check below and gets skipped.
+            raw_dates = row.get('dates')
+            raw_prices = row.get('prices')
+            try:
+                dates = json.loads(raw_dates) if isinstance(raw_dates, str) else (raw_dates or [])
+                prices = json.loads(raw_prices) if isinstance(raw_prices, str) else (raw_prices or [])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if len(dates) < 2 or len(prices) != len(dates):
+                continue
+            for i in range(1, len(dates)):
+                d = dates[i]
+                if prices[i] is None or prices[i-1] is None:
+                    continue
+                if d not in breadth:
+                    breadth[d] = [0, 0, 0]
+                if prices[i] > prices[i-1]:
+                    breadth[d][0] += 1
+                elif prices[i] < prices[i-1]:
+                    breadth[d][1] += 1
+                else:
+                    breadth[d][2] += 1
+
+        if len(page) < PAGE:
+            break
+        offset += PAGE
+
+    rows_to_save = [
+        {'date': d, 'advances': a, 'declines': dec, 'unchanged': u, 'total': a+dec+u}
+        for d, (a, dec, u) in breadth.items()
+    ]
+    rows_to_save.sort(key=lambda r: r['date'])
+    log.info(f"  Computed breadth for {len(rows_to_save)} trading days")
+
+    BATCH = 500
+    for i in range(0, len(rows_to_save), BATCH):
+        batch = rows_to_save[i:i+BATCH]
+        try:
+            async with session.post(
+                f"{SUPABASE_URL}/rest/v1/market_breadth_history",
+                headers={**headers, "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates"},
+                json=batch, timeout=aiohttp.ClientTimeout(total=30)
+            ) as r:
+                if r.status not in (200, 201, 204):
+                    body = await r.text()
+                    log.warning(f"  breadth backfill batch failed: status={r.status} body={body[:200]}")
+        except Exception as e:
+            log.warning(f"  breadth backfill batch error: {e}")
+    log.info(f"✅ Market breadth backfill complete: {len(rows_to_save)} days saved")
+    gc.collect()
+
+
+
+async def backfill_sector_history_30days(session: aiohttp.ClientSession, target_days: int = 30):
+    """
+    Retroactively reconstructs sector_history for the past ~30 trading
+    days by aggregating stock_history — NOT by recomputing anything from
+    raw prices. sector_history was silently broken since it was built
+    (missing 'improving' column meant every single write 400'd — see the
+    2026-07-12 diagnosis), so unlike backfill_stock_history_30days this
+    isn't "reconstruct from scratch", it's "roll up data that was already
+    sitting there the whole time, just never aggregated".
+
+    Deliberately mirrors build_sector_rs()'s exact membership rule (only
+    symbols listed in SECTOR_MAP, ~20 sectors) rather than each stock's
+    broader get_sector()-derived sector field stored in stock_history —
+    matching that was a deliberate choice (see conversation: "leave
+    build_sector_rs as-is, 20 curated sectors only"), so backfilled days
+    and future live-written days show the same sector universe instead of
+    the count changing day to day depending on which code wrote it.
+    """
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/sector_history?select=snapshot_date",
+            headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+        ) as r:
+            distinct_dates = set()
+            if r.status in (200, 206):
+                for row in await r.json():
+                    if row.get('snapshot_date'):
+                        distinct_dates.add(row['snapshot_date'])
+            if len(distinct_dates) >= target_days - 2:
+                log.info(f"  sector_history already has {len(distinct_dates)} distinct trading days "
+                         f"(target {target_days}) — skipping backfill")
+                return
+    except Exception as e:
+        log.warning(f"sector_history backfill guard check failed: {e}")
+        return
+
+    # Pull only the columns needed for aggregation, paginated (stock_history
+    # can be 2000+ stocks × 30 days = 60k+ rows, well past PostgREST's
+    # default single-request cap).
+    all_rows = []
+    try:
+        offset = 0
+        while True:
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/stock_history?select=snapshot_date,sym,rs_tv,rs_trend,is_pp"
+                f"&order=snapshot_date.desc&limit=1000&offset={offset}",
+                headers=headers, timeout=aiohttp.ClientTimeout(total=30)
+            ) as r:
+                if r.status not in (200, 206):
+                    log.error(f"sector_history backfill: stock_history fetch failed: {r.status}")
+                    break
+                batch = await r.json()
+                if not batch:
+                    break
+                all_rows.extend(batch)
+                offset += 1000
+                if len(batch) < 1000:
+                    break
+    except Exception as e:
+        log.error(f"sector_history backfill: failed to load stock_history: {e}")
+        return
+
+    if not all_rows:
+        log.error("sector_history backfill: no stock_history rows found, aborting")
+        return
+
+    dates = sorted({r['snapshot_date'] for r in all_rows})[-target_days:]
+    date_set = set(dates)
+
+    by_date = {}
+    for row in all_rows:
+        d = row['snapshot_date']
+        if d not in date_set:
+            continue
+        by_date.setdefault(d, {})[row['sym']] = row
+
+    sector_history_rows = []
+    for d, sym_map in by_date.items():
+        sector_agg = {}
+        for sector_name, syms in SECTOR_MAP.items():
+            members = [sym_map[s] for s in syms if s in sym_map and sym_map[s].get('rs_tv') is not None]
+            if not members:
+                continue
+            avg_rs = round(sum(m['rs_tv'] for m in members) / len(members))
+            pp_count = sum(1 for m in members if m.get('is_pp'))
+            improving = sum(1 for m in members if m.get('rs_trend') == 'improving')
+            top = sorted(members, key=lambda m: m['rs_tv'], reverse=True)[:5]
+            sector_agg[sector_name] = {
+                'avg_rs': avg_rs, 'count': len(members),
+                'pp_count': pp_count, 'improving': improving,
+                'top_stocks': [m['sym'] for m in top],
+            }
+        ranked = sorted(sector_agg.items(), key=lambda kv: kv[1]['avg_rs'], reverse=True)
+        for i, (sector_name, agg) in enumerate(ranked):
+            sector_history_rows.append({
+                'snapshot_date': d,
+                'sector':        sector_name,
+                'avg_rs':        agg['avg_rs'],
+                'rank':          i + 1,
+                'count':         agg['count'],
+                'pp_count':      agg['pp_count'],
+                'improving':     agg['improving'],
+                'top_stocks':    json.dumps(agg['top_stocks']),
+            })
+
+    if sector_history_rows:
+        await supabase_upsert(session, 'sector_history', sector_history_rows, on_conflict='snapshot_date,sector')
+        log.info(f"✅ sector_history backfill complete: {len(by_date)} trading days, "
+                 f"{len(sector_history_rows)} sector-day rows saved")
+    else:
+        log.error("sector_history backfill: computed zero rows (no SECTOR_MAP symbols found in "
+                   "stock_history?), aborting")
+
+
+
+async def backfill_stock_history_30days(session: aiohttp.ClientSession, target_days: int = 30):
+    """
+    Retroactively reconstructs stock_history for the past ~30 trading
+    days, using price history already stored in stock_full_history.
+    Unlike the simpler breadth backfills, this needs the FULL computed
+    scanner state per stock per day — RS-TV (a cross-market comparison,
+    normally the hardest thing to reconstruct after the fact), PP/HY/HT/
+    IBV signals, and Weinstein stage — not just a single metric.
+
+    Made feasible by calc_raw_rs_series()/normalize_rs() and detect_pp()
+    etc already being pure functions of (prices, volumes, ..., end_idx)
+    with no live-API dependency — computing "as of day N" just means
+    truncating each stock's arrays to end at day N and calling the same
+    functions the live scan already uses, not writing new logic.
+
+    Self-guards to skip if stock_history already has enough recent rows
+    (checked via a distinct-date count within the target window).
+
+    target_days temporarily bumped 30->35 (both call sites) to force a
+    fresh backfill pass after confirming 2026-07-27 was missing entirely
+    (0 rows) despite the aggregate distinct-date count already being
+    high enough to satisfy the old guard threshold — a single missing
+    day among ~30 mostly-present ones doesn't necessarily drop the total
+    below that threshold, so a plain restart wouldn't have re-triggered
+    this on its own. Safe to run again even for already-correct days —
+    upserts, doesn't duplicate.
+    """
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+
+    # Guard: skip only if we already have close to target_days worth of
+    # DISTINCT dates — not just a row-count threshold, since a backfill
+    # that times out partway through (e.g. after 7 of 30 days) would
+    # already exceed a flat row-count threshold and incorrectly be
+    # skipped as "done" on the next restart instead of resuming. Queries
+    # the available_history_dates view (distinct dates already) rather
+    # than fetching every stock_history row just to dedupe client-side.
+    # NOTE: checks per-date ROW COUNTS, not just distinct presence — a
+    # date with SOME rows already (e.g. 498 of ~2400 stocks, from the
+    # index-alignment bug fixed alongside this) would otherwise look
+    # "already present" and get silently skipped forever, never actually
+    # getting completed. Queries stock_history directly (not the
+    # available_history_dates view, which only exposes distinct dates,
+    # not counts) for a recent window, counting occurrences per date
+    # client-side.
+    date_counts = {}
+    try:
+        cutoff_date = (datetime.now(IST) - timedelta(days=target_days + 5)).strftime('%Y-%m-%d')
+        offset = 0
+        PAGE_SZ = 1000  # Supabase/PostgREST caps responses at 1000 rows by
+                         # default REGARDLESS of what a larger Range header
+                         # requests — the previous version assumed getting
+                         # fewer than the requested size meant "last page,"
+                         # which is wrong when the server silently caps
+                         # below that. Confirmed via production log: only
+                         # 1000 rows ever got fetched total (one page),
+                         # missing ~71000 of the real ~72000 rows, which
+                         # made date_counts nearly empty and caused EVERY
+                         # day to look incomplete. Now advances by the
+                         # ACTUAL number of rows received each call and
+                         # only stops on a genuinely empty page.
+        while True:
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/stock_history?select=snapshot_date&snapshot_date=gte.{cutoff_date}",
+                headers={**headers, "Range": f"{offset}-{offset+PAGE_SZ-1}"},
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as r:
+                if r.status == 400:
+                    log.error("❌ stock_history table/query issue! Check Supabase.")
+                    return
+                if r.status not in (200, 206):
+                    log.warning(f"stock_history backfill guard check failed: status {r.status}")
+                    return
+                page = await r.json()
+            if not page:
+                break
+            for row in page:
+                dt = row.get('snapshot_date')
+                if dt:
+                    date_counts[dt] = date_counts.get(dt, 0) + 1
+            offset += len(page)
+            if len(page) < PAGE_SZ:
+                break  # a real short page — genuinely no more rows
+        log.info(f"  stock_history has {len(date_counts)} distinct days on record in the recent window "
+                 f"({offset} total rows fetched; per-day counts range "
+                 f"{min(date_counts.values()) if date_counts else 0}-"
+                 f"{max(date_counts.values()) if date_counts else 0}) — checking for gaps/incomplete "
+                 f"days in the last {target_days} trading days...")
+    except Exception as e:
+        log.warning(f"stock_history backfill guard check failed: {e}")
+        return
+
+    log.info("📚 Backfilling stock_history for the past ~30 trading days (one-time, this takes a while)...")
+
+    # Fetch every stock's full OHLCV history, processing each page as it
+    # arrives (see load_all_history_from_supabase for the full reasoning
+    # on why accumulating raw pages before parsing any of them roughly
+    # doubles peak memory during exactly this kind of startup-time load).
+    stock_data = {}
+    skip_reasons = {}  # reason -> [syms], so a skip is diagnosable instead of silent
+    PAGE = 1000
+    offset = 0
+    nifty_prices = await load_index_history_from_db(session, "Nifty 50")
+    if not nifty_prices:
+        log.error("stock_history backfill: no Nifty 50 benchmark history found, aborting (RS-TV needs it)")
+        return
+    while True:
+        try:
+            page_headers = {**headers, "Range": f"{offset}-{offset + PAGE - 1}"}
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/stock_full_history?select=sym,dates,prices,volumes,highs,lows",
+                headers=page_headers, timeout=aiohttp.ClientTimeout(total=30)
+            ) as r:
+                if r.status not in (200, 206):
+                    body = await r.text()
+                    log.error(f"stock_history backfill: fetch failed {r.status} {body[:200]}")
+                    break
+                page = await r.json()
+        except Exception as e:
+            log.error(f"backfill_stock_history_30days fetch error: {e}")
+            break
+
+        # Parse every stock's arrays once (JSON-string decoding, same gotcha
+        # the breadth backfills hit) and precompute its full raw-RS series
+        # once — the expensive O(n) part — so each of the 30 days only needs
+        # a cheap re-normalization over a slice, not a full recompute.
+        for row in page:
+            sym = row.get('sym')
+            try:
+                dates   = json.loads(row['dates'])   if isinstance(row.get('dates'), str)   else (row.get('dates') or [])
+                prices  = json.loads(row['prices'])  if isinstance(row.get('prices'), str)  else (row.get('prices') or [])
+                volumes = json.loads(row['volumes']) if isinstance(row.get('volumes'), str) else (row.get('volumes') or [])
+                highs   = json.loads(row['highs'])   if isinstance(row.get('highs'), str)   else (row.get('highs') or [])
+                lows    = json.loads(row['lows'])    if isinstance(row.get('lows'), str)    else (row.get('lows') or [])
+            except (json.JSONDecodeError, TypeError):
+                skip_reasons.setdefault('json_decode_error', []).append(sym or '?')
+                continue
+            if not sym:
+                continue
+            # Was `< 260` — but normalize_rs() degrades gracefully with fewer
+            # valid points (falls back to whatever window is available, only
+            # actually needs >=2), so requiring a near-full year here was
+            # excluding established, long-listed stocks whenever their stored
+            # history happened to be shorter than that for any reason —
+            # rather than giving them a shorter-but-real backfilled trail.
+            # >=35 just guarantees enough for target_days=30 plus a small
+            # margin, not "enough for a statistically ideal RS-TV window".
+            if len(dates) < 35:
+                skip_reasons.setdefault('too_few_dates', []).append(f"{sym}({len(dates)})")
+                continue
+            if len(prices) != len(dates) or len(volumes) != len(dates):
+                skip_reasons.setdefault('array_length_mismatch', []).append(
+                    f"{sym}(dates={len(dates)},prices={len(prices)},volumes={len(volumes)})")
+                continue
+            raw_rs_series = calc_raw_rs_series(prices, nifty_prices)
+            stock_data[sym] = {
+                'dates': dates, 'prices': prices, 'volumes': volumes,
+                'highs': highs if len(highs) == len(dates) else prices,
+                'lows':  lows  if len(lows)  == len(dates) else prices,
+                'raw_rs_series': raw_rs_series,
+                # Maps calendar date -> this stock's OWN index for that
+                # date, used below instead of a shared numeric position
+                # across all stocks. Confirmed necessary: 2,389/2,415
+                # stocks genuinely had 2026-07-27 in their own `dates`
+                # array, but the old shared-index approach (assuming
+                # every stock's array is identically aligned/gap-free)
+                # only produced 498 rows for that day — most stocks'
+                # OWN array position for that date didn't match the
+                # reference stock's position for the same date, so they
+                # were silently skipped or matched to the wrong day.
+                'date_to_idx': {dt: i for i, dt in enumerate(dates)},
+            }
+
+        if len(page) < PAGE:
+            break
+        offset += PAGE
+
+    if skip_reasons:
+        for reason, syms in skip_reasons.items():
+            log.warning(f"  stock_history backfill: {len(syms)} stocks skipped ({reason}): "
+                        f"{syms[:15]}{'...' if len(syms) > 15 else ''}")
+
+    if not stock_data:
+        log.error("stock_history backfill: no stocks had enough history to compute RS-TV, aborting")
+        return
+
+    # Sector lookup — use get_sector() (not just a raw SECTOR_MAP scan)
+    # so historical rows get the same SECTOR_MAP + SECTOR_INDUSTRY_LOOKUP
+    # fallback chain the live scan uses, instead of silently defaulting
+    # every non-SECTOR_MAP stock to "Other" here.
+    sym_to_sector = {sym: get_sector(sym) for sym in stock_data}
+
+    # Use whichever stock has the most days as the calendar reference —
+    # take its last `target_days` dates as the trading days to consider.
+    ref_sym = max(stock_data, key=lambda s: len(stock_data[s]['dates']))
+    ref_dates = stock_data[ref_sym]['dates']
+    total_days = len(ref_dates)
+    candidate_indices = list(range(max(0, total_days - target_days), total_days))
+    # Reconstruct any date that's either fully missing OR only partially
+    # populated — checked via actual row count vs how many stocks we
+    # have data for now, not just binary presence. Confirmed necessary:
+    # after fixing the index-alignment bug alone, July 27 still had
+    # exactly 498 rows and the count DIDN'T change on the next run,
+    # because a binary "is this date in stock_history at all" check
+    # saw 498 existing rows and considered the date already done,
+    # skipping it forever instead of ever completing the remaining
+    # ~1900 stocks. 90% threshold leaves room for stocks that
+    # legitimately don't have data that far back (newly listed, etc.)
+    # without being fooled by a large-but-incomplete day.
+    completeness_threshold = len(stock_data) * 0.9
+    backfill_indices = [i for i in candidate_indices
+                        if date_counts.get(ref_dates[i], 0) < completeness_threshold]
+    if not backfill_indices:
+        log.info(f"  stock_history: all {len(candidate_indices)} recent trading days already "
+                 f"sufficiently complete (>=90% of {len(stock_data)} stocks), nothing to backfill")
+        return
+    backfill_indices.reverse()  # most recent day first — if this times out
+    # partway through, the recent (more useful) days are the ones that
+    # actually get saved, not the oldest ones.
+    log.info(f"  Reconstructing {len(backfill_indices)} missing/incomplete trading day(s) (of "
+             f"{len(candidate_indices)} in the last {target_days}) across {len(stock_data)} stocks: "
+             f"{[ref_dates[i] for i in backfill_indices]}")
+
+    days_saved = 0
+    for day_idx in backfill_indices:
+        snapshot_date = ref_dates[day_idx]
+        day_rows = []
+        for sym, d in stock_data.items():
+            idx = d['date_to_idx'].get(snapshot_date)
+            if idx is None:
+                continue  # this stock's own history genuinely doesn't have this date
+            prices_upto  = d['prices'][:idx+1]
+            volumes_upto = d['volumes'][:idx+1]
+            highs_upto   = d['highs'][:idx+1]
+            lows_upto    = d['lows'][:idx+1]
+            last = prices_upto[-1]
+
+            raw_series_upto = d['raw_rs_series'][:idx+1] if idx < len(d['raw_rs_series']) else d['raw_rs_series']
+            rs = normalize_rs(raw_series_upto) or 0
+            hist15 = tv_history_from_raw(raw_series_upto, days=15) if raw_series_upto else [None]*15
+            trend_data = rs_slope(hist15)
+
+            pp = detect_pp(prices_upto, volumes_upto)
+
+            yr_vols  = volumes_upto[-252:] if len(volumes_upto) >= 252 else volumes_upto
+            max_yr   = max(yr_vols) if yr_vols else 1
+            max_all  = max(volumes_upto) if volumes_upto else 1
+            chg_today = round((last - prices_upto[-2]) / prices_upto[-2] * 100, 2) if len(prices_upto) >= 2 and prices_upto[-2] else 0
+            hy_pct = round(volumes_upto[-1] / max_yr * 100, 1) if max_yr > 0 else 0
+            ht_pct = round(volumes_upto[-1] / max_all * 100, 1) if max_all > 0 else 0
+            is_hy = hy_pct >= 95 and chg_today > 0
+            is_ht = ht_pct >= 95 and chg_today > 0
+
+            ibv_signal = detect_ibv_signal(
+                volumes_upto[:-1], volumes_upto[-1],
+                highs_upto[-1], lows_upto[-1], last
+            )
+
+            p252 = prices_upto[-252:] if len(prices_upto) >= 252 else prices_upto
+            h52 = max(p252)
+            l52 = min(p252)
+            pct_from_h52 = round((last - h52) / h52 * 100, 1) if h52 else 0
+            weinstein_stage = calc_weinstein_stage(rs, trend_data['trend'], pct_from_h52, hist15)
+
+            day_rows.append({
+                'snapshot_date':  snapshot_date,
+                'sym':            sym,
+                'sector':         sym_to_sector.get(sym, 'Other'),
+                'last_price':     round(last, 2),
+                'chg_pct':        chg_today,
+                'rs':             rs,
+                'rs_tv':          rs,
+                'rs_hist':        hist15,
+                'rs_trend':       trend_data['trend'],
+                'is_pp':          pp['is_pp'],
+                'pp_hist':        pp['pp_hist'],
+                'pp_count_10d':   pp['pp_count_10d'],
+                'is_hy':          is_hy,
+                'hy_pct':         hy_pct,
+                'is_ht':          is_ht,
+                'ht_pct':         ht_pct,
+                'ibv_signal':     ibv_signal,
+                'weinstein_stage': weinstein_stage,
+                'high_52w':       round(h52, 2),
+                'low_52w':        round(l52, 2),
+            })
+
+        if day_rows:
+            await supabase_upsert(session, 'stock_history', day_rows, on_conflict='snapshot_date,sym')
+            days_saved += 1
+        if days_saved % 5 == 0:
+            log.info(f"  ...{days_saved}/{len(backfill_indices)} days reconstructed so far")
+
+    log.info(f"✅ stock_history 30-day backfill complete: {days_saved} trading days saved")
+    gc.collect()
+
+
+
+def build_sector_rs(processed: list, sector_map: dict) -> list:
+    sectors = []
+    for sector, syms in sector_map.items():
+        members = [s for s in processed if s['sym'] in syms]
+        if not members:
+            continue
+        avg_rs   = round(sum(s['rs'] for s in members) / len(members))
+        pp_count = sum(1 for s in members if s.get('is_pp'))
+        improving= sum(1 for s in members if s.get('rs_trend') == 'improving')
+        top5     = sorted(members, key=lambda x: x['rs'], reverse=True)[:5]
+
+        # Breadth — % of this sector's stocks advancing at each timeframe.
+        # Matches the "Segment Advances %" concept: not just "is the
+        # sector index up", but "how broad is the move across its members"
+        # (a sector up 2% on one large-cap carrying it looks very
+        # different from one up 2% with 80% of members participating).
+        def advance_pct(field):
+            vals = [s.get(field) for s in members if s.get(field) is not None]
+            if not vals:
+                return None
+            return round(sum(1 for v in vals if v > 0) / len(vals) * 100, 2)
+
+        sectors.append({
+            'sector':   sector,
+            'avg_rs':   avg_rs,
+            'count':    len(members),
+            'pp_count': pp_count,
+            'improving':improving,
+            'advances_d': advance_pct('chg_pct'),
+            'advances_w': advance_pct('chg_w_pct'),
+            'advances_m': advance_pct('chg_m_pct'),
+            'top_stocks': [{'sym': s['sym'], 'rs': s['rs']} for s in top5],
+        })
+    sectors.sort(key=lambda x: x['avg_rs'], reverse=True)
+    for i, s in enumerate(sectors):
+        s['rank'] = i + 1
+    return sectors
+
+# ── Sector map ────────────────────────────────────────────────────────
+SECTOR_MAP = {
+    "IT":            ["TCS","INFY","WIPRO","HCLTECH","TECHM","MPHASIS","PERSISTENT","COFORGE","LTTS","KPITTECH","TATAELXSI"],
+    "Private Bank":  ["HDFCBANK","ICICIBANK","KOTAKBANK","AXISBANK","INDUSINDBK","BANDHANBNK","FEDERALBNK","IDFCFIRSTB","RBLBANK","AUBANK","YESBANK"],
+    "PSU Bank":      ["SBIN","PNB","CANBK","BANKBARODA","UNIONBANK","BANKINDIA"],
+    "Defence":       ["HAL","BEL","BDL","MAZDOCK","COCHINSHIP","BEML","MIDHANI","GRSE",
+                       "DATAPATTNS","PARAS","ZENTEC","APOLLO"],
+    "NBFC":          ["BAJFINANCE","BAJAJFINSV","CHOLAFIN","MUTHOOTFIN","MANAPPURAM","AAVAS","HOMEFIRST","LICHSGFIN","PNBHOUSING","CANFINHOME"],
+    "Auto":          ["MARUTI","TMPV","M&M","BAJAJ-AUTO","HEROMOTOCO","TVSMOTOR","EICHERMOT","BOSCHLTD","MOTHERSON","ESCORTS"],
+    "Pharma":        ["SUNPHARMA","DRREDDY","CIPLA","DIVISLAB","LUPIN","AUROPHARMA","BIOCON","ALKEM","GLENMARK","IPCALAB","MANKIND","JUBLPHARMA"],
+    "FMCG":          ["HINDUNILVR","ITC","NESTLEIND","DABUR","MARICO","COLPAL","EMAMILTD","GODREJCP","TATACONSUM"],
+    "Energy":        ["RELIANCE","ONGC","BPCL","IOC","HINDPETRO","GAIL","PETRONET","IGL","MGL","ATGL"],
+    "Metals":        ["JSWSTEEL","TATASTEEL","HINDALCO","COALINDIA","VEDL","NMDC","MOIL"],
+    "Infra/Capital": ["LT","SIEMENS","ABB","BHEL","CUMMINSIND","THERMAX","HAVELLS"],
+    "Cement":        ["ULTRACEMCO","GRASIM","SHREECEM","AMBUJACEM","ACC","JKCEMENT","RAMCOCEM"],
+    "Consumer":      ["TITAN","ASIANPAINT","BERGEPAINT","PIDILITIND","VOLTAS","CROMPTON"],
+    "Telecom":       ["BHARTIARTL","IDEA","TATACOMM","RAILTEL","HFCL","STLTECH"],
+    "Realty":        ["DLF","GODREJPROP","OBEROIRLTY","PRESTIGE","BRIGADE","PHOENIXLTD","SOBHA","LODHA"],
+    "Healthcare":    ["APOLLOHOSP","FORTIS","MAXHEALTH","METROPOLIS","THYROCARE","LALPATHLAB","NH","ASTERDM"],
+    "Insurance":     ["SBILIFE","HDFCLIFE","ICICIPRULI","LICI","GICRE","STARHEALTH"],
+    "Internet":      ["ETERNAL","NYKAA","PAYTM","POLICYBZR","INDIAMART","JUSTDIAL","RATEGAIN","IXIGO"],
+    "Travel":        ["IRCTC","EASEMYTRIP","THOMASCOOK"],
+    "Exchange":      ["BSE","CDSL","CAMS","MCX","ANGELONE"],
+}
+
+
+def build_synthetic_index(symbols: list, cache: dict, min_stocks: int = 20) -> dict:
+    """
+    Build synthetic index from constituent stocks.
+    Uses the LONGEST common window (most stocks have 285 days).
+    Stocks with shorter history are excluded rather than truncating all.
+    """
+    # Get all series, find the most common length (mode)
+    all_series = []
+    for sym in symbols:
+        data = cache.get(sym)
+        if data and len(data.get('prices', [])) >= 252:
+            all_series.append(data['prices'])
+
+    if len(all_series) < min_stocks:
+        return {}
+
+    # Use the max length that at least 80% of stocks share
+    lengths = sorted([len(s) for s in all_series], reverse=True)
+    target_len = lengths[int(len(lengths) * 0.2)]  # 80th percentile length
+
+    # Keep only stocks with enough history, truncate to target_len
+    series = [s[-target_len:] for s in all_series if len(s) >= target_len]
+
+    if len(series) < min_stocks:
+        return {}
+
+    prices = [
+        sum(s[i] for s in series) / len(series)
+        for i in range(target_len)
+    ]
+    return {'prices': prices}
+
+NIFTY_INSTRUMENT_KEY = "NSE_INDEX|Nifty 50"  # Upstox key for Nifty 50 index
+
+# All indices to track on the Index Dashboard page
+# Key = display name, value = Upstox instrument key
+INDEX_TRACKER = {
+    "Nifty 50":       "NSE_INDEX|Nifty 50",
+    "Nifty Next 50":  "NSE_INDEX|Nifty Next 50",
+    "Nifty 500":      "NSE_INDEX|Nifty 500",
+    "Bank Nifty":     "NSE_INDEX|Nifty Bank",
+    "IT":             "NSE_INDEX|Nifty IT",
+    "Pharma":         "NSE_INDEX|Nifty Pharma",
+    "Auto":           "NSE_INDEX|Nifty Auto",
+    "FMCG":           "NSE_INDEX|Nifty FMCG",
+    "Metal":          "NSE_INDEX|Nifty Metal",
+    "Realty":         "NSE_INDEX|Nifty Realty",
+    "Energy":         "NSE_INDEX|Nifty Energy",
+    "Defence":            "NSE_INDEX|Nifty India Defence",
+    "Financial Services": "NSE_INDEX|Nifty Fin Service",
+    "PSU Bank":           "NSE_INDEX|Nifty PSU Bank",
+    "Private Bank":       "NSE_INDEX|Nifty Pvt Bank",
+    "PSE":                "NSE_INDEX|Nifty PSE",
+    "Media":              "NSE_INDEX|Nifty Media",
+    "Infrastructure":     "NSE_INDEX|Nifty Infra",
+    "Healthcare":         "NSE_INDEX|Nifty Healthcare",
+    "Consumer Durables":  "NSE_INDEX|Nifty Consr Durable",
+    "Oil & Gas":          "NSE_INDEX|Nifty Oil & Gas",
+    "Chemicals":          "NSE_INDEX|Nifty Chemicals",
+    "Commodities":        "NSE_INDEX|Nifty Commodities",
+    "MNC":                "NSE_INDEX|Nifty MNC",
+    "Consumption":        "NSE_INDEX|Nifty India Consumption",
+    "Manufacturing":      "NSE_INDEX|Nifty India Manufacturing",
+    "CPSE":               "NSE_INDEX|Nifty CPSE",
+    "Digital":            "NSE_INDEX|Nifty India Digital",
+    "EV & New Age Auto":  "NSE_INDEX|Nifty EV & New Age Automotive",
+    "Tourism":            "NSE_INDEX|Nifty India Tourism",
+    "Capital Markets":    "NSE_INDEX|Nifty Capital Markets",
+    "Housing":            "NSE_INDEX|Nifty Housing",
+    "Railways":           "NSE_INDEX|Nifty India Railways PSU",
+    "Internet":           "NSE_INDEX|Nifty India Internet",
+    "Rural":              "NSE_INDEX|Nifty Rural",
+    "Services":           "NSE_INDEX|Nifty Services Sector",
+    "REITs & InvITs":     "NSE_INDEX|Nifty REITs & InvITs",
+    "Mobility":           "NSE_INDEX|Nifty Mobility",
+    "Infra & Logistics":  "NSE_INDEX|Nifty India Infrastructure & Logistics",
+    "Transport & Logistics": "NSE_INDEX|Nifty Transportation & Logistics",
+    "IPO":                "NSE_INDEX|Nifty IPO",
+}
+
+# Cache for all index historical data
+index_history_cache: dict = {}  # name -> {prices, volumes}
+
+
+def calc_live_raw_rs_today(prices: list, bench_prices: list,
+                            live_price: float, live_bench_price: float) -> Optional[float]:
+    """
+    Compute TODAY's raw RS using live price/benchmark instead of waiting
+    for historical_cache to be refreshed at EOD. During live market hours,
+    historical_cache's last element is still YESTERDAY's close — this
+    function treats live_price/live_bench_price as an implicit "today"
+    point one step past the end of the arrays, using the same 63/126/189/
+    252-day-back weighting as calc_raw_rs_series. The lookback anchors
+    (prices[-63] etc) are measured from yesterday rather than today, which
+    is off by one trading day out of a 63-252 day window — negligible.
+    """
+    if live_price is None or live_bench_price is None:
+        return None
+    n = min(len(prices), len(bench_prices))
+    if n < 252:
+        return None
+    prices = prices[-n:]
+    bench_prices = bench_prices[-n:]
+
+    def pct(last_val, arr, length):
+        prev = arr[-length]
+        return (last_val - prev) / prev * 100 if prev else None
+
+    r3,  br3  = pct(live_price, prices, 63),  pct(live_bench_price, bench_prices, 63)
+    r6,  br6  = pct(live_price, prices, 126), pct(live_bench_price, bench_prices, 126)
+    r9,  br9  = pct(live_price, prices, 189), pct(live_bench_price, bench_prices, 189)
+    r12, br12 = pct(live_price, prices, 252), pct(live_bench_price, bench_prices, 252)
+    if None in (r3, br3, r6, br6, r9, br9, r12, br12):
+        return None
+    return (r3-br3)*0.4 + (r6-br6)*0.2 + (r9-br9)*0.2 + (r12-br12)*0.2
+
+
+
+def calc_raw_rs_series(prices: list, bench_prices: list) -> list:
+    """
+    Compute full rawRS series for a stock vs benchmark in ONE pass.
+    Returns list of rawRS values (one per day, None where not computable).
+    This is called ONCE per stock — result is cached and used for normalization.
+
+    CRITICAL: prices and bench_prices are usually different lengths (e.g. a
+    stock's own ~500-day Yahoo history vs a ~1738-day Nifty cache seeded
+    with years of extra history). Both arrays end on the same "today", so
+    they must be RIGHT-aligned (trimmed from the front) before comparing by
+    index — left-aligning (as a naive `arr[i]` for i in range(min(len...)))
+    would compare the stock's recent prices against the benchmark's oldest
+    prices, from a completely different calendar period.
+    """
+    n = min(len(prices), len(bench_prices))
+    prices = prices[-n:]
+    bench_prices = bench_prices[-n:]
+    result = []
+    for i in range(n):
+        if i < 252:
+            result.append(None)
+            continue
+        def pct(arr, length):
+            prev = arr[i - length]
+            return (arr[i] - prev) / prev * 100 if prev else None
+        r3  = pct(prices, 63);  br3  = pct(bench_prices, 63)
+        r6  = pct(prices, 126); br6  = pct(bench_prices, 126)
+        r9  = pct(prices, 189); br9  = pct(bench_prices, 189)
+        r12 = pct(prices, 252); br12 = pct(bench_prices, 252)
+        if None in (r3,br3,r6,br6,r9,br9,r12,br12):
+            result.append(None)
+        else:
+            result.append((r3-br3)*0.4 + (r6-br6)*0.2 + (r9-br9)*0.2 + (r12-br12)*0.2)
+    return result
+
+
+
+def calc_rs_line(prices: list, bench_prices: list) -> dict:
+    """
+    RS Line = stock price / Nifty price * 100.
+    RS Line New High = RS line at all-time high in last 252 days BEFORE price.
+    This is the IBD 'RS Line in Blue Sky' signal — early leader detection.
+    """
+    if len(prices) < 60 or len(bench_prices) < 60:
+        return {'rs_line_new_high': False, 'rs_line_trend': 'flat'}
+    # Right-align: both series end on "today" but are usually different
+    # lengths (stock's own history vs a much longer benchmark cache), so
+    # trim from the front to match up the same calendar period — see the
+    # same fix/comment in calc_raw_rs_series.
+    n = min(len(prices), len(bench_prices))
+    prices = prices[-n:]
+    bench_prices = bench_prices[-n:]
+    rs_line = [prices[i] / bench_prices[i] * 100 for i in range(n) if bench_prices[i] > 0]
+    if len(rs_line) < 30:
+        return {'rs_line_new_high': False, 'rs_line_trend': 'flat'}
+    current = rs_line[-1]
+    high_252 = max(rs_line[-min(252,len(rs_line)):])
+    price_high_252 = max(prices[-min(252,len(prices)):])
+    # RS Line New High = RS line at high but price NOT at high yet
+    rs_line_new_high = (current >= high_252 * 0.99 and prices[-1] < price_high_252 * 0.98)
+    # RS Line trend (5d vs 20d slope)
+    if len(rs_line) >= 20:
+        slope = (rs_line[-1] - rs_line[-20]) / rs_line[-20] * 100
+        trend = 'rising' if slope > 1 else 'falling' if slope < -1 else 'flat'
+    else:
+        trend = 'flat'
+    return {
+        'rs_line_new_high': rs_line_new_high,
+        'rs_line_trend': trend,
+        'rs_line_value': round(current, 2),
+    }
+
+
+def calc_rs_tv_normalized(prices: list, bench_prices: list, end_idx: int = None) -> Optional[int]:
+    """Convenience wrapper — computes full series then normalizes."""
+    raw = calc_raw_rs_series(prices, bench_prices)
+    if end_idx is not None:
+        raw = raw[:end_idx+1]
+    return normalize_rs(raw)
+
+
+
+def calc_rvol(volumes: list, today_vol: int = None) -> dict:
+    """
+    Relative Volume — today's volume vs average volume at same time.
+    Without intraday data, we compare today's vol vs 20d avg.
+    RVOL > 2.0 = very high, > 1.5 = high, < 0.5 = drying up.
+    """
+    if len(volumes) < 20:
+        return {'rvol': None, 'avg_vol_20d': None}
+    avg_20d = sum(volumes[-21:-1]) / 20  # exclude today
+    today = today_vol if today_vol else volumes[-1]
+    rvol = round(today / avg_20d, 2) if avg_20d > 0 else None
+    return {
+        'rvol': rvol,
+        'avg_vol_20d': round(avg_20d),
+        'vol_signal': 'surge' if rvol and rvol >= 2.0 else
+                      'high'   if rvol and rvol >= 1.5 else
+                      'avg'    if rvol and rvol >= 0.8 else
+                      'dry'    if rvol else 'unknown'
+    }
+
+
+def calc_stage2_new_entry(prices: list, prev_stage: int = None) -> bool:
+    """
+    Stage 2 New Entry = stock just entered Stage 2 this scan
+    (was Stage 1 previously, now above 30W MA with rising momentum).
+    prev_stage comes from previous scan data — not available in stateless calc,
+    so we approximate: price crossed above MA30 in last 3 days.
+    """
+    if len(prices) < 30:
+        return False
+    ma30_now   = sum(prices[-30:]) / 30
+    ma30_3d    = sum(prices[-33:-3]) / 30 if len(prices) >= 33 else None
+    last_price = prices[-1]
+    # Crossed above MA30 in last 3 days
+    recently_crossed = (ma30_3d and prices[-4] < ma30_3d and last_price > ma30_now)
+    return bool(recently_crossed and last_price > ma30_now)
+
+
+def calc_weinstein_stage(rs: float, trend: str, pct_from_high: float, hist: list) -> int:
+    """
+    Exact port of the frontend's calcWeinsteinStage (App.jsx) — kept
+    identical so a stock's Stage badge in the app and its contribution
+    to the Stage 2 breadth count always agree. Was previously only
+    computed client-side; 'weinstein_stage' was referenced for the
+    stage2_count/stage4_count breadth stats but never actually set,
+    so those counts had silently always been zero.
+    """
+    recent_rs = [h for h in (hist or []) if h][-5:]
+    avg_recent_rs = sum(recent_rs) / len(recent_rs) if recent_rs else rs
+
+    if rs >= 70 and trend in ('improving', 'flat') and pct_from_high >= -30:
+        return 3 if pct_from_high >= -5 else 2
+    if rs >= 70 and trend == 'declining':
+        return 3
+    if rs < 40 and (trend == 'declining' or avg_recent_rs < 40):
+        return 4
+    if rs < 50 and trend == 'flat':
+        return 1
+    if 50 <= rs < 70:
+        return 2
+    return 1
+
+
+
+def compute_best_pick_score(row: dict) -> float:
+    """Weighted composite score (0-100) from signals already computed
+    during the scan (technical) plus fundamentals_cache (fundamental) —
+    both already merged into `row`. This is a confluence score to
+    surface candidates for the AI rationale pass to explain in plain
+    English, not a prediction or a recommendation. Weighted toward
+    technical strength (this is a momentum scanner), with fundamentals
+    acting as a confirming or penalizing factor."""
+    score = 0.0
+
+    # --- Technical (up to ~64 pts) ---
+    if row.get('weinstein_stage') == 2:
+        score += 15
+    if row.get('vcp_fired'):
+        score += 10
+    if row.get('is_resistance_breakout'):
+        score += 8
+    if row.get('is_cup_handle_breakout'):
+        score += 8
+    if row.get('is_guppy_bullish_crossover'):
+        score += 5
+    if row.get('is_52wh_breakout'):
+        score += 5
+    rs = row.get('rs_tv') if row.get('rs_tv') is not None else row.get('rs')
+    if isinstance(rs, (int, float)):
+        score += min(rs, 99) * 0.15  # up to ~15 pts at RS 99
+    rvol = row.get('rvol')
+    if isinstance(rvol, (int, float)):
+        if rvol >= 2:
+            score += 6
+        elif rvol >= 1.3:
+            score += 3
+
+    # --- Fundamentals (up to ~35 pts, confirming/penalizing) ---
+    eps_qoq, eps_yoy = row.get('eps_qoq'), row.get('eps_yoy')
+    if isinstance(eps_qoq, (int, float)) and isinstance(eps_yoy, (int, float)) and eps_qoq > 0 and eps_yoy > 0:
+        score += 8
+    streak = row.get('eps_growth_streak')
+    if isinstance(streak, (int, float)) and streak >= 2:
+        score += 4
+    sales_qoq, sales_yoy = row.get('sales_qoq'), row.get('sales_yoy')
+    if isinstance(sales_qoq, (int, float)) and isinstance(sales_yoy, (int, float)) and sales_qoq > 0 and sales_yoy > 0:
+        score += 6
+    roe = row.get('roe')
+    if isinstance(roe, (int, float)) and roe >= 15:
+        score += 5
+    debt_eq = row.get('debt_eq')
+    if isinstance(debt_eq, (int, float)):
+        if debt_eq < 1:
+            score += 4
+        elif debt_eq > 2:
+            score -= 5
+    if row.get('promoter_trend') == 'increasing':
+        score += 4
+    elif row.get('promoter_trend') == 'decreasing':
+        score -= 5
+    if row.get('fii_trend') == 'increasing' or row.get('dii_trend') == 'increasing':
+        score += 4
+    peg = row.get('peg_ratio')
+    if isinstance(peg, (int, float)) and 0 < peg <= 1.5:
+        score += 4
+
+    # --- Penalties ---
+    if row.get('is_weak_rs'):
+        score -= 12
+
+    return round(max(0.0, min(100.0, score)), 1)
+
+
+
+def compute_fundamental_score(row: dict) -> float:
+    """Pure fundamentals quality score (0-100) — deliberately separate
+    from compute_best_pick_score, which mixes in technical/momentum
+    signals. This one only looks at business quality: profitability
+    (ROE), growth (EPS/Sales QoQ+YoY), leverage (D/E), valuation
+    sanity (PEG), and ownership signals (promoter/FII/DII trend).
+    This is a QUALITY score, not a price target or fair-value estimate
+    — those need real DCF/comparable-multiple modeling this doesn't
+    attempt, and a fake-precise price number would be worse than no
+    number at all."""
+    score = 0.0
+    roe = row.get('roe')
+    if isinstance(roe, (int, float)):
+        if roe >= 20: score += 20
+        elif roe >= 15: score += 15
+        elif roe >= 10: score += 8
+        elif roe < 0: score -= 15
+
+    eps_qoq, eps_yoy = row.get('eps_qoq'), row.get('eps_yoy')
+    if isinstance(eps_qoq, (int, float)) and isinstance(eps_yoy, (int, float)):
+        if eps_qoq > 0 and eps_yoy > 0: score += 18
+        elif eps_yoy > 0: score += 8
+        elif eps_yoy < -10: score -= 12
+
+    sales_qoq, sales_yoy = row.get('sales_qoq'), row.get('sales_yoy')
+    if isinstance(sales_qoq, (int, float)) and isinstance(sales_yoy, (int, float)):
+        if sales_qoq > 0 and sales_yoy > 0: score += 14
+        elif sales_yoy > 0: score += 6
+        elif sales_yoy < -10: score -= 10
+
+    debt_eq = row.get('debt_eq')
+    if isinstance(debt_eq, (int, float)):
+        if debt_eq < 0.3: score += 12
+        elif debt_eq < 1: score += 6
+        elif debt_eq > 2: score -= 15
+        elif debt_eq > 1.5: score -= 8
+
+    opm_trend = row.get('opm_trend')
+    if opm_trend == 'increasing': score += 10
+    elif opm_trend == 'decreasing': score -= 8
+
+    promoter_trend = row.get('promoter_trend')
+    if promoter_trend == 'increasing': score += 8
+    elif promoter_trend == 'decreasing': score -= 12  # weighted heavier — a real red flag in India specifically
+
+    if row.get('fii_trend') == 'increasing' or row.get('dii_trend') == 'increasing':
+        score += 6
+
+    peg = row.get('peg_ratio')
+    if isinstance(peg, (int, float)):
+        if 0 < peg <= 1: score += 8
+        elif peg > 3: score -= 6
+
+    eps_streak = row.get('eps_growth_streak')
+    if isinstance(eps_streak, (int, float)) and eps_streak >= 3:
+        score += 4
+
+    return round(max(0.0, min(100.0, score + 50)), 1)  # centered at 50 so an all-neutral/unknown stock lands "Fair", not "Poor"
+
+
+
+def compute_hy_ht_history(prices: list, volumes: list) -> dict:
+    """
+    Last-10-day history for HY (volume near 52-week max) and HT (volume
+    near all-time max), same 'was this signal true on each of the last
+    10 trading days' pattern as detect_pp's pp_hist. Uses the historical
+    close-to-close change for each day (not live intraday data, since
+    these are past days) — the caller overrides the LAST element with
+    today's live-computed is_hy/is_ht for consistency with the live value.
+    """
+    n = len(volumes)
+    hy_hist, ht_hist = [], []
+    for d in range(9, -1, -1):
+        idx = n - 1 - d
+        if idx < 1 or idx >= n:
+            hy_hist.append(False); ht_hist.append(False)
+            continue
+        window_yr  = volumes[max(0, idx-251):idx+1]
+        max_yr     = max(window_yr) if window_yr else 0
+        window_all = volumes[:idx+1]
+        max_all    = max(window_all) if window_all else 0
+        day_chg    = prices[idx] - prices[idx-1]
+        hy_hist.append(bool(max_yr  > 0 and volumes[idx] >= 0.95 * max_yr  and day_chg > 0))
+        ht_hist.append(bool(max_all > 0 and volumes[idx] >= 0.95 * max_all and day_chg > 0))
+    return {'hy_hist': hy_hist, 'ht_hist': ht_hist}
+
+
+def compute_ibv_history(prices: list, volumes: list, highs: list = None, lows: list = None) -> dict:
+    """
+    Last-10-day history for IBV (Institutional-style Buying Volume) —
+    same 'was this signal true on each of the last 10 trading days'
+    pattern as compute_hy_ht_history. Falls back to close prices for
+    highs/lows if the real intraday range isn't available (same
+    fallback used elsewhere in this file for VCP/squeeze detection),
+    since only prices/volumes are guaranteed present in the fast cache.
+    """
+    n = len(volumes)
+    h = highs if highs and len(highs) == n else prices
+    l = lows if lows and len(lows) == n else prices
+    ibv_hist = []
+    for d in range(9, -1, -1):
+        idx = n - 1 - d
+        if idx < 10 or idx >= n:
+            ibv_hist.append(False)
+            continue
+        max_recent = max(volumes[idx-10:idx])
+        if max_recent <= 0 or volumes[idx] < 2 * max_recent:
+            ibv_hist.append(False)
+            continue
+        day_range = h[idx] - l[idx]
+        if day_range <= 0:
+            ibv_hist.append(False)
+            continue
+        ibv_hist.append(bool((prices[idx] - l[idx]) / day_range * 100 > 50))
+    return {'ibv_hist': ibv_hist}
+
+
+def detect_52wl(prices: list, volumes: list) -> dict:
+    n = len(prices)
+    empty = {
+        'near_52wl': False, 'pct_from_52wl': 999, 'low_52w': 0, 'high_52w': 0,
+        'crossed_ema5': False, 'pp_volume': False, 'ema5': None,
+        'is_signal': False
+    }
+    if n < 260:
+        return empty
+    today, yesterday = prices[n-1], prices[n-2]
+    low52  = min(prices[-252:])
+    high52 = max(prices[-252:])
+    pct    = round((today - low52) / low52 * 100, 2)
+    near   = pct <= 15
+    ea     = ema_arr(prices, 5)
+    e5t, e5y = ea[n-1], ea[n-2]
+    crossed = e5y is not None and e5t is not None and yesterday <= e5y and today > e5t
+    p10 = prices[n-11:n-1]
+    v10 = volumes[n-11:n-1]
+    max_down = max((v10[i] for i in range(1, len(p10)) if p10[i] < p10[i-1]), default=0)
+    if max_down == 0:
+        max_down = sum(v10) / len(v10) if v10 else 1
+    pp_vol = today > yesterday and volumes[n-1] > max_down
+    return {
+        'near_52wl':   near,
+        'pct_from_52wl': pct,
+        'low_52w':     round(low52, 2),
+        'high_52w':    round(high52, 2),
+        'crossed_ema5': crossed,
+        'pp_volume':   pp_vol,
+        'ema5':        e5t,
+        'is_signal':   near and crossed and pp_vol,
+    }
+
+
+def detect_bb_squeeze(prices: list, highs: list, lows: list, n: int = 20) -> dict:
+    """
+    Bollinger Band Squeeze: BB width at multi-month low, BB inside Keltner Channel.
+    Classic TTM Squeeze indicator logic.
+    """
+    empty = {'in_squeeze': False, 'squeeze_fired': False, 'bb_width_pct': None, 'squeeze_days': 0}
+    if len(prices) < n + 60:
+        return empty
+
+    closes = prices
+    ma20 = sma(closes, n)
+    sd20 = std_dev(closes, n)
+    if not ma20 or not sd20:
+        return empty
+
+    upper_bb = ma20 + 2 * sd20
+    lower_bb = ma20 - 2 * sd20
+    bb_width = upper_bb - lower_bb
+    bb_width_pct = round((bb_width / ma20) * 100, 2) if ma20 else None
+
+    # Keltner Channel using ATR
+    atr_val = atr(highs, lows, closes, n)
+    if not atr_val:
+        return empty
+    upper_kc = ma20 + 1.5 * atr_val
+    lower_kc = ma20 - 1.5 * atr_val
+
+    # Squeeze ON when BB is inside KC
+    in_squeeze = (upper_bb < upper_kc) and (lower_bb > lower_kc)
+
+    # Check how many consecutive days squeeze has been on.
+    # PERFORMANCE: avoid re-slicing/re-scanning the full price history on every
+    # iteration (was O(n) work x 20 iterations x 3 functions x 2400 stocks,
+    # which froze the event loop for minutes). Instead, precompute a short
+    # window of closes/highs/lows once and reuse it.
+    squeeze_days = 0
+    max_lookback = min(20, len(closes) - n - 20)
+    if max_lookback > 0:
+        # Only need the last (n + max_lookback + 20) closes for this whole check
+        window_size = n + max_lookback + 21
+        wc = closes[-window_size:] if len(closes) > window_size else closes
+        wh = highs[-window_size:]  if len(highs)  > window_size else highs
+        wl = lows[-window_size:]   if len(lows)   > window_size else lows
+
+        for d in range(0, max_lookback):
+            end = len(wc) - 1 - d
+            if end < n + 20:
+                break
+            sub_closes = wc[:end+1]
+            sub_highs  = wh[:end+1]
+            sub_lows   = wl[:end+1]
+            m = sma(sub_closes, n)
+            s = std_dev(sub_closes, n)
+            a = atr(sub_highs, sub_lows, sub_closes, n)
+            if not m or not s or not a:
+                break
+            ub, lb = m + 2*s, m - 2*s
+            uk, lk = m + 1.5*a, m - 1.5*a
+            if ub < uk and lb > lk:
+                squeeze_days += 1
+            else:
+                break
+
+    # Squeeze fired = was in squeeze yesterday, not in squeeze today (breakout)
+    squeeze_fired = squeeze_days == 0 and was_in_squeeze_yesterday(closes, highs, lows, n)
+
+    return {
+        'in_squeeze': in_squeeze,
+        'squeeze_fired': squeeze_fired,
+        'bb_width_pct': bb_width_pct,
+        'squeeze_days': squeeze_days,
+    }
+
+
+def detect_chart_patterns(highs: list, lows: list, prices: list, volumes: list) -> dict:
+    """
+    Classic chart patterns from swing-point geometry over the trailing
+    ~120 daily bars:
+      - Head & Shoulders / Inverse — 3 swing extremes, middle one clearly
+        beyond the outer two (roughly symmetric), neckline break confirms.
+      - Double Top / Double Bottom — 2 comparable swing extremes with a
+        clear trough/peak between, neckline break confirms.
+      - Triangles — recent swing-high trend vs swing-low trend classified
+        as ascending / descending / symmetrical.
+      - Wedges — highs and lows trending the SAME direction but
+        converging (narrowing range) — rising or falling.
+      - Flags & Pennants — a strong directional "pole" move followed by a
+        tight consolidation (parallel = flag, converging = pennant).
+    """
+    result = {
+        'is_head_shoulders': False, 'is_inv_head_shoulders': False,
+        'is_double_top': False, 'is_double_bottom': False,
+        'triangle_type': None,      # 'ascending' | 'descending' | 'symmetrical' | None
+        'wedge_type': None,         # 'rising' | 'falling' | None
+        'is_flag_bullish': False, 'is_flag_bearish': False, 'is_pennant': False,
+        'pattern_fired': False,     # confirmed neckline/breakout break, for H&S/double top-bottom
+    }
+    n = len(prices)
+    if n < 40:
+        return result
+    last = prices[-1]
+
+    piv_hi, piv_lo = find_pivots(highs, lows, left=3, right=3)
+    RECENT = 120  # only "current" structure, not ancient swing history
+    cutoff = n - RECENT
+    piv_hi = [p for p in piv_hi if p[0] >= cutoff]
+    piv_lo = [p for p in piv_lo if p[0] >= cutoff]
+
+    def pct_diff(a, b):
+        return abs(a - b) / max(a, b) if max(a, b) else 0
+
+    # ── Double Top / Double Bottom ──────────────────────────────────
+    if len(piv_hi) >= 2:
+        p1i, p1 = piv_hi[-2]; p2i, p2 = piv_hi[-1]
+        troughs_between = [l for (li, l) in piv_lo if p1i < li < p2i]
+        if troughs_between and pct_diff(p1, p2) <= 0.03:
+            trough = min(troughs_between)
+            if trough <= min(p1, p2) * 0.97:
+                result['is_double_top'] = True
+                if last < trough:
+                    result['pattern_fired'] = True
+    if len(piv_lo) >= 2:
+        p1i, p1 = piv_lo[-2]; p2i, p2 = piv_lo[-1]
+        peaks_between = [h for (hi, h) in piv_hi if p1i < hi < p2i]
+        if peaks_between and pct_diff(p1, p2) <= 0.03:
+            peak = max(peaks_between)
+            if peak >= max(p1, p2) * 1.03:
+                result['is_double_bottom'] = True
+                if last > peak:
+                    result['pattern_fired'] = True
+
+    # ── Head & Shoulders / Inverse ──────────────────────────────────
+    if len(piv_hi) >= 3 and len(piv_lo) >= 2:
+        s1i, s1 = piv_hi[-3]; _, head = piv_hi[-2]; s2i, s2 = piv_hi[-1]
+        troughs = [(li, l) for (li, l) in piv_lo if s1i < li < s2i]
+        if head > s1 * 1.02 and head > s2 * 1.02 and pct_diff(s1, s2) <= 0.06 and len(troughs) >= 2:
+            t1, t2 = troughs[0][1], troughs[-1][1]
+            if pct_diff(t1, t2) <= 0.06:
+                result['is_head_shoulders'] = True
+                if last < min(t1, t2):
+                    result['pattern_fired'] = True
+    if len(piv_lo) >= 3 and len(piv_hi) >= 2:
+        s1i, s1 = piv_lo[-3]; _, head = piv_lo[-2]; s2i, s2 = piv_lo[-1]
+        peaks = [(hi, h) for (hi, h) in piv_hi if s1i < hi < s2i]
+        if head < s1 * 0.98 and head < s2 * 0.98 and pct_diff(s1, s2) <= 0.06 and len(peaks) >= 2:
+            t1, t2 = peaks[0][1], peaks[-1][1]
+            if pct_diff(t1, t2) <= 0.06:
+                result['is_inv_head_shoulders'] = True
+                if last > max(t1, t2):
+                    result['pattern_fired'] = True
+
+    # ── Triangles & Wedges — trend of recent swing highs vs recent ──
+    #    swing lows (simple two-point slope, since pivot counts here
+    #    are small — 2 to 4 points — a full regression buys nothing) ─
+    def slope_pct(pivots):
+        if len(pivots) < 2:
+            return None
+        (i1, v1), (i2, v2) = pivots[0], pivots[-1]
+        if i2 == i1 or v1 == 0:
+            return None
+        return ((v2 - v1) / v1) / (i2 - i1)
+
+    recent_hi = piv_hi[-4:]
+    recent_lo = piv_lo[-4:]
+    hi_slope = slope_pct(recent_hi)
+    lo_slope = slope_pct(recent_lo)
+    FLAT = 0.0006  # ~0.06%/bar treated as "flat" — tune after seeing real output
+
+    if hi_slope is not None and lo_slope is not None:
+        hi_flat = abs(hi_slope) <= FLAT
+        lo_flat = abs(lo_slope) <= FLAT
+        if hi_flat and lo_slope > FLAT:
+            result['triangle_type'] = 'ascending'
+        elif lo_flat and hi_slope < -FLAT:
+            result['triangle_type'] = 'descending'
+        elif hi_slope < -FLAT and lo_slope > FLAT:
+            result['triangle_type'] = 'symmetrical'
+        elif hi_slope > FLAT and lo_slope > FLAT and lo_slope > hi_slope:
+            result['wedge_type'] = 'rising'   # both rising, narrowing
+        elif hi_slope < -FLAT and lo_slope < -FLAT and hi_slope < lo_slope:
+            result['wedge_type'] = 'falling'  # both falling, narrowing
+
+    # ── Flags & Pennants — strong pole move, then a tight recent ─────
+    #    consolidation; converging = pennant, parallel = flag ────────
+    POLE_LOOKBACK, CONSOL_BARS = 15, 10
+    if n >= POLE_LOOKBACK + CONSOL_BARS:
+        pole_start = prices[-(POLE_LOOKBACK + CONSOL_BARS)]
+        pole_end   = prices[-CONSOL_BARS]
+        pole_chg   = (pole_end - pole_start) / pole_start if pole_start else 0
+        consol = prices[-CONSOL_BARS:]
+        consol_range = (max(consol) - min(consol)) / pole_end if pole_end else 1
+        if abs(pole_chg) >= 0.08 and consol_range <= 0.06 and len(consol) >= 6:
+            early, late = consol[:3], consol[-3:]
+            consol_hi_slope = (max(late) - max(early)) / max(early) if max(early) else 0
+            consol_lo_slope = (min(late) - min(early)) / min(early) if min(early) else 0
+            converging = (consol_hi_slope < 0 and consol_lo_slope > 0) if pole_chg > 0 \
+                else (consol_hi_slope > 0 and consol_lo_slope < 0)
+            if converging:
+                result['is_pennant'] = True
+            elif pole_chg > 0:
+                result['is_flag_bullish'] = True
+            else:
+                result['is_flag_bearish'] = True
+
+    return result
+
+
+def detect_cup_handle_breakout(prices: list, live_price: float = None, lookback: int = 130) -> dict:
+    """
+    Same Cup & Handle heuristic the chart already draws (detectCupAndHandle
+    in chartAnalysis.js), reimplemented here using close prices so it can
+    run as a scanner signal across all stocks, not just one chart at a
+    time. Identical trade-off to detect_resistance_breakout: uses closes
+    rather than real highs/lows, since only prices/volumes are held in
+    the fast in-memory cache this runs against.
+
+    1. Left lip = highest close in the first ~15% of the window
+    2. Cup bottom = lowest close between the left lip and the handle zone
+    3. Right lip = highest close after the bottom, before the handle zone
+    4. Handle = a shallow (5-20%) pullback in the last ~20% of the window
+    5. "Breakout" = today's live price just crossed above the handle's
+       high (or the right lip if no handle), yesterday's close still at
+       or below it — a fresh crossover, not just "currently above".
+    """
+    n = len(prices)
+    empty = {'is_breakout': False, 'has_cup': False, 'depth_pct': None}
+    if n < lookback:
+        return empty
+    window = prices[-lookback:]
+
+    left_zone_end = int(lookback * 0.15)
+    left_lip_idx, left_lip = 0, -1
+    for i in range(left_zone_end):
+        if window[i] > left_lip:
+            left_lip, left_lip_idx = window[i], i
+
+    handle_zone_start = int(lookback * 0.8)
+    bottom_idx, bottom = left_lip_idx, float('inf')
+    for i in range(left_lip_idx, handle_zone_start):
+        if window[i] < bottom:
+            bottom, bottom_idx = window[i], i
+    depth_pct = (left_lip - bottom) / left_lip * 100 if left_lip else 0
+
+    right_lip_idx, right_lip = bottom_idx, -1
+    for i in range(bottom_idx, handle_zone_start):
+        if window[i] > right_lip:
+            right_lip, right_lip_idx = window[i], i
+    right_lip_recovery = right_lip / left_lip if left_lip else 0
+
+    is_valid_cup = (12 <= depth_pct <= 50 and right_lip_recovery >= 0.90
+                     and (bottom_idx - left_lip_idx) >= lookback * 0.15)
+    if not is_valid_cup:
+        return empty
+
+    handle_window = window[handle_zone_start:]
+    handle_high = max(handle_window) if handle_window else right_lip
+    breakout_level = max(right_lip, handle_high)
+
+    today_price = live_price if live_price is not None else prices[-1]
+    yesterday_price = prices[-2] if n >= 2 else prices[-1]
+    is_breakout = bool(yesterday_price <= breakout_level < today_price)
+
+    return {'is_breakout': is_breakout, 'has_cup': True, 'depth_pct': round(depth_pct)}
+
+
+
+def detect_guppy_crossover(prices: list, live_price: float = None) -> dict:
+    """
+    Guppy Crossover — simplified to EMA9 crossing EMA50 (a classic golden-
+    cross/death-cross style signal), rather than the full Guppy Multiple
+    Moving Average's two 6-EMA-group averages. Bullish crossover = EMA9
+    was at-or-below EMA50 yesterday, now above it today (a fresh cross,
+    not an ongoing state).
+
+    Uses the live price as an implicit extra final bar (same technique
+    used elsewhere for live RS/PP) so the crossover can fire intraday,
+    not just at yesterday's close.
+    """
+    empty = {'is_bullish_crossover': False, 'is_bearish_crossover': False, 'is_compressed': False}
+    n = len(prices)
+    if n < 55:
+        return empty
+
+    series = prices + [live_price] if live_price is not None else prices
+    ema9  = ema_arr(series, 9)
+    ema50 = ema_arr(series, 50)
+
+    m = len(series)
+    today_9, today_50 = ema9[m-1], ema50[m-1]
+    yday_9, yday_50 = ema9[m-2], ema50[m-2]
+    if None in (today_9, today_50, yday_9, yday_50):
+        return empty
+
+    bullish = yday_9 <= yday_50 and today_9 > today_50
+    bearish = yday_9 >= yday_50 and today_9 < today_50
+    # "Compressed" — EMA9 and EMA50 within 2% of each other, the classic
+    # pre-breakout squeeze, regardless of direction.
+    compressed = today_50 != 0 and abs(today_9 - today_50) / today_50 < 0.02
+
+    return {'is_bullish_crossover': bool(bullish), 'is_bearish_crossover': bool(bearish), 'is_compressed': bool(compressed)}
+
+
+
+def detect_ibv_signal(volumes: list, live_vol, live_high, live_low, live_close) -> bool:
+    if not volumes or len(volumes) < 10 or not live_vol or not live_high or not live_low or not live_close:
+        return False
+    max_recent = max(volumes[-10:])
+    if max_recent <= 0 or live_vol < 2 * max_recent:
+        return False
+    day_range = live_high - live_low
+    if day_range <= 0:
+        return False
+    return (live_close - live_low) / day_range * 100 > 50
+
+
+
+def detect_pp(prices: list, volumes: list) -> dict:
+    n = len(prices)
+    result = {
+        'is_pp': False, 'pp_hist': [False]*10, 'pp_count_10d': 0,
+        'vol_ratio': 0.0, 'ma10': None, 'ma50': None
+    }
+    if n < 12:
+        return result
+
+    def is_pp_at(idx):
+        if idx < 11:
+            return False
+        today, yesterday = prices[idx], prices[idx-1]
+        if today <= yesterday:
+            return False
+        ma10 = sma(prices[:idx+1], 10)
+        ma50 = sma(prices[:idx+1], min(50, idx+1))
+        if not ma10 or not ma50:
+            return False
+        if not (today > ma10 and today < ma10 * 1.08 and today > ma50):
+            return False
+        p10 = prices[idx-10:idx]
+        v10 = volumes[idx-10:idx]
+        max_down = max((v10[i] for i in range(1, len(p10)) if p10[i] < p10[i-1]), default=0)
+        if max_down == 0:
+            max_down = sum(v10) / len(v10)
+        return volumes[idx] > max_down
+
+    pp_hist = [is_pp_at(n - 1 - d) for d in range(9, -1, -1)]
+    result['pp_hist']      = pp_hist
+    result['pp_count_10d'] = sum(pp_hist)
+    result['is_pp']        = pp_hist[-1]
+    result['ma10']         = sma(prices, 10)
+    result['ma50']         = sma(prices, 50)
+
+    # Vol ratio
+    p10 = prices[n-11:n-1]
+    v10 = volumes[n-11:n-1]
+    max_down = max((v10[i] for i in range(1, len(p10)) if p10[i] < p10[i-1]), default=0)
+    if max_down == 0:
+        max_down = sum(v10) / len(v10) if v10 else 1
+    result['vol_ratio'] = round(volumes[n-1] / max_down, 2) if max_down > 0 else 0.0
+    return result
+
+
+
+def detect_resistance_breakout(prices: list, live_price: float = None) -> dict:
+    """
+    Detects a fresh breakout above the nearest significant resistance
+    level (R1) — same swing-high concept the candlestick chart already
+    draws as a dashed line, computed here for every stock so it can be
+    used as a scanner signal, not just viewed one chart at a time.
+
+    Uses CLOSE prices for the swing-high detection (not intraday highs —
+    those aren't held in the in-memory cache this runs against, only
+    prices/volumes are; the chart's own R1/R2 uses real highs since it
+    has the full OHLC data for one stock at a time). A close-based swing
+    high is a reasonable approximation of the same idea: a bar counts as
+    a swing high if it's the local max within a +/-5 day window.
+
+    R1 = the closest swing high found in the lookback window, excluding
+    the last 10 days (so R1 isn't just "yesterday's high" — it needs to
+    be an established level the stock was actually held under for a
+    while). "Breakout" = today's price just crossed above that level
+    (yesterday's close was still at/below it).
+    """
+    n = len(prices)
+    empty = {'is_breakout': False, 'r1': None}
+    if n < 60:
+        return empty
+
+    lookback = min(n, 252)
+    window_start = n - lookback
+    swing_highs = []
+    for i in range(window_start + 5, n - 10):  # exclude the last 10 days from R1 candidates
+        seg = prices[max(0, i-5):i+6]
+        if seg and prices[i] == max(seg):
+            swing_highs.append(prices[i])
+    if not swing_highs:
+        return empty
+
+    today_price = live_price if live_price is not None else prices[-1]
+    yesterday_price = prices[-2] if n >= 2 else prices[-1]
+
+    # R1 = nearest swing high that today's price is now above, but
+    # yesterday's price was still at/below — i.e. a level just crossed.
+    candidates = sorted(set(swing_highs))
+    for level in candidates:
+        if yesterday_price <= level < today_price:
+            return {'is_breakout': True, 'r1': round(level, 2)}
+    return {'is_breakout': False, 'r1': round(max(candidates), 2) if candidates else None}
+
+
+
+def detect_vcp(prices: list, volumes: list, highs: list, lows: list) -> dict:
+    """
+    VCP (Volatility Contraction Pattern) - Minervini style.
+    Looks for 2-4 contracting pullbacks, each shallower than the last,
+    with declining volume on each pullback, price near top of range.
+    """
+    empty = {'is_vcp': False, 'vcp_stage': 0, 'contractions': [], 'vcp_fired': False}
+    n = len(prices)
+    if n < 60:
+        return empty
+
+    # Find swing highs and lows in last 60 days using simple pivot detection
+    window = 60
+    sub_p = prices[-window:]
+    sub_v = volumes[-window:]
+    sub_h = highs[-window:]
+    sub_l = lows[-window:]
+
+    pivots = []  # list of (idx, price, type) type: 'H' or 'L'
+    for i in range(3, len(sub_p) - 3):
+        if sub_h[i] == max(sub_h[i-3:i+4]):
+            pivots.append((i, sub_h[i], 'H'))
+        elif sub_l[i] == min(sub_l[i-3:i+4]):
+            pivots.append((i, sub_l[i], 'L'))
+
+    # Build alternating H-L sequence
+    contractions = []
+    last_type = None
+    sequence = []
+    for idx, price, typ in pivots:
+        if typ != last_type:
+            sequence.append((idx, price, typ))
+            last_type = typ
+
+    # Find H-L-H-L patterns and measure pullback %
+    i = 0
+    while i < len(sequence) - 1:
+        if sequence[i][2] == 'H' and i+1 < len(sequence) and sequence[i+1][2] == 'L':
+            high_price = sequence[i][1]
+            low_price  = sequence[i+1][1]
+            pullback_pct = round((high_price - low_price) / high_price * 100, 1)
+            contractions.append(pullback_pct)
+        i += 1
+
+    # Keep only the most recent 2-4 contractions
+    recent_contractions = contractions[-4:] if len(contractions) >= 2 else []
+
+    # VCP valid if each contraction is smaller than the previous (contracting)
+    is_contracting = False
+    if len(recent_contractions) >= 2:
+        is_contracting = all(
+            recent_contractions[i] > recent_contractions[i+1] * 0.95  # allow small tolerance
+            for i in range(len(recent_contractions)-1)
+        )
+
+    # Price should be within 15% of 52-week high (tight area)
+    high_252 = max(prices[-252:]) if len(prices) >= 252 else max(prices)
+    last_price = prices[-1]
+    pct_from_high = (last_price - high_252) / high_252 * 100
+
+    # Volume should be drying up (last 5 days avg < 20 day avg)
+    vol_5d  = sum(volumes[-5:]) / 5 if len(volumes) >= 5 else 0
+    vol_20d = sum(volumes[-20:]) / 20 if len(volumes) >= 20 else 1
+    vol_drying = vol_5d < vol_20d * 0.8
+
+    is_vcp = (
+        is_contracting and
+        len(recent_contractions) >= 2 and
+        pct_from_high >= -20 and
+        vol_drying
+    )
+
+    # VCP fired = was VCP, now breaking out with volume (today vol > 20d avg * 1.5)
+    today_vol_ratio = volumes[-1] / vol_20d if vol_20d > 0 else 0
+    price_breaking = prices[-1] > prices[-2] if len(prices) > 1 else False
+    vcp_fired = is_vcp and today_vol_ratio >= 1.5 and price_breaking
+
+    return {
+        'is_vcp': is_vcp,
+        'vcp_stage': len(recent_contractions),
+        'contractions': recent_contractions,
+        'vcp_fired': vcp_fired,
+        'vol_drying': vol_drying,
+        'pct_from_high': round(pct_from_high, 1),
+    }
+
+# ── Classic chart pattern detection ─────────────────────────────────
+# Heuristic, swing-point (fractal pivot) based — not exact textbook
+# geometry, but a reasonable, tunable approximation. Runs off the same
+# price history already in memory for every other signal here, so no
+# new data source is needed. Validated against synthetic price series
+# (double top/bottom, all three triangle types, head & shoulders, a
+# bullish flag) before being wired in — not yet checked against real
+# market data, so expect to tune the tolerance constants once real
+# results come in.
+
+def detect_weak_rs(prices: list, volumes: list, rs: int, threshold: float = 8.0) -> dict:
+    n = len(prices)
+    if n < 6:
+        return {'is_weak_rs': False, 'chg_1d': 0, 'chg_5d': 0, 'vol_spike': 0}
+    today    = prices[n-1]
+    yesterday= prices[n-2]
+    week     = prices[n-6]
+    chg1d    = round((today - yesterday) / yesterday * 100, 2)
+    chg5d    = round((today - week) / week * 100, 2)
+    avg5     = sum(volumes[-6:-1]) / 5
+    spike    = round(volumes[n-1] / avg5, 2) if avg5 > 0 else 0
+    return {
+        'is_weak_rs':  rs < 50 and chg1d >= threshold,
+        'chg_1d':      chg1d,
+        'chg_5d':      chg5d,
+        'vol_spike':   spike,
+    }
+
+
+def ema(prices: list, n: int) -> Optional[float]:
+    if len(prices) < n:
+        return None
+    k = 2 / (n + 1)
+    e = sum(prices[:n]) / n
+    for p in prices[n:]:
+        e = p * k + e * (1 - k)
+    return round(e, 2)
+
+
+def ema_arr(prices: list, n: int) -> list:
+    result = [None] * len(prices)
+    if len(prices) < n:
+        return result
+    k = 2 / (n + 1)
+    e = sum(prices[:n]) / n
+    result[n-1] = round(e, 2)
+    for i in range(n, len(prices)):
+        e = prices[i] * k + e * (1 - k)
+        result[i] = round(e, 2)
+    return result
+
+
+async def ensure_best_picks_history_table(session: aiohttp.ClientSession,
+                                           retries: int = 6, delay: float = 10.0) -> bool:
+    """Same self-healing pattern as ensure_best_picks_table."""
+    url = f"{SUPABASE_URL}/rest/v1/best_picks_history?limit=1"
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    for attempt in range(retries):
+        try:
+            async with session.get(url, headers=headers,
+                                   timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status == 200:
+                    return True
+                if r.status == 404 and attempt < retries - 1:
+                    await asyncio.sleep(delay)
+                    continue
+                log.error(f"best_picks_history table check failed: {r.status}")
+                return False
+        except Exception as e:
+            if attempt < retries - 1:
+                await asyncio.sleep(delay)
+                continue
+            log.error(f"best_picks_history table check failed: {e}")
+            return False
+    return False
+
+
+
+async def ensure_best_picks_table(session: aiohttp.ClientSession,
+                                   retries: int = 6, delay: float = 10.0) -> bool:
+    """Same self-healing pattern as ensure_fundamentals_table — see that
+    function for why the retry loop is needed (PostgREST schema cache
+    lag after creating a table via the SQL Editor)."""
+    url = f"{SUPABASE_URL}/rest/v1/best_picks?limit=1"
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    for attempt in range(retries):
+        try:
+            async with session.get(url, headers=headers,
+                                   timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status == 200:
+                    return True
+                if r.status == 404 and attempt < retries - 1:
+                    await asyncio.sleep(delay)
+                    continue
+                log.error(f"best_picks table check failed: {r.status}")
+                return False
+        except Exception as e:
+            if attempt < retries - 1:
+                await asyncio.sleep(delay)
+                continue
+            log.error(f"best_picks table check failed: {e}")
+            return False
+    return False
+
+
+
+async def ensure_db_columns(session: aiohttp.ClientSession):
+    """Verify rs_tv and eps_qoq columns exist by doing test queries.
+    IMPORTANT: if a column used in the per-scan stocks upsert is missing,
+    Supabase/PostgREST can reject the WHOLE upsert with a 400 error — not
+    just silently skip that one field — so this check matters for every
+    field added to the stock record, not just these two canaries."""
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json"
+    }
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/stocks?select=rs_tv&limit=1",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ DB columns OK — rs_tv column exists")
+            elif r.status == 400:
+                body = await r.text()
+                if 'rs_tv' in body:
+                    log.error("❌ rs_tv column MISSING from stocks table!")
+                    log.error("   → Go to Supabase SQL Editor and run:")
+                    log.error("   alter table public.stocks add column if not exists rs_tv int;")
+                    log.error("   alter table public.stocks add column if not exists rs_midcap int;")
+                    log.error("   alter table public.stocks add column if not exists rs_smallcap int;")
+                    log.error("   alter table public.stocks add column if not exists rs_sector int;")
+    except Exception as e:
+        log.warning(f"DB column check error: {e}")
+
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/stocks?select=eps_qoq&limit=1",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ DB columns OK — eps_qoq (fundamentals growth) column exists")
+            elif r.status == 400:
+                log.error("❌ Fundamentals growth/trend columns MISSING from stocks table! "
+                          "The per-scan upsert may be failing entirely until this is fixed.")
+                log.error("   → Go to Supabase SQL Editor and run:")
+                log.error("   alter table public.stocks")
+                log.error("     add column if not exists eps_qoq numeric,")
+                log.error("     add column if not exists eps_yoy numeric,")
+                log.error("     add column if not exists sales_qoq numeric,")
+                log.error("     add column if not exists sales_yoy numeric,")
+                log.error("     add column if not exists opm_pct numeric,")
+                log.error("     add column if not exists opm_trend numeric,")
+                log.error("     add column if not exists eps_growth_streak int,")
+                log.error("     add column if not exists fii_pct numeric,")
+                log.error("     add column if not exists fii_trend numeric,")
+                log.error("     add column if not exists dii_pct numeric,")
+                log.error("     add column if not exists dii_trend numeric,")
+                log.error("     add column if not exists promoter_trend numeric,")
+                log.error("     add column if not exists peg_ratio numeric;")
+    except Exception as e:
+        log.warning(f"DB column check error (fundamentals growth): {e}")
+
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/stocks?select=chg_m_pct&limit=1",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ DB columns OK — chg_m_pct (weekly/monthly change) column exists")
+            elif r.status == 400:
+                log.error("❌ chg_w_pct/chg_m_pct columns MISSING from stocks table! "
+                          "The ENTIRE per-scan stocks upsert has been failing (not just these "
+                          "two fields) since these were added — PostgREST rejects the whole "
+                          "request when any field is unrecognized.")
+                log.error("   → Go to Supabase SQL Editor and run:")
+                log.error("   alter table public.stocks")
+                log.error("     add column if not exists chg_w_pct numeric,")
+                log.error("     add column if not exists chg_m_pct numeric;")
+    except Exception as e:
+        log.warning(f"DB column check error (chg_w_pct/chg_m_pct): {e}")
+
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/stocks?select=is_head_shoulders&limit=1",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ DB columns OK — is_head_shoulders (classic chart patterns) column exists")
+            elif r.status == 400:
+                log.error("❌ Classic chart pattern columns MISSING from stocks table! "
+                          "The ENTIRE per-scan stocks upsert has been failing (not just these "
+                          "fields) since these were added — PostgREST rejects the whole "
+                          "request when any field is unrecognized.")
+                log.error("   → Go to Supabase SQL Editor and run:")
+                log.error("   alter table public.stocks")
+                log.error("     add column if not exists is_head_shoulders boolean,")
+                log.error("     add column if not exists is_inv_head_shoulders boolean,")
+                log.error("     add column if not exists is_double_top boolean,")
+                log.error("     add column if not exists is_double_bottom boolean,")
+                log.error("     add column if not exists triangle_type text,")
+                log.error("     add column if not exists wedge_type text,")
+                log.error("     add column if not exists is_flag_bullish boolean,")
+                log.error("     add column if not exists is_flag_bearish boolean,")
+                log.error("     add column if not exists is_pennant boolean,")
+                log.error("     add column if not exists chart_pattern_fired boolean;")
+    except Exception as e:
+        log.warning(f"DB column check error (chart patterns): {e}")
+
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/index_dashboard?select=rank_d,advances_d&limit=1",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ DB columns OK — rank_d/advances_d (index ranks + breadth) columns exist")
+            elif r.status == 400:
+                log.error("❌ rank_d/rank_w/rank_m/advances_d/advances_w/advances_m columns MISSING "
+                          "from index_dashboard table! The index dashboard upsert may be failing "
+                          "entirely until this is fixed.")
+                log.error("   → Go to Supabase SQL Editor and run:")
+                log.error("   alter table public.index_dashboard")
+                log.error("     add column if not exists rank_d int,")
+                log.error("     add column if not exists rank_w int,")
+                log.error("     add column if not exists rank_m int,")
+                log.error("     add column if not exists total_indices int,")
+                log.error("     add column if not exists advances_d numeric,")
+                log.error("     add column if not exists advances_w numeric,")
+                log.error("     add column if not exists advances_m numeric;")
+    except Exception as e:
+        log.warning(f"DB column check error (index ranks/breadth): {e}")
+
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/index_dashboard?select=rank_w_change&limit=1",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ DB columns OK — rank_w_change (week-over-week rank movement) column exists")
+            elif r.status == 400:
+                log.error("❌ rank_w_history/rank_w_change columns MISSING from index_dashboard table!")
+                log.error("   → Go to Supabase SQL Editor and run:")
+                log.error("   alter table public.index_dashboard")
+                log.error("     add column if not exists rank_w_history text,")
+                log.error("     add column if not exists rank_w_change int;")
+    except Exception as e:
+        log.warning(f"DB column check error (rank_w_change): {e}")
+
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/stock_full_history?select=opens&limit=1",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ DB columns OK — opens (candlestick chart data) column exists")
+            elif r.status == 400:
+                log.error("❌ opens column MISSING from stock_full_history table! "
+                          "Candlestick charts need Open prices, not just Close/High/Low.")
+                log.error("   → Go to Supabase SQL Editor and run:")
+                log.error("   alter table public.stock_full_history add column if not exists opens jsonb;")
+    except Exception as e:
+        log.warning(f"DB column check error (opens): {e}")
+
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/sectors?select=rank_change&limit=1",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ DB columns OK — rank_change (sector week-over-week movement) column exists")
+            elif r.status == 400:
+                log.error("❌ rank_history/rank_change columns MISSING from sectors table!")
+                log.error("   → Go to Supabase SQL Editor and run:")
+                log.error("   alter table public.sectors")
+                log.error("     add column if not exists rank_history text,")
+                log.error("     add column if not exists rank_change int;")
+    except Exception as e:
+        log.warning(f"DB column check error (sector rank_change): {e}")
+
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/stocks?select=industry&limit=1",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ DB columns OK — industry column exists")
+            elif r.status == 400:
+                log.error("❌ industry column MISSING! The whole stocks upsert may be failing.")
+                log.error("   → Go to Supabase SQL Editor and run:")
+                log.error("   alter table public.stocks add column if not exists industry text;")
+                log.error("   alter table public.stock_fundamentals add column if not exists industry text;")
+    except Exception as e:
+        log.warning(f"DB column check error (industry): {e}")
+
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/stocks?select=ibv_signal&limit=1",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ DB columns OK — ibv_signal column exists")
+            elif r.status == 400:
+                log.error("❌ ibv_signal column MISSING! The whole stocks upsert may be failing.")
+                log.error("   → Go to Supabase SQL Editor and run:")
+                log.error("   alter table public.stocks add column if not exists ibv_signal boolean;")
+    except Exception as e:
+        log.warning(f"DB column check error (ibv_signal): {e}")
+
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/stocks?select=hy_hist,ht_hist&limit=1",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ DB columns OK — hy_hist/ht_hist columns exist")
+            elif r.status == 400:
+                log.error("❌ hy_hist/ht_hist columns MISSING! The whole stocks upsert may be failing.")
+                log.error("   → Go to Supabase SQL Editor and run:")
+                log.error("   alter table public.stocks")
+                log.error("     add column if not exists hy_hist jsonb,")
+                log.error("     add column if not exists ht_hist jsonb;")
+    except Exception as e:
+        log.warning(f"DB column check error (hy_hist/ht_hist): {e}")
+
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/stocks?select=is_resistance_breakout&limit=1",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ DB columns OK — is_resistance_breakout column exists")
+            elif r.status == 400:
+                log.error("❌ is_resistance_breakout/resistance_r1 columns MISSING! The whole stocks upsert may be failing.")
+                log.error("   → Go to Supabase SQL Editor and run:")
+                log.error("   alter table public.stocks")
+                log.error("     add column if not exists is_resistance_breakout boolean,")
+                log.error("     add column if not exists resistance_r1 numeric;")
+    except Exception as e:
+        log.warning(f"DB column check error (resistance_breakout): {e}")
+
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/stocks?select=is_cup_handle_breakout&limit=1",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ DB columns OK — is_cup_handle_breakout column exists")
+            elif r.status == 400:
+                log.error("❌ cup handle breakout columns MISSING! The whole stocks upsert may be failing.")
+                log.error("   → Go to Supabase SQL Editor and run:")
+                log.error("   alter table public.stocks")
+                log.error("     add column if not exists is_cup_handle_breakout boolean,")
+                log.error("     add column if not exists has_cup_pattern boolean,")
+                log.error("     add column if not exists cup_depth_pct numeric;")
+    except Exception as e:
+        log.warning(f"DB column check error (cup_handle_breakout): {e}")
+
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/stocks?select=is_guppy_bullish_crossover&limit=1",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ DB columns OK — is_guppy_bullish_crossover column exists")
+            elif r.status == 400:
+                log.error("❌ guppy crossover columns MISSING! The whole stocks upsert may be failing.")
+                log.error("   → Go to Supabase SQL Editor and run:")
+                log.error("   alter table public.stocks")
+                log.error("     add column if not exists is_guppy_bullish_crossover boolean,")
+                log.error("     add column if not exists is_guppy_bearish_crossover boolean,")
+                log.error("     add column if not exists is_guppy_compressed boolean;")
+    except Exception as e:
+        log.warning(f"DB column check error (guppy_crossover): {e}")
+
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/stocks?select=near_ema21,near_ema50&limit=1",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ DB columns OK — near_ema21/near_ema50 columns exist")
+            elif r.status == 400:
+                log.error("❌ EMA21/EMA50 columns MISSING! The whole stocks upsert may be failing.")
+                log.error("   → Go to Supabase SQL Editor and run:")
+                log.error("   alter table public.stocks add column if not exists ema21 numeric;")
+                log.error("   alter table public.stocks add column if not exists near_ema21 boolean;")
+                log.error("   alter table public.stocks add column if not exists pct_from_ema21 numeric;")
+                log.error("   alter table public.stocks add column if not exists ema50 numeric;")
+                log.error("   alter table public.stocks add column if not exists near_ema50 boolean;")
+                log.error("   alter table public.stocks add column if not exists pct_from_ema50 numeric;")
+                log.error("   NOTIFY pgrst, 'reload schema';")
+    except Exception as e:
+        log.warning(f"DB column check error (ema21_ema50): {e}")
+
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/stocks?select=weinstein_stage&limit=1",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ DB columns OK — weinstein_stage column exists")
+            elif r.status == 400:
+                log.error("❌ weinstein_stage column MISSING! The whole stocks upsert has been failing.")
+                log.error("   → Go to Supabase SQL Editor and run:")
+                log.error("   alter table public.stocks add column if not exists weinstein_stage int;")
+                log.error("   NOTIFY pgrst, 'reload schema';")
+    except Exception as e:
+        log.warning(f"DB column check error (weinstein_stage): {e}")
+
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/stocks?select=ibv_hist&limit=1",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ DB columns OK — ibv_hist column exists")
+            elif r.status == 400:
+                log.error("❌ ibv_hist column MISSING! The whole stocks upsert will fail.")
+                log.error("   → Go to Supabase SQL Editor and run:")
+                log.error("   alter table public.stocks add column if not exists ibv_hist jsonb;")
+                log.error("   NOTIFY pgrst, 'reload schema';")
+    except Exception as e:
+        log.warning(f"DB column check error (ibv_hist): {e}")
+
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/stocks?select=is_52wh_breakout&limit=1",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ DB columns OK — is_52wh_breakout column exists")
+            elif r.status == 400:
+                log.error("❌ is_52wh_breakout column MISSING! The whole stocks upsert will fail.")
+                log.error("   → Go to Supabase SQL Editor and run:")
+                log.error("   alter table public.stocks add column if not exists is_52wh_breakout boolean;")
+                log.error("   NOTIFY pgrst, 'reload schema';")
+    except Exception as e:
+        log.warning(f"DB column check error (is_52wh_breakout): {e}")
+
+
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/sectors?select=advances_d&limit=1",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ DB columns OK — advances_d (sector breadth) column exists")
+            elif r.status == 400:
+                log.error("❌ advances_d/advances_w/advances_m columns MISSING from sectors table! "
+                          "The sectors upsert may be failing entirely until this is fixed.")
+                log.error("   → Go to Supabase SQL Editor and run:")
+                log.error("   alter table public.sectors")
+                log.error("     add column if not exists advances_d numeric,")
+                log.error("     add column if not exists advances_w numeric,")
+                log.error("     add column if not exists advances_m numeric;")
+    except Exception as e:
+        log.warning(f"DB column check error (sector breadth): {e}")
+
+
+
+
+
+
+async def ensure_full_history_table(session: aiohttp.ClientSession,
+                                     retries: int = 6, delay: float = 10.0) -> bool:
+    """
+    Verify the stock_full_history table exists. Supabase's PostgREST layer
+    caches its schema, so a table created via the SQL Editor can 404 for a
+    short while after creation even though it exists in Postgres. Retry a
+    few times with a delay before giving up, so a fresh table created just
+    before a deploy doesn't need a second manual restart.
+    """
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+    }
+    last_status = None
+    last_body = ""
+    for attempt in range(1, retries + 1):
+        try:
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/stock_full_history?select=sym&limit=1",
+                headers=headers, timeout=aiohttp.ClientTimeout(total=10)
+            ) as r:
+                if r.status == 200:
+                    log.info("✅ stock_full_history table OK"
+                              + (f" (after {attempt} attempt(s))" if attempt > 1 else ""))
+                    return True
+                last_status = r.status
+                last_body = await r.text()
+        except Exception as e:
+            last_status = None
+            last_body = str(e)
+
+        if attempt < retries:
+            log.warning(f"stock_full_history not ready yet (attempt {attempt}/{retries}, "
+                        f"status={last_status}) — retrying in {delay:.0f}s "
+                        f"(PostgREST schema cache may still be reloading)…")
+            await asyncio.sleep(delay)
+
+    log.error("❌ stock_full_history table MISSING or misconfigured (after retries)!")
+    log.error(f"   status={last_status} body={last_body[:200]}")
+    log.error("   → If you already ran the CREATE TABLE SQL, force a schema reload:")
+    log.error("     Supabase Dashboard → Settings → API → 'Reload schema', or run:")
+    log.error("     NOTIFY pgrst, 'reload schema';")
+    log.error("   → Otherwise, go to Supabase SQL Editor and run:")
+    log.error("   create table if not exists public.stock_full_history (")
+    log.error("     sym text primary key,")
+    log.error("     dates jsonb, prices jsonb, volumes jsonb,")
+    log.error("     highs jsonb, lows jsonb, opens jsonb,")
+    log.error("     days_count int, updated_at timestamptz")
+    log.error("   );")
+    return False
+
+
+
+async def fetch_bulk_ohlc(session: aiohttp.ClientSession, instrument_keys: list) -> dict:
+    """
+    Fetch live quotes for instruments in one call.
+    IMPORTANT: uses Upstox's Full Market Quotes endpoint (/market-quote/quotes),
+    NOT the OHLC endpoint (/market-quote/ohlc) — the OHLC endpoint's response
+    shape is just {"ohlc": {...}, "last_price": ...} and has NO "volume" field
+    at all. Every volume-dependent signal (HY/HT/rvol) was silently falling
+    back to yesterday's completed volume the entire time, since live.get(
+    'volume') was always None/missing from that endpoint — not a bug in the
+    signal logic itself, just fetching from an endpoint that never had live
+    volume to give. Full Market Quotes includes live_price, volume (live,
+    updating all session), depth, etc.
+    Keep batch small — GET URL length limits apply.
+    """
+    url = "https://api.upstox.com/v2/market-quote/quotes"
+    headers = {
+        "Authorization": f"Bearer {ANALYTICS_TOKEN}",
+        "Accept": "application/json"
+    }
+    params = {
+        "instrument_key": ",".join(instrument_keys),
+    }
+    try:
+        async with session.get(url, headers=headers, params=params,
+                               timeout=aiohttp.ClientTimeout(total=30)) as r:
+            text = await r.text()
+            if r.status != 200:
+                log.warning(f"Quotes fetch failed: {r.status} — {text[:300]}")
+                return {}
+            try:
+                data = json.loads(text)
+            except Exception:
+                log.warning(f"Quotes response not JSON: {text[:200]}")
+                return {}
+            result = data.get('data', {})
+            if not result:
+                log.warning(f"Quotes empty data field. Full response keys: {list(data.keys())} status={data.get('status')}")
+            return result
+    except Exception as e:
+        log.error(f"Quotes fetch error: {e}")
+        return {}
+
+
+async def fetch_full_history_for_symbols(session: aiohttp.ClientSession, symbols: list,
+                                          label: str = "full") -> int:
+    """
+    Fetch the full 2-year daily OHLCV history from Yahoo Finance for the
+    given list of symbols and persist it into Supabase `stock_full_history`
+    + historical_cache/history_dates_cache. This is the expensive full
+    fetch — used only for symbols that are missing or stale in Supabase,
+    NOT for every stock on every restart (see load_history_at_startup).
+    Returns the count of symbols successfully fetched.
+    """
+    if not symbols:
+        return 0
+
+    table_ready = await ensure_full_history_table(session)
+    if not table_ready:
+        log.error("⏭️  Skipping Yahoo history fetch this run — table still unavailable "
+                   "(will try again on next restart).")
+        return 0
+
+    total = len(symbols)
+    log.info(f"📥 Fetching full 2yr Yahoo history for {total} stocks ({label})…")
+
+    sem = asyncio.Semaphore(20)
+    rows: list = []
+    done = 0
+    failed = 0
+    failed_syms: list = []
+    lock = asyncio.Lock()
+
+    async def fetch_one(sym):
+        nonlocal done, failed
+        _debug_this = sym in ('GRSE', 'RRKABEL')
+        async with sem:
+            data = await fetch_yahoo_full_ohlcv(session, sym)
+            if _debug_this:
+                log.info(f"  🔍 {sym} Yahoo history fetch: {'got ' + str(len(data['prices'])) + ' days' if data else 'FAILED (no data)'}")
+            if not data:
+                # Yahoo permanently fails ~72 symbols (no .NS/.BO ticker) —
+                # they showed absurd chg% (stale prev close) and no chart
+                # data. Upstox's historical-candle API resolves them by ISIN.
+                ikey = instrument_key_map.get(sym)
+                if _debug_this:
+                    log.info(f"  🔍 {sym} instrument_key_map lookup: {ikey!r}")
+                data = await fetch_upstox_full_ohlcv(session, sym)
+                if _debug_this:
+                    log.info(f"  🔍 {sym} Upstox fallback fetch: {'got ' + str(len(data['prices'])) + ' days' if data else 'FAILED (no data)'}")
+            await asyncio.sleep(0.02)
+        async with lock:
+            if data:
+                # Yahoo's range=2y/interval=1d includes TODAY's still-forming
+                # candle whenever the market is open — its "close" is really
+                # just the latest traded price at fetch time, not a real
+                # daily close. If we let that become prices[-1] while the
+                # market is open, every live scan's chg% calc (which assumes
+                # prices[-1] is the most recent COMPLETED close) ends up
+                # comparing live price against a stale intraday snapshot
+                # from whenever this fetch ran, instead of yesterday's real
+                # close — producing wrong/stale % change all session long.
+                # Drop that last bar in this case; keep it once the market
+                # has closed (EOD refresh), when it's a genuine final close.
+                today_ist = datetime.now(IST).strftime('%Y-%m-%d')
+                mkt_open = is_market_open()
+                will_trim = mkt_open and data['dates'] and data['dates'][-1] == today_ist
+
+                if will_trim:
+                    for k in ('dates', 'prices', 'volumes', 'highs', 'lows', 'opens'):
+                        data[k] = data[k][:-1]
+
+                rows.append({
+                    'sym':        sym,
+                    'dates':      json.dumps(data['dates']),
+                    'prices':     json.dumps(data['prices']),
+                    'volumes':    json.dumps(data['volumes']),
+                    'highs':      json.dumps(data['highs']),
+                    'lows':       json.dumps(data['lows']),
+                    'opens':      json.dumps(data.get('opens', [])),
+                    'days_count': len(data['prices']),
+                    'updated_at': datetime.now(timezone.utc).isoformat(),
+                })
+                # Also feed straight into the in-memory caches used by RS
+                # calculations — Upstox only gives ~550 days at best, so
+                # this Yahoo 2yr pull is the authoritative source for RS.
+                historical_cache[sym] = {
+                    'prices':  data['prices'],
+                    'volumes': [v if v is not None else 0 for v in data['volumes']],
+                    'highs':   [h if h is not None else p for h, p in zip(data['highs'], data['prices'])],
+                    'lows':    [l if l is not None else p for l, p in zip(data['lows'],  data['prices'])],
+                }
+                history_dates_cache[sym] = data['dates']
+                opens_cache[sym] = data.get('opens', [])
+                done += 1
+            else:
+                failed += 1
+                failed_syms.append(sym)
+            seen = done + failed
+            if seen % 200 == 0 or seen == total:
+                log.info(f"  …{seen}/{total} fetched ({done} ok, {failed} failed)")
+            # Upload incrementally so partial progress survives a crash/timeout
+            if len(rows) >= 200:
+                batch, rows[:] = rows[:], []
+                await save_full_history_batch_to_db(session, batch)
+
+    await asyncio.gather(*[fetch_one(sym) for sym in symbols])
+
+    # Retry pass — Yahoo fails a random subset of requests each run
+    # (rate-limits, timeouts) that has nothing to do with the symbol itself.
+    # Without a retry, a stock that's unlucky on this particular run keeps
+    # whatever historical_cache value it already had — potentially days
+    # stale — until some future run happens to succeed for it. One retry
+    # pass over just the failures fixes most of these transient misses
+    # cheaply, since it's usually a small fraction of the full universe.
+    if failed_syms:
+        retry_list = failed_syms[:]
+        failed_syms = []
+        log.info(f"🔁 Retrying {len(retry_list)} stocks that failed the first Yahoo fetch pass…")
+        await asyncio.sleep(2)
+        await asyncio.gather(*[fetch_one(sym) for sym in retry_list])
+        recovered = len(retry_list) - len(failed_syms)
+        # Use the final unresolved list as the source of truth instead of
+        # subtracting — fetch_one's failure branch increments `failed` on
+        # EVERY attempt, so a symbol that fails both the first pass and the
+        # retry was being counted twice (e.g. "144 failed out of 72").
+        failed = len(failed_syms)
+        log.info(f"🔁 Retry pass complete: {recovered} recovered, {len(failed_syms)} still failing after retry")
+
+    if rows:
+        await save_full_history_batch_to_db(session, rows)
+
+    log.info(f"✅ Yahoo history fetch ({label}) complete: {done} ok, {failed} failed out of {total}")
+    return done
+
+
+
+async def fetch_full_nifty_history(session: aiohttp.ClientSession) -> dict:
+    """
+    One-time fetch of 5yr Nifty/Midcap/Smallcap history.
+    Tries multiple sources until one works.
+    Returns dict: {"Nifty 50": [prices...], "Midcap 150": [...], "Smallcap 250": [...]}
+    """
+    results = {}
+
+    # Source 1: Yahoo Finance (yfinance style direct URL)
+    yahoo_map = {
+        "Nifty 50":    "%5ENSEI",
+        "Midcap 150":  "%5ENIMDCP150",
+        "Smallcap 250":"%5ENSMCP250",
+    }
+    for name, ticker in yahoo_map.items():
+        if name in results:
+            continue
+        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=5y"
+        try:
+            async with session.get(url,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+                timeout=aiohttp.ClientTimeout(total=15)) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    closes = data["chart"]["result"][0]["indicators"]["quote"][0]["close"]
+                    prices = [c for c in closes if c is not None]
+                    if len(prices) >= 500:
+                        results[name] = prices
+                        log.info(f"  ✅ Yahoo {name}: {len(prices)} days")
+        except Exception as e:
+            log.warning(f"  Yahoo {name}: {e}")
+        await asyncio.sleep(0.3)
+
+    # Source 2: NSE Bhavcopy index CSV (already works for constituents)
+    if "Nifty 50" not in results:
+        nse_indices = {
+            "Nifty 50":    "NIFTY 50",
+            "Midcap 150":  "NIFTY MIDCAP 150",
+            "Smallcap 250":"NIFTY SMALLCAP 250",
+        }
+        # Try NSE index historical API
+        for name, idx_name in nse_indices.items():
+            if name in results:
+                continue
+            encoded = idx_name.replace(" ", "%20")
+            url = f"https://www.nseindia.com/api/historical/indicesHistory?indexType={encoded}&from=01-Jan-2020&to=06-Jul-2026"
+            try:
+                async with session.get(url,
+                    headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.nseindia.com"},
+                    timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        records = data.get("data", {}).get("indexCloseOnlineRecords", [])
+                        prices = [float(rec["EOD_CLOSE_INDEX_VAL"]) for rec in reversed(records)]
+                        if len(prices) >= 500:
+                            results[name] = prices
+                            log.info(f"  ✅ NSE {name}: {len(prices)} days")
+            except Exception as e:
+                log.warning(f"  NSE {name}: {e}")
+            await asyncio.sleep(0.5)
+
+    # Source 3: Stooq CSV
+    stooq_map = {
+        "Nifty 50":    "%5ensei",
+        "Midcap 150":  "%5ecnxmc",
+        "Smallcap 250":"%5ecnxsc",
+    }
+    for name, ticker in stooq_map.items():
+        if name in results:
+            continue
+        url = f"https://stooq.com/q/d/l/?s={ticker}&i=d"
+        try:
+            async with session.get(url,
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=aiohttp.ClientTimeout(total=15)) as r:
+                if r.status == 200:
+                    text = await r.text()
+                    lines = text.strip().split("\n")
+                    prices = []
+                    for line in lines[1:]:
+                        parts = line.split(",")
+                        if len(parts) >= 5 and parts[4] not in ("N/D", "null", ""):
+                            try: prices.append(float(parts[4]))
+                            except: pass
+                    prices = list(reversed(prices))
+                    if len(prices) >= 500:
+                        results[name] = prices
+                        log.info(f"  ✅ Stooq {name}: {len(prices)} days")
+        except Exception as e:
+            log.warning(f"  Stooq {name}: {e}")
+        await asyncio.sleep(0.3)
+
+    return results
+
+
+
+async def fetch_historical(session: aiohttp.ClientSession, sym: str,
+                           instrument_key: str = None) -> dict:
+    """Fetch 15 months of daily historical data for one stock."""
+    to   = datetime.now(IST).strftime('%Y-%m-%d')
+    from_= (datetime.now(IST) - timedelta(days=550)).strftime('%Y-%m-%d')
+
+    # Use provided instrument_key or build from symbol
+    key = instrument_key if instrument_key else f"NSE_EQ|{sym}"
+    encoded_key = key.replace('|', '%7C')
+    url = f"https://api.upstox.com/v2/historical-candle/{encoded_key}/day/{to}/{from_}"
+
+    headers = {
+        "Authorization": f"Bearer {ANALYTICS_TOKEN}",
+        "Accept": "application/json"
+    }
+    try:
+        async with session.get(url, headers=headers,
+                               timeout=aiohttp.ClientTimeout(total=15)) as r:
+            if r.status != 200:
+                return {}
+            data = await r.json()
+            candles = list(reversed(data.get('data', {}).get('candles', [])))
+            return {
+                'prices':  [c[4] for c in candles],  # close
+                'volumes': [c[5] for c in candles],  # volume
+                'highs':   [c[2] for c in candles],
+                'lows':    [c[3] for c in candles],
+            }
+    except Exception as e:
+        return {}
+
+# ── Supabase client ───────────────────────────────────────────────────
+
+async def fetch_index_csv(session: aiohttp.ClientSession, url: str) -> list:
+    """Download an NSE index constituent CSV and return list of trading symbols."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+        "Accept": "text/csv,*/*",
+    }
+    try:
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as r:
+            if r.status != 200:
+                log.warning(f"Index CSV fetch failed ({url}): HTTP {r.status}")
+                return []
+            raw = await r.read()
+            text = raw.decode('utf-8', errors='ignore')
+
+            import csv, io
+            reader = csv.DictReader(io.StringIO(text))
+            symbols = []
+            for row in reader:
+                # NSE CSVs use a "Symbol" column (case can vary slightly)
+                sym = None
+                for key in row:
+                    if key and key.strip().lower() == 'symbol':
+                        sym = row[key]
+                        break
+                if sym:
+                    sym = sym.strip().upper()
+                    if sym:
+                        symbols.append(sym)
+            return symbols
+    except Exception as e:
+        log.warning(f"Index CSV fetch error ({url}): {e}")
+        return []
+
+
+async def fetch_upstox_full_ohlcv(session: aiohttp.ClientSession, sym: str,
+                                   days: int = 730) -> Optional[dict]:
+    """
+    Fallback history source for the ~72 symbols whose Yahoo fetch always
+    fails (no .NS/.BO ticker) — uses Upstox's historical-candle API,
+    which works by ISIN instrument key (same API that loads index
+    history). Returns the same shape as fetch_yahoo_full_ohlcv. Requires
+    instrument_key_map to be populated (it is, before any scan runs).
+    Candle format: [ts, open, high, low, close, volume, oi], newest first.
+    """
+    ikey = instrument_key_map.get(sym)
+    _debug_this = sym in ('GRSE', 'RRKABEL')
+    if not ikey or '|' not in ikey:
+        if _debug_this:
+            log.info(f"  🔍 {sym} Upstox fallback: no valid instrument_key ({ikey!r}), bailing out")
+        return None
+    encoded = ikey.replace('|', '%7C').replace(' ', '%20').replace('&', '%26')
+    to = datetime.now(IST).strftime('%Y-%m-%d')
+    from_ = (datetime.now(IST) - timedelta(days=days)).strftime('%Y-%m-%d')
+    url = f"https://api.upstox.com/v2/historical-candle/{encoded}/day/{to}/{from_}"
+    headers = {"Authorization": f"Bearer {ANALYTICS_TOKEN}", "Accept": "application/json"}
+    try:
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as r:
+            if r.status != 200:
+                if _debug_this:
+                    body = await r.text()
+                    log.info(f"  🔍 {sym} Upstox historical-candle status={r.status} url={url} body={body[:200]}")
+                return None
+            data = await r.json()
+            candles = list(reversed(data.get('data', {}).get('candles', [])))
+            if len(candles) < 30:
+                if _debug_this:
+                    log.info(f"  🔍 {sym} Upstox historical-candle returned only {len(candles)} candles (need 30+)")
+                return None
+            return {
+                'dates':   [str(c[0])[:10] for c in candles],
+                'prices':  [round(c[4], 2) for c in candles],
+                'volumes': [int(c[5] or 0) for c in candles],
+                'highs':   [round(c[2], 2) for c in candles],
+                'lows':    [round(c[3], 2) for c in candles],
+                'opens':   [round(c[1], 2) for c in candles],
+            }
+    except Exception as e:
+        if _debug_this:
+            log.info(f"  🔍 {sym} Upstox historical-candle exception: {type(e).__name__}: {e}")
+        return None
+
+
+
+async def fetch_yahoo_full_ohlcv(session: aiohttp.ClientSession, sym: str,
+                                  range_period: str = "2y", min_points: int = 100) -> Optional[dict]:
+    """Fetch daily OHLCV (dates, close, volume, high, low) for one NSE stock
+    from Yahoo Finance. Tries .NS first, then .BO as fallback.
+    range_period/min_points let this double as either a full 2yr backfill
+    (range='2y', min_points=100) or a lightweight incremental fetch for the
+    EOD daily update (range='10d', min_points=1) — same parsing logic,
+    much smaller response for the common case where we already have most
+    of the history and just need the last day or two."""
+    for suffix in [".NS", ".BO"]:
+        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{sym}{suffix}?interval=1d&range={range_period}"
+        try:
+            async with session.get(url,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+                timeout=aiohttp.ClientTimeout(total=12)) as r:
+                if r.status != 200:
+                    continue
+                data = await r.json()
+                result_list = data.get("chart", {}).get("result") or []
+                if not result_list:
+                    continue
+                result = result_list[0]
+                timestamps = result.get("timestamp") or []
+                quote = (result.get("indicators", {}).get("quote") or [{}])[0]
+                closes  = quote.get("close")  or []
+                volumes = quote.get("volume") or []
+                highs   = quote.get("high")   or []
+                lows    = quote.get("low")    or []
+                opens   = quote.get("open")   or []
+
+                dates, prices, vols, hi, lo, op = [], [], [], [], [], []
+                for i, c in enumerate(closes):
+                    if c is None:
+                        continue
+                    ts = timestamps[i] if i < len(timestamps) else None
+                    dates.append(
+                        datetime.fromtimestamp(ts, tz=IST).strftime('%Y-%m-%d') if ts else None
+                    )
+                    prices.append(round(c, 2))
+                    v = volumes[i] if i < len(volumes) else None
+                    vols.append(int(v) if v is not None else None)
+                    h = highs[i] if i < len(highs) else None
+                    hi.append(round(h, 2) if h is not None else None)
+                    l = lows[i] if i < len(lows) else None
+                    lo.append(round(l, 2) if l is not None else None)
+                    o = opens[i] if i < len(opens) else None
+                    op.append(round(o, 2) if o is not None else None)
+
+                if len(prices) >= min_points:
+                    return {'dates': dates, 'prices': prices, 'volumes': vols,
+                            'highs': hi, 'lows': lo, 'opens': op}
+        except Exception:
+            pass
+    return None
+
+
+
+def find_pivots(highs: list, lows: list, left: int = 3, right: int = 3):
+    """Fractal-style swing highs/lows: bar i is a pivot high if it's the
+    max within [i-left, i+right] (similarly for pivot lows). Adjacent
+    pivots of the same type within `left` bars of each other are merged,
+    keeping the more extreme one, to avoid near-duplicate noise pivots."""
+    n = len(highs)
+    piv_hi, piv_lo = [], []
+    for i in range(left, n - right):
+        window_h = highs[i-left:i+right+1]
+        window_l = lows[i-left:i+right+1]
+        if highs[i] == max(window_h):
+            piv_hi.append((i, highs[i]))
+        if lows[i] == min(window_l):
+            piv_lo.append((i, lows[i]))
+
+    def dedupe(pivots, keep_max):
+        if not pivots:
+            return pivots
+        out = [pivots[0]]
+        for idx, val in pivots[1:]:
+            pidx, pval = out[-1]
+            if idx - pidx <= left:
+                if (keep_max and val > pval) or (not keep_max and val < pval):
+                    out[-1] = (idx, val)
+            else:
+                out.append((idx, val))
+        return out
+
+    return dedupe(piv_hi, True), dedupe(piv_lo, False)
+
+
+def fundamental_score_label(score) -> str:
+    """Excellent / Good / Fair / Poor — deliberately worded as a
+    quality assessment, never as 'buy'/'sell'/'target' language."""
+    if score is None:
+        return None
+    if score >= 75: return 'Excellent'
+    if score >= 58: return 'Good'
+    if score >= 40: return 'Fair'
+    return 'Poor'
+
+
+
+async def generate_ai_picks_reasoning(session: aiohttp.ClientSession, top_rows: list) -> dict:
+    """One batched Anthropic call (or the free templated fallback) that
+    turns each top pick's raw signals into a short plain-English
+    rationale. Returns {symbol: reasoning_text}. Same cost-optional
+    pattern as rate_announcements_with_ai: if ANTHROPIC_API_KEY isn't
+    set, or the call fails for any reason, falls back to a templated
+    sentence built from whichever signals actually fired rather than
+    skipping the field."""
+    api_key = os.getenv('ANTHROPIC_API_KEY', '')
+    if not top_rows:
+        return {}
+    if not api_key:
+        return {r['sym']: _template_pick_reasoning(r) for r in top_rows}
+
+    listing = "\n".join(
+        f"{i+1}. {r['sym']} (sector: {r.get('sector') or '?'}, mcap ₹{int(r['market_cap']) if r.get('market_cap') else '?'} Cr, "
+        f"score {r.get('best_pick_score')}/100) — "
+        f"stage {r.get('weinstein_stage')}, RS {r.get('rs_tv') or r.get('rs')}, "
+        f"VCP={'Y' if r.get('vcp_fired') else 'N'}, "
+        f"breakout={'Y' if r.get('is_resistance_breakout') or r.get('is_cup_handle_breakout') else 'N'}, "
+        f"RVOL={r.get('rvol')}, EPS QoQ/YoY={r.get('eps_qoq')}/{r.get('eps_yoy')}, "
+        f"Sales QoQ/YoY={r.get('sales_qoq')}/{r.get('sales_yoy')}, ROE={r.get('roe')}, "
+        f"D/E={r.get('debt_eq')}, promoter trend={r.get('promoter_trend')}, "
+        f"FII/DII trend={r.get('fii_trend')}/{r.get('dii_trend')}"
+        for i, r in enumerate(top_rows)
+    )
+    prompt = (
+        "You are a technical+fundamental analyst writing one-line rationales for a stock "
+        "scanner's 'Best Picks' list, for Indian retail investors on the NSE. Each numbered "
+        "line below gives one stock's confluence of signals that already qualified it for "
+        "this list. Write a crisp reason (max 100 characters) explaining IN YOUR OWN PLAIN "
+        "WORDS why this stock stands out — reference the 2-3 strongest signals only, don't "
+        "just restate every field. This is analysis of already-public scan data, not a buy "
+        "recommendation — never use words like 'buy', 'target', or promise returns.\n"
+        "Respond ONLY with a JSON array like "
+        "[{\"n\":1,\"reason\":\"Stage-2 breakout on rising RVOL with 3 straight qtrs of EPS growth\"}] "
+        "— no other text.\n\n"
+        + listing
+    )
+    try:
+        async with session.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5",
+                "max_tokens": 2500,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as r:
+            if r.status != 200:
+                body = await r.text()
+                log.warning(f"⚠️ AI picks reasoning call failed ({r.status}): {body[:200]} — using templated fallback")
+                return {r2['sym']: _template_pick_reasoning(r2) for r2 in top_rows}
+            data = await r.json()
+        text = "".join(b.get('text', '') for b in data.get('content', []) if b.get('type') == 'text')
+        text = text.replace('```json', '').replace('```', '').strip()
+        items = json.loads(text)
+        out = {}
+        for item in items:
+            idx = item.get('n')
+            reason = (item.get('reason') or '').strip()
+            if isinstance(idx, int) and 1 <= idx <= len(top_rows) and reason:
+                out[top_rows[idx - 1]['sym']] = reason[:160]
+        for r in top_rows:
+            out.setdefault(r['sym'], _template_pick_reasoning(r))
+        log.info(f"  🧠 AI-rationaled {len(out)}/{len(top_rows)} best picks")
+        return out
+    except Exception as e:
+        log.warning(f"⚠️ AI picks reasoning failed ({type(e).__name__}: {e}) — using templated fallback")
+        return {r['sym']: _template_pick_reasoning(r) for r in top_rows}
+
+
+
+async def incremental_eod_update(session: aiohttp.ClientSession):
+    """
+    Once-per-day EOD task: instead of re-pulling the full 2-year history
+    from Yahoo for all ~2385 stocks (slow, and the main source of Yahoo
+    rate-limiting), fetch just a small recent window (range=10d) per
+    stock and merge the new day(s) into what's already stored — a much
+    lighter request that still keeps the rolling 2yr window current.
+    Stocks with no existing history yet (new IPOs, or ones that never
+    successfully backfilled) fall back to a full fetch instead.
+    """
+    table_ready = await ensure_full_history_table(session)
+    if not table_ready:
+        log.error("⏭️  Skipping EOD history update — table still unavailable.")
+        return
+
+    has_history  = [s for s in ALL_STOCKS if s in historical_cache and s in history_dates_cache
+                    and len(historical_cache[s].get('prices', [])) >= 100]
+    needs_full   = [s for s in ALL_STOCKS if s not in has_history]
+
+    total = len(has_history)
+    log.info(f"📥 EOD incremental update: {total} stocks (light fetch), "
+             f"{len(needs_full)} need a full fetch first…")
+
+    if needs_full:
+        await fetch_full_history_for_symbols(session, needs_full, label="eod-backfill")
+
+    sem = asyncio.Semaphore(20)
+    rows: list = []
+    done = 0
+    failed = 0
+    failed_syms: list = []
+    lock = asyncio.Lock()
+
+    async def fetch_one(sym):
+        nonlocal done, failed
+        async with sem:
+            data = await fetch_yahoo_full_ohlcv(session, sym, range_period="10d", min_points=1)
+            if not data:
+                data = await fetch_upstox_full_ohlcv(session, sym, days=15)
+            await asyncio.sleep(0.02)
+        async with lock:
+            if data:
+                merged = merge_incremental_days(
+                    history_dates_cache.get(sym, []),
+                    historical_cache.get(sym, {}).get('prices', []),
+                    historical_cache.get(sym, {}).get('volumes', []),
+                    historical_cache.get(sym, {}).get('highs', []),
+                    historical_cache.get(sym, {}).get('lows', []),
+                    opens_cache.get(sym, []),
+                    data,
+                )
+                historical_cache[sym] = {
+                    'prices':  merged['prices'],
+                    'volumes': merged['volumes'],
+                    'highs':   merged['highs'],
+                    'lows':    merged['lows'],
+                }
+                history_dates_cache[sym] = merged['dates']
+                opens_cache[sym] = merged['opens']
+                rows.append({
+                    'sym':        sym,
+                    'dates':      json.dumps(merged['dates']),
+                    'prices':     json.dumps(merged['prices']),
+                    'volumes':    json.dumps(merged['volumes']),
+                    'highs':      json.dumps(merged['highs']),
+                    'lows':       json.dumps(merged['lows']),
+                    'opens':      json.dumps(merged['opens']),
+                    'days_count': len(merged['prices']),
+                    'updated_at': datetime.now(timezone.utc).isoformat(),
+                })
+                done += 1
+            else:
+                failed += 1
+                failed_syms.append(sym)
+            seen = done + failed
+            if seen % 200 == 0 or seen == total:
+                log.info(f"  …{seen}/{total} incremental-updated ({done} ok, {failed} failed)")
+            if len(rows) >= 200:
+                batch, rows[:] = rows[:], []
+                await save_full_history_batch_to_db(session, batch)
+
+    await asyncio.gather(*[fetch_one(sym) for sym in has_history])
+
+    if failed_syms:
+        retry_list = failed_syms[:]
+        failed_syms = []
+        log.info(f"🔁 Retrying {len(retry_list)} stocks that failed the incremental fetch…")
+        await asyncio.sleep(2)
+        await asyncio.gather(*[fetch_one(sym) for sym in retry_list])
+        recovered = len(retry_list) - len(failed_syms)
+        failed = len(failed_syms)  # authoritative count — see comment in fetch_full_history_for_symbols
+        log.info(f"🔁 Retry pass complete: {recovered} recovered, {len(failed_syms)} still failing")
+
+    if rows:
+        await save_full_history_batch_to_db(session, rows)
+
+    log.info(f"✅ EOD incremental update complete: {done} ok, {failed} failed out of {total}")
+
+
+
+def is_scan_time() -> bool:
+    """Run scan during market hours + 30 min before/after."""
+    now = datetime.now(IST)
+    if now.weekday() >= 5:
+        return False
+    open_time  = now.replace(hour=MARKET_OPEN_H,  minute=MARKET_OPEN_M,  second=0, microsecond=0) - timedelta(minutes=30)
+    close_time = now.replace(hour=MARKET_CLOSE_H, minute=MARKET_CLOSE_M, second=0, microsecond=0) + timedelta(minutes=30)
+    return open_time <= now <= close_time
+
+# ── Squeeze fire state tracking ──────────────────────────────────────
+# Track which stocks were firing last scan — only alert on NEW fires
+# Format: {sym: {'bb': bool, 'vcp': bool}}
+prev_squeeze_state: dict = {}
+
+# ── HY/HT volume-climax fire state tracking ──────────────────────────
+# Same "only alert on the transition into firing" pattern as squeeze
+# state above, tracked separately so a stock that stays HY/HT for
+# several scans in a row (common — these are daily volume-vs-history
+# ratios, not instantaneous events) only triggers one notification at
+# the moment it turns on, not every single scan while it's true.
+# Format: {sym: {'hy': bool, 'ht': bool}}
+prev_hy_ht_state: dict = {}
+
+
+historical_cache: dict = {}   # sym -> {prices, volumes, highs, lows}
+history_dates_cache: dict = {}  # sym -> [dates] — parallel to historical_cache,
+# tracked separately since RS calc doesn't need dates but incremental merges do
+opens_cache: dict = {}  # sym -> [opens] — parallel to historical_cache, tracked
+# separately since RS/PP/signal calc doesn't need Open prices, only the
+# persisted stock_full_history table (for candlestick charts) does
+last_eod_refresh_date: Optional[str] = None  # IST date string — ensures the
+# expensive EOD refresh (full Yahoo re-fetch + fundamentals) runs only ONCE
+# per day, not on every single scan cycle while the market stays closed.
+nifty_cache: dict = {}        # {'prices': [...]} — Nifty index daily closes for TV RS calc
+midcap_cache: dict = {}       # {'prices': [...]} — synthetic Midcap 150 index
+smallcap_cache: dict = {}     # {'prices': [...]} — synthetic Smallcap 250 index
+
+
+async def load_all_history_from_supabase(session: aiohttp.ClientSession) -> list:
+    """
+    Load previously-fetched full-history rows straight from Supabase —
+    ZERO Yahoo calls. This is the key optimization: without it, every
+    single restart re-fetched full 2yr history from Yahoo for all ~2385
+    stocks, which is both slow and the main source of Yahoo rate-limiting
+    (the cause of the RRKABEL stale-data bug earlier). Now a restart just
+    loads what's already stored, and Yahoo is only hit for symbols that
+    are missing entirely or whose stored data has gone stale.
+
+    Processes each page as it arrives instead of accumulating every page
+    into one big list before parsing any of it — the old approach held
+    the full raw JSON for all ~2385 stocks AND the fully-parsed
+    historical_cache in memory at the same time, roughly doubling peak
+    memory during exactly this startup phase (which is where the
+    memory-driven crash-loop concentrates). Streaming page-by-page means
+    each page's raw JSON is released before the next page is even
+    fetched.
+
+    Returns the list of symbols that need a Yahoo fetch (missing/stale).
+    """
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    PAGE = 1000
+    offset = 0
+
+    loaded = 0
+    stale_or_missing: list = []
+    found_syms: set = set()
+    today = datetime.now(IST).date()
+
+    def parse(v):
+        if v is None:
+            return []
+        return json.loads(v) if isinstance(v, str) else v
+
+    while True:
+        try:
+            page_headers = {**headers, "Range": f"{offset}-{offset + PAGE - 1}"}
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/stock_full_history"
+                f"?select=sym,dates,prices,volumes,highs,lows,opens,updated_at",
+                headers=page_headers, timeout=aiohttp.ClientTimeout(total=30)
+            ) as r:
+                if r.status not in (200, 206):
+                    log.warning(f"load_all_history_from_supabase page failed: status={r.status}")
+                    break
+                page = await r.json()
+        except Exception as e:
+            log.error(f"load_all_history_from_supabase error: {e}")
+            break
+
+        # Process this page immediately — the raw `page` JSON goes out
+        # of scope (and becomes GC-eligible) as soon as this block ends,
+        # rather than living alongside every other page until the very
+        # end of the whole fetch.
+        for row in page:
+            sym = row.get('sym')
+            if not sym:
+                continue
+            found_syms.add(sym)
+            try:
+                dates   = parse(row.get('dates'))
+                prices  = parse(row.get('prices'))
+                volumes = parse(row.get('volumes'))
+                highs   = parse(row.get('highs'))
+                lows    = parse(row.get('lows'))
+                opens   = parse(row.get('opens'))
+
+                if len(prices) < 100:
+                    stale_or_missing.append(sym)
+                    continue
+
+                opens_cache[sym] = opens
+
+                historical_cache[sym] = {
+                    'prices':  prices,
+                    'volumes': [v if v is not None else 0 for v in volumes],
+                    'highs':   [h if h is not None else p for h, p in zip(highs, prices)],
+                    'lows':    [l if l is not None else p for l, p in zip(lows,  prices)],
+                }
+                history_dates_cache[sym] = dates
+                loaded += 1
+
+                # Freshness check — allow up to 4 calendar days back so
+                # weekends/the odd market holiday don't falsely flag as stale.
+                last_date_str = dates[-1] if dates else None
+                is_stale = True
+                if last_date_str:
+                    try:
+                        last_date = datetime.strptime(last_date_str, '%Y-%m-%d').date()
+                        is_stale = (today - last_date).days > 4
+                    except Exception:
+                        is_stale = True
+                if is_stale:
+                    stale_or_missing.append(sym)
+            except Exception:
+                stale_or_missing.append(sym)
+
+        if len(page) < PAGE:
+            break
+        offset += PAGE
+
+    missing_entirely = [s for s in ALL_STOCKS if s not in found_syms]
+    stale_or_missing.extend(missing_entirely)
+
+    log.info(f"📦 Loaded {loaded} stocks from Supabase stock_full_history "
+             f"(0 Yahoo calls) — {len(stale_or_missing)} need a Yahoo fetch "
+             f"(missing or stale)")
+    # Explicit collect — this just finished allocating/parsing the single
+    # largest in-memory dataset in the process (full price/volume/high/low
+    # history for ~2385 stocks); prompting a collection here rather than
+    # waiting for Python's generational GC to get around to it reduces
+    # the peak memory this startup phase leaves behind for whatever runs
+    # next (which, per Railway's memory graph, is exactly where usage was
+    # cresting toward the OOM kill).
+    gc.collect()
+    return stale_or_missing
+
+
+
+async def load_bse_only_stocks(session: aiohttp.ClientSession) -> int:
+    """
+    Adds BSE-only stocks (listed on BSE but NOT on NSE) on top of whatever
+    load_instrument_master already built from NSE — additive only, never
+    modifies or removes any existing NSE-sourced entry.
+
+    Most major Indian companies are dual-listed on both exchanges; this
+    is specifically for the ones that chose BSE only. Upstox's own
+    instrument-search docs confirm ISIN is the reliable way to match a
+    security across exchanges (their API explicitly supports "pass an
+    ISIN, get back both the NSE and BSE listings for it") — so this
+    collects every ISIN already covered by an NSE listing, then adds any
+    BSE equity whose ISIN ISN'T in that set. Deliberately uses the JSON
+    instrument files, not CSV — Upstox's own docs state the CSV format
+    is being deprecated in favor of JSON.
+
+    Deliberately best-effort: any failure here just means BSE-only
+    stocks aren't added this run. Never touches ALL_STOCKS or
+    instrument_key_map unless it has a real, non-empty NSE ISIN set to
+    dedupe against, to avoid the failure mode of accidentally treating
+    EVERY BSE stock as "BSE-only" because the dedupe set came back empty.
+    """
+    global instrument_key_map, ALL_STOCKS
+
+    nse_isins = set()
+    try:
+        url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
+        # No explicit Accept-Encoding here — this URL is a static .gz FILE
+        # (compression baked into the file itself, not an HTTP transport
+        # negotiation), so forcing Accept-Encoding:gzip risked some CDNs
+        # double-wrapping the response in transport-level gzip on top of
+        # the file's own gzip, which aiohttp's auto-decompression would
+        # only unwrap one layer of — leaving `content` still gzip-magic-
+        # byte-prefixed by the time it reached json.loads. Let aiohttp's
+        # own default negotiation handle transport compression, and
+        # explicitly check the file's own gzip magic bytes below.
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as r:
+            if r.status != 200:
+                log.warning(f"BSE-only stocks: NSE re-fetch for ISIN set failed ({r.status}), skipping")
+                return 0
+            content = await r.read()
+            try:
+                data = json.loads(gzip.decompress(content) if content[:2] == b'\x1f\x8b' else content)
+            except Exception as decode_err:
+                log.warning(f"BSE-only stocks: ISIN set response decode failed "
+                            f"({type(decode_err).__name__}: {decode_err}), skipping")
+                return 0
+            for item in data:
+                isin = item.get('isin', '')
+                if item.get('exchange') == 'NSE' and item.get('instrument_type') in ('EQ', 'ETF') and isin:
+                    nse_isins.add(isin)
+    except Exception as e:
+        log.warning(f"BSE-only stocks: couldn't build NSE ISIN set ({e}), skipping")
+        return 0
+
+    if not nse_isins:
+        log.warning("BSE-only stocks: NSE ISIN set came back empty, skipping to avoid false positives")
+        return 0
+
+    added_syms = []
+    try:
+        url2 = "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz"
+        async with session.get(url2, timeout=aiohttp.ClientTimeout(total=90),
+                               headers={"Accept-Encoding": "gzip"}) as r:
+            if r.status != 200:
+                log.warning(f"BSE-only stocks: complete instrument file fetch failed ({r.status})")
+                return 0
+            content = await r.read()
+            try:
+                data = json.loads(gzip.decompress(content))
+            except Exception:
+                data = json.loads(content)
+
+            for item in data:
+                if item.get('exchange') != 'BSE' or item.get('instrument_type') != 'EQ':
+                    continue
+                isin = item.get('isin', '')
+                if not isin or isin in nse_isins:
+                    continue  # dual-listed — already covered via the NSE side
+                sym = item.get('trading_symbol', '').strip()
+                key = item.get('instrument_key', '')
+                if not sym or not key or sym in instrument_key_map:
+                    continue  # missing data, or symbol collision — skip rather than risk overwriting
+                instrument_key_map[sym] = key
+                added_syms.append(sym)
+    except Exception as e:
+        log.warning(f"BSE-only stocks: fetch/parse failed ({e})")
+        return 0
+
+    if added_syms:
+        ALL_STOCKS = list(dict.fromkeys(ALL_STOCKS + added_syms))
+        log.info(f"✅ Added {len(added_syms)} BSE-only stocks — total universe now {len(ALL_STOCKS)}")
+    return len(added_syms)
+
+
+async def load_full_history_once(session: aiohttp.ClientSession):
+    """
+    Check if we already have 2yr history in DB.
+    If not, fetch full history from external source and save to DB.
+    Only runs once — after that DB has enough history.
+    """
+    global nifty_cache, midcap_cache, smallcap_cache
+
+    # Check nifty_cache directly — seed updates it immediately without DB round-trip
+    if len(nifty_cache.get('prices', [])) >= 1400:
+        log.info(f"✅ Nifty cache has {len(nifty_cache['prices'])}d — skipping external fetch")
+        # Still try to get Midcap/Smallcap from Yahoo if not cached
+        db_mid = await load_index_history_from_db(session, "Midcap 150")
+        db_sml = await load_index_history_from_db(session, "Smallcap 250")
+        if db_mid: midcap_cache = {'prices': db_mid}
+        if db_sml: smallcap_cache = {'prices': db_sml}
+        if not db_mid or not db_sml:
+            # Fetch Midcap/Smallcap from Yahoo
+            results = await fetch_full_nifty_history(session)
+            if "Midcap 150" in results:
+                midcap_cache = {"prices": results["Midcap 150"]}
+                await save_index_history_to_db(session, "Midcap 150", results["Midcap 150"])
+                log.info(f"  💾 Saved Midcap 150: {len(results['Midcap 150'])} days")
+            if "Smallcap 250" in results:
+                smallcap_cache = {"prices": results["Smallcap 250"]}
+                await save_index_history_to_db(session, "Smallcap 250", results["Smallcap 250"])
+                log.info(f"  💾 Saved Smallcap 250: {len(results['Smallcap 250'])} days")
+        return
+
+    log.info(f"📥 DB has only {len(nifty_cache.get('prices', []))}d — fetching full history from external sources…")
+    results = await fetch_full_nifty_history(session)
+
+    if not results:
+        log.warning("⚠️ All external sources blocked — history will accumulate daily")
+        return
+
+    for name, prices in results.items():
+        existing = await load_index_history_from_db(session, name)
+        if existing and len(existing) >= len(prices):
+            log.info(f"  Keeping DB {len(existing)}d for {name} (longer than external {len(prices)}d)")
+            continue
+        await save_index_history_to_db(session, name, prices)
+        log.info(f"  💾 Saved {name}: {len(prices)} days to DB")
+
+    if "Nifty 50" in results and len(results["Nifty 50"]) > len(nifty_cache.get('prices', [])):
+        nifty_cache = {"prices": results["Nifty 50"]}
+    if "Midcap 150" in results:
+        midcap_cache = {"prices": results["Midcap 150"]}
+    if "Smallcap 250" in results:
+        smallcap_cache = {"prices": results["Smallcap 250"]}
+    log.info("✅ Full history loaded!")
+
+
+
+async def load_fundamentals_at_startup(session: aiohttp.ClientSession):
+    """
+    Startup: load fundamentals from Supabase first (fast, free), then
+    kick off a BACKGROUND task to scrape Screener.in only for symbols
+    that are missing or stale — decoupled from the once-per-day EOD gate,
+    so it can actually finish across restarts instead of always starting
+    over from zero. Runs as a background task (not awaited) since a full
+    scrape can take 8-15+ minutes and fundamentals aren't as time-critical
+    as price data.
+
+    SERVICE_MODE=scan permanently disables this (a separate fundamentals
+    worker service owns the job instead — see fundamentals_worker_main).
+    SKIP_FUNDAMENTALS_ON_STARTUP=true does the same temporarily, for
+    manual bypass while diagnosing something unrelated. Either way this
+    still loads whatever's already cached in Supabase, just doesn't kick
+    off new Screener.in scraping itself.
+    """
+    table_ready = await ensure_fundamentals_table(session)
+    if not table_ready:
+        log.error("⏭️  stock_fundamentals table unavailable — will rely on the once-daily "
+                   "EOD Screener.in fetch only (no persistence across restarts until fixed).")
+        return
+
+    stale_or_missing = await load_fundamentals_from_supabase(session)
+    if scan_should_skip_fundamentals():
+        log.info(f"⏭️  Fundamentals fetch skipped on this process (that's worthy-simplicity's "
+                  f"job now, plus the hourly Supabase-only sync) — {len(stale_or_missing)} stocks "
+                  f"need fundamentals, handled elsewhere.")
+        return
+    if stale_or_missing:
+        log.info(f"📊 Starting background fundamentals fetch for {len(stale_or_missing)} stocks…")
+        asyncio.create_task(load_fundamentals_batch(session, stale_or_missing))
+
+
+async def load_historical_cache(session: aiohttp.ClientSession):
+    """Load historical data for all stocks at startup."""
+    log.info(f"Loading historical data for {len(ALL_STOCKS)} stocks…")
+    BATCH = 10
+    loaded = 0
+    failed_syms = []
+    for i in range(0, len(ALL_STOCKS), BATCH):
+        batch = ALL_STOCKS[i:i+BATCH]
+        results = await asyncio.gather(*[
+            fetch_historical(session, sym, instrument_key_map.get(sym, f"NSE_EQ|{sym}"))
+            for sym in batch
+        ])
+        for sym, data in zip(batch, results):
+            if data:
+                historical_cache[sym] = data
+                loaded += 1
+            else:
+                failed_syms.append(sym)
+        await asyncio.sleep(0.5)
+        if (i // BATCH) % 10 == 0:
+            log.info(f"  Loaded {loaded}/{len(ALL_STOCKS)} stocks…")
+
+    # Retry failed stocks with BSE exchange key
+    if failed_syms:
+        log.info(f"  Retrying {len(failed_syms)} failed stocks with BSE keys…")
+        retry_loaded = 0
+        for i in range(0, len(failed_syms), BATCH):
+            batch = failed_syms[i:i+BATCH]
+            results = await asyncio.gather(*[
+                fetch_historical(session, sym, f"BSE_EQ|{sym}")
+                for sym in batch
+            ])
+            for sym, data in zip(batch, results):
+                if data:
+                    historical_cache[sym] = data
+                    loaded += 1
+                    retry_loaded += 1
+            await asyncio.sleep(0.5)
+        log.info(f"  BSE retry: {retry_loaded} additional stocks loaded")
+
+    log.info(f"✅ Historical cache loaded: {loaded} stocks")
+
+# ── Main scan function ────────────────────────────────────────────────
+# ============================================================
+# AI Best Picks — composite technical+fundamental scoring, with an
+# AI-generated (or free templated) rationale for the top candidates.
+# Recomputed at most once per _AI_PICKS_REFRESH_INTERVAL_SEC from
+# inside run_scan, since `processed` already has every technical AND
+# fundamental field merged per stock by the time that function
+# finishes — no extra fetching needed here.
+# ============================================================
+_LAST_AI_PICKS_TS = 0.0
+_zero_chg_debug_count = 0  # reset each run_scan cycle — caps zero-chg diagnostic logging
+_LAST_FUNDAMENTALS_SYNC_TS = 0.0
+_AI_PICKS_REFRESH_INTERVAL_SEC = 3600  # ranking + rationale refresh at most hourly
+_AI_PICKS_TOP_N = 30
+
+
+async def load_history_at_startup(session: aiohttp.ClientSession):
+    """
+    Startup replacement for the old 'always re-fetch all ~2385 stocks from
+    Yahoo' behavior. Loads everything already stored in Supabase first
+    (fast, free), then only hits Yahoo for symbols that are missing or
+    whose stored data is stale — normally a small fraction of the universe
+    (new IPOs, or symbols that failed every fetch attempt for several
+    days running), rather than the whole thing every single restart.
+    """
+    table_ready = await ensure_full_history_table(session)
+    if not table_ready:
+        log.error("⏭️  stock_full_history table unavailable — falling back to full "
+                   "Yahoo fetch for all stocks this run.")
+        await fetch_full_history_for_symbols(session, list(ALL_STOCKS), label="startup-fallback-all")
+        return
+
+    stale_or_missing = await load_all_history_from_supabase(session)
+    if stale_or_missing:
+        await fetch_full_history_for_symbols(session, stale_or_missing, label="startup-backfill")
+
+
+
+async def load_index_cache(session: aiohttp.ClientSession):
+    """Fetch historical data for all tracked indices."""
+    global index_history_cache
+    log.info(f"Loading historical data for {len(INDEX_TRACKER)} indices…")
+    to   = datetime.now(IST).strftime('%Y-%m-%d')
+    from_= (datetime.now(IST) - timedelta(days=550)).strftime('%Y-%m-%d')
+    headers = {
+        "Authorization": f"Bearer {ANALYTICS_TOKEN}",
+        "Accept": "application/json"
+    }
+    loaded = 0
+    # Alternative key formats to try if primary fails
+    KEY_ALTERNATIVES = {
+        "Midcap 150":   ["NSE_INDEX|Nifty Midcap 150", "NSE_INDEX|NIFTY MIDCAP 150", "NSE_INDEX|Nifty MidCap 150"],
+        "Smallcap 250": ["NSE_INDEX|Nifty Smallcap 250", "NSE_INDEX|NIFTY SMALLCAP 250", "NSE_INDEX|Nifty SmallCap 250"],
+        "Microcap 250": ["NSE_INDEX|Nifty Microcap 250", "NSE_INDEX|NIFTY MICROCAP 250", "NSE_INDEX|Nifty MicroCap 250"],
+        # Newer additions — exact Upstox naming for these is less certain
+        # than the well-established ones above, so try a few common
+        # variants each (same self-healing approach as Mid/Small/Microcap).
+        "Defence":            ["NSE_INDEX|Nifty India Defence", "NSE_INDEX|Nifty Defence",
+                                "NSE_INDEX|NIFTY INDIA DEFENCE", "NSE_INDEX|Nifty Ind Defence",
+                                "NSE_INDEX|NIFTY IND DEFENCE"],
+        "Financial Services": ["NSE_INDEX|Nifty Fin Service", "NSE_INDEX|Nifty Financial Services"],
+        "PSU Bank":           ["NSE_INDEX|Nifty PSU Bank"],
+        "Private Bank":       ["NSE_INDEX|Nifty Pvt Bank", "NSE_INDEX|Nifty Private Bank"],
+        "PSE":                ["NSE_INDEX|Nifty PSE"],
+        "Media":              ["NSE_INDEX|Nifty Media"],
+        "Infrastructure":     ["NSE_INDEX|Nifty Infra", "NSE_INDEX|Nifty Infrastructure"],
+        "Healthcare":         ["NSE_INDEX|Nifty Healthcare", "NSE_INDEX|Nifty Healthcare Index",
+                                "NSE_INDEX|NIFTY HEALTHCARE INDEX"],
+        "Consumer Durables":  ["NSE_INDEX|Nifty Consr Durable", "NSE_INDEX|Nifty Consumer Durables",
+                                "NSE_INDEX|NIFTY CONSR DURABLE"],
+        "Oil & Gas":          ["NSE_INDEX|Nifty Oil & Gas", "NSE_INDEX|Nifty Oil and Gas",
+                                "NSE_INDEX|NIFTY OIL & GAS"],
+        "Chemicals":          ["NSE_INDEX|Nifty Chemicals"],
+        "Commodities":        ["NSE_INDEX|Nifty Commodities"],
+        "MNC":                ["NSE_INDEX|Nifty MNC"],
+        "Consumption":        ["NSE_INDEX|Nifty India Consumption", "NSE_INDEX|Nifty Consumption"],
+        "Manufacturing":      ["NSE_INDEX|Nifty India Manufacturing", "NSE_INDEX|NIFTY INDIA MANUFACTURING"],
+        "CPSE":               ["NSE_INDEX|Nifty CPSE", "NSE_INDEX|NIFTY CPSE"],
+        "Digital":            ["NSE_INDEX|Nifty India Digital", "NSE_INDEX|NIFTY INDIA DIGITAL"],
+        "EV & New Age Auto":  ["NSE_INDEX|Nifty EV & New Age Automotive", "NSE_INDEX|NIFTY EV & NEW AGE AUTOMOTIVE",
+                                "NSE_INDEX|Nifty EV and New Age Automotive"],
+        "Tourism":            ["NSE_INDEX|Nifty India Tourism", "NSE_INDEX|NIFTY INDIA TOURISM"],
+        "Capital Markets":    ["NSE_INDEX|Nifty Capital Markets", "NSE_INDEX|NIFTY CAPITAL MARKETS"],
+        "Housing":            ["NSE_INDEX|Nifty Housing", "NSE_INDEX|NIFTY HOUSING"],
+        # Newly added — confirmed real via NSE's own official current
+        # thematic index list, but exact Upstox instrument-key naming is
+        # unverified (can't reach Upstox/NSE directly from this sandbox
+        # to test), so each gets several plausible variants to try.
+        "Railways":           ["NSE_INDEX|Nifty India Railways PSU", "NSE_INDEX|NIFTY INDIA RAILWAYS PSU",
+                                "NSE_INDEX|Nifty Railways PSU", "NSE_INDEX|Nifty India Railways"],
+        "Internet":           ["NSE_INDEX|Nifty India Internet", "NSE_INDEX|NIFTY INDIA INTERNET"],
+        "Rural":              ["NSE_INDEX|Nifty Rural", "NSE_INDEX|NIFTY RURAL"],
+        "Services":           ["NSE_INDEX|Nifty Services Sector", "NSE_INDEX|Nifty Services",
+                                "NSE_INDEX|NIFTY SERVICES SECTOR"],
+        "REITs & InvITs":     ["NSE_INDEX|Nifty REITs & InvITs", "NSE_INDEX|Nifty REIT and InvIT",
+                                "NSE_INDEX|NIFTY REITS AND INVITS", "NSE_INDEX|Nifty REITs and InvITs"],
+        "Mobility":           ["NSE_INDEX|Nifty Mobility", "NSE_INDEX|NIFTY MOBILITY"],
+        "Infra & Logistics":  ["NSE_INDEX|Nifty India Infrastructure & Logistics",
+                                "NSE_INDEX|Nifty India Infra & Logistics",
+                                "NSE_INDEX|NIFTY INDIA INFRASTRUCTURE AND LOGISTICS"],
+        "Transport & Logistics": ["NSE_INDEX|Nifty Transportation & Logistics",
+                                   "NSE_INDEX|Nifty Transportation and Logistics",
+                                   "NSE_INDEX|NIFTY TRANSPORTATION AND LOGISTICS"],
+        "IPO":                ["NSE_INDEX|Nifty IPO", "NSE_INDEX|NIFTY IPO"],
+    }
+    for name, ikey in INDEX_TRACKER.items():
+        # Try primary key, then alternatives
+        keys_to_try = KEY_ALTERNATIVES.get(name, [ikey])
+        if ikey not in keys_to_try:
+            keys_to_try = [ikey] + keys_to_try
+        success = False
+        for try_key in keys_to_try:
+            encoded = try_key.replace('|', '%7C').replace(' ', '%20').replace('&', '%26')
+            url = f"https://api.upstox.com/v2/historical-candle/{encoded}/day/{to}/{from_}"
+            try:
+                async with session.get(url, headers=headers,
+                                       timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        candles = list(reversed(data.get('data', {}).get('candles', [])))
+                        if candles:
+                            index_history_cache[name] = {
+                                'prices':  [c[4] for c in candles],
+                                'volumes': [c[5] for c in candles],
+                                'highs':   [c[2] for c in candles],
+                                'lows':    [c[3] for c in candles],
+                            }
+                            loaded += 1
+                            # Update tracker with working key
+                            INDEX_TRACKER[name] = try_key
+                            success = True
+                            break
+                    else:
+                        body = await r.text()
+                        log.warning(f"Index {name} key '{try_key}' failed: {r.status} — {body[:150]}")
+            except Exception as e:
+                log.warning(f"Index {name} error: {e}")
+            await asyncio.sleep(0.2)
+        if not success:
+            log.warning(f"⚠️ Index {name}: all key formats failed — MID/SML RS will use Nifty as fallback")
+    log.info(f"✅ Index cache loaded: {loaded}/{len(INDEX_TRACKER)} indices")
+
+
+
+async def load_index_history_from_db(session: aiohttp.ClientSession, name: str) -> list:
+    """Load index price history from Supabase."""
+    import json as _json
+    service_key = os.environ.get('SUPABASE_SERVICE_KEY', SUPABASE_KEY)
+    headers = {
+        "apikey": service_key,
+        "Authorization": f"Bearer {service_key}",
+    }
+    encoded_name = name.replace(' ', '%20')
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/index_price_history?name=eq.{encoded_name}&select=prices",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=15)
+        ) as r:
+            if r.status == 200:
+                data = await r.json()
+                if data and data[0].get("prices"):
+                    return _json.loads(data[0]["prices"])
+            else:
+                body = await r.text()
+                log.warning(f"  Load {name} failed: {r.status} — {body[:100]}")
+    except Exception as e:
+        log.warning(f"  Load index history failed: {e}")
+    return []
+
+
+
+async def load_index_rank_history(session: aiohttp.ClientSession) -> dict:
+    """Load each index's existing rank_w_history from Supabase in one
+    query — used to compute week-over-week rank movement without
+    needing a per-index round trip."""
+    import json as _json
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    result: dict = {}
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/index_dashboard?select=name,rank_w_history",
+            headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+        ) as r:
+            if r.status == 200:
+                for row in await r.json():
+                    raw = row.get('rank_w_history')
+                    if raw:
+                        try:
+                            result[row['name']] = _json.loads(raw) if isinstance(raw, str) else raw
+                        except Exception:
+                            pass
+            else:
+                body = await r.text()
+                log.warning(f"  Load index rank history failed: {r.status} — {body[:150]}")
+    except Exception as e:
+        log.warning(f"  Load index rank history error: {e}")
+    return result
+
+
+
+async def load_nifty_cache(session: aiohttp.ClientSession):
+    """Fetch Nifty 50 daily close history needed for TradingView-style RS calculation."""
+    global nifty_cache
+    log.info("Fetching Nifty 50 historical data for TV-style RS calc…")
+    to   = datetime.now(IST).strftime('%Y-%m-%d')
+    from_= (datetime.now(IST) - timedelta(days=550)).strftime('%Y-%m-%d')
+    encoded = NIFTY_INSTRUMENT_KEY.replace('|', '%7C').replace(' ', '%20')
+    url  = f"https://api.upstox.com/v2/historical-candle/{encoded}/day/{to}/{from_}"
+    headers = {
+        "Authorization": f"Bearer {ANALYTICS_TOKEN}",
+        "Accept": "application/json"
+    }
+    try:
+        async with session.get(url, headers=headers,
+                               timeout=aiohttp.ClientTimeout(total=30)) as r:
+            if r.status != 200:
+                text = await r.text()
+                log.warning(f"Nifty fetch failed: {r.status} {text[:200]}")
+                return
+            data = await r.json()
+            candles = list(reversed(data.get('data', {}).get('candles', [])))
+            fresh_prices = [c[4] for c in candles]
+
+            # Merge with DB seed (2020-2025) — no overlap
+            # DB seed ends Dec 2025, Upstox starts ~Jul 2025 (371 days back)
+            # Overlap ~125 days. Solution: take DB base + Upstox tail only
+            db_prices = await load_index_history_from_db(session, "Nifty 50")
+            if db_prices and len(db_prices) > len(fresh_prices):
+                # DB has more history (seed). Replace last N days with fresh.
+                # This avoids overlap: base = everything before Upstox window
+                base = db_prices[:-len(fresh_prices)]
+                merged = base + fresh_prices
+                log.info(f"✅ Nifty 50: {len(merged)}d total (seed:{len(base)}d + fresh:{len(fresh_prices)}d, no overlap)")
+            else:
+                merged = fresh_prices
+                log.info(f"✅ Nifty 50: {len(merged)}d from Upstox only")
+
+            nifty_cache = {'prices': merged, 'volumes': [c[5] for c in candles]}
+            # Save back to DB for next restart
+            await save_index_history_to_db(session, "Nifty 50", merged)
+    except Exception as e:
+        log.warning(f"Nifty cache load failed: {e}")
+
+
+async def load_official_index_lists(session: aiohttp.ClientSession):
+    """
+    Replace hardcoded NIFTY50/MIDCAP/SMALLCAP/MICROCAP with the real,
+    current official lists from niftyindices.com. Falls back silently
+    to the existing hardcoded lists on any failure.
+    """
+    global NIFTY50, MIDCAP, SMALLCAP, MICROCAP, ALL_STOCKS
+
+    log.info("Fetching official NSE index constituent lists…")
+    results = await asyncio.gather(
+        fetch_index_csv(session, NIFTY_INDEX_CSV_URLS['NIFTY50']),
+        fetch_index_csv(session, NIFTY_INDEX_CSV_URLS['MIDCAP150']),
+        fetch_index_csv(session, NIFTY_INDEX_CSV_URLS['SMALLCAP250']),
+        fetch_index_csv(session, NIFTY_INDEX_CSV_URLS['MICROCAP250']),
+        return_exceptions=True,
+    )
+    fresh_nifty50, fresh_midcap, fresh_smallcap, fresh_microcap = [
+        r if isinstance(r, list) else [] for r in results
+    ]
+
+    if len(fresh_nifty50) >= 40:
+        NIFTY50 = fresh_nifty50
+        log.info(f"✅ Nifty 50: {len(NIFTY50)} stocks (official)")
+    else:
+        log.warning(f"⚠️ Nifty 50 fetch returned {len(fresh_nifty50)} — keeping {len(NIFTY50)} hardcoded fallback")
+
+    if len(fresh_midcap) >= 100:
+        MIDCAP = fresh_midcap
+        log.info(f"✅ Midcap 150: {len(MIDCAP)} stocks (official)")
+    else:
+        log.warning(f"⚠️ Midcap fetch returned {len(fresh_midcap)} — keeping {len(MIDCAP)} hardcoded fallback")
+
+    if len(fresh_smallcap) >= 150:
+        SMALLCAP = fresh_smallcap
+        log.info(f"✅ Smallcap 250: {len(SMALLCAP)} stocks (official)")
+    else:
+        log.warning(f"⚠️ Smallcap fetch returned {len(fresh_smallcap)} — keeping {len(SMALLCAP)} hardcoded fallback")
+
+    if len(fresh_microcap) >= 150:
+        MICROCAP = fresh_microcap
+        log.info(f"✅ Microcap 250: {len(MICROCAP)} stocks (official)")
+    else:
+        log.warning(f"⚠️ Microcap fetch returned {len(fresh_microcap)} — keeping {len(MICROCAP)} hardcoded fallback")
+
+    # Rebuild ALL_STOCKS to include any official-list stocks not already covered
+    # (ALL_STOCKS itself is later overwritten by the Upstox instrument master in
+    # main(), so this just ensures the index membership flags stay consistent)
+    
+# Popular NSE stocks not in major indices — PSU, Defence, Mid/Small caps
+EXTRA_STOCKS = [
+    # Defence PSU
+    "GRSE","BDL","HAL","BEL","MIDHANI","BEML","COCHINSHIP","MAZAGON",
+    # PSU Banks/Finance  
+    "BANKBARODA","PNB","UNIONBANK","CANARABANK","INDIANB","IOB","CENTRALBK",
+    # PSU Energy/Infra
+    "NHPC","SJVN","IRFC","RVNL","IRCON","NBCC","HUDCO","RAILTEL",
+    # Popular midcap/smallcap
+    "SHAKTIPUMP","ELECON","GPIL","JYOTICNC","PNCINFRA","KNRCON",
+    "HGINFRA","AHLUCONT","CAPACITE","WELCORP","RAMCOCEM","DALBHARAT",
+    "JKCEMENT","NUVOCO","HEIDELBERG","BIRLACORPN","ORIENTCEM",
+    # Auto ancillary
+    "SUPRAJIT","LUMAXTECH","SANDHAR","ENDURANCE","SUBROS","UCALFUEL",
+    # Chemicals
+    "DEEPAKFERT","GNFC","GSFC","RASHTRIYA","CHAMBAL","COROMANDEL",
+    # Textiles  
+    "GRASIM","VARDHMAN","RAYMOND","ARVIND","WELSPUNIND","TRIDENT",
+    # Pharma
+    "IPCALAB","AJANTPHARM","NATCOPHARM","GRANULES","SOLARA","AARTI",
+]
+
+ALL_STOCKS = list(dict.fromkeys(NIFTY50 + MIDCAP + SMALLCAP + MICROCAP + EXTRA_STOCKS))
+
+
+async def load_sector_rank_history(session: aiohttp.ClientSession) -> dict:
+    """Same idea as load_index_rank_history, for sectors — loads each
+    sector's existing rank_history from Supabase in one query."""
+    import json as _json
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    result: dict = {}
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/sectors?select=sector,rank_history",
+            headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+        ) as r:
+            if r.status == 200:
+                for row in await r.json():
+                    raw = row.get('rank_history')
+                    if raw:
+                        try:
+                            result[row['sector']] = _json.loads(raw) if isinstance(raw, str) else raw
+                        except Exception:
+                            pass
+            else:
+                body = await r.text()
+                log.warning(f"  Load sector rank history failed: {r.status} — {body[:150]}")
+    except Exception as e:
+        log.warning(f"  Load sector rank history error: {e}")
+    return result
+
+
+
+# ── Seeded Nifty 50 history (2020-2025, 1492 days) ────────────────────
+# Uploaded from NSE bhavcopy CSVs — used to bootstrap RS accuracy
+NIFTY50_SEED_PRICES = [12182.5, 12282.2, 12226.65, 11993.05, 12052.95, 12025.35, 12215.9, 12256.8, 12329.55, 12362.3, 12343.3, 12355.5, 12352.35, 12224.55, 12169.85, 12106.9, 12180.35, 12248.25, 12119.0, 12055.8, 12129.5, 12035.8, 11962.1, 11661.85, 11707.9, 11979.65, 12089.15, 12137.95, 12098.35, 12031.5, 12107.9, 12201.2, 12174.65, 12113.45, 12045.8, 11992.5, 12125.9, 12080.85, 11829.4, 11797.9, 11678.5, 11633.3, 11201.75, 11132.75, 11303.3, 11251.0, 11269.0, 10989.45, 10451.45, 10458.4, 9590.15, 9955.2, 9197.4, 8967.05, 8468.8, 8263.45, 8745.45, 7610.25, 7801.05, 8317.85, 8641.45, 8660.25, 8281.1, 8597.75, 8253.8, 8083.8, 8792.2, 8748.75, 9111.9, 8993.85, 8925.3, 8992.8, 9266.75, 9261.85, 8981.45, 9187.3, 9313.9, 9154.4, 9282.3, 9380.9, 9553.35, 9859.9, 9293.5, 9205.6, 9270.9, 9199.05, 9251.5, 9239.2, 9196.55, 9383.55, 9142.75, 9136.85, 8823.25, 8879.1, 9066.55, 9106.25, 9039.25, 9029.05, 9314.95, 9490.1, 9580.3, 9826.15, 9979.1, 10061.55, 10029.1, 10142.15, 10167.45, 10046.65, 10116.15, 9902.0, 9972.9, 9813.7, 9914.0, 9881.15, 10091.65, 10244.4, 10311.2, 10471.0, 10305.3, 10288.9, 10383.0, 10312.4, 10302.1, 10430.05, 10551.7, 10607.35, 10763.65, 10799.65, 10705.75, 10813.45, 10768.05, 10802.7, 10607.35, 10618.2, 10739.95, 10901.7, 11022.2, 11162.25, 11132.6, 11215.45, 11194.15, 11131.8, 11300.55, 11202.85, 11102.15, 11073.45, 10891.6, 11095.25, 11101.65, 11200.15, 11214.05, 11270.15, 11322.5, 11308.4, 11300.45, 11178.4, 11247.1, 11385.35, 11408.4, 11312.2, 11371.6, 11466.45, 11472.25, 11549.6, 11559.25, 11647.6, 11387.5, 11470.25, 11535.0, 11527.45, 11333.85, 11355.05, 11317.35, 11278.0, 11449.25, 11464.45, 11440.05, 11521.8, 11604.55, 11516.1, 11504.95, 11250.55, 11153.65, 11131.85, 10805.55, 11050.25, 11227.55, 11222.4, 11247.55, 11416.95, 11503.35, 11662.4, 11738.85, 11834.6, 11914.2, 11930.95, 11934.5, 11971.05, 11680.35, 11762.45, 11873.05, 11896.8, 11937.65, 11896.45, 11930.35, 11767.75, 11889.4, 11729.6, 11670.8, 11642.4, 11669.15, 11813.5, 11908.5, 12120.3, 12263.55, 12461.05, 12631.1, 12749.15, 12690.8, 12719.95, 12780.25, 12874.2, 12938.25, 12771.7, 12859.05, 12926.45, 13055.15, 12858.4, 12987.0, 12968.95, 13109.05, 13113.75, 13133.9, 13258.55, 13355.75, 13392.95, 13529.1, 13478.3, 13513.85, 13558.15, 13567.85, 13682.7, 13740.7, 13760.55, 13328.4, 13466.3, 13601.1, 13749.25, 13873.2, 13932.6, 13981.95, 13981.75, 14018.5, 14132.9, 14199.5, 14146.25, 14137.35, 14347.25, 14484.75, 14563.45, 14564.85, 14595.6, 14433.7, 14281.3, 14521.15, 14644.7, 14590.35, 14371.9, 14238.9, 13967.5, 13817.55, 13634.6, 14281.2, 14647.85, 14789.95, 14895.65, 14924.25, 15115.8, 15109.3, 15106.5, 15173.3, 15163.3, 15314.7, 15313.45, 15208.9, 15118.95, 14981.75, 14675.7, 14707.8, 14982.0, 15097.35, 14529.15, 14761.55, 14919.1, 15245.6, 15080.75, 14938.1, 14956.2, 15098.4, 15174.8, 15030.95, 14929.5, 14910.45, 14721.3, 14557.85, 14744.0, 14736.4, 14814.75, 14549.4, 14324.9, 14507.3, 14845.1, 14690.7, 14867.35, 14637.8, 14683.5, 14819.05, 14873.8, 14834.85, 14310.8, 14504.8, 14581.45, 14617.85, 14359.45, 14296.4, 14406.15, 14341.35, 14485.0, 14653.05, 14864.55, 14894.9, 14631.1, 14634.15, 14496.5, 14617.85, 14724.8, 14823.15, 14942.35, 14850.75, 14696.5, 14677.8, 14923.15, 15108.1, 15030.15, 14906.05, 15175.3, 15197.7, 15208.45, 15301.45, 15337.85, 15435.65, 15582.8, 15574.85, 15576.2, 15690.35, 15670.25, 15751.65, 15740.1, 15635.35, 15737.75, 15799.35, 15811.85, 15869.25, 15767.55, 15691.4, 15683.35, 15746.5, 15772.75, 15686.95, 15790.45, 15860.35, 15814.7, 15748.45, 15721.5, 15680.0, 15722.2, 15834.35, 15818.25, 15879.65, 15727.9, 15689.8, 15692.6, 15812.35, 15853.95, 15924.2, 15923.4, 15752.4, 15632.1, 15824.05, 15856.05, 15824.45, 15746.45, 15709.4, 15778.45, 15763.05, 15885.15, 16130.75, 16258.8, 16294.6, 16238.2, 16258.25, 16280.1, 16282.25, 16364.4, 16529.1, 16563.05, 16614.6, 16568.85, 16450.5, 16496.45, 16624.6, 16634.65, 16636.9, 16705.2, 16931.05, 17132.2, 17076.25, 17234.15, 17323.6, 17377.8, 17362.1, 17353.5, 17369.25, 17355.3, 17380.0, 17519.45, 17629.5, 17585.15, 17396.9, 17562.0, 17546.65, 17822.95, 17853.2, 17855.1, 17748.6, 17711.3, 17618.15, 17532.05, 17691.25, 17822.3, 17646.0, 17790.35, 17895.2, 17945.95, 17991.95, 18161.75, 18338.55, 18477.05, 18418.75, 18266.6, 18178.1, 18114.9, 18125.4, 18268.4, 18210.95, 17857.25, 17671.65, 17929.65, 17888.95, 17829.2, 17916.8, 18068.55, 18044.25, 18017.2, 17873.6, 18102.75, 18109.45, 17999.2, 17898.65, 17764.8, 17416.55, 17503.35, 17415.05, 17536.25, 17026.45, 17053.95, 16983.2, 17166.9, 17401.65, 17196.7, 16912.25, 17176.7, 17469.75, 17516.85, 17511.3, 17368.25, 17324.9, 17221.4, 17248.4, 16985.2, 16614.2, 16770.85, 16955.45, 17072.6, 17003.75, 17086.25, 17233.25, 17213.6, 17203.95, 17354.05, 17625.7, 17805.25, 17925.25, 17745.9, 17812.7, 18003.3, 18055.75, 18212.35, 18257.8, 18255.75, 18308.1, 18113.05, 17938.4, 17757.0, 17617.15, 17149.1, 17277.95, 17110.15, 17101.95, 17339.85, 17576.85, 17780.0, 17560.2, 17516.3, 17213.6, 17266.75, 17463.8, 17605.85, 17374.75, 16842.8, 17352.45, 17322.2, 17304.6, 17276.3, 17206.65, 17092.2, 17063.25, 16247.95, 16658.4, 16793.9, 16605.95, 16498.05, 16245.35, 15863.15, 16013.45, 16345.35, 16594.9, 16630.45, 16871.3, 16663.0, 16975.35, 17287.05, 17117.6, 17315.5, 17245.65, 17222.75, 17153.0, 17222.0, 17325.3, 17498.25, 17464.75, 17670.45, 18053.4, 17957.4, 17807.65, 17639.55, 17784.35, 17674.95, 17530.3, 17475.65, 17173.65, 16958.65, 17136.55, 17392.6, 17171.95, 16953.95, 17200.8, 17038.4, 17245.05, 17102.55, 17069.1, 16677.6, 16682.65, 16411.25, 16301.85, 16240.05, 16167.1, 15808.0, 15782.15, 15842.3, 16259.3, 16240.3, 15809.4, 16266.15, 16214.7, 16125.15, 16025.8, 16170.15, 16352.45, 16661.4, 16584.55, 16522.75, 16628.0, 16584.3, 16569.55, 16416.35, 16356.25, 16478.1, 16201.8, 15774.4, 15732.1, 15692.15, 15360.6, 15293.5, 15350.15, 15638.8, 15413.3, 15556.65, 15699.25, 15832.05, 15850.2, 15799.1, 15780.25, 15752.05, 15835.35, 15810.85, 15989.8, 16132.9, 16220.6, 16216.0, 16058.3, 15966.65, 15938.65, 16049.2, 16278.5, 16340.55, 16520.85, 16605.25, 16719.45, 16631.0, 16483.85, 16641.8, 16929.6, 17158.25, 17340.05, 17345.45, 17388.15, 17382.0, 17397.5, 17525.1, 17534.75, 17659.0, 17698.15, 17825.25, 17944.25, 17956.5, 17758.45, 17490.7, 17577.5, 17604.95, 17522.45, 17558.9, 17312.9, 17759.3, 17542.8, 17539.45, 17665.8, 17655.6, 17624.4, 17798.75, 17833.35, 17936.35, 18070.05, 18003.75, 17877.4, 17530.85, 17622.25, 17816.25, 17718.35, 17629.8, 17327.35, 17016.3, 17007.4, 16858.6, 16818.1, 17094.35, 16887.35, 17274.3, 17331.8, 17314.65, 17241.0, 16983.55, 17123.6, 17014.35, 17185.7, 17311.8, 17486.95, 17512.25, 17563.95, 17576.3, 17730.75, 17656.35, 17736.95, 17786.8, 18012.2, 18145.4, 18082.85, 18052.7, 18117.15, 18202.8, 18157.0, 18028.2, 18349.7, 18329.15, 18403.4, 18409.65, 18343.9, 18307.65, 18159.95, 18244.2, 18267.25, 18484.1, 18512.75, 18562.75, 18618.05, 18758.35, 18812.5, 18696.1, 18701.05, 18642.75, 18560.5, 18609.35, 18496.6, 18497.15, 18608.0, 18660.3, 18414.9, 18269.0, 18420.45, 18385.3, 18199.1, 18127.35, 17806.8, 18014.6, 18132.3, 18122.5, 18191.0, 18105.3, 18197.45, 18232.55, 18042.95, 17992.15, 17859.45, 18101.2, 17914.15, 17895.7, 17858.2, 17956.6, 17894.85, 18053.3, 18165.35, 18107.85, 18027.65, 18118.55, 18118.3, 17891.95, 17604.35, 17648.95, 17662.15, 17616.3, 17610.4, 17854.05, 17764.6, 17721.5, 17871.7, 17893.45, 17856.5, 17770.9, 17929.85, 18015.85, 18035.85, 17944.2, 17844.6, 17826.7, 17554.3, 17511.25, 17465.8, 17392.7, 17303.95, 17450.9, 17321.9, 17594.35, 17711.45, 17754.4, 17589.6, 17412.9, 17154.3, 17043.3, 16972.15, 16985.6, 17100.05, 16988.4, 17107.5, 17151.9, 17076.9, 16945.05, 16985.7, 16951.7, 17080.7, 17359.75, 17398.05, 17557.05, 17599.15, 17624.05, 17722.3, 17812.4, 17828.0, 17706.85, 17660.15, 17618.75, 17624.45, 17624.05, 17743.4, 17769.25, 17813.6, 17915.05, 18065.0, 18147.65, 18089.85, 18255.8, 18069.0, 18264.4, 18265.95, 18315.1, 18297.0, 18314.8, 18398.85, 18286.5, 18181.75, 18129.95, 18203.4, 18314.4, 18348.0, 18285.4, 18321.15, 18499.35, 18598.65, 18633.85, 18534.4, 18487.75, 18534.1, 18593.85, 18599.0, 18726.4, 18634.55, 18563.4, 18601.5, 18716.15, 18755.9, 18688.1, 18826.0, 18755.45, 18816.7, 18856.85, 18771.25, 18665.5, 18691.2, 18817.4, 18972.1, 19189.05, 19322.55, 19389.0, 19398.5, 19497.3, 19331.8, 19355.9, 19439.4, 19384.3, 19413.75, 19564.5, 19711.45, 19749.25, 19833.15, 19979.15, 19745.0, 19672.35, 19680.6, 19778.3, 19659.9, 19646.05, 19753.8, 19733.55, 19526.55, 19381.65, 19517.0, 19597.3, 19570.85, 19632.55, 19543.1, 19428.3, 19434.55, 19465.0, 19365.25, 19310.15, 19393.6, 19396.45, 19444.0, 19386.7, 19265.8, 19306.05, 19342.65, 19347.45, 19253.8, 19435.3, 19528.8, 19574.9, 19611.05, 19727.05, 19819.95, 19996.35, 19993.2, 20070.0, 20103.1, 20192.35, 20133.3, 19901.4, 19742.35, 19674.25, 19674.55, 19664.7, 19716.45, 19523.55, 19638.3, 19528.75, 19436.1, 19545.75, 19653.5, 19512.35, 19689.85, 19811.35, 19794.0, 19751.05, 19731.75, 19811.5, 19671.1, 19624.7, 19542.65, 19281.75, 19122.15, 18857.25, 19047.25, 19140.9, 19079.6, 18989.15, 19133.25, 19230.6, 19411.75, 19406.7, 19443.5, 19395.3, 19425.35, 19525.55, 19443.55, 19675.45, 19765.2, 19731.8, 19694.0, 19783.4, 19811.85, 19802.0, 19794.7, 19889.7, 20096.6, 20133.15, 20267.9, 20686.8, 20855.1, 20937.7, 20901.15, 20969.4, 20997.1, 20906.4, 20926.35, 21182.7, 21456.65, 21418.65, 21453.1, 21150.15, 21255.05, 21349.4, 21441.35, 21654.75, 21778.7, 21731.4, 21741.9, 21665.8, 21517.35, 21658.6, 21710.8, 21513.0, 21544.85, 21618.7, 21647.2, 21894.55, 22097.45, 22032.3, 21571.95, 21462.25, 21622.4, 21571.8, 21238.8, 21453.95, 21352.6, 21737.6, 21522.1, 21725.7, 21697.45, 21853.8, 21771.7, 21929.4, 21930.5, 21717.95, 21782.5, 21616.05, 21743.25, 21840.05, 21910.75, 22040.7, 22122.25, 22196.95, 22055.05, 22217.45, 22212.7, 22122.05, 22198.35, 21951.15, 21982.8, 22338.75, 22378.4, 22405.6, 22356.3, 22474.05, 22493.55, 22332.65, 22335.7, 21997.7, 22146.65, 22023.35, 22055.7, 21817.45, 21839.1, 22011.95, 22096.75, 22004.7, 22123.65, 22326.9, 22462.0, 22453.3, 22434.65, 22514.65, 22513.7, 22666.3, 22642.75, 22753.8, 22519.4, 22272.5, 22147.9, 21995.85, 22147.0, 22336.4, 22368.0, 22402.4, 22570.35, 22419.95, 22643.4, 22604.85, 22648.2, 22475.85, 22442.7, 22302.5, 22302.5, 21957.5, 22055.2, 22104.05, 22217.85, 22200.55, 22403.85, 22466.1, 22502.0, 22529.05, 22597.8, 22967.65, 22957.1, 22932.45, 22888.15, 22704.7, 22488.65, 22530.7, 23263.9, 21884.5, 22620.35, 22821.4, 23290.15, 23259.2, 23264.85, 23322.95, 23398.9, 23465.6, 23557.9, 23516.0, 23567.0, 23501.1, 23537.85, 23721.3, 23868.8, 24044.5, 24010.6, 24141.95, 24123.85, 24286.5, 24302.15, 24323.85, 24320.55, 24433.2, 24324.45, 24315.95, 24502.15, 24586.7, 24613.0, 24800.85, 24530.9, 24509.25, 24479.05, 24413.5, 24406.1, 24834.85, 24836.1, 24857.3, 24951.15, 25010.9, 24717.7, 24055.6, 23992.55, 24297.5, 24117.0, 24367.5, 24347.0, 24139.0, 24143.75, 24541.15, 24572.65, 24698.85, 24770.2, 24811.5, 24823.15, 25010.6, 25017.75, 25052.35, 25151.95, 25235.9, 25278.7, 25279.85, 25198.7, 25145.1, 24852.15, 24936.4, 25041.1, 24918.45, 25388.9, 25356.5, 25383.75, 25418.55, 25377.55, 25415.8, 25790.95, 25939.05, 25940.4, 26004.15, 26216.05, 26178.95, 25810.85, 25796.9, 25250.1, 25014.6, 24795.75, 25013.15, 24981.95, 24998.45, 24964.25, 25127.95, 25057.35, 24971.3, 24749.85, 24854.05, 24781.1, 24472.1, 24435.5, 24399.4, 24180.8, 24339.15, 24466.85, 24340.85, 24205.35, 24304.35, 23995.35, 24213.3, 24484.05, 24199.35, 24148.2, 24141.3, 23883.45, 23559.05, 23532.7, 23453.8, 23518.5, 23349.9, 23907.25, 24221.9, 24194.5, 24274.9, 23914.15, 24131.1, 24276.05, 24457.15, 24467.45, 24708.4, 24677.8, 24619.0, 24610.05, 24641.8, 24548.7, 24768.3, 24668.25, 24336.0, 24198.85, 23951.7, 23587.5, 23753.45, 23727.65, 23750.2, 23813.4, 23644.9, 23644.8, 23742.9, 24188.65, 24004.75, 23616.05, 23707.9, 23688.95, 23526.5, 23431.5, 23085.95, 23176.05, 23213.2, 23311.8, 23203.2, 23344.75, 23024.65, 23155.35, 23205.35, 23092.2, 22829.15, 22957.25, 23163.1, 23249.5, 23508.4, 23482.15, 23361.05, 23739.25, 23696.3, 23603.35, 23559.95, 23381.6, 23071.8, 23045.25, 23031.4, 22929.25, 22959.5, 22945.3, 22932.9, 22913.15, 22795.9, 22553.35, 22547.55, 22545.05, 22124.7, 22119.3, 22082.65, 22337.3, 22544.7, 22552.5, 22460.3, 22497.9, 22470.5, 22397.2, 22508.75, 22834.3, 22907.6, 23190.65, 23350.4, 23658.35, 23668.65, 23486.85, 23591.95, 23519.35, 23165.7, 23332.35, 23250.1, 22904.45, 22161.6, 22535.85, 22399.15, 22828.55, 23328.55, 23437.2, 23851.65, 24125.55, 24167.25, 24328.95, 24246.7, 24039.35, 24328.5, 24335.95, 24334.2, 24346.7, 24461.15, 24379.6, 24414.4, 24273.8, 24008.0, 24924.7, 24578.35, 24666.9, 25062.1, 25019.8, 24945.45, 24683.9, 24813.45, 24609.7, 24853.15, 25001.15, 24826.2, 24752.45, 24833.6, 24750.7, 24716.6, 24542.5, 24620.2, 24750.9, 25003.05, 25103.2, 25104.25, 25141.4, 24888.2, 24718.6, 24946.5, 24853.4, 24812.05, 24793.25, 25112.4, 24971.9, 25044.35, 25244.75, 25549.0, 25637.8, 25517.05, 25541.8, 25453.4, 25405.3, 25461.0, 25461.3, 25522.5, 25476.1, 25355.25, 25149.85, 25082.3, 25195.8, 25212.05, 25111.45, 24968.4, 25090.7, 25060.9, 25219.9, 25062.1, 24837.0, 24680.9, 24821.1, 24855.05, 24768.35, 24565.35, 24722.75, 24649.55, 24574.2, 24596.15, 24363.3, 24585.05, 24487.4, 24619.35, 24631.3, 24876.95, 24980.65, 25050.55, 25083.75, 24870.1, 24967.75, 24712.05, 24500.9, 24426.85, 24625.05, 24579.6, 24715.05, 24734.3, 24741.0, 24773.15, 24868.6, 24973.1, 25005.5, 25114.0, 25069.2, 25239.1, 25330.25, 25423.6, 25327.05, 25202.35, 25169.5, 25056.9, 24890.85, 24654.7, 24634.9, 24611.1, 24836.3, 24894.25, 25077.65, 25108.3, 25046.15, 25181.8, 25285.35, 25227.35, 25145.5, 25323.55, 25585.3, 25709.85, 25843.15, 25868.6, 25891.4, 25795.15, 25966.05, 25936.2, 26053.9, 25877.85, 25722.1, 25763.35, 25597.65, 25509.7, 25492.3, 25574.35, 25694.95, 25875.8, 25879.15, 25910.05, 26013.45, 25910.05, 26052.65, 26192.15, 26068.15, 25959.5, 25884.8, 26205.3, 26215.55, 26202.95, 26175.75, 26032.2, 25986.0, 26033.75, 26186.45, 25960.55, 25839.65, 25758.0, 25898.55, 26046.95, 26027.3, 25860.1, 25818.55, 25815.55, 25966.4, 26172.4, 26177.15, 26142.1, 26042.3, 25942.1, 25938.85, 26129.6]
+
+
+def merge_incremental_days(existing_dates: list, existing_prices: list, existing_volumes: list,
+                            existing_highs: list, existing_lows: list, existing_opens: list = None,
+                            fresh: dict = None, max_days: int = 504) -> dict:
+    """
+    Append new trailing day(s) from a lightweight incremental Yahoo fetch
+    onto an existing full-history series, matching by date so an already-
+    stored day isn't duplicated. If the fresh fetch's date matches the
+    last stored date, it OVERWRITES that day instead (handles the case
+    where we'd previously stored an EOD close and Yahoo later has a
+    correction, or where a day stored mid-session gets finalized).
+    Trims from the front afterward to keep a rolling ~2yr window.
+    """
+    dates   = list(existing_dates)
+    prices  = list(existing_prices)
+    volumes = list(existing_volumes)
+    highs   = list(existing_highs)
+    lows    = list(existing_lows)
+    opens   = list(existing_opens) if existing_opens else [None] * len(dates)
+
+    last_date = dates[-1] if dates else None
+    fresh_opens = fresh.get('opens') or []
+
+    for i, d in enumerate(fresh.get('dates', [])):
+        if d is None:
+            continue
+        p = fresh['prices'][i]
+        v = fresh['volumes'][i] if fresh['volumes'][i] is not None else 0
+        h = fresh['highs'][i]   if fresh['highs'][i]   is not None else p
+        l = fresh['lows'][i]    if fresh['lows'][i]    is not None else p
+        o = fresh_opens[i] if i < len(fresh_opens) and fresh_opens[i] is not None else p
+
+        if last_date and d <= last_date:
+            if d == last_date and dates:
+                prices[-1], volumes[-1], highs[-1], lows[-1] = p, v, h, l
+                if opens:
+                    opens[-1] = o
+            continue  # already have an earlier day than this — skip
+
+        dates.append(d)
+        prices.append(p)
+        volumes.append(v)
+        highs.append(h)
+        lows.append(l)
+        opens.append(o)
+        last_date = d
+
+    if len(dates) > max_days:
+        dates   = dates[-max_days:]
+        prices  = prices[-max_days:]
+        volumes = volumes[-max_days:]
+        highs   = highs[-max_days:]
+        lows    = lows[-max_days:]
+        opens   = opens[-max_days:]
+
+    return {'dates': dates, 'prices': prices, 'volumes': volumes, 'highs': highs, 'lows': lows, 'opens': opens}
+
+
+
+def normalize_rs(raw_series: list) -> Optional[int]:
+    """
+    Self-normalized RS matching Pine Script exactly.
+    With stooq providing 500+ days, we have 250 valid rawRS points for min/max window.
+    """
+    if not raw_series:
+        return None
+    valid = [v for v in raw_series if v is not None]
+    if len(valid) < 2:
+        return None
+    current = raw_series[-1]
+    if current is None:
+        return None
+    # Use last 252 valid points for normalization window (Pine Script: ta.highest/lowest 252)
+    window = [v for v in raw_series[-300:] if v is not None][-252:]
+    hi = max(window)
+    lo = min(window)
+    if hi == lo:
+        return 50
+    return max(1, min(99, round(((current - lo) / (hi - lo)) * 98 + 1)))
+
+
+
+def rs_slope(hist: list) -> dict:
+    valid = [v for v in hist if v is not None]
+    if len(valid) < 4:
+        return {'trend': 'flat', 'slope': 0.0}
+    n = len(valid)
+    x_mean = (n - 1) / 2
+    y_mean = sum(valid) / n
+    num = sum((x - x_mean) * (y - y_mean) for x, y in enumerate(valid))
+    den = sum((x - x_mean) ** 2 for x in range(n))
+    slope = round(num / den, 2) if den else 0.0
+    trend = 'improving' if slope > 1.5 else 'declining' if slope < -1.5 else 'flat'
+    return {'trend': trend, 'slope': slope}
+
+
+async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> int:
+    start = time.time()
+    now_ist = datetime.now(IST)
+    log.info(f"🔄 Starting {scan_type} scan at {now_ist.strftime('%H:%M:%S IST')}")
+    global _zero_chg_debug_count
+    _zero_chg_debug_count = 0
+
+    # Step 1: Fetch live prices for all stocks (bulk OHLC — 500 per call)
+    # Use correct instrument keys from master map
+    instrument_keys = [
+        instrument_key_map.get(sym, f"NSE_EQ|{sym}")
+        for sym in ALL_STOCKS
+        if sym in historical_cache  # only fetch stocks we have history for
+    ]
+    stocks_for_ohlc = [
+        sym for sym in ALL_STOCKS
+        if sym in historical_cache
+    ]
+
+    live_data = {}
+    OHLC_BATCH = 500  # Upstox supports 500 per call — use max to reduce round trips
+    first_batch_logged = False
+
+    # Fetch all OHLC batches concurrently for maximum speed
+    async def fetch_ohlc_batch(batch_keys, batch_syms):
+        data = await fetch_bulk_ohlc(session, batch_keys)
+        result = {}
+        for sym in batch_syms:
+            resp_key = f"NSE_EQ:{sym}"
+            if resp_key in data:
+                result[sym] = data[resp_key]
+        return result
+
+    # Split into batches and fire all concurrently (with small concurrency limit)
+    batches = [
+        (instrument_keys[i:i+OHLC_BATCH], stocks_for_ohlc[i:i+OHLC_BATCH])
+        for i in range(0, len(instrument_keys), OHLC_BATCH)
+    ]
+    # Run up to 5 concurrent OHLC fetches
+    sem = asyncio.Semaphore(5)
+    async def fetch_with_sem(bkeys, bsyms):
+        async with sem:
+            return await fetch_ohlc_batch(bkeys, bsyms)
+
+    results = await asyncio.gather(*[fetch_with_sem(bk, bs) for bk, bs in batches])
+    for r in results:
+        live_data.update(r)
+
+    # Live Nifty 50 price — needed so RS-TV can react intraday instead of
+    # only updating at EOD (historical_cache's Nifty series only refreshes
+    # once at startup + once daily, same as every stock's own history).
+    # Response keys from the quotes endpoint don't reliably match the
+    # requested instrument key format (exchange prefix, |: separator,
+    # casing, and spacing all vary) — so match on a NORMALIZED form
+    # (lowercase, no spaces/separators/prefix) instead of exact strings.
+    def _norm_key(k):
+        return k.lower().replace('nse_index', '').replace('|', '').replace(':', '').replace(' ', '').replace('&', 'and')
+
+    global _live_nifty_debug_count
+    live_nifty_price = None
+    try:
+        nifty_live_raw = await fetch_bulk_ohlc(session, [NIFTY_INSTRUMENT_KEY])
+        debug_nifty = _live_nifty_debug_count < 5
+        if debug_nifty:
+            _live_nifty_debug_count += 1
+            log.info(f"  🔍 Live Nifty fetch raw keys: {list(nifty_live_raw.keys())}")
+        want = _norm_key(NIFTY_INSTRUMENT_KEY)
+        for rk, rv in nifty_live_raw.items():
+            if _norm_key(rk) == want:
+                live_nifty_price = rv.get('last_price')
+                if debug_nifty:
+                    log.info(f"  🔍 Live Nifty price resolved via key '{rk}': {live_nifty_price}")
+                break
+    except Exception as e:
+        log.warning(f"Live Nifty fetch failed: {e}")
+
+    # Live synthetic Midcap 150 / Smallcap 250 values — same simple-average
+    # method as build_synthetic_index (the historical version), just using
+    # this scan's live prices instead of historical closes. Lets RS-TV's
+    # Midcap/Smallcap-benchmarked variants also react intraday, not just
+    # the Nifty-benchmarked one.
+    def _live_synthetic_price(symbols, min_stocks=20):
+        vals = [live_data[s]['last_price'] for s in symbols
+                if s in live_data and live_data[s].get('last_price')]
+        return (sum(vals) / len(vals)) if len(vals) >= min_stocks else None
+
+    live_midcap_price   = _live_synthetic_price(MIDCAP)
+    live_smallcap_price = _live_synthetic_price(SMALLCAP)
+
+    # Live prices for ALL tracked indices (Index Dashboard page) — same
+    # normalized-key matching as the Nifty fetch above. Also splits the
+    # request into two batches: index quote requests can partially fail
+    # as a group, and a smaller batch reduces blast radius.
+    global _live_index_debug_count
+    live_index_data: dict = {}
+    try:
+        # Only request indices whose historical key already resolved —
+        # confirmed via logs: one invalid instrument key in a batch makes
+        # Upstox reject the WHOLE batch (all 16 missing indices were
+        # exactly the second half-batch, which contained the unresolvable
+        # thematic names). INDEX_TRACKER[name] is updated to the proven
+        # working key during load_index_cache, so use only those.
+        valid = [(n, INDEX_TRACKER[n]) for n in INDEX_TRACKER if n in index_history_cache]
+        idx_live_raw = {}
+        CHUNK = 8
+        for ci in range(0, len(valid), CHUNK):
+            chunk_keys = [k for _, k in valid[ci:ci+CHUNK]]
+            if chunk_keys:
+                idx_live_raw.update(await fetch_bulk_ohlc(session, chunk_keys))
+        debug_idx = _live_index_debug_count < 5
+        if debug_idx:
+            _live_index_debug_count += 1
+            log.info(f"  🔍 Live index fetch: requested {len(valid)} resolved keys, "
+                     f"got {len(idx_live_raw)} back. Sample response keys: {list(idx_live_raw.keys())[:6]}")
+        norm_resp = {_norm_key(rk): rv for rk, rv in idx_live_raw.items()}
+        for name, ikey in valid:
+            hit = norm_resp.get(_norm_key(ikey))
+            if hit:
+                live_index_data[name] = hit.get('last_price')
+        if debug_idx:
+            missing = [n for n, _ in valid if n not in live_index_data]
+            log.info(f"  🔍 Live index prices resolved: {len(live_index_data)}/{len(valid)}"
+                     + (f" — missing: {missing}" if missing else ""))
+    except Exception as e:
+        log.warning(f"Live index prices fetch failed: {e}")
+
+    if live_data:
+        sample = list(live_data.keys())[:3]
+        log.info(f"  Sample OHLC keys: {[f'NSE_EQ:{s}' for s in sample]}")
+
+    log.info(f"  Live prices: {len(live_data)} stocks")
+
+    # Step 2: Only reload full 15-month history once per day, after market
+    # close (batch_eod) — this bakes in today's now-final candle as the new
+    # baseline for tomorrow. During the day, 'live' scans reuse the cache
+    # as-is and just overlay live_data for display, so no re-fetch needed.
+    # 'batch_morning' does NOT reload here — the startup sequence already
+    # loaded history once before any scan runs, re-loading again on every
+    # batch_morning-tagged cycle was wasted API calls and the root cause of
+    # repeated multi-minute "stalls" that looked like the live data was
+    # not updating.
+    global last_eod_refresh_date
+    today_ist_check = datetime.now(IST).strftime('%Y-%m-%d')
+    is_first_eod_today = (scan_type == 'batch_eod' and last_eod_refresh_date != today_ist_check)
+
+    if scan_type == 'batch_eod':
+        if not is_first_eod_today:
+            log.info(f"  End-of-day refresh already done today ({today_ist_check}) — skipping "
+                     f"(scan loop keeps tagging cycles 'batch_eod' for as long as the "
+                     f"market stays closed, so this must be a once-per-day guard).")
+        else:
+            log.info("  End-of-day scan — incrementally updating Yahoo history to bake in today's final close…")
+            # Lightweight incremental update (small per-stock fetch + merge)
+            # instead of re-pulling the full 2yr history for every stock —
+            # much less Yahoo load, same result (today's close gets added).
+            await incremental_eod_update(session)
+            await load_nifty_cache(session)
+            await load_index_cache(session)
+            last_eod_refresh_date = today_ist_check
+            # Rebuild synthetic indices with fresh EOD data
+            global midcap_cache, smallcap_cache
+            fresh_mid = build_synthetic_index(list(MIDCAP),   historical_cache, min_stocks=50)
+            fresh_sml = build_synthetic_index(list(SMALLCAP), historical_cache, min_stocks=80)
+            db_mid = await load_index_history_from_db(session, "Midcap 150")
+            db_sml = await load_index_history_from_db(session, "Smallcap 250")
+            def merge_p(db, fresh):
+                fp = fresh.get('prices', [])
+                return db[:-len(fp)] + fp if db and len(db) > len(fp) else fp
+            midcap_cache   = {'prices': merge_p(db_mid, fresh_mid)}
+            smallcap_cache = {'prices': merge_p(db_sml, fresh_sml)}
+            if midcap_cache['prices']:   await save_index_history_to_db(session, "Midcap 150",   midcap_cache['prices'])
+            if smallcap_cache['prices']: await save_index_history_to_db(session, "Smallcap 250", smallcap_cache['prices'])
+            log.info(f"  Indices rebuilt: Mid={len(midcap_cache['prices'])}d Sml={len(smallcap_cache['prices'])}d")
+
+    # Step 3: DO NOT mutate historical_cache prices in place (was causing chg% drift).
+    # Instead, keep historical close as the immutable baseline and use live price
+    # only for today's last/chg calculation downstream.
+    # (No-op here intentionally — see Step 5 for safe chg calculation.)
+
+    # Step 4: Calculate RS ratings for all stocks
+    stocks_with_hist = [
+        {'sym': sym, **historical_cache[sym]}
+        for sym in ALL_STOCKS
+        if sym in historical_cache and len(historical_cache[sym].get('prices', [])) >= 60
+    ]
+
+    if not stocks_with_hist:
+        log.warning("⚠️ No stocks with historical data yet — skipping scan, will retry next cycle")
+        return 0
+
+    # Build one synthetic price index per sector (average of that sector's
+    # member stocks' own price histories) so sector-relative RS can use the
+    # SAME TV-style, self-normalized-vs-benchmark method as Nifty/Midcap/
+    # Smallcap, instead of a totally different percentile-rank scale that
+    # doesn't match the Pine Script numbers at all.
+    sym_to_sector: dict = {}
+    for s in stocks_with_hist:
+        sym_to_sector[s['sym']] = get_sector(s['sym'])
+
+    sector_index_prices: dict = {}
+    for sector_name, sector_syms in SECTOR_MAP.items():
+        idx = build_synthetic_index(list(sector_syms), historical_cache, min_stocks=5)
+        if idx.get('prices'):
+            sector_index_prices[sector_name] = idx['prices']
+
+    log.info(f"  Built {len(sector_index_prices)} sector benchmark indices for TV-style sector RS")
+
+    # Step 5: Build full stock records
+    log.info(f"  Building per-stock records (RS/PP/squeeze/VCP) for {len(stocks_with_hist)} stocks…")
+
+    # Fetch fundamentals only once per day at EOD — they change quarterly,
+    # no point fetching every ~60-90s for as long as the market stays closed.
+    # This call is awaited directly in the main scan flow (unlike the
+    # startup fetch, which is a background task) — meaning until it
+    # completes, the scan cannot reach Step 7 (Save to Supabase + R2
+    # upload) below. THIS is what caused a confirmed 900s scan timeout in
+    # production once the missing-market-cap catch-up condition made the
+    # fetch list balloon to 700+ stocks — a single blocking call that
+    # used to be quick became slow enough to break the entire scan cycle.
+    # scan_should_skip_fundamentals() now returns True here unconditionally
+    # (worthy-simplicity owns this job full-time instead).
+    if is_first_eod_today and not scan_should_skip_fundamentals():
+        all_syms = [s['sym'] for s in stocks_with_hist]
+        await load_fundamentals_batch(session, all_syms)
+
+    processed = []
+    for loop_idx, s in enumerate(stocks_with_hist):
+        sym = s['sym']
+        prices  = s['prices']
+        volumes = s['volumes']
+        # Safety: align prices and volumes to same length
+        if volumes and len(volumes) != len(prices):
+            min_len = min(len(prices), len(volumes))
+            prices  = prices[-min_len:]
+            volumes = volumes[-min_len:]
+        elif not volumes:
+            volumes = [0] * len(prices)
+        n = len(prices)
+
+        # Yield control back to the event loop periodically. Without this,
+        # the synchronous CPU-bound work below (especially squeeze/VCP math)
+        # across ~2400 stocks can block the event loop for minutes straight,
+        # freezing heartbeats, timeouts, and Railway health checks.
+        if loop_idx % 50 == 0:
+            await asyncio.sleep(0)
+
+        # RS-TV — TradingView / Lakshmi Mata Pine Script formula.
+        # This is now the ONE methodology used everywhere: the main RS
+        # badge, the 15-day sparkline/trend, and sector-relative RS all
+        # derive from the same self-normalized-vs-benchmark calculation —
+        # previously the main badge/sparkline used a totally different
+        # IBD-style percentile-rank scale that didn't match the Pine
+        # Script numbers at all (e.g. showing 96 while RS-TV showed 72).
+        nifty_prices    = nifty_cache.get('prices', [])
+        midcap_prices   = midcap_cache.get('prices', [])   or nifty_prices
+        smallcap_prices = smallcap_cache.get('prices', []) or nifty_prices
+
+        # Compute the raw series ONCE per stock, reuse for current value,
+        # 15-day history, and (via debug block below) diagnostics — avoids
+        # recomputing the same O(n) series 2-3x per stock like before.
+        tv_raw_series  = calc_raw_rs_series(prices, nifty_prices)     if nifty_prices    else []
+        mid_raw_series = calc_raw_rs_series(prices, midcap_prices)    if midcap_prices   else []
+        sml_raw_series = calc_raw_rs_series(prices, smallcap_prices)  if smallcap_prices else []
+        raw_tv  = normalize_rs(tv_raw_series)  if tv_raw_series  else None
+        raw_mid = normalize_rs(mid_raw_series) if mid_raw_series else None
+        raw_sml = normalize_rs(sml_raw_series) if sml_raw_series else None
+
+        # Make today's RS-TV (and Mid/Smallcap-benchmarked RS) live instead
+        # of frozen at yesterday's close. historical_cache only refreshes
+        # at startup + once daily at EOD, so during live market hours the
+        # values above reflect YESTERDAY's strength, not today's. If we
+        # have live prices for both this stock and the benchmark, compute
+        # a live "today" raw RS value and normalize it against the SAME
+        # historical hi/lo window each benchmark already has.
+        _live_for_rs = live_data.get(sym, {})
+        _live_price_for_rs = _live_for_rs.get('last_price', 0)
+        _dates_for_rs = history_dates_cache.get(sym, [])
+        _today_str_for_rs = datetime.now(IST).strftime('%Y-%m-%d')
+        _prices_already_today = bool(_dates_for_rs) and _dates_for_rs[-1] == _today_str_for_rs
+
+        def _live_normalized(bench_prices, bench_raw_series, live_bench_price):
+            if _prices_already_today or not _live_price_for_rs or not live_bench_price or not bench_raw_series:
+                return None
+            live_raw = calc_live_raw_rs_today(prices, bench_prices, _live_price_for_rs, live_bench_price)
+            if live_raw is None:
+                return None
+            window = [v for v in bench_raw_series[-300:] if v is not None][-252:]
+            if not window:
+                return None
+            hi, lo = max(window), min(window)
+            return 50 if hi == lo else max(1, min(99, round(((live_raw - lo) / (hi - lo)) * 98 + 1)))
+
+        _live_tv  = _live_normalized(nifty_prices,    tv_raw_series,  live_nifty_price)
+        _live_mid = _live_normalized(midcap_prices,   mid_raw_series, live_midcap_price)
+        _live_sml = _live_normalized(smallcap_prices, sml_raw_series, live_smallcap_price)
+        if _live_tv  is not None: raw_tv  = _live_tv
+        if _live_mid is not None: raw_mid = _live_mid
+        if _live_sml is not None: raw_sml = _live_sml
+
+        rs = raw_tv if raw_tv is not None else 0  # main badge now TV-style, matches RS-TV exactly
+        hist = tv_history_from_raw(tv_raw_series, days=15) if tv_raw_series else [None] * 15
+        if hist and raw_tv is not None:
+            hist[-1] = raw_tv  # keep "today" dot consistent with the live-updated main badge
+        trend_data = rs_slope(hist)
+
+        # Debug: log RS details for GRSE every scan (previous guard used
+        # loop_idx — GRSE's position within this scan's stock list — which
+        # almost never lands under 5 out of ~2300+ stocks, so this never
+        # actually fired before). Also checks for a discontinuity at the
+        # seed/fresh Nifty data stitch point, a likely source of RS-TV drift.
+        if sym in ('GRSE', 'RRKABEL'):
+            valid_pts = [v for v in tv_raw_series if v is not None]
+            window = [v for v in tv_raw_series[-300:] if v is not None][-252:]
+            hi = max(window) if window else None
+            lo = min(window) if window else None
+            current = tv_raw_series[-1] if tv_raw_series else None
+            stitch_idx = len(nifty_prices) - 371  # fresh Upstox data starts ~371d back
+            stitch_note = ""
+            if 0 < stitch_idx < len(nifty_prices) - 1:
+                stitch_note = (f", nifty@stitch-1={nifty_prices[stitch_idx-1]:.1f}, "
+                                f"nifty@stitch={nifty_prices[stitch_idx]:.1f}")
+            log.info(f"  🔍 {sym}: stock_days={len(prices)}, nifty_days={len(nifty_prices)}, "
+                     f"rawRS_valid_points={len(valid_pts)}, current_rawRS={current}, "
+                     f"norm_window_hi={hi}, norm_window_lo={lo}, rs_tv={raw_tv}{stitch_note}")
+
+        # Sector-relative RS — TV-style vs a synthetic sector benchmark
+        # index (same method as Nifty/Midcap/Smallcap), replacing the old
+        # percentile-rank-vs-sector-peers approach for consistency.
+        my_sector    = sym_to_sector.get(sym, 'Other')
+        sector_bench = sector_index_prices.get(my_sector)
+        rs_sector = normalize_rs(calc_raw_rs_series(prices, sector_bench)) if sector_bench else None
+
+        # RVOL — relative volume
+        rvol_data = calc_rvol(volumes)
+
+        # RS Line vs Nifty
+        rs_line_data = calc_rs_line(prices, nifty_cache.get('prices', []))
+
+        # Stage 2 New Entry
+        is_s2_new = calc_stage2_new_entry(prices)
+
+        # Live price — use sym-based lookup
+        # IMPORTANT: historical_cache prices are NEVER mutated for RS/PP/etc,
+        # which always read the raw array. But for chg% specifically we need
+        # to know whether prices[-1] represents YESTERDAY's close (live
+        # market hours — compare it against today's live_price) or TODAY's
+        # close (after the EOD incremental update has already baked today's
+        # close in) — in the latter case, live_price also reflects today, so
+        # comparing it against prices[-1] (also today) always gives 0.00%.
+        # Use history_dates_cache to tell which case we're in.
+        live = live_data.get(sym, {})
+        live_price = live.get('last_price', 0)
+
+        dates_for_sym = history_dates_cache.get(sym, [])
+        today_str = datetime.now(IST).strftime('%Y-%m-%d')
+        prices_last_is_today = bool(dates_for_sym) and dates_for_sym[-1] == today_str
+
+        if prices_last_is_today and n > 1:
+            true_prev_close = prices[n-2]  # prices[-1] is today — baseline is the day before
+        else:
+            true_prev_close = prices[n-1]  # prices[-1] is still yesterday — baseline as-is
+
+        # REVERTED (see b92bee9 -> this commit): assumed live.ohlc.close was
+        # the broker's previous-day close reference, same as every broker
+        # app computes % change against. Log evidence proved that wrong —
+        # live_ohlc_close tracked live_price scan-to-scan (2343.0 -> 2344.0
+        # -> 2343.3 -> 2344.4, moving in lockstep with live_price each
+        # time), meaning it's the CURRENT session's running close, not a
+        # fixed prior-day reference — using it made prev == last, so chg
+        # came out to a flat 0.0% for every stock. Reverting to always
+        # trust the locally-cached array; still logged for visibility, just
+        # no longer used for the actual calculation.
+        live_ohlc_close = live.get('ohlc', {}).get('close') if isinstance(live.get('ohlc'), dict) else None
+
+        if live_price and live_price > 0:
+            last = live_price
+            prev = true_prev_close
+        else:
+            # No live data (market closed / fetch failed) — show last completed
+            # close vs the one before it, exactly like EOD.
+            last = prices[n-1]
+            prev = prices[n-2] if n > 1 else last
+
+        chg = round((last - prev) / prev * 100, 2) if prev else 0
+        # Staleness guard — the ~72 Yahoo-failing symbols had prev closes
+        # months old, producing absurd chg like +896% (live price vs a
+        # pre-corporate-action stale close). If the last stored bar is
+        # over 7 calendar days old, the % against it is meaningless.
+        # Previously tried live.ohlc.close as a fallback here too, but
+        # that's now confirmed to track the CURRENT live price during
+        # market hours rather than a genuine previous-day close (see the
+        # revert note above) — using it would silently produce a
+        # near-zero chg instead of flagging that we genuinely don't have
+        # a trustworthy reference, which is worse than just saying 0.
+        if dates_for_sym:
+            try:
+                _age_days = (datetime.now(IST).date() - datetime.strptime(dates_for_sym[-1], '%Y-%m-%d').date()).days
+                if _age_days > 7:
+                    chg = 0
+            except Exception:
+                pass
+        vol = live.get('volume') if live.get('volume') else (volumes[n-1] if volumes else 0)
+
+        # Weekly/monthly % change per stock — needed for sector breadth
+        # (% of stocks advancing) at each timeframe, not just daily.
+        chg_w = round((last - prices[n-6])  / prices[n-6]  * 100, 2) if n >= 6  and prices[n-6]  else None
+        chg_m = round((last - prices[n-22]) / prices[n-22] * 100, 2) if n >= 22 and prices[n-22] else None
+
+        # RRKABEL always logged (originally added for RS-TV debugging);
+        # ALSO log any stock with a suspiciously large daily move, since
+        # that's exactly the symptom of the stale-reference-price bug —
+        # this surfaces every affected stock in the next scan's logs
+        # instead of just the one hardcoded symbol, needed to tell
+        # whether the live-quote-first fix is actually taking effect or
+        # falling back to the local cache because live_ohlc_close simply
+        # isn't present in the quote for these symbols.
+        if sym in ('RRKABEL', 'GRSE') or (chg is not None and abs(chg) > 20) or \
+           (chg == 0 and _zero_chg_debug_count < 8):
+            if chg == 0:
+                _zero_chg_debug_count += 1
+            log.info(f"  🔍 {sym} chg-calc: n={n}, dates_last3={dates_for_sym[-3:] if dates_for_sym else None}, "
+                     f"today_str={today_str}, prices_last_is_today={prices_last_is_today}, "
+                     f"prices_last3={prices[-3:]}, true_prev_close={true_prev_close}, "
+                     f"live_ohlc_close={live_ohlc_close}, "
+                     f"live_price={live_price}, last={last}, prev={prev}, chg={chg}")
+
+        # PP — needs to trigger intraday, not just at EOD. detect_pp reads
+        # only the static historical prices/volumes, which during live
+        # market hours still end on YESTERDAY's close (today's close only
+        # lands there after the EOD update) — so PP would otherwise lag a
+        # full day behind. Build a live-augmented series with today's live
+        # price/volume appended as an extra trailing point when we're still
+        # mid-session; once prices[-1] already IS today (post-EOD), no
+        # augmentation is needed since today's real close is already there.
+        if prices_last_is_today or not (live_price and live_price > 0):
+            rt_prices, rt_volumes = prices, volumes
+        else:
+            rt_prices  = prices + [live_price]
+            rt_volumes = volumes + [vol]
+        pp = detect_pp(rt_prices, rt_volumes)
+        ibv_signal = detect_ibv_signal(
+            volumes, vol,
+            live.get('ohlc', {}).get('high'), live.get('ohlc', {}).get('low'), last
+        )
+        resistance_breakout = detect_resistance_breakout(prices, live_price=last)
+        cup_handle = detect_cup_handle_breakout(prices, live_price=last)
+        guppy = detect_guppy_crossover(prices, live_price=last)
+
+        # Volume signals
+        yr_vols  = volumes[-252:] if len(volumes) >= 252 else volumes
+        max_yr   = max(yr_vols) if yr_vols else 1
+        max_all  = max(volumes) if volumes else 1
+        hy_pct   = round(vol / max_yr * 100, 1) if max_yr > 0 else 0
+        ht_pct   = round(vol / max_all * 100, 1) if max_all > 0 else 0
+        is_hy_today = hy_pct >= 95 and chg > 0
+        is_ht_today = ht_pct >= 95 and chg > 0
+        hy_ht_hist = compute_hy_ht_history(prices, volumes)
+        if hy_ht_hist['hy_hist']:
+            hy_ht_hist['hy_hist'][-1] = is_hy_today
+        if hy_ht_hist['ht_hist']:
+            hy_ht_hist['ht_hist'][-1] = is_ht_today
+        ibv_hist = compute_ibv_history(prices, volumes, s.get('highs'), s.get('lows'))
+        if ibv_hist['ibv_hist']:
+            ibv_hist['ibv_hist'][-1] = ibv_signal
+
+        # EMA9
+        e9 = ema(prices, 9)
+        near_ema9 = False
+        pct_ema9  = None
+        if e9 and rs >= 90:
+            pct_ema9  = round((last - e9) / e9 * 100, 2)
+            near_ema9 = abs(pct_ema9) <= 3
+
+        # EMA21 / EMA50 — same "pullback to a rising average" idea as
+        # EMA9, just longer-term. Same rs>=90 gate (a pullback to a
+        # longer average is only a meaningful setup on an already-strong
+        # stock, same reasoning as EMA9).
+        e21 = ema(prices, 21)
+        near_ema21 = False
+        pct_ema21  = None
+        if e21 and rs >= 90:
+            pct_ema21  = round((last - e21) / e21 * 100, 2)
+            near_ema21 = abs(pct_ema21) <= 3
+
+        e50 = ema(prices, 50)
+        near_ema50 = False
+        pct_ema50  = None
+        if e50 and rs >= 90:
+            pct_ema50  = round((last - e50) / e50 * 100, 2)
+            near_ema50 = abs(pct_ema50) <= 3
+
+        # 52WL
+        wl = detect_52wl(prices, volumes)
+
+        # Weak RS
+        weak = detect_weak_rs(prices, volumes, rs)
+
+        # Squeeze (BB + Keltner) and VCP
+        highs_arr = s.get('highs', prices)
+        lows_arr  = s.get('lows', prices)
+        squeeze = detect_bb_squeeze(prices, highs_arr, lows_arr)
+        vcp     = detect_vcp(prices, volumes, highs_arr, lows_arr)
+        cp      = detect_chart_patterns(highs_arr, lows_arr, prices, volumes)
+
+        # 52W high/low
+        p252  = prices[-252:] if len(prices) >= 252 else prices
+        h52   = max(p252)
+        l52   = min(p252)
+        pct_from_h52 = round((last - h52) / h52 * 100, 1) if h52 else 0
+        weinstein_stage = calc_weinstein_stage(rs, trend_data['trend'], pct_from_h52, hist)
+        # Fresh breakout above the prior 52-week high — yesterday's close
+        # was at/below it, today's live price is now above it. h52 is
+        # computed from stored history only (doesn't include today), so
+        # this genuinely detects "just broke out", not an ongoing state.
+        is_52wh_breakout = bool(h52 and prices[-1] <= h52 and last > h52)
+
+        # Live market cap / P/E — recomputed every scan cycle from TODAY's
+        # live price × the shares-outstanding/EPS captured at the last
+        # monthly fundamentals fetch, instead of just replaying that
+        # month-old snapshot untouched. Shares outstanding and EPS barely
+        # move (only a fresh issue/buyback or a new quarterly result
+        # changes them), so this keeps market cap and P/E effectively
+        # daily-fresh at zero extra Screener.in/Upstox requests. Falls
+        # back to the cached snapshot value when shares_outstanding isn't
+        # known yet (e.g. this stock hasn't been through the fallback
+        # path that derives it).
+        _fc = fundamentals_cache.get(sym, {})
+        _shares_out = _fc.get('shares_outstanding')
+        _cached_eps = _fc.get('eps')
+        _live_mcap = (round(_shares_out * last, 2)
+                      if _shares_out and last else _fc.get('market_cap'))
+        _live_pe = (round(last / _cached_eps, 2)
+                    if _cached_eps and last else _fc.get('pe'))
+
+        processed.append({
+            'sym':            sym,
+            'weinstein_stage': weinstein_stage,
+            'is_52wh_breakout': is_52wh_breakout,
+            'last_price':     round(last, 2),
+            'open':           round(live.get('ohlc', {}).get('open', last), 2),
+            'high':           round(live.get('ohlc', {}).get('high', last), 2),
+            'low':            round(live.get('ohlc', {}).get('low', last), 2),
+            'close':          round(last, 2),
+            'prev_close':     round(prev, 2),
+            'chg_pct':        chg,
+            'chg_w_pct':      chg_w,
+            'chg_m_pct':      chg_m,
+            'volume':         int(vol),
+            'rs':             rs,
+            'rs_tv':          raw_tv,
+            'rs_midcap':      raw_mid,
+            'rs_smallcap':    raw_sml,
+            'rvol':           rvol_data.get('rvol'),
+            'vol_signal':     rvol_data.get('vol_signal'),
+            'rs_line_new_high': rs_line_data.get('rs_line_new_high', False),
+            'rs_line_trend':  rs_line_data.get('rs_line_trend', 'flat'),
+            'rs_line_value':  rs_line_data.get('rs_line_value'),
+            'is_s2_new_entry': is_s2_new,       # TradingView / Lakshmi Mata Pine Script RS
+            'rs_nifty50':     None,        # deprecated — use rs_tv
+            'rs_microcap':    None,
+            'rs_sector':      rs_sector,
+            'rs_raw':         round(tv_raw_series[-1], 6) if tv_raw_series and tv_raw_series[-1] is not None else None,
+            'rs_trend':       trend_data['trend'],
+            'rs_slope':       trend_data['slope'],
+            'rs_hist':        hist,
+            'is_pp':          pp['is_pp'],
+            'ibv_signal':     ibv_signal,
+            'pp_count_10d':   pp['pp_count_10d'],
+            'pp_hist':        pp['pp_hist'],
+            'pp_vol_ratio':   pp['vol_ratio'],
+            'ma10':           round(pp['ma10'], 2) if pp['ma10'] else None,
+            'ma50':           round(pp['ma50'], 2) if pp['ma50'] else None,
+            'is_hy':          is_hy_today,
+            'hy_pct':         hy_pct,
+            'hy_hist':        hy_ht_hist['hy_hist'],
+            'is_ht':          is_ht_today,
+            'ht_pct':         ht_pct,
+            'ht_hist':        hy_ht_hist['ht_hist'],
+            'ibv_hist':       ibv_hist['ibv_hist'],
+            'is_resistance_breakout': resistance_breakout['is_breakout'],
+            'resistance_r1':          resistance_breakout['r1'],
+            'is_cup_handle_breakout': cup_handle['is_breakout'],
+            'has_cup_pattern':        cup_handle['has_cup'],
+            'cup_depth_pct':          cup_handle['depth_pct'],
+            'is_guppy_bullish_crossover': guppy['is_bullish_crossover'],
+            'is_guppy_bearish_crossover': guppy['is_bearish_crossover'],
+            'is_guppy_compressed':        guppy['is_compressed'],
+            'ema9':           e9,
+            'near_ema9':      near_ema9,
+            'pct_from_ema9':  pct_ema9,
+            'ema21':          e21,
+            'near_ema21':     near_ema21,
+            'pct_from_ema21': pct_ema21,
+            'ema50':          e50,
+            'near_ema50':     near_ema50,
+            'pct_from_ema50': pct_ema50,
+            'low_52w':        round(l52, 2),
+            'high_52w':       round(h52, 2),
+            'pct_from_52wl':  wl['pct_from_52wl'],
+            'near_52wl':      wl['near_52wl'],
+            'crossed_ema5':   wl['crossed_ema5'],
+            'pp_volume_52wl': wl['pp_volume'],
+            'is_52wl_signal': wl['is_signal'],
+            'ema5':           wl['ema5'],
+            'is_weak_rs':     weak['is_weak_rs'],
+            'weak_chg_1d':    weak['chg_1d'],
+            'weak_chg_5d':    weak['chg_5d'],
+            'weak_vol_spike': weak['vol_spike'],
+            'in_squeeze':     squeeze['in_squeeze'],
+            'squeeze_fired':  squeeze['squeeze_fired'],
+            'bb_width_pct':   squeeze['bb_width_pct'],
+            'squeeze_days':   squeeze['squeeze_days'],
+            'is_vcp':         vcp['is_vcp'],
+            'vcp_stage':      vcp['vcp_stage'],
+            'vcp_fired':      vcp['vcp_fired'],
+            'vcp_contractions': json.dumps(vcp['contractions']),
+            'is_head_shoulders':     cp['is_head_shoulders'],
+            'is_inv_head_shoulders': cp['is_inv_head_shoulders'],
+            'is_double_top':         cp['is_double_top'],
+            'is_double_bottom':      cp['is_double_bottom'],
+            'triangle_type':         cp['triangle_type'],
+            'wedge_type':            cp['wedge_type'],
+            'is_flag_bullish':       cp['is_flag_bullish'],
+            'is_flag_bearish':       cp['is_flag_bearish'],
+            'is_pennant':            cp['is_pennant'],
+            'chart_pattern_fired':   cp['pattern_fired'],
+            'sector':         get_sector(sym),
+            'in_nifty50':     sym in NIFTY50,
+            'in_midcap':      sym in MIDCAP,
+            'in_smallcap':    sym in SMALLCAP,
+            'in_microcap':    sym in MICROCAP,
+            # Fundamentals from Upstox API (Screener.in fallback), cached
+            # monthly — market_cap/pe are recomputed live above using
+            # today's price, everything else refreshes on its normal
+            # monthly cadence since it doesn't move daily.
+            'market_cap':     _live_mcap,
+            'pe':             _live_pe,
+            'roe':            fundamentals_cache.get(sym, {}).get('roe'),
+            'eps':            fundamentals_cache.get(sym, {}).get('eps'),
+            'debt_eq':        fundamentals_cache.get(sym, {}).get('debt_eq'),
+            'promoter':       fundamentals_cache.get(sym, {}).get('promoter'),
+            # Growth/trend fundamentals — earnings acceleration (CANSLIM-style)
+            # and smart-money holding trends, not just static snapshots
+            'eps_qoq':            fundamentals_cache.get(sym, {}).get('eps_qoq'),
+            'eps_yoy':            fundamentals_cache.get(sym, {}).get('eps_yoy'),
+            'sales_qoq':          fundamentals_cache.get(sym, {}).get('sales_qoq'),
+            'sales_yoy':          fundamentals_cache.get(sym, {}).get('sales_yoy'),
+            'opm_pct':            fundamentals_cache.get(sym, {}).get('opm_pct'),
+            'opm_trend':          fundamentals_cache.get(sym, {}).get('opm_trend'),
+            'eps_growth_streak':  fundamentals_cache.get(sym, {}).get('eps_growth_streak'),
+            'fii_pct':            fundamentals_cache.get(sym, {}).get('fii_pct'),
+            'fii_trend':          fundamentals_cache.get(sym, {}).get('fii_trend'),
+            'dii_pct':            fundamentals_cache.get(sym, {}).get('dii_pct'),
+            'dii_trend':          fundamentals_cache.get(sym, {}).get('dii_trend'),
+            'promoter_trend':     fundamentals_cache.get(sym, {}).get('promoter_trend'),
+            'peg_ratio':          fundamentals_cache.get(sym, {}).get('peg_ratio'),
+            'industry':           get_industry(sym),
+            'last_updated':   now_ist.isoformat(),
+            'scan_type':      scan_type,
+        })
+
+    # Step 5.25: Fundamental quality score/label for every stock (not
+    # gated hourly like Best Picks — this is pure arithmetic on data
+    # already in `processed`, cheap to redo every cycle so it stays as
+    # fresh as everything else here).
+    for row in processed:
+        row['fundamental_score'] = compute_fundamental_score(row)
+        row['fundamental_label'] = fundamental_score_label(row['fundamental_score'])
+
+    # Step 5.3: Periodic fundamentals-cache sync from Supabase — NOT a
+    # rescrape, just a cheap read. This live-scan process only ever
+    # loaded fundamentals_cache from Supabase once, at its own startup
+    # (see load_fundamentals_at_startup) — without this, it would never
+    # see market_cap/PE/etc. filled in by the SEPARATE fundamentals
+    # worker service's ongoing work (daily full refresh + hourly
+    # market-cap-only catchup) unless this process also restarts. Real
+    # gap this closes: worthy-simplicity can successfully fill market
+    # cap into Supabase all day, but angelic-strength (which is what
+    # actually computes/displays it via the live-price recompute) would
+    # keep showing stale/blank values until its own next restart.
+    # load_fundamentals_from_supabase() makes no Screener.in/Upstox
+    # calls of its own, so syncing hourly costs nothing at the API
+    # level — it just keeps this process's in-memory view current.
+    global _LAST_FUNDAMENTALS_SYNC_TS
+    if time.time() - _LAST_FUNDAMENTALS_SYNC_TS > 3600:
+        try:
+            await load_fundamentals_from_supabase(session)
+            _LAST_FUNDAMENTALS_SYNC_TS = time.time()
+            log.info("  🔄 Fundamentals cache synced from Supabase")
+        except Exception as e:
+            log.warning(f"⚠️ Fundamentals cache sync failed: {e}")
+
+    # Step 5.35: AI Best Picks — composite score + AI rationale for the
+    # top candidates, recomputed at most once per hour (ranking doesn't
+    # need to be fresher than that, and this keeps ANTHROPIC_API_KEY
+    # usage cheap even when it's set). `processed` already has every
+    # technical AND fundamental field merged per stock at this point.
+    global _LAST_AI_PICKS_TS
+    if time.time() - _LAST_AI_PICKS_TS > _AI_PICKS_REFRESH_INTERVAL_SEC:
+        try:
+            for row in processed:
+                row['best_pick_score'] = compute_best_pick_score(row)
+            top_picks = sorted(processed, key=lambda r: r.get('best_pick_score') or 0, reverse=True)[:_AI_PICKS_TOP_N]
+            reasoning = await generate_ai_picks_reasoning(session, top_picks)
+            await save_best_picks(session, top_picks, reasoning)
+            await save_best_picks_history(session, top_picks, reasoning)
+            _LAST_AI_PICKS_TS = time.time()
+        except Exception as e:
+            log.warning(f"⚠️ Best Picks scan step failed: {e}")
+
+    # Step 5.4: Detect NEW squeeze/VCP fires (state change from last scan)
+    global prev_squeeze_state
+    new_fires = []
+    for s in processed:
+        sym = s['sym']
+        bb_fired  = s.get('squeeze_fired', False)
+        vcp_fired = s.get('vcp_fired', False)
+        prev = prev_squeeze_state.get(sym, {'bb': False, 'vcp': False})
+
+        new_bb  = bb_fired  and not prev['bb']
+        new_vcp = vcp_fired and not prev['vcp']
+
+        if new_bb or new_vcp:
+            fire_type = []
+            if new_bb:  fire_type.append('BB Squeeze')
+            if new_vcp: fire_type.append('VCP')
+            new_fires.append({
+                'sym':        sym,
+                'fire_type':  ', '.join(fire_type),
+                'rs_tv':      s.get('rs_tv'),
+                'rs':         s.get('rs'),
+                'last_price': s.get('last_price'),
+                'chg_pct':    s.get('chg_pct'),
+                'sector':     s.get('sector'),
+                'fired_at':   now_ist.isoformat(),
+            })
+
+    # Update state for next scan
+    prev_squeeze_state = {
+        s['sym']: {
+            'bb':  s.get('squeeze_fired', False),
+            'vcp': s.get('vcp_fired', False),
+        }
+        for s in processed
+    }
+
+    if new_fires:
+        log.info(f"  🔥 {len(new_fires)} NEW squeeze fires: {[f['sym'] for f in new_fires]}")
+        # Save to Supabase so frontend can poll and show notifications
+        await supabase_upsert(session, 'squeeze_alerts', new_fires, on_conflict='sym,fired_at')
+
+    # Step 5.4b: Detect NEW HY/HT volume-climax fires, same state-transition
+    # pattern as squeeze/VCP above but tracked separately (see
+    # prev_hy_ht_state) — reuses the same squeeze_alerts table + frontend
+    # notification pipeline rather than a new one, since both are just
+    # "tell me the moment this signal turns on" alerts.
+    global prev_hy_ht_state
+    new_vol_fires = []
+    # fired_at is offset by 1 microsecond from the squeeze/VCP block above —
+    # both use the same fixed now_ist for this scan, and the on_conflict key
+    # is (sym, fired_at). Without this offset, a stock that fires BOTH a
+    # squeeze/VCP signal and an HY/HT signal in the same scan would collide
+    # on that key and the second upsert would silently overwrite the first
+    # alert instead of creating two.
+    hy_ht_fired_at = (now_ist + timedelta(microseconds=1)).isoformat()
+    for s in processed:
+        sym = s['sym']
+        hy_fired = s.get('is_hy', False)
+        ht_fired = s.get('is_ht', False)
+        prev = prev_hy_ht_state.get(sym, {'hy': False, 'ht': False})
+
+        new_hy = hy_fired and not prev['hy']
+        new_ht = ht_fired and not prev['ht']
+
+        if new_hy or new_ht:
+            fire_type = []
+            if new_hy: fire_type.append('HY')
+            if new_ht: fire_type.append('HT')
+            new_vol_fires.append({
+                'sym':        sym,
+                'fire_type':  ', '.join(fire_type),
+                'rs_tv':      s.get('rs_tv'),
+                'rs':         s.get('rs'),
+                'last_price': s.get('last_price'),
+                'chg_pct':    s.get('chg_pct'),
+                'sector':     s.get('sector'),
+                'fired_at':   hy_ht_fired_at,
+            })
+
+    prev_hy_ht_state = {
+        s['sym']: {
+            'hy': s.get('is_hy', False),
+            'ht': s.get('is_ht', False),
+        }
+        for s in processed
+    }
+
+    if new_vol_fires:
+        log.info(f"  🔊 {len(new_vol_fires)} NEW HY/HT fires: {[f['sym'] for f in new_vol_fires]}")
+        await supabase_upsert(session, 'squeeze_alerts', new_vol_fires, on_conflict='sym,fired_at')
+
+    # Step 5.5: Market Breadth metrics
+    # These give a pulse on overall market health
+    total = len(processed)
+    if total > 0:
+        breadth = {
+            'total_stocks':       total,
+            'above_ma10':         sum(1 for s in processed if s.get('ma10') and s.get('last_price',0) > s.get('ma10',0)),
+            'above_ma50':         sum(1 for s in processed if s.get('ma50') and s.get('last_price',0) > s.get('ma50',0)),
+            'rs_above_70':        sum(1 for s in processed if (s.get('rs_tv') or s.get('rs',0)) >= 70),
+            'rs_above_50':        sum(1 for s in processed if (s.get('rs_tv') or s.get('rs',0)) >= 50),
+            'rs_improving':       sum(1 for s in processed if s.get('rs_trend') == 'improving'),
+            'rs_declining':       sum(1 for s in processed if s.get('rs_trend') == 'declining'),
+            'stage2_count':       sum(1 for s in processed if s.get('weinstein_stage') == 2),
+            'stage4_count':       sum(1 for s in processed if s.get('weinstein_stage') == 4),
+            'new_52w_high':       sum(1 for s in processed if s.get('pct_from_52wh', -100) >= -2),
+            'new_52w_low':        sum(1 for s in processed if s.get('pct_from_52wl', 100) <= 2),
+            'pp_count':           sum(1 for s in processed if s.get('is_pp')),
+            'rvol_surge':         sum(1 for s in processed if s.get('vol_signal') == 'surge'),
+            's2_new_entry':       sum(1 for s in processed if s.get('is_s2_new_entry')),
+            'rs_line_new_high':   sum(1 for s in processed if s.get('rs_line_new_high')),
+            'advances':           sum(1 for s in processed if s.get('chg_pct', 0) > 0),
+            'declines':           sum(1 for s in processed if s.get('chg_pct', 0) < 0),
+            'last_updated':       now_ist.isoformat(),
+            'scan_date':          now_ist.strftime('%Y-%m-%d'),
+        }
+        await supabase_upsert(session, 'market_breadth', [breadth], on_conflict='scan_date')
+        log.info(f"  📈 Market breadth saved: {breadth['advances']}↑ {breadth['declines']}↓ Stage2:{breadth['stage2_count']}")
+
+
+
+    # Step 6: Build sector RS
+    sector_rows = build_sector_rs(processed, SECTOR_MAP)
+
+    # Step 6.5: Build index dashboard data
+    # For each tracked index: live price + daily/weekly/monthly chg + RS-TV + Stage
+    index_rows = []
+    nifty_prices = nifty_cache.get('prices', [])
+
+    for idx_name, idx_data in index_history_cache.items():
+        prices  = idx_data['prices']
+        n       = len(prices)
+        if n < 5:
+            continue
+
+        # Live override — index_history_cache only refreshes at startup +
+        # once daily at EOD (confirmed: load_index_cache is called inside
+        # the is_first_eod_today guard), so during live market hours
+        # prices[-1] is still yesterday's close. Once the market closes,
+        # that EOD refresh has already happened by the time this runs
+        # again, so the historical array is already current — no live
+        # override needed then, hence gating on is_market_open().
+        live_idx_price = live_index_data.get(idx_name)
+        mkt_open_now = is_market_open()
+        if mkt_open_now and live_idx_price:
+            last = live_idx_price
+            prev = prices[-1]  # yesterday's close (correct baseline while market is open)
+        else:
+            last = prices[-1]
+            prev = prices[-2] if n >= 2 else last
+        week    = prices[-6]  if n >= 6   else prices[0]
+        month   = prices[-22] if n >= 22  else prices[0]
+        qtr     = prices[-66] if n >= 66  else prices[0]
+        yr      = prices[-252] if n >= 252 else prices[0]
+
+        chg_d = round((last - prev) / prev * 100, 2) if prev else 0
+        chg_w = round((last - week) / week * 100, 2) if week else 0
+        chg_m = round((last - month) / month * 100, 2) if month else 0
+        chg_q = round((last - qtr)  / qtr  * 100, 2) if qtr  else 0
+        chg_y = round((last - yr)   / yr   * 100, 2) if yr   else 0
+
+        # RS-TV using Nifty as benchmark — meaningless for Nifty 50 itself
+        # (comparing an index against itself trivially gives 0 relative
+        # performance every day, which normalizes to a degenerate 50).
+        # Showing a plain "50" there looks like a real median reading
+        # rather than "not applicable", so use None (renders as "—") instead.
+        if idx_name == 'Nifty 50':
+            rs_tv_idx = None
+        elif nifty_prices and len(nifty_prices) >= 252:
+            rs_tv_idx = calc_rs_tv_normalized(prices, nifty_prices)
+            # Live-update this index's own RS-TV too, same approach as
+            # the per-stock live RS-TV above — otherwise the Index
+            # Dashboard's RS-TV would stay just as frozen as everything
+            # else was before this fix.
+            if mkt_open_now and live_idx_price and live_nifty_price:
+                idx_raw_series = calc_raw_rs_series(prices, nifty_prices)
+                live_idx_raw = calc_live_raw_rs_today(prices, nifty_prices, live_idx_price, live_nifty_price)
+                if live_idx_raw is not None:
+                    window = [v for v in idx_raw_series[-300:] if v is not None][-252:]
+                    if window:
+                        hi, lo = max(window), min(window)
+                        rs_tv_idx = 50 if hi == lo else max(1, min(99, round(((live_idx_raw - lo) / (hi - lo)) * 98 + 1)))
+        else:
+            rs_tv_idx = None
+
+        # Weinstein Stage for the index
+        highs = idx_data.get('highs', prices)
+        lows  = idx_data.get('lows', prices)
+        ma30  = sma(prices, min(30, n))
+        ma10  = sma(prices, min(10, n))
+        h52   = max(prices[-252:]) if n >= 252 else max(prices)
+        l52   = min(prices[-252:]) if n >= 252 else min(prices)
+        pct_from_high = round((last - h52) / h52 * 100, 1) if h52 else 0
+
+        # Stage logic for index — uses MA10-vs-MA30 (a stable, multi-day
+        # trend-confirmation signal, same as the up/down arrows already
+        # shown in the UI) instead of today's single-day price change.
+        # The previous version gated Stage 2/3/4 on chg_d >= 0 / <= 0,
+        # meaning a single red day in an established uptrend (rising
+        # MA10, rising MA30, strong 1W/1M/3M returns) would flip the
+        # whole index down to "S1 Base" — which is exactly why so many
+        # genuinely-uptrending indices were all showing "Base" together
+        # on an ordinary red day for the broader market.
+        if ma30 and last > ma30 and ma10 and ma10 >= ma30:
+            if pct_from_high >= -5:
+                stage = 3
+            else:
+                stage = 2
+        elif ma30 and last < ma30 and ma10 and ma10 <= ma30:
+            stage = 4
+        else:
+            stage = 1
+
+        stage_labels = {1:'S1 Base', 2:'S2 Up', 3:'S3 Top', 4:'S4 Down'}
+        stage_label  = stage_labels.get(stage, 'S1 Base')
+
+        # Above/below key MAs
+        above_ma10 = last > ma10 if ma10 else None
+        above_ma30 = last > ma30 if ma30 else None
+
+        # Top 3 stocks in this index from our scan (only for constituent indices)
+        top_stocks = []
+        adv_d = adv_w = adv_m = None
+        constituent_map = {
+            'Nifty 50':    [s for s in processed if s.get('in_nifty50')],
+            'Midcap 150':  [s for s in processed if s.get('in_midcap')],
+            'Smallcap 250':[s for s in processed if s.get('in_smallcap')],
+            'Microcap 250':[s for s in processed if s.get('in_microcap')],
+        }
+        if idx_name in constituent_map:
+            members = constituent_map[idx_name]
+            top3    = sorted(members, key=lambda x: x.get('rs_tv') or x.get('rs') or 0, reverse=True)[:3]
+            bot3    = sorted(members, key=lambda x: x.get('rs_tv') or x.get('rs') or 0)[:3]
+            top_stocks = [{'sym':s['sym'],'rs':s.get('rs_tv') or s.get('rs')} for s in top3]
+            bot_stocks = [{'sym':s['sym'],'rs':s.get('rs_tv') or s.get('rs')} for s in bot3]
+
+            # Breadth — % of this index's constituent stocks advancing at
+            # each timeframe (same concept as sector breadth). Two indices
+            # both "up 1% today" look very different if one has 90% of
+            # members participating vs one carried by a handful of names.
+            def _adv_pct(field):
+                vals = [m.get(field) for m in members if m.get(field) is not None]
+                return round(sum(1 for v in vals if v > 0) / len(vals) * 100, 2) if vals else None
+            adv_d = _adv_pct('chg_pct')
+            adv_w = _adv_pct('chg_w_pct')
+            adv_m = _adv_pct('chg_m_pct')
+        else:
+            bot_stocks = []
+
+        index_rows.append({
+            'name':          idx_name,
+            'last_price':    round(last, 2),
+            'chg_d':         chg_d,
+            'chg_w':         chg_w,
+            'chg_m':         chg_m,
+            'chg_q':         chg_q,
+            'chg_y':         chg_y,
+            'rs_tv':         rs_tv_idx,
+            'stage':         stage,
+            'stage_label':   stage_label,
+            'above_ma10':    above_ma10,
+            'above_ma30':    above_ma30,
+            'high_52w':      round(h52, 2),
+            'low_52w':       round(l52, 2),
+            'pct_from_high': pct_from_high,
+            'advances_d':    adv_d,
+            'advances_w':    adv_w,
+            'advances_m':    adv_m,
+            'top_stocks':    json.dumps(top_stocks),
+            'bot_stocks':    json.dumps(bot_stocks),
+            'last_updated':  now_ist.isoformat(),
+        })
+
+    # Rank each index's daily/weekly/monthly performance against all other
+    # indices (1 = best performer for that timeframe). Needs a second pass
+    # since ranking requires seeing every index's chg value first.
+    for field, rank_field in (('chg_d', 'rank_d'), ('chg_w', 'rank_w'), ('chg_m', 'rank_m')):
+        ordered = sorted(index_rows, key=lambda r: r[field], reverse=True)
+        for rank, row in enumerate(ordered, start=1):
+            row[rank_field] = rank
+    total_indices = len(index_rows)
+    for row in index_rows:
+        row['total_indices'] = total_indices
+
+    # Week-over-week rank movement — "was #7 a week ago, now #3" is more
+    # useful than a bare rank on its own. Loads each index's existing
+    # rank_w_history from Supabase, appends today's rank_w once per day
+    # (not every ~60-90s scan — a rolling weekly comparison shouldn't
+    # jitter intraday), and computes the change vs the oldest entry in
+    # an 8-day rolling window (roughly a week of trading days).
+    prev_history = await load_index_rank_history(session)
+    for row in index_rows:
+        hist = list(prev_history.get(row['name'], []))
+        if is_first_eod_today:
+            hist.append(row['rank_w'])
+            hist = hist[-8:]
+        elif not hist:
+            # No history yet at all (first run ever for this index) —
+            # seed it with today's value so a change becomes computable
+            # starting next week, rather than staying empty forever.
+            hist = [row['rank_w']]
+        row['rank_w_history'] = json.dumps(hist)
+        row['rank_w_change'] = (hist[0] - hist[-1]) if len(hist) >= 2 else None
+        # Positive = rank number went down = moved UP the standings (good).
+
+    if index_rows:
+        await supabase_upsert(session, 'index_dashboard', index_rows, on_conflict='name')
+        log.info(f"  📊 Index dashboard: {len(index_rows)} indices saved")
+
+    # Step 7: Save to Supabase
+    log.info(f"  Saving {len(processed)} stocks to Supabase…")
+    await supabase_upsert(session, 'stocks', processed)
+
+    # Also publish the same data to R2 for the frontend to read directly —
+    # see upload_snapshot_to_r2's docstring. Trimmed to only the fields
+    # transformStockRow() actually reads (trim_for_r2, defined above) —
+    # unlike the Supabase write, this doesn't need the full processed
+    # dict, just what the frontend displays.
+    await upload_snapshot_to_r2('stocks-snapshot.json', trim_for_r2(processed))
+
+    # Week-over-week rank movement for sectors — same approach as the
+    # Index Dashboard's rank_w_change: append today's rank once per day,
+    # compute change vs the oldest entry in an 8-day rolling window.
+    prev_sector_history = await load_sector_rank_history(session)
+    for s in sector_rows:
+        hist = list(prev_sector_history.get(s['sector'], []))
+        if is_first_eod_today:
+            hist.append(s['rank'])
+            hist = hist[-8:]
+        elif not hist:
+            hist = [s['rank']]
+        s['rank_history'] = json.dumps(hist)
+        s['rank_change'] = (hist[0] - hist[-1]) if len(hist) >= 2 else None
+        # Positive = rank number went down = moved UP the standings (good).
+
+    await supabase_upsert(session, 'sectors', [
+        {**s, 'last_updated': now_ist.isoformat(), 'top_stocks': json.dumps(s['top_stocks'])}
+        for s in sector_rows
+    ])
+
+    # Clean up stale sector rows — SECTOR_MAP has been restructured a
+    # few times over this project's history, and the upsert above only
+    # adds/updates CURRENT sectors, never removes ones that no longer
+    # exist. A leftover row (e.g. an old 'Engineering' category) keeps
+    # showing cached top_stocks/avg_rs from whenever it was last live,
+    # while the actual stocks table correctly has zero members for it
+    # now — confusing 'sector shows data but has 0 stocks when expanded'
+    # symptom. Runs once per scan; cheap (one SELECT + occasional DELETE).
+    try:
+        current_sector_names = set(SECTOR_MAP.keys())
+        sec_headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/sectors?select=sector",
+            headers=sec_headers, timeout=aiohttp.ClientTimeout(total=15)
+        ) as r:
+            if r.status == 200:
+                existing_sector_names = {row['sector'] for row in await r.json() if row.get('sector')}
+                stale = existing_sector_names - current_sector_names
+                if stale:
+                    for stale_name in stale:
+                        del_headers = {**sec_headers, "Content-Type": "application/json"}
+                        async with session.delete(
+                            f"{SUPABASE_URL}/rest/v1/sectors",
+                            headers=del_headers,
+                            params={"sector": f"eq.{stale_name}"},
+                            timeout=aiohttp.ClientTimeout(total=15)
+                        ) as dr:
+                            if dr.status not in (200, 204):
+                                log.warning(f"  Failed to delete stale sector '{stale_name}': {dr.status}")
+                    log.info(f"  🧹 Cleaned up {len(stale)} stale sector row(s): {sorted(stale)}")
+    except Exception as e:
+        log.warning(f"Stale sector cleanup failed: {e}")
+
+    # Step 7.5: At end-of-day, also archive a permanent daily snapshot.
+    # This is what powers the "view any past date" history feature —
+    # without this, only today's live state is ever available.
+    #
+    # This previously failed SILENTLY for as long as the feature existed
+    # (stock_history's schema never got the same new columns stocks kept
+    # accumulating — weinstein_stage, ibv_hist, is_52wh_breakout, etc. —
+    # so PostgREST rejected the whole upsert every single day, and it
+    # only ever produced a single log.warning that nobody noticed since
+    # this only runs once daily, unlike the main stocks upsert which
+    # fails every ~scan and becomes obvious fast). Added an explicit
+    # verification step below so a failure here is loud, not silent.
+    if is_first_eod_today:
+        snapshot_date = now_ist.strftime('%Y-%m-%d')
+        log.info(f"  📸 Archiving EOD snapshot for {snapshot_date}…")
+
+        history_rows = []
+        for p in processed:
+            # Exclude fields added to `processed` AFTER stock_history's
+            # schema was created (best_pick_score/fundamental_score/
+            # fundamental_label, from the AI Best Picks and Fundamental
+            # Rating features) — confirmed via production log that their
+            # presence here breaks the ENTIRE upsert (PostgREST rejects
+            # the whole batch if even one column doesn't exist in the
+            # target table), silently failing today's EOD archive
+            # (0/2380 rows) even though everything else about the scan
+            # succeeded. These are daily-recomputed "current state"
+            # outputs, not core historical data worth preserving anyway
+            # — simplest fix is excluding them here rather than growing
+            # stock_history's schema every time a new field is added to
+            # the live scanner.
+            row = {k: v for k, v in p.items()
+                   if k not in ('last_updated', 'scan_type', 'best_pick_score',
+                                'fundamental_score', 'fundamental_label')}
+            row['snapshot_date'] = snapshot_date
+            history_rows.append(row)
+        await supabase_upsert(session, 'stock_history', history_rows, on_conflict='snapshot_date,sym')
+
+        try:
+            verify_headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                               "Prefer": "count=exact"}
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/stock_history?select=sym&snapshot_date=eq.{snapshot_date}",
+                headers=verify_headers, timeout=aiohttp.ClientTimeout(total=15)
+            ) as vr:
+                saved_count = 0
+                if vr.status in (200, 206):
+                    cr = vr.headers.get('content-range', '')
+                    if '/' in cr:
+                        saved_count = int(cr.split('/')[-1])
+                if saved_count >= len(history_rows) * 0.9:  # allow small variance
+                    log.info(f"  ✅ EOD snapshot verified: {saved_count} stocks saved for {snapshot_date}")
+                else:
+                    log.error(f"  ❌ EOD snapshot for {snapshot_date} likely FAILED — only {saved_count}/"
+                               f"{len(history_rows)} rows found. This usually means stock_history's schema "
+                               f"is missing a column stocks has. Check Supabase: the columns on both tables "
+                               f"should match.")
+        except Exception as e:
+            log.warning(f"EOD snapshot verification check failed: {e}")
+
+        sector_history_rows = [
+            {
+                'snapshot_date': snapshot_date,
+                'sector':        s['sector'],
+                'avg_rs':        s['avg_rs'],
+                'rank':          s['rank'],
+                'count':         s['count'],
+                'pp_count':      s['pp_count'],
+                'improving':     s['improving'],
+                'top_stocks':    json.dumps(s['top_stocks']),
+            }
+            for s in sector_rows
+        ]
+        await supabase_upsert(session, 'sector_history', sector_history_rows, on_conflict='snapshot_date,sector')
+        # (Removed the old unconditional "✅ Snapshot archived" log here —
+        # it printed success regardless of whether the upsert actually
+        # worked, which is exactly how the stock_history failure above
+        # went unnoticed for as long as it did. The verification block
+        # above this now reports the real outcome.)
+        try:
+            sec_verify_headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                                   "Prefer": "count=exact"}
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/sector_history?select=sector&snapshot_date=eq.{snapshot_date}",
+                headers=sec_verify_headers, timeout=aiohttp.ClientTimeout(total=15)
+            ) as svr:
+                sec_saved = 0
+                if svr.status in (200, 206):
+                    cr = svr.headers.get('content-range', '')
+                    if '/' in cr:
+                        sec_saved = int(cr.split('/')[-1])
+                if sec_saved >= len(sector_history_rows) * 0.9:
+                    log.info(f"  ✅ Sector snapshot verified: {sec_saved} sectors saved for {snapshot_date}")
+                else:
+                    log.error(f"  ❌ Sector snapshot for {snapshot_date} likely FAILED — only {sec_saved}/"
+                               f"{len(sector_history_rows)} rows found.")
+        except Exception as e:
+            log.warning(f"Sector snapshot verification check failed: {e}")
+
+        # Same daily-snapshot pattern as sector_history above, for indices.
+        # index_dashboard only ever holds each index's CURRENT state
+        # (upserted on 'name'), so without this there was no way to see
+        # an index's RS-TV/rank history over time — needed for the Index
+        # scope of the rotation view, same as sector_history/stock_history
+        # already power the Sector and Watchlist scopes.
+        index_history_rows = [
+            {
+                'snapshot_date': snapshot_date,
+                'name':          r['name'],
+                'rs_tv':         r.get('rs_tv'),
+                'rank_d':        r.get('rank_d'),
+                'rank_w':        r.get('rank_w'),
+                'rank_m':        r.get('rank_m'),
+                'chg_d':         r.get('chg_d'),
+                'stage':         r.get('stage'),
+            }
+            for r in index_rows
+        ]
+        if index_history_rows:
+            await supabase_upsert(session, 'index_history', index_history_rows, on_conflict='snapshot_date,name')
+            try:
+                idx_verify_headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                                       "Prefer": "count=exact"}
+                async with session.get(
+                    f"{SUPABASE_URL}/rest/v1/index_history?select=name&snapshot_date=eq.{snapshot_date}",
+                    headers=idx_verify_headers, timeout=aiohttp.ClientTimeout(total=15)
+                ) as ivr:
+                    idx_saved = 0
+                    if ivr.status in (200, 206):
+                        cr = ivr.headers.get('content-range', '')
+                        if '/' in cr:
+                            idx_saved = int(cr.split('/')[-1])
+                    if idx_saved >= len(index_history_rows) * 0.9:
+                        log.info(f"  ✅ Index snapshot verified: {idx_saved} indices saved for {snapshot_date}")
+                    else:
+                        log.error(f"  ❌ Index snapshot for {snapshot_date} likely FAILED — only {idx_saved}/"
+                                   f"{len(index_history_rows)} rows found. If this persists, the index_history "
+                                   f"table may not exist yet — create it in Supabase:\n"
+                                   f"   create table if not exists public.index_history (\n"
+                                   f"     snapshot_date date not null, name text not null,\n"
+                                   f"     rs_tv int, rank_d int, rank_w int, rank_m int, chg_d numeric, stage int,\n"
+                                   f"     primary key (snapshot_date, name)\n"
+                                   f"   );")
+            except Exception as e:
+                log.warning(f"Index snapshot verification check failed: {e}")
+
+        # Append today to the historical advance/decline line — the
+        # one-time backfill at startup covers the past 2 years from
+        # stored price history; this keeps it current going forward.
+        if breadth:
+            await supabase_upsert(session, 'market_breadth_history', [{
+                'date': snapshot_date,
+                'advances': breadth.get('advances', 0),
+                'declines': breadth.get('declines', 0),
+                'unchanged': max(0, len(processed) - breadth.get('advances', 0) - breadth.get('declines', 0)),
+                'total': len(processed),
+            }], on_conflict='date')
+
+        # Append today to the EMA-above-count line (backfilled for the
+        # past month at startup) and the Stage 2 count. Stage 2 can only
+        # ever accumulate going forward — it depends on RS-TV, a
+        # cross-market comparison that can't be reconstructed for past
+        # days from stored price history alone the way EMA-above can.
+        above9  = sum(1 for s in processed if s.get('last_price') and s.get('ema9')  and s['last_price'] > s['ema9'])
+        above21 = sum(1 for s in processed if s.get('last_price') and s.get('ema21') and s['last_price'] > s['ema21'])
+        above50 = sum(1 for s in processed if s.get('last_price') and s.get('ema50') and s['last_price'] > s['ema50'])
+        stage2_count = sum(1 for s in processed if s.get('weinstein_stage') == 2)
+        await supabase_upsert(session, 'ema_breadth_history', [{
+            'date': snapshot_date,
+            'above_ema9': above9, 'above_ema21': above21, 'above_ema50': above50,
+            'stage2_count': stage2_count,
+            'total': len(processed),
+        }], on_conflict='date')
+
+        # Retry the 30-day backfills daily, not just at process startup —
+        # previously these ONLY ran once at startup, meaning any fix to
+        # one of them (a schema change, a relaxed threshold, etc.) needed
+        # someone to manually restart Railway to actually take effect.
+        # Each backfill already self-guards on "do we have enough days
+        # already?", so calling them here every EOD is cheap on a normal
+        # day (a fast row-count check that says "already sufficient,
+        # skip") and self-healing on an abnormal one — no manual restart
+        # ever needed again for this class of issue.
+        try:
+            await asyncio.wait_for(backfill_stock_history_30days(session), timeout=1500)
+        except Exception as e:
+            log.warning(f"Daily stock_history backfill retry error (non-fatal): {e}")
+        try:
+            await asyncio.wait_for(backfill_sector_history_30days(session), timeout=120)
+        except Exception as e:
+            log.warning(f"Daily sector_history backfill retry error (non-fatal): {e}")
+        try:
+            await asyncio.wait_for(backfill_index_history_30days(session), timeout=300)
+        except Exception as e:
+            log.warning(f"Daily index_history backfill retry error (non-fatal): {e}")
+
+        # Send daily Telegram digest at EOD
+        if breadth:
+            await send_daily_digest(session, processed, breadth)
+
+    # Step 8: Update scan metadata
+    duration = round(time.time() - start, 1)
+    next_scan = (now_ist + timedelta(seconds=UPDATE_INTERVAL)).isoformat()
+    await supabase_update_meta(session, {
+        'last_scan':    now_ist.isoformat(),
+        'scan_type':    scan_type,
+        'stocks_count': len(processed),
+        'duration_sec': duration,
+        'status':       'success',
+        'error_msg':    None,
+        'next_scan':    next_scan,
+    })
+
+    log.info(f"✅ {scan_type} scan done: {len(processed)} stocks in {duration}s")
+    return len(processed)
+
+# ── Announcement enrichment + 1-month history backfill ──────────────────
+
+async def save_best_picks(session: aiohttp.ClientSession, top_rows: list, reasoning: dict):
+    """Full-replace semantics: today's top N fully overwrite the table.
+    Best Picks is a point-in-time snapshot, not a growing history — a
+    symbol that fell out of the top N shouldn't linger in the table."""
+    if not top_rows:
+        return
+    now_iso = datetime.now(timezone.utc).isoformat()
+    payload = []
+    for i, r in enumerate(top_rows):
+        payload.append({
+            'symbol': r['sym'],
+            'rank': i + 1,
+            'score': r.get('best_pick_score'),
+            'reasoning': reasoning.get(r['sym']),
+            'last_price': r.get('last_price'),
+            'chg_pct': r.get('chg_pct'),
+            'sector': r.get('sector'),
+            'industry': r.get('industry'),
+            'market_cap': r.get('market_cap'),
+            'rs_tv': r.get('rs_tv') or r.get('rs'),
+            'weinstein_stage': r.get('weinstein_stage'),
+            'vcp_fired': r.get('vcp_fired'),
+            'is_resistance_breakout': r.get('is_resistance_breakout'),
+            'is_cup_handle_breakout': r.get('is_cup_handle_breakout'),
+            'eps_yoy': r.get('eps_yoy'),
+            'sales_yoy': r.get('sales_yoy'),
+            'roe': r.get('roe'),
+            'promoter_trend': r.get('promoter_trend'),
+            'generated_at': now_iso,
+        })
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates",
+    }
+    try:
+        async with session.post(f"{SUPABASE_URL}/rest/v1/best_picks?on_conflict=symbol",
+                                headers=headers, json=payload,
+                                timeout=aiohttp.ClientTimeout(total=20)) as r:
+            if r.status not in (200, 201):
+                body = await r.text()
+                log.warning(f"⚠️ Best picks upsert failed ({r.status}): {body[:300]}")
+                return
+        # Remove any symbol no longer in today's top N (full-replace).
+        current_syms = {r['sym'] for r in top_rows}
+        plain_headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+        async with session.get(f"{SUPABASE_URL}/rest/v1/best_picks?select=symbol",
+                               headers=plain_headers, timeout=aiohttp.ClientTimeout(total=15)) as r2:
+            if r2.status == 200:
+                existing = {row['symbol'] for row in await r2.json()}
+                stale = existing - current_syms
+                for sym in stale:
+                    async with session.delete(
+                        f"{SUPABASE_URL}/rest/v1/best_picks",
+                        headers=plain_headers,
+                        params={"symbol": f"eq.{sym}"},
+                        timeout=aiohttp.ClientTimeout(total=15)
+                    ) as dr:
+                        if dr.status not in (200, 204):
+                            log.warning(f"  Failed to delete stale best_pick '{sym}': {dr.status}")
+        log.info(f"  🏆 Saved {len(payload)} best picks to Supabase")
+    except Exception as e:
+        log.warning(f"⚠️ Best picks save exception: {e}")
+
+
+
+async def save_best_picks_history(session: aiohttp.ClientSession, top_rows: list, reasoning: dict):
+    """Append-only track record, unlike save_best_picks' full-replace
+    snapshot. Upserts on (symbol, picked_date) — the FIRST time a symbol
+    is picked on a given calendar day, this creates its permanent
+    history row with today's price; every subsequent hourly refresh
+    that same day just updates rank/score/reasoning on that SAME row
+    (price_at_pick stays whatever it was at the day's first pick, not
+    overwritten), so 'did it go up since being picked' has a stable
+    baseline. A new calendar day always creates fresh rows rather than
+    touching previous days — that's what makes this a real history
+    instead of another snapshot."""
+    if not top_rows:
+        return
+    picked_date = datetime.now(IST).strftime('%Y-%m-%d')
+    now_iso = datetime.now(timezone.utc).isoformat()
+    payload = [{
+        'symbol': r['sym'],
+        'picked_date': picked_date,
+        'rank': i + 1,
+        'score': r.get('best_pick_score'),
+        'reasoning': reasoning.get(r['sym']),
+        'price_at_pick': r.get('last_price'),
+        'sector': r.get('sector'),
+        'market_cap': r.get('market_cap'),
+        'generated_at': now_iso,
+    } for i, r in enumerate(top_rows)]
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        # merge-duplicates on (symbol,picked_date) would normally
+        # overwrite price_at_pick too on every hourly refresh — instead
+        # this uses ignore-duplicates so the FIRST insert of the day
+        # wins for price_at_pick, then a separate lightweight PATCH
+        # below updates just rank/score/reasoning on top of it.
+        "Prefer": "resolution=ignore-duplicates",
+    }
+    try:
+        async with session.post(
+            f"{SUPABASE_URL}/rest/v1/best_picks_history?on_conflict=symbol,picked_date",
+            headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=20)
+        ) as r:
+            if r.status not in (200, 201):
+                body = await r.text()
+                log.warning(f"⚠️ Best picks history insert failed ({r.status}): {body[:300]}")
+                return
+        # Refresh rank/score/reasoning on today's existing rows (the
+        # ignore-duplicates insert above skips rows that already exist
+        # today, so this PATCH is what keeps rank/reasoning current
+        # through the day without touching price_at_pick).
+        patch_headers = {**headers, "Prefer": "return=minimal"}
+        for r in top_rows:
+            async with session.patch(
+                f"{SUPABASE_URL}/rest/v1/best_picks_history",
+                headers=patch_headers,
+                params={"symbol": f"eq.{r['sym']}", "picked_date": f"eq.{picked_date}"},
+                json={
+                    'rank': top_rows.index(r) + 1,
+                    'score': r.get('best_pick_score'),
+                    'reasoning': reasoning.get(r['sym']),
+                },
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as pr:
+                if pr.status not in (200, 204):
+                    log.warning(f"  Failed to refresh history row for {r['sym']}: {pr.status}")
+        log.info(f"  📜 Saved/updated {len(payload)} best-picks-history rows for {picked_date}")
+    except Exception as e:
+        log.warning(f"⚠️ Best picks history save exception: {e}")
+
+
+
+async def save_full_history_batch_to_db(session: aiohttp.ClientSession, rows: list):
+    """Upsert full-history rows into Supabase in small chunks (payload per
+    row is large — full 2yr OHLCV — so chunks are kept smaller than the
+    generic supabase_upsert default)."""
+    if not rows:
+        return
+    url = f"{SUPABASE_URL}/rest/v1/stock_full_history?on_conflict=sym"
+    headers = {
+        "apikey":        SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type":  "application/json",
+        "Prefer":        "resolution=merge-duplicates",
+    }
+    CHUNK = 40
+    chunks = [rows[i:i+CHUNK] for i in range(0, len(rows), CHUNK)]
+    sem = asyncio.Semaphore(5)
+    uploaded = 0
+
+    async def upload(chunk):
+        nonlocal uploaded
+        async with sem:
+            for attempt in (1, 2):
+                try:
+                    async with session.post(url, headers=headers, json=chunk,
+                                            timeout=aiohttp.ClientTimeout(total=60)) as r:
+                        if r.status in (200, 201, 204):
+                            uploaded += len(chunk)
+                            return
+                        text = await r.text()
+                        # PGRST205 = PostgREST schema cache hasn't picked up the
+                        # table yet — wait a bit and try once more before giving up.
+                        if attempt == 1 and r.status == 404 and 'PGRST205' in text:
+                            await asyncio.sleep(5)
+                            continue
+                        log.warning(f"stock_full_history upsert failed: {r.status} {text[:150]}")
+                        return
+                except Exception as e:
+                    if attempt == 1:
+                        await asyncio.sleep(2)
+                        continue
+                    log.error(f"stock_full_history upsert error: {e}")
+                    return
+
+    await asyncio.gather(*[upload(c) for c in chunks])
+    log.info(f"  💾 Uploaded {uploaded}/{len(rows)} full-history rows to Supabase")
+
+
+
+async def save_index_history_to_db(session: aiohttp.ClientSession, name: str, prices: list):
+    """Save index price history to Supabase for persistence across restarts."""
+    import json as _json
+    # Use service role key for writes (anon key blocked by RLS)
+    service_key = os.environ.get('SUPABASE_SERVICE_KEY', SUPABASE_KEY)
+    headers = {
+        "apikey": service_key,
+        "Authorization": f"Bearer {service_key}",
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates"
+    }
+    row = {"name": name, "prices": _json.dumps(prices), "updated_at": datetime.now(IST).isoformat()}
+    try:
+        async with session.post(
+            f"{SUPABASE_URL}/rest/v1/index_price_history",
+            headers=headers,
+            json=row,
+            timeout=aiohttp.ClientTimeout(total=30)
+        ) as r:
+            if r.status in (200, 201):
+                log.info(f"  💾 Saved {name}: {len(prices)} days to DB")
+            else:
+                body = await r.text()
+                log.warning(f"  Save {name} failed: {r.status} — {body[:200]}")
+    except Exception as e:
+        log.warning(f"  Save index history failed: {e}")
+
+
+
+def scan_should_skip_fundamentals() -> bool:
+    """True if the live-scan process should never fetch fundamentals
+    itself. Was previously gated on SERVICE_MODE=='scan' — a mode
+    angelic-strength never actually runs with (it has no SERVICE_MODE
+    set at all), so this always returned False there and the live-scan
+    process DID do its own heavy Screener.in/Upstox fetching. That was a
+    tolerable redundancy back when the fetch list was small, but became
+    a real problem once the missing-market-cap catch-up condition (see
+    load_fundamentals_from_supabase/load_fundamentals_batch) made that
+    list balloon to 700+ stocks — confirmed via production log showing
+    the live scan blocked long enough to hit its own 900s watchdog
+    timeout and abort before ever finishing a single scan cycle.
+
+    Now that worthy-simplicity owns ALL fundamentals scraping (daily
+    full refresh + hourly market-cap-only catchup) and angelic-strength
+    has its own hourly Supabase-only sync to absorb that work for free,
+    angelic-strength doing its own scraping is pure redundancy with a
+    real cost, not a useful safety net — so this now always returns
+    True. FORCE_FUNDAMENTALS_ON_SCAN=true is an escape hatch for running
+    this as a single standalone service without the separate worker."""
+    if os.getenv('FORCE_FUNDAMENTALS_ON_SCAN', '').lower() == 'true':
+        return False
+    # worthy-simplicity (SERVICE_MODE=fundamentals) is the one process
+    # whose entire job is fetching this — never skip there, only for
+    # the live-scan process (angelic-strength, no SERVICE_MODE set).
+    if os.getenv('SERVICE_MODE', '').lower() == 'fundamentals':
+        return False
+    return True
+_fundamentals_debug_count = 0  # caps detailed per-request diagnostic logging
+_upstox_fundamentals_debug_count = 0  # caps raw-response logging for the new Upstox fundamentals API
+_upstox_shareholding_debug_count = 0  # separate budget so share-holdings isn't starved by key-ratios logging
+_live_nifty_debug_count = 0  # caps raw-response logging for the live Nifty price fetch
+_live_index_debug_count = 0  # caps raw-response logging for the live all-indices price fetch
+_industry_endpoint_path = None  # remembered once a working fundamentals industry path is found
+_fetch_error_counts: dict = {}  # exception-type name -> count, reset per load_fundamentals_batch call,
+# aggregated (not logged per-call) so a systemic failure shows up as one
+# clear summary line instead of thousands of repeated log entries
+
+_NSE_ANNOUNCEMENTS_HEADER_SETS = [
+    {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate",
+        "Referer": "https://www.nseindia.com/get-quotes/equity?symbol=HDFCBANK",
+    },
+    {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; rv:109.0) Gecko/20100101 Firefox/118.0",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate",
+        "Referer": "https://www.nseindia.com/get-quotes/equity?symbol=HDFCBANK",
+    },
+]
+_nse_announcements_debug_count = 0  # caps raw-response logging while verifying the real field shape
+
+
+async def seed_index_history_if_needed(session: aiohttp.ClientSession):
+    """
+    One-time seed: push 1492 days of Nifty 50 history to Supabase.
+    Then merge with Upstox fresh data (2026 onwards) for complete history.
+    """
+    global nifty_cache
+    existing = await load_index_history_from_db(session, "Nifty 50")
+    if len(existing) >= 1400:
+        log.info(f"✅ Nifty 50 already seeded: {len(existing)} days in DB — skipping")
+        return
+
+    upstox_prices = nifty_cache.get("prices", [])
+    seed = NIFTY50_SEED_PRICES
+
+    if upstox_prices:
+        overlap_days = 125
+        new_from_upstox = upstox_prices[overlap_days:]
+        merged = seed + new_from_upstox
+    else:
+        merged = seed
+
+    await save_index_history_to_db(session, "Nifty 50", merged)
+    nifty_cache = {'prices': merged, 'volumes': nifty_cache.get('volumes', [])}
+    log.info(f"✅ Seeded Nifty 50: {len(merged)} days saved to DB!")
+
+
+async def send_daily_digest(session, processed: list, breadth: dict):
+    """Send EOD digest to Telegram."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    improvers = sorted(
+        [s for s in processed if s.get('rs_trend') == 'improving' and (s.get('rs_tv') or 0) >= 70],
+        key=lambda x: x.get('rs_tv') or x.get('rs', 0), reverse=True
+    )[:5]
+    s2_new   = [s for s in processed if s.get('is_s2_new_entry')][:5]
+    pp_today = [s for s in processed if s.get('is_pp')][:10]
+    rs_highs = [s for s in processed if s.get('rs_line_new_high')][:5]
+
+    date_str = datetime.now(IST).strftime('%d %b %Y')
+    adv = breadth.get('advances', 0)
+    dec = breadth.get('declines', 0)
+    s2c = breadth.get('stage2_count', 0)
+    s4c = breadth.get('stage4_count', 0)
+    imp = breadth.get('rs_improving', 0)
+    dcl = breadth.get('rs_declining', 0)
+    h52 = breadth.get('new_52w_high', 0)
+    l52 = breadth.get('new_52w_low', 0)
+    ppc = breadth.get('pp_count', 0)
+    vol = breadth.get('rvol_surge', 0)
+
+    s2_lines  = '\n'.join(f"  {s['sym']} RS:{s.get('rs_tv') or s.get('rs','?')}" for s in s2_new) or '  None'
+    rsl_lines = '\n'.join(f"  {s['sym']} RS:{s.get('rs_tv') or s.get('rs','?')}" for s in rs_highs) or '  None'
+    pp_syms   = ', '.join(s['sym'] for s in pp_today) or 'None'
+    top_syms  = '\n'.join(f"  {s['sym']} {s.get('rs_tv') or s.get('rs','?')}" for s in improvers) or '  None'
+
+    msg = (
+        f"<b>Lakshmimata EOD Digest — {date_str}</b>\n\n"
+        f"<b>Market Breadth</b>\n"
+        f"Up: {adv}  Down: {dec}\n"
+        f"Stage2: {s2c}  Stage4: {s4c}\n"
+        f"RS Improving: {imp}  Declining: {dcl}\n"
+        f"52W High: {h52}  52W Low: {l52}\n"
+        f"PP Signals: {ppc}  Vol Surge: {vol}\n\n"
+        f"<b>New Stage 2 Entries ({len(s2_new)})</b>\n{s2_lines}\n\n"
+        f"<b>RS Line New Highs ({len(rs_highs)})</b>\n{rsl_lines}\n\n"
+        f"<b>PP Signals Today</b>\n{pp_syms}\n\n"
+        f"<b>Top RS Improvers</b>\n{top_syms}"
+    )
+    await send_telegram(session, msg)
+    log.info("Daily digest sent to Telegram")
+
+
+# Market hours IST
+MARKET_OPEN_H, MARKET_OPEN_M   = 9, 15
+MARKET_CLOSE_H, MARKET_CLOSE_M = 15, 30
+
+# ── Math functions ────────────────────────────────────────────────────
+
+async def send_telegram(session, message: str):
+    """Send a message via Telegram bot."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        async with session.post(url, json={
+            'chat_id': TELEGRAM_CHAT_ID,
+            'text': message,
+            'parse_mode': 'HTML',
+            'disable_web_page_preview': True,
+        }, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status != 200:
+                log.warning(f"Telegram send failed: {r.status}")
+    except Exception as e:
+        log.warning(f"Telegram error: {e}")
+
+
+def sma(prices: list, n: int) -> Optional[float]:
+    if len(prices) < n:
+        return None
+    return sum(prices[-n:]) / n
+
+
+def std_dev(prices: list, n: int) -> Optional[float]:
+    if len(prices) < n:
+        return None
+    vals = prices[-n:]
+    mean = sum(vals) / n
+    variance = sum((p - mean) ** 2 for p in vals) / n
+    return variance ** 0.5
+
+
+async def supabase_update_meta(session: aiohttp.ClientSession, meta: dict):
+    """Update scan metadata."""
+    url = f"{SUPABASE_URL}/rest/v1/scan_meta"
+    headers = {
+        "apikey":        SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type":  "application/json",
+        "Prefer":        "resolution=merge-duplicates",
+    }
+    try:
+        async with session.post(url, headers=headers, json=[{"id": "latest", **meta}],
+                                timeout=aiohttp.ClientTimeout(total=10)) as r:
+            pass
+    except Exception as e:
+        log.error(f"Meta update error: {e}")
+
+# ── Market hours check ────────────────────────────────────────────────
+
+async def supabase_upsert(session: aiohttp.ClientSession, table: str, rows: list, on_conflict: str = None):
+    """Upsert rows into Supabase table in parallel chunks for speed."""
+    if not rows:
+        return
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    if on_conflict:
+        url += f"?on_conflict={on_conflict}"
+    headers = {
+        "apikey":        SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type":  "application/json",
+        "Prefer":        "resolution=merge-duplicates",
+    }
+    CHUNK = 500  # larger chunks = fewer round trips
+
+    async def upsert_chunk(chunk):
+        try:
+            async with session.post(url, headers=headers, json=chunk,
+                                    timeout=aiohttp.ClientTimeout(total=30)) as r:
+                if r.status not in (200, 201, 204):
+                    text = await r.text()
+                    log.warning(f"Supabase upsert {table} failed: {r.status} {text[:100]}")
+        except Exception as e:
+            log.error(f"Supabase error ({table}): {e}")
+
+    # Fire all chunks concurrently (max 4 at a time)
+    chunks = [rows[i:i+CHUNK] for i in range(0, len(rows), CHUNK)]
+    sem = asyncio.Semaphore(4)
+    async def upsert_with_sem(chunk):
+        async with sem:
+            await upsert_chunk(chunk)
+    await asyncio.gather(*[upsert_with_sem(c) for c in chunks])
+
+
+def trim_for_r2(stocks: list) -> list:
+    """Filters each stock dict down to only _R2_STOCK_FIELDS before
+    uploading — the R2 copy is read-only display data for the frontend,
+    it doesn't need whatever extra internal-only fields the backend's
+    own processing carries that the Supabase table/frontend never use."""
+    trimmed = [{k: s[k] for k in _R2_STOCK_FIELDS if k in s} for s in stocks]
+
+    # One-time diagnostic: the trim only brought the file from ~6.05MB to
+    # ~5.6-5.9MB, far less than expected if extra internal-only fields
+    # were the dominant contributor — measuring actual per-field size
+    # directly instead of continuing to guess which field is actually
+    # large.
+    global _r2_size_diagnostic_logged
+    if not _r2_size_diagnostic_logged:
+        _r2_size_diagnostic_logged = True
+        field_sizes = {}
+        for field in _R2_STOCK_FIELDS:
+            total = 0
+            for s in trimmed:
+                if field in s:
+                    total += len(json.dumps(s[field], default=str))
+            field_sizes[field] = total
+        top20 = sorted(field_sizes.items(), key=lambda x: -x[1])[:20]
+        total_size = sum(field_sizes.values())
+        log.info(f"  🔍 R2 payload field-size breakdown (total ~{total_size/1024:.0f} KB across {len(trimmed)} stocks):")
+        for field, size in top20:
+            log.info(f"     {field}: {size/1024:.1f} KB ({size/max(total_size,1)*100:.1f}%)")
+
+    return trimmed
+_r2_size_diagnostic_logged = False
+
+
+def true_range_series(highs: list, lows: list, closes: list) -> list:
+    tr = []
+    for i in range(len(closes)):
+        if i == 0:
+            tr.append(highs[i] - lows[i])
+        else:
+            tr.append(max(
+                highs[i] - lows[i],
+                abs(highs[i] - closes[i-1]),
+                abs(lows[i] - closes[i-1])
+            ))
+    return tr
+
+
+def tv_history_from_raw(raw_series: list, days: int = 15) -> list:
+    """
+    Build a day-by-day TV-style (self-normalized) RS history from an
+    already-computed raw RS series, so the sparkline/trend uses the SAME
+    methodology as the main RS-TV score — instead of a completely different
+    percentile-rank scale that doesn't match the Pine Script numbers.
+    """
+    n = len(raw_series)
+    hist = []
+    for d in range(days - 1, -1, -1):
+        end_idx = n - 1 - d
+        hist.append(normalize_rs(raw_series[:end_idx + 1]) if end_idx >= 0 else None)
+    return hist
+
+
+async def upload_snapshot_to_r2(key: str, data, cache_seconds: int = 60):
+    """Uploads a JSON snapshot to R2 for the frontend to read directly
+    instead of querying Supabase — same data, but served from Cloudflare's
+    CDN cache to everyone requesting it within cache_seconds of each other,
+    instead of every single user triggering their own database read.
+
+    Deliberately best-effort: any failure here (R2 down, not configured
+    yet, network hiccup) only logs a warning and returns — it must NEVER
+    interrupt or fail the scan loop, since Supabase remains the real
+    source of truth regardless of whether this succeeds. The frontend
+    also falls back to querying Supabase directly if the R2 file is
+    missing or stale, so a failed upload here degrades gracefully rather
+    than breaking anything.
+    """
+    global _r2_warned
+    if _r2_client is None:
+        if not _r2_warned:
+            log.warning("⚠️ R2 not configured (R2_ACCOUNT_ID/R2_ACCESS_KEY_ID/"
+                        "R2_SECRET_ACCESS_KEY/R2_BUCKET_NAME) — skipping snapshot "
+                        "upload, frontend will keep reading from Supabase directly")
+            _r2_warned = True
+        return
+    try:
+        body = json.dumps(data, default=str).encode('utf-8')
+        await asyncio.to_thread(_r2_put_object_sync, key, body, 'application/json', cache_seconds)
+        log.info(f"  ☁️ Uploaded {key} to R2 ({len(body)/1024:.1f} KB)")
+    except Exception as e:
+        log.warning(f"⚠️ R2 upload failed for {key}: {e}")
+
+
+def validate_hardcoded_symbol_lists():
+    """
+    Catches exactly the class of bug that made Mazagon Dock silently
+    invisible for as long as it was: a typo'd/wrong symbol in a
+    hand-maintained list (SECTOR_MAP, NIFTY50, MIDCAP, SMALLCAP,
+    MICROCAP) that doesn't match any real NSE symbol, so it never gets
+    matched to actual price/scan data — but doesn't error either, since
+    Python doesn't know "MAZAGON" isn't a real ticker, it's just a
+    string. The only way to actually catch this is to cross-check every
+    hardcoded symbol against the real, live instrument master this app
+    already loads at startup — which is exactly what this does, once,
+    right after that load finishes. Logs every mismatch loudly so it
+    shows up in Railway logs on every restart, instead of silently
+    doing nothing for months like this one did.
+    """
+    if not instrument_key_map:
+        log.warning("  Symbol validation skipped — instrument_key_map not populated yet")
+        return
+    named_lists = {
+        'NIFTY50': NIFTY50, 'MIDCAP': MIDCAP, 'SMALLCAP': SMALLCAP, 'MICROCAP': MICROCAP,
+    }
+    total_bad = 0
+    for list_name, syms in named_lists.items():
+        bad = [s for s in syms if s not in instrument_key_map]
+        if bad:
+            total_bad += len(bad)
+            log.warning(f"  ⚠️ {list_name} has {len(bad)} symbol(s) not found in the live instrument "
+                        f"master (likely typos, delisted, or renamed — will silently never get real "
+                        f"data): {bad}")
+    for sector_name, syms in SECTOR_MAP.items():
+        bad = [s for s in syms if s not in instrument_key_map]
+        if bad:
+            total_bad += len(bad)
+            log.warning(f"  ⚠️ SECTOR_MAP['{sector_name}'] has {len(bad)} symbol(s) not found in the "
+                        f"live instrument master: {bad}")
+    if total_bad == 0:
+        log.info("  ✅ All hardcoded symbol lists (SECTOR_MAP, NIFTY50/MIDCAP/SMALLCAP/MICROCAP) "
+                  "validated against the live instrument master — no bad symbols found")
+    else:
+        log.error(f"  ❌ {total_bad} bad symbol(s) found across hardcoded lists — see warnings above. "
+                  f"These stocks are silently invisible in the app until the symbol is corrected.")
+
+
+instrument_key_map: dict = {} # sym -> full instrument key (e.g. NSE_EQ|INE002A01018)
+
+
+def was_in_squeeze_yesterday(closes, highs, lows, n=20) -> bool:
+    if len(closes) < n + 21:
+        return False
+    sub_closes = closes[:-1]
+    sub_highs  = highs[:-1]
+    sub_lows   = lows[:-1]
+    m = sma(sub_closes, n)
+    s = std_dev(sub_closes, n)
+    a = atr(sub_highs, sub_lows, sub_closes, n)
+    if not m or not s or not a:
+        return False
+    ub, lb = m + 2*s, m - 2*s
+    uk, lk = m + 1.5*a, m - 1.5*a
+    return ub < uk and lb > lk
+
+
+
+# ══ SERVICE ENTRY POINT ══
+
+async def run_live_scan_service():
+    global ALL_STOCKS, NIFTY50, MIDCAP, SMALLCAP, MICROCAP
+
+    log.info("=" * 60)
+    log.info("  PocketRS Pro — Live Update Server")
+    log.info(f"  Update interval: {UPDATE_INTERVAL} seconds")
+    log.info(f"  Market hours: {MARKET_OPEN_H}:{MARKET_OPEN_M:02d} - {MARKET_CLOSE_H}:{MARKET_CLOSE_M:02d} IST")
+    log.info("=" * 60)
+
+    connector = aiohttp.TCPConnector(limit=50, ssl=False)  # higher limit for parallel OHLC fetches
+    async with aiohttp.ClientSession(connector=connector) as session:
+
+        # Step 0: Fetch real official Nifty index constituent lists
+        # (replaces the small hardcoded MIDCAP/SMALLCAP/MICROCAP samples
+        #  with the actual current 150/250/250 stock lists)
+        await load_official_index_lists(session)
+
+        # Step 1: Fetch ALL NSE instruments from Upstox
+        log.info("Fetching all NSE instruments from Upstox…")
+        try:
+            url = "https://api.upstox.com/v2/instruments"
+            headers = {
+                "Authorization": f"Bearer {ANALYTICS_TOKEN}",
+                "Accept": "application/json"
+            }
+            async with session.get(url, headers=headers,
+                                   timeout=aiohttp.ClientTimeout(total=60)) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    instruments = data.get('data', [])
+                    # Filter NSE equity stocks only
+                    nse_eq = [
+                        i['trading_symbol'] for i in instruments
+                        if i.get('exchange') == 'NSE'
+                        and i.get('instrument_type') == 'EQ'
+                        and i.get('trading_symbol')
+                        and '-' not in i.get('trading_symbol','')[-3:]
+                    ]
+                    # Remove duplicates and sort
+                    nse_eq = list(dict.fromkeys(nse_eq))
+                    log.info(f"✅ Fetched {len(nse_eq)} NSE equity stocks from Upstox")
+                    if len(nse_eq) > 100:
+                        ALL_STOCKS = nse_eq
+                    else:
+                        log.warning("Too few instruments fetched — using hardcoded list")
+                else:
+                    log.warning(f"Instrument fetch failed: {r.status} — using hardcoded list")
+        except Exception as e:
+            log.warning(f"Could not fetch instruments: {e} — using hardcoded list")
+
+        log.info(f"📊 Total stocks to scan: {len(ALL_STOCKS)}")
+
+        # Step 2: Load instrument master to get correct API keys
+        await load_instrument_master(session)
+
+        # Step 2b: Add BSE-only stocks (not dual-listed on NSE) on top of
+        # the NSE-based universe above. Best-effort/additive — see
+        # load_bse_only_stocks' docstring.
+        await load_bse_only_stocks(session)
+
+        # Step 2 (validate): catch typo'd/wrong symbols in hand-maintained
+        # lists NOW, loudly, instead of them silently never getting real
+        # data for months (see: MAZAGON vs the real MAZDOCK).
+        validate_hardcoded_symbol_lists()
+
+        # Step 2a: Ensure all required DB columns exist
+        await ensure_db_columns(session)
+        # Step 2a-2: Ensure the best_picks table exists (AI Best Picks
+        # runs from inside run_scan on this service, not the fundamentals
+        # worker, since `processed` already has technicals+fundamentals
+        # merged here).
+        await ensure_best_picks_table(session)
+        await ensure_best_picks_history_table(session)
+        # Step 2b: Load Nifty 50 + all index histories
+        await load_nifty_cache(session)
+        await load_index_cache(session)
+        # Step 2c: Seed + load history
+        await seed_index_history_if_needed(session)
+        # Small wait to ensure DB write completes
+        await asyncio.sleep(2)
+        # Step 2d: Try external sources for Midcap/Smallcap only
+        await load_full_history_once(session)
+
+        # Step 3: Load historical data cache at startup
+        log.info("Loading historical data cache at startup…")
+        await load_historical_cache(session)
+
+        # Step 3b: Build synthetic Midcap/Smallcap indices AFTER history is loaded
+        global midcap_cache, smallcap_cache
+
+        # Build fresh from constituents
+        fresh_mid = build_synthetic_index(list(MIDCAP),   historical_cache, min_stocks=50)
+        fresh_sml = build_synthetic_index(list(SMALLCAP), historical_cache, min_stocks=80)
+
+        # Merge with accumulated DB history
+        db_mid = await load_index_history_from_db(session, "Midcap 150")
+        db_sml = await load_index_history_from_db(session, "Smallcap 250")
+
+        def merge_prices(db, fresh):
+            fp = fresh.get('prices', [])
+            if db and len(db) > len(fp):
+                return db[:-len(fp)] + fp
+            return fp
+
+        mid_prices = merge_prices(db_mid, fresh_mid)
+        sml_prices = merge_prices(db_sml, fresh_sml)
+
+        midcap_cache   = {'prices': mid_prices}
+        smallcap_cache = {'prices': sml_prices}
+
+        # Save back to DB
+        if mid_prices: await save_index_history_to_db(session, "Midcap 150",   mid_prices)
+        if sml_prices: await save_index_history_to_db(session, "Smallcap 250", sml_prices)
+
+        log.info(f"✅ Midcap index: {len(mid_prices)}d (DB had {len(db_mid)}d)")
+        log.info(f"✅ Smallcap index: {len(sml_prices)}d (DB had {len(db_sml)}d)")
+
+        # Step 3c: Load full 2yr history at startup — from Supabase first
+        # (fast, zero Yahoo calls), falling back to Yahoo only for symbols
+        # that are missing or stale. Previously this always re-fetched all
+        # ~2385 stocks from Yahoo on every single restart, which was slow
+        # and the main source of Yahoo rate-limit failures.
+        FULL_HISTORY_TIMEOUT = 1800  # 30 min ceiling if a large backfill is needed
+        try:
+            await asyncio.wait_for(load_history_at_startup(session), timeout=FULL_HISTORY_TIMEOUT)
+        except asyncio.TimeoutError:
+            log.error(f"⏱ Startup history load exceeded {FULL_HISTORY_TIMEOUT}s — continuing with partial data")
+        except Exception as e:
+            import traceback
+            log.error(f"Startup history load error: {e}\n{traceback.format_exc()}")
+
+        # One-time backfill of the historical advance/decline line, using
+        # the price history just loaded above — self-guards to skip if
+        # already populated, so this is cheap on every restart after the
+        # first successful run.
+        try:
+            await asyncio.wait_for(backfill_market_breadth_history(session), timeout=300)
+        except Exception as e:
+            log.warning(f"Market breadth backfill error (non-fatal): {e}")
+
+        try:
+            await asyncio.wait_for(backfill_ema_breadth_history(session), timeout=600)
+        except Exception as e:
+            log.warning(f"EMA breadth backfill error (non-fatal): {e}")
+
+        try:
+            await asyncio.wait_for(backfill_stock_history_30days(session), timeout=1500)
+        except asyncio.TimeoutError:
+            log.error("⏱ stock_history 30-day backfill exceeded 25 min — it should resume/skip completed "
+                      "days on next restart rather than starting over, since the guard checks total row count.")
+        except Exception as e:
+            log.warning(f"stock_history 30-day backfill error (non-fatal): {e}")
+
+        try:
+            await asyncio.wait_for(backfill_sector_history_30days(session), timeout=120)
+        except asyncio.TimeoutError:
+            log.error("⏱ sector_history backfill exceeded 2 min — unexpected, it's a pure aggregation "
+                      "over already-fetched stock_history, should resume/skip on next restart regardless.")
+        except Exception as e:
+            log.warning(f"sector_history backfill error (non-fatal): {e}")
+
+        try:
+            await asyncio.wait_for(backfill_index_history_30days(session), timeout=300)
+        except asyncio.TimeoutError:
+            log.error("⏱ index_history backfill exceeded 5 min — should resume/skip completed "
+                      "days on next restart via the same distinct-date guard as the others.")
+        except Exception as e:
+            log.warning(f"index_history backfill error (non-fatal): {e}")
+
+        # Step 3d: Load fundamentals — Supabase first, then a background
+        # scrape for anything missing/stale (not blocking, since a full
+        # scrape can take 8-15+ minutes and fundamentals aren't as
+        # time-critical as price data).
+        try:
+            await load_fundamentals_at_startup(session)
+        except Exception as e:
+            import traceback
+            log.error(f"Startup fundamentals load error: {e}\n{traceback.format_exc()}")
+
+        log.info("✅ Proceeding to initial scan…")
+
+
+        # Step 4: Run initial scan
+        SCAN_TIMEOUT = 900
+        ist_now_initial = datetime.now(IST)
+        if is_market_open():
+            initial_scan_type = 'live'
+        elif ist_now_initial.hour < 9 or (ist_now_initial.hour == 9 and ist_now_initial.minute < 15):
+            initial_scan_type = 'batch_morning'
+        else:
+            initial_scan_type = 'batch_eod'
+        log.info(f"Initial scan type detected: {initial_scan_type} (current time {ist_now_initial.strftime('%H:%M IST')})")
+        try:
+            await asyncio.wait_for(run_scan(session, initial_scan_type), timeout=SCAN_TIMEOUT)
+        except asyncio.TimeoutError:
+            log.error(f"⏱ Initial scan exceeded {SCAN_TIMEOUT}s timeout — aborting and continuing to main loop")
+
+        # NOTE: the legacy per-stock Yahoo "extend short history" background
+        # task is no longer needed here — load_history_at_startup()
+        # (called earlier, before the initial scan) already gives every
+        # stock full 2yr Yahoo OHLCV directly into historical_cache, which
+        # is a strict superset of what extend_stock_history_from_yahoo did.
+
+        last_scan = time.time()
+        scan_count = 0
+
+        while True:
+            try:
+                now = time.time()
+                elapsed = now - last_scan
+
+                # Cost gating: this loop previously ran full scans (hitting
+                # Upstox for ~2,400 stocks + writing to Supabase) every
+                # UPDATE_INTERVAL unconditionally, 24/7 — including nights
+                # and weekends, when nothing about the market is actually
+                # changing. is_scan_time() already existed (market hours +
+                # 30min buffer) but was never used to gate anything, only
+                # to pick a label. Now: scan normally during that window;
+                # outside it, still allow ONE more scan if today's EOD
+                # snapshot/digest hasn't run yet (so that still completes
+                # shortly after close), then go quiet with a long sleep
+                # instead of polling every 5s and burning compute for no
+                # reason.
+                today_check = datetime.now(IST).strftime('%Y-%m-%d')
+                eod_pending_today = last_eod_refresh_date != today_check
+                should_scan_now = is_scan_time() or eod_pending_today
+
+                if should_scan_now and elapsed >= UPDATE_INTERVAL:
+                    scan_type = 'live' if is_market_open() else 'batch_eod'
+                    try:
+                        await asyncio.wait_for(run_scan(session, scan_type), timeout=SCAN_TIMEOUT)
+                        scan_count += 1
+                    except asyncio.TimeoutError:
+                        log.error(f"⏱ Scan exceeded {SCAN_TIMEOUT}s timeout — skipping this cycle")
+                    except Exception as e:
+                        # Any other exception (bug, bad data, etc.) must NOT
+                        # be allowed to skip past last_scan's update below —
+                        # otherwise elapsed stays >= UPDATE_INTERVAL forever
+                        # and this becomes an instant, zero-delay retry loop
+                        # (which is exactly what happened once already: a
+                        # NameError crashed every scan attempt back-to-back,
+                        # multiple times per second, for as long as the bug
+                        # was live).
+                        import traceback
+                        log.error(f"Scan failed with unexpected error: {e}\n{traceback.format_exc()}")
+                    last_scan = time.time()
+
+                # Outside market hours with today's EOD already done: sleep
+                # long instead of polling every 5s. Still short enough to
+                # wake up promptly for tomorrow's pre-market window.
+                await asyncio.sleep(5 if should_scan_now else 1800)
+
+            except KeyboardInterrupt:
+                log.info("Shutting down…")
+                break
+            except Exception as e:
+                import traceback
+                log.error(f"Loop error: {e}\n{traceback.format_exc()}")
+                # Defense in depth: even if something outside run_scan itself
+                # throws (e.g. is_market_open(), the 5s sleep call site, etc.),
+                # back off before retrying instead of spinning immediately.
+                await asyncio.sleep(10)
