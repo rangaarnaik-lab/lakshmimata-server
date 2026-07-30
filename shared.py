@@ -433,6 +433,7 @@ _nse_announcements_debug_count = 0  # caps raw-response logging while verifying 
 _R2_STOCK_FIELDS = frozenset({
     'sym','rs','rs_tv','rs_nifty50','rs_midcap','rs_smallcap','rs_microcap','rs_sector',
     'last_price','chg_pct','high_52w','sector','industry','chg_w_pct','chg_m_pct',
+    'stop_loss','target',
     'in_nifty50','in_midcap','in_smallcap','in_microcap','rvol','ibv_signal',
     'is_resistance_breakout','is_52wh_breakout','resistance_r1',
     'is_cup_handle_breakout','has_cup_pattern','cup_depth_pct',

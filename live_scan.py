@@ -4200,11 +4200,25 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         _live_pe = (round(last / _cached_eps, 2)
                     if _cached_eps and last else _fc.get('pe'))
 
+        # Stop-loss/target — ATR-based (adapts to each stock's own
+        # volatility, rather than one flat % for every stock regardless
+        # of how choppy or calm it normally trades). 2×ATR below entry
+        # for stop-loss, 4×ATR above for target (a 2:1 reward:risk
+        # ratio) — standard, widely-used technical-analysis convention,
+        # not a guarantee of anything. These are quality-of-life
+        # reference levels, not a buy/sell instruction — same framing
+        # as the rest of this app's "not a recommendation" stance.
+        _atr_val = atr(s.get('highs') or prices, s.get('lows') or prices, prices, 20)
+        _stop_loss = round(last - 2 * _atr_val, 2) if _atr_val and last else None
+        _target = round(last + 4 * _atr_val, 2) if _atr_val and last else None
+
         processed.append({
             'sym':            sym,
             'weinstein_stage': weinstein_stage,
             'is_52wh_breakout': is_52wh_breakout,
             'last_price':     round(last, 2),
+            'stop_loss':      _stop_loss,
+            'target':         _target,
             'open':           round(live.get('ohlc', {}).get('open', last), 2),
             'high':           round(live.get('ohlc', {}).get('high', last), 2),
             'low':            round(live.get('ohlc', {}).get('low', last), 2),
@@ -4980,6 +4994,8 @@ async def save_best_picks(session: aiohttp.ClientSession, top_rows: list, reason
             'score': r.get('best_pick_score'),
             'reasoning': reasoning.get(r['sym']),
             'last_price': r.get('last_price'),
+            'stop_loss': r.get('stop_loss'),
+            'target': r.get('target'),
             'chg_pct': r.get('chg_pct'),
             'sector': r.get('sector'),
             'industry': r.get('industry'),
@@ -5052,6 +5068,8 @@ async def save_best_picks_history(session: aiohttp.ClientSession, top_rows: list
         'score': r.get('best_pick_score'),
         'reasoning': reasoning.get(r['sym']),
         'price_at_pick': r.get('last_price'),
+        'stop_loss': r.get('stop_loss'),
+        'target': r.get('target'),
         'sector': r.get('sector'),
         'market_cap': r.get('market_cap'),
         'generated_at': now_iso,
