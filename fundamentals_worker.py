@@ -43,7 +43,6 @@ async def _announcements_loop(session: aiohttp.ClientSession):
             log.error(f"Announcements loop cycle failed: {e}\n{traceback.format_exc()}")
         await asyncio.sleep(CHECK_INTERVAL)
 
-
 def _dedupe_by_key(rows: list, keys: tuple) -> list:
     """NSE feeds sometimes contain the same item twice in one response;
     Postgres rejects a bulk upsert that touches the same unique key twice
@@ -53,7 +52,6 @@ def _dedupe_by_key(rows: list, keys: tuple) -> list:
         k = tuple(str(r.get(x) or '') for x in keys)
         seen[k] = r
     return list(seen.values())
-
 
 def _extract_period_ended_from_text(text: str):
     """Pull the reporting period's end date straight out of an
@@ -109,7 +107,6 @@ def _extract_period_ended_from_text(text: str):
             continue
     return None
 
-
 def _extract_value_crore(text: str):
     """Best-effort extraction of a monetary value in ₹ crore from filing
     text — regex over the common Indian formats ('Rs. 450 crore',
@@ -135,7 +132,6 @@ def _extract_value_crore(text: str):
         if v > 0 and (best is None or v > best):
             best = v
     return best
-
 
 async def _fundamentals_loop(session: aiohttp.ClientSession):
     """Reuses fetch_upstox_fundamentals / fetch_fundamentals_screener /
@@ -169,7 +165,6 @@ async def _fundamentals_loop(session: aiohttp.ClientSession):
             log.error(f"Fundamentals loop cycle failed: {e}\n{traceback.format_exc()}")
         await asyncio.sleep(CHECK_INTERVAL)
 
-
 def _is_results_announcement(row: dict) -> bool:
     """Same category/subject matching the frontend's Results tab uses,
     kept in sync deliberately so 'what counts as a results filing' is
@@ -178,7 +173,6 @@ def _is_results_announcement(row: dict) -> bool:
     if any(x in text for x in _RESULTS_ANN_EXCLUDE):
         return False
     return any(x in text for x in _RESULTS_ANN_KEYWORDS)
-
 
 async def _market_cap_catchup_loop(session: aiohttp.ClientSession):
     """Runs hourly, separate from the once-daily FULL fundamentals
@@ -235,7 +229,6 @@ async def _market_cap_catchup_loop(session: aiohttp.ClientSession):
             log.error(f"Market cap catchup loop failed: {type(e).__name__}: {e}")
         await asyncio.sleep(CHECK_INTERVAL)
 
-
 def _norm_date(s):
     """NSE's two endpoints format the same date differently — the
     results LIST feed gives 'toDate' as e.g. '31-Dec-2024' (title-case
@@ -258,17 +251,6 @@ def _norm_date(s):
         except ValueError:
             continue
     return s.upper()  # last resort — at least case-insensitive
-
-# ── Direct XBRL parsing — a company's real filed numbers, structured,
-# available the moment the filing lands, rather than waiting on NSE's
-# separate results-comparision API to sync (confirmed via production
-# log: that sync can lag many hours behind the public announcement —
-# COFORGE's June-2026 numbers stayed unavailable there for 7+ hours
-# after the press release went public with the same figures). The
-# announcements feed only gives a hasXbrl boolean and the PDF link, not
-# the XBRL file itself — the real link lives in the results-LIST feed's
-# 'xbrl' field (see fetch_nse_financial_results), so this cross-
-# references that feed by symbol+period first.
 
 def _nse_local_to_utc_iso(raw) -> str:
     """NSE's timestamp fields (an_dt, broadCastDate, filingDate, etc.)
@@ -294,7 +276,6 @@ def _nse_local_to_utc_iso(raw) -> str:
         except ValueError:
             continue
     return raw
-
 
 async def _results_loop(session: aiohttp.ClientSession):
     """Polls NSE's structured financial-results feed every 30 min — new
@@ -361,7 +342,6 @@ async def _results_loop(session: aiohttp.ClientSession):
             log.error(f"Results loop error: {type(e).__name__}: {e}")
         await asyncio.sleep(CHECK_INTERVAL)
 
-
 async def backfill_announcements_history(session: aiohttp.ClientSession, days: int = 30):
     """One-time backfill of the last `days` days of NSE announcements,
     looped one day at a time (rather than a single wide date-range
@@ -388,8 +368,6 @@ async def backfill_announcements_history(session: aiohttp.ClientSession, days: i
             log.warning(f"  ⚠️ Backfill failed for {date_str}: {e}")
         await asyncio.sleep(2)  # polite pacing between days
     log.info(f"📚 Backfill complete: {total_saved} announcement-rows processed across {days} days")
-
-# ── NSE quarterly financial results (structured, no PDF parsing) ────────
 
 async def backfill_results_history(session: aiohttp.ClientSession, days: int = 30):
     """One-time backfill of quarterly results filed in the last `days`
@@ -437,8 +415,6 @@ async def backfill_results_history(session: aiohttp.ClientSession, days: int = 3
             log.info(f"  📚 Results backfill numbers: {i+1}/{min(cap,len(rows))} fetched…")
     await save_financial_results_to_db(session, rows)
     log.info(f"📚 Results backfill complete: {len(rows)} filings saved, numbers filled for {filled}")
-
-# ── Main loop ─────────────────────────────────────────────────────────
 
 async def enrich_and_save_announcements(session: aiohttp.ClientSession, rows: list):
     """Wraps save_announcements_to_db with sector/industry/market_cap
@@ -505,7 +481,6 @@ async def enrich_and_save_announcements(session: aiohttp.ClientSession, rows: li
                  f"({len(results_rows)} results-type announcement(s) this batch, "
                  f"{len(results_rows)-attempted} skipped via cooldown)")
 
-
 def enrich_announcement_row(row: dict) -> dict:
     """Stamps one announcement row with the stock's sector, industry, and
     market cap (₹ Cr) so the frontend can filter the Announcements tab by
@@ -518,46 +493,6 @@ def enrich_announcement_row(row: dict) -> dict:
     row['industry'] = get_industry(sym) if sym else None
     row['market_cap'] = fundamentals_cache.get(sym, {}).get('market_cap') if sym else None
     return row
-
-_ANN_POSITIVE_PATTERNS = [
-    'award of order', 'work order', 'purchase order', 'order worth', 'order valued',
-    'bagged', 'bagging', 'receiving of order', 'receipt of order', 'receiving of contract',
-    'receipt of contract', 'secures order', 'secured order', 'wins order', 'won order', 'new order',
-    'letter of intent', 'contract awarded', 'awarded a contract', 'received an order',
-    'order received from', 'capacity expansion', 'commercial production', 'usfda',
-    'approval received', 'patent granted', 'buyback', 'bonus issue', 'stock split',
-    'reduced to nil', 'in favour of the company', 'in favor of the company',
-    'settled in favour', 'demand quashed', 'preferential allotment completed',
-]
-_ANN_NEGATIVE_PATTERNS = [
-    'resignation of', 'resigned', 'penalty', 'show cause', 'gst demand', 'tax demand',
-    'demand order', 'search and seizure', 'default', 'downgrade', 'fire at', 'accident at',
-    'plant shutdown', 'suspension of operations', 'insolvency', 'nclt admission',
-    'fraud', 'auditor has resigned', 'pledge of shares', 'shares pledged',
-    'disqualified', 'sebi order against', 'debarred',
-    'cancellation of order', 'cancellation of work order', 'cancellation of purchase order',
-    'order cancelled', 'work order cancelled', 'purchase order cancelled',
-    'cancellation of contract', 'contract cancelled', 'termination of contract',
-    'contract terminated', 'termination of work order', 'work order terminated',
-    'rescission of', 'order rescinded', 'contract rescinded', 'order withdrawn',
-    'withdrawal of order', 'loss of order', 'order lost', 'annulment of',
-]
-# Order-win phrases (_ORDER_WIN_PATTERNS below) can appear inside the text of
-# an order CANCELLATION too — e.g. "Cancellation of Work Order by Reliance
-# Industries Limited" contains "work order". Any row matching one of these
-# cancel/termination phrases must never be treated as an order win, no matter
-# what else it contains. Kept in sync with _ANN_NEGATIVE_PATTERNS' cancel
-# terms above (a superset — this one doesn't need the resignation/penalty/etc
-# entries that are irrelevant to order-win detection).
-_ORDER_CANCEL_PATTERNS = [
-    'cancellation of order', 'cancellation of work order', 'cancellation of purchase order',
-    'order cancelled', 'work order cancelled', 'purchase order cancelled',
-    'cancellation of contract', 'contract cancelled', 'termination of contract',
-    'contract terminated', 'termination of work order', 'work order terminated',
-    'rescission of', 'order rescinded', 'contract rescinded', 'order withdrawn',
-    'withdrawal of order', 'loss of order', 'order lost', 'annulment of',
-]
-
 
 async def ensure_announcements_table(session: aiohttp.ClientSession,
                                       retries: int = 6, delay: float = 10.0) -> bool:
@@ -584,7 +519,6 @@ async def ensure_announcements_table(session: aiohttp.ClientSession,
             log.error(f"corporate_announcements table check failed: {e}")
             return False
     return False
-
 
 async def fetch_and_parse_xbrl(session: aiohttp.ClientSession, url: str, debug: bool = False) -> dict:
     """Downloads and parses an NSE XBRL filing directly — structured
@@ -647,7 +581,6 @@ async def fetch_and_parse_xbrl(session: aiohttp.ClientSession, url: str, debug: 
         result['eps'] = round(eps, 2)
     return result
 
-
 async def fetch_and_save_result_for_announcement(session: aiohttp.ClientSession, headers: dict,
                                                   row: dict, debug: bool = False) -> bool:
     """Given ONE results-type announcement, fetch that stock's numbers
@@ -682,7 +615,6 @@ async def fetch_and_save_result_for_announcement(session: aiohttp.ClientSession,
         result_row.update({k: v for k, v in nums.items() if v is not None})
     await save_financial_results_to_db(session, [result_row])
     return bool(nums)
-
 
 async def fetch_nse_announcements(session: aiohttp.ClientSession, debug: bool = False) -> list:
     """
@@ -770,7 +702,6 @@ async def fetch_nse_announcements(session: aiohttp.ClientSession, debug: bool = 
         })
     return results
 
-
 async def fetch_nse_announcements_for_range(session: aiohttp.ClientSession, from_date: str,
                                              to_date: str, debug: bool = False) -> list:
     """Same NSE corporate-announcements endpoint as fetch_nse_announcements,
@@ -824,7 +755,6 @@ async def fetch_nse_announcements_for_range(session: aiohttp.ClientSession, from
             'announced_at': _nse_local_to_utc_iso(announced_at),
         })
     return results
-
 
 async def fetch_nse_financial_results(session: aiohttp.ClientSession, debug: bool = False,
                                       from_date: str = None, to_date: str = None) -> list:
@@ -893,7 +823,6 @@ async def fetch_nse_financial_results(session: aiohttp.ClientSession, debug: boo
                                             # can tell "no XBRL" apart from "has a PDF instead".
         })
     return results
-
 
 async def fetch_nse_results_numbers(session: aiohttp.ClientSession, headers: dict,
                                     symbol: str, period_ended: str, debug: bool = False) -> dict:
@@ -970,7 +899,6 @@ async def fetch_nse_results_numbers(session: aiohttp.ClientSession, headers: dic
                  f"among {len(items)} item(s), available periods={sorted(set(available_periods))}")
     return {}
 
-
 async def fetch_xbrl_url_for_symbol(session: aiohttp.ClientSession, symbol: str,
                                      period_ended: str, debug: bool = False) -> str:
     """Searches the last few days of the results-LIST feed (day-by-day
@@ -1001,20 +929,6 @@ async def fetch_xbrl_url_for_symbol(session: aiohttp.ClientSession, symbol: str,
         log.info(f"  📄 {symbol} not found in results-list feed at all across the last 3 days — "
                  f"either it hasn't synced there yet, or this filing type isn't in that feed.")
     return None
-
-# Candidate XBRL element local-names (namespace-agnostic — matched by
-# tag name only, ignoring the namespace prefix, since different filers
-# can use different taxonomy namespaces for conceptually the same
-# concept). These are best-effort guesses at standard Ind-AS/SEBI XBRL
-# taxonomy names; logged verbatim on first use so they can be
-# verified/corrected against a real filing, same pattern used for
-# every other NSE field-mapping in this file.
-_XBRL_SALES_TAGS = ['RevenueFromOperations', 'Revenue', 'TotalIncome', 'IncomeFromOperations']
-_XBRL_PAT_TAGS = ['ProfitLossForPeriod', 'ProfitLoss', 'NetProfitLoss',
-                  'ProfitLossForPeriodFromContinuingOperations']
-_XBRL_EPS_TAGS = ['BasicEarningsLossPerShareFromContinuingAndDiscontinuedOperations',
-                  'BasicEarningsPerShare', 'BasicEPS']
-
 
 async def fundamentals_worker_main():
     """
@@ -1057,7 +971,6 @@ async def fundamentals_worker_main():
             _results_loop(session),
         )
 
-
 def rate_announcements_free(rows: list) -> list:
     """Zero-cost rule-based fallback for when ANTHROPIC_API_KEY isn't
     set: keyword rules for positive/negative/neutral, plus regex value
@@ -1082,7 +995,6 @@ def rate_announcements_free(rows: list) -> list:
             else:
                 r['ai_summary'] = f"₹{val:,.0f} Cr mentioned in filing"
     return rows
-
 
 async def rate_announcements_with_ai(session: aiohttp.ClientSession, rows: list) -> list:
     """Tags each announcement with an AI sentiment rating ('positive' /
@@ -1157,15 +1069,6 @@ async def rate_announcements_with_ai(session: aiohttp.ClientSession, rows: list)
         log.warning(f"⚠️ AI rating failed ({type(e).__name__}: {e}) — saving unrated")
     return rows
 
-_ORDER_WIN_PATTERNS = [
-    'award of order', 'work order', 'purchase order', 'order worth', 'order valued',
-    'bagged', 'bagging', 'receiving of order', 'receipt of order', 'receiving of contract',
-    'receipt of contract', 'secures order', 'secured order', 'wins order', 'won order', 'new order',
-    'letter of intent', 'contract awarded', 'awarded a contract', 'received an order',
-    'order received from',
-]
-
-
 async def save_announcements_to_db(session: aiohttp.ClientSession, rows: list):
     """Upsert on (symbol, subject, announced_at) so re-fetching the same
     announcement across polling cycles doesn't create duplicates."""
@@ -1189,8 +1092,6 @@ async def save_announcements_to_db(session: aiohttp.ClientSession, rows: list):
                 log.info(f"  📢 Upserted {len(rows)} announcements to Supabase")
     except Exception as e:
         log.warning(f"⚠️ Announcements upsert exception: {e}")
-
-
 
 async def save_financial_results_to_db(session: aiohttp.ClientSession, rows: list):
     """Upserts structured quarterly results on (symbol, period_ended,
@@ -1220,7 +1121,6 @@ async def save_financial_results_to_db(session: aiohttp.ClientSession, rows: lis
                 log.warning(f"⚠️ Financial results upsert failed ({r.status}): {body[:300]}")
     except Exception as e:
         log.warning(f"⚠️ Financial results upsert error: {type(e).__name__}: {e}")
-
 
 def tag_order_size(rows: list) -> list:
     """For business order-win announcements, tags order_size as
@@ -1261,4 +1161,3 @@ def tag_order_size(rows: list) -> list:
             # session before the market-cap fixes.
             r['order_size'] = 'big' if val >= 500 else 'medium' if val >= 50 else 'small'
     return rows
-
