@@ -5323,8 +5323,18 @@ async def load_instrument_master(session: aiohttp.ClientSession):
                 # fallback we built for Yahoo-failing symbols could never
                 # work for them, since that fallback depends entirely on
                 # instrument_key_map having a real entry.
+                #
+                # SEPARATE BUG FOUND while investigating a different
+                # missing-stock report: the old code did
+                # .replace('-EQ','').replace('EQ','') — that second
+                # blanket replace strips 'EQ' from ANYWHERE in the
+                # symbol, not just the '-EQ' suffix Upstox actually adds.
+                # Any real ticker containing 'EQ' as a substring (not at
+                # the end) would get silently corrupted. Fixed to only
+                # strip a genuine trailing '-EQ'.
                 for item in data:
-                    sym = item.get('trading_symbol', '').replace('-EQ', '').replace('EQ', '')
+                    raw_sym = item.get('trading_symbol', '')
+                    sym = raw_sym[:-3] if raw_sym.endswith('-EQ') else raw_sym
                     itype = item.get('instrument_type', '')
                     exch = item.get('exchange', '')
                     key = item.get('instrument_key', '')
@@ -5332,6 +5342,18 @@ async def load_instrument_master(session: aiohttp.ClientSession):
                         instrument_key_map[sym] = key
 
                 log.info(f"✅ Instrument master loaded: {len(instrument_key_map)} EQ+ETF instruments")
+                # Diagnostic for tracking down specific missing-stock
+                # reports (e.g. COFORGE silently dropping out of the
+                # live scan for days with no error) — logs whether a
+                # short watchlist of previously-reported symbols made it
+                # into the map this run, without spamming the log for
+                # the full ~2400-symbol universe.
+                _watch_syms = ['COFORGE']
+                _missing_watch = [s for s in _watch_syms if s not in instrument_key_map]
+                if _missing_watch:
+                    log.warning(f"⚠️ Symbols missing from instrument_key_map this run: {_missing_watch}")
+                else:
+                    log.info(f"  ✓ Watchlist symbols present in instrument_key_map: {_watch_syms}")
 
                 # Update ALL_STOCKS to only include stocks we have keys for
                 if len(instrument_key_map) > 100:
