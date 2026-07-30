@@ -5081,13 +5081,21 @@ async def save_best_picks_history(session: aiohttp.ClientSession, top_rows: list
         # today, so this PATCH is what keeps rank/reasoning current
         # through the day without touching price_at_pick).
         patch_headers = {**headers, "Prefer": "return=minimal"}
-        for r in top_rows:
+        for i, r in enumerate(top_rows):
             async with session.patch(
                 f"{SUPABASE_URL}/rest/v1/best_picks_history",
                 headers=patch_headers,
                 params={"symbol": f"eq.{r['sym']}", "picked_date": f"eq.{picked_date}"},
                 json={
-                    'rank': top_rows.index(r) + 1,
+                    'rank': i + 1,  # was top_rows.index(r) + 1 - a fragile, sometimes-
+                                    # wrong search for r's position that could return a
+                                    # DIFFERENT stock's index if any two entries happened
+                                    # to compare equal. Confirmed in production: Track
+                                    # Record showed multiple different stocks sharing the
+                                    # same rank (#1 appearing twice, #8 appearing four
+                                    # times). enumerate() gives the correct position
+                                    # directly, matching what the initial insert above
+                                    # already does correctly.
                     'score': r.get('best_pick_score'),
                     'reasoning': reasoning.get(r['sym']),
                 },
