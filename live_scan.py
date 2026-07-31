@@ -3041,14 +3041,19 @@ async def load_all_history_from_supabase(session: aiohttp.ClientSession) -> list
                 history_dates_cache[sym] = dates
                 loaded += 1
 
-                # Freshness check — allow up to 4 calendar days back so
-                # weekends/the odd market holiday don't falsely flag as stale.
+                # Freshness check — 7 days (roughly weekly), so this bulk
+                # Yahoo re-fetch runs on a predictable weekly-ish cadence
+                # rather than re-triggering on every restart whenever a
+                # weekend alone pushes the last stored date a few days
+                # back. Chart history doesn't need to be fresher than
+                # this — it's for the 6M/1Y/2Y chart range views, not
+                # live scanning (which is entirely Upstox, unaffected).
                 last_date_str = dates[-1] if dates else None
                 is_stale = True
                 if last_date_str:
                     try:
                         last_date = datetime.strptime(last_date_str, '%Y-%m-%d').date()
-                        is_stale = (today - last_date).days > 4
+                        is_stale = (today - last_date).days > 7
                     except Exception:
                         is_stale = True
                 if is_stale:
