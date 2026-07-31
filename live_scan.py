@@ -3369,11 +3369,31 @@ async def load_index_cache(session: aiohttp.ClientSession):
                                    "NSE_INDEX|NIFTY TRANSPORTATION AND LOGISTICS"],
         "IPO":                ["NSE_INDEX|Nifty IPO", "NSE_INDEX|NIFTY IPO"],
     }
+    def _norm_index_name_lookup(s):
+        s = (s or '').lower().strip()
+        s = s.replace('&', 'and')
+        s = re.sub(r'\s+', ' ', s)
+        return s
+
     for name, ikey in INDEX_TRACKER.items():
         # Try primary key, then alternatives
         keys_to_try = KEY_ALTERNATIVES.get(name, [ikey])
         if ikey not in keys_to_try:
             keys_to_try = [ikey] + keys_to_try
+        # Confirmed-correct key first, if Upstox's own instrument master
+        # (index_key_map, built in load_instrument_master from the same
+        # NSE.json.gz file we already fetch) has a match for any of our
+        # already-curated name variants — replaces guessing blind
+        # against the historical-candle endpoint, which was confirmed
+        # failing for ~10 thematic sector indices even after trying
+        # several hand-written variants each.
+        resolved_keys = []
+        for k in keys_to_try:
+            bare_name = k.split('|', 1)[-1] if '|' in k else k
+            match = index_key_map.get(_norm_index_name_lookup(bare_name))
+            if match and match not in resolved_keys:
+                resolved_keys.append(match)
+        keys_to_try = resolved_keys + [k for k in keys_to_try if k not in resolved_keys]
         success = False
         for try_key in keys_to_try:
             encoded = try_key.replace('|', '%7C').replace(' ', '%20').replace('&', '%26')
