@@ -122,6 +122,7 @@ __all__ = [
     'historical_cache',
     'history_dates_cache',
     'index_history_cache',
+    'index_key_map',
     'instrument_key_map',
     'is_market_open',
     'json',
@@ -547,6 +548,9 @@ NIFTY50_SEED_PRICES = [12182.5, 12282.2, 12226.65, 11993.05, 12052.95, 12025.35,
 
 # ── Full 2yr history → Supabase (all stocks, at startup) ──────────────
 instrument_key_map: dict = {} # sym -> full instrument key (e.g. NSE_EQ|INE002A01018)
+index_key_map: dict = {}     # normalized index name -> instrument key (e.g. NSE_INDEX|...) —
+                              # built alongside instrument_key_map in load_instrument_master,
+                              # replaces guessing text variants for thematic sector indices
 
 # ── Main scan function ────────────────────────────────────────────────
 # ============================================================
@@ -1558,6 +1562,42 @@ async def load_instrument_master(session: aiohttp.ClientSession):
                     log.warning(f"⚠️ Symbols missing from instrument_key_map this run: {_missing_watch}")
                 else:
                     log.info(f"  ✓ Watchlist symbols present in instrument_key_map: {_watch_syms}")
+
+                # ── Index key lookup — replaces guessing text variants
+                # ('Nifty EV & New Age Automotive' vs 'NIFTY EV AND NEW
+                # AGE AUTOMOTIVE' etc.) against the historical-candle
+                # endpoint, which was confirmed failing for ~10 thematic
+                # sector indices (Digital, EV & New Age Auto, Tourism,
+                # Capital Markets, Railways, Internet, Services, REITs &
+                # InvITs, Infra & Logistics, Transport & Logistics — all
+                # silently falling back to Nifty as their RS benchmark).
+                # This same already-fetched NSE.json.gz file includes
+                # NSE_INDEX entries with the real, confirmed-correct key
+                # — no more guessing needed for any index actually
+                # present here. Normalized (lowercase, whitespace/&/and
+                # collapsed) so 'Nifty EV & New Age Automotive' and
+                # 'NIFTY EV AND NEW AGE AUTOMOTIVE' match the same entry
+                # regardless of which exact casing/wording Upstox uses.
+                def _norm_index_name(s):
+                    s = (s or '').lower().strip()
+                    s = s.replace('&', 'and')
+                    s = re.sub(r'\s+', ' ', s)
+                    return s
+
+                index_key_map.clear()
+                _index_debug_sample = []
+                for item in data:
+                    itype = item.get('instrument_type', '')
+                    seg = item.get('segment', '')
+                    key = item.get('instrument_key', '')
+                    name = item.get('name') or item.get('trading_symbol', '')
+                    if (itype == 'INDEX' or seg == 'NSE_INDEX') and name and key:
+                        index_key_map[_norm_index_name(name)] = key
+                        if len(_index_debug_sample) < 15:
+                            _index_debug_sample.append({'name': name, 'key': key, 'type': itype, 'segment': seg})
+                log.info(f"  📇 Index key lookup built: {len(index_key_map)} indices "
+                         f"(sample: {json.dumps(_index_debug_sample[:8])})")
+
 
                 # Update ALL_STOCKS to only include stocks we have keys for
                 if len(instrument_key_map) > 100:
