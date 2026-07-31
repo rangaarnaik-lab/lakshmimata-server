@@ -2555,9 +2555,24 @@ async def fetch_full_nifty_history(session: aiohttp.ClientSession) -> dict:
 
 async def fetch_historical(session: aiohttp.ClientSession, sym: str,
                            instrument_key: str = None) -> dict:
-    """Fetch 15 months of daily historical data for one stock."""
+    """Fetch historical daily data for one stock, feeding historical_cache
+    (used for RS/pattern/technical calculations — NOT the same as the
+    separate 2-year stock_full_history table used for charting, which
+    intentionally stays at its own longer length).
+
+    Window reduced from 550 to 400 calendar days (2026-07-31) as a real
+    cost optimization — confirmed via grep that the deepest lookback
+    ANY calculation in this file actually uses is 300 TRADING days
+    (RS/52-week-high-low windows all slice [-300:] or [-252:]). 400
+    calendar days covers ~285-290 trading days after accounting for
+    weekends/NSE holidays — a safe buffer above 300, while meaningfully
+    cutting both historical_cache's memory footprint (held for all
+    ~2400 stocks continuously) and network egress (less data fetched
+    per stock on every call), both confirmed as real cost drivers via
+    Railway's own cost breakdown (egress was the single largest line
+    item, memory the second)."""
     to   = datetime.now(IST).strftime('%Y-%m-%d')
-    from_= (datetime.now(IST) - timedelta(days=550)).strftime('%Y-%m-%d')
+    from_= (datetime.now(IST) - timedelta(days=400)).strftime('%Y-%m-%d')
 
     # Use provided instrument_key or build from symbol
     key = instrument_key if instrument_key else f"NSE_EQ|{sym}"
