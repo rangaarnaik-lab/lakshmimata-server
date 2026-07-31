@@ -4999,6 +4999,26 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         except Exception as e:
             log.warning(f"Daily index_history backfill retry error (non-fatal): {e}")
 
+        # Yahoo 2yr chart-history backfill — runs ONLY on Sundays, per
+        # user request for a predictable, once-a-week schedule rather
+        # than the staleness-threshold approach alone (which could still
+        # fire on any day depending on exact restart/staleness timing).
+        # This whole block already only runs once per day (inside
+        # is_first_eod_today), so no separate "already ran this Sunday"
+        # tracking is needed — the day-of-week check below is sufficient.
+        if datetime.now(IST).weekday() == 6:  # Monday=0 ... Sunday=6
+            try:
+                stale_or_missing = await load_all_history_from_supabase(session)
+                if stale_or_missing:
+                    log.info(f"📅 Sunday Yahoo history backfill: {len(stale_or_missing)} stocks due")
+                    await asyncio.wait_for(
+                        fetch_full_history_for_symbols(session, stale_or_missing, label="sunday-weekly"),
+                        timeout=1800)
+                else:
+                    log.info("📅 Sunday Yahoo history backfill: nothing stale, skipping")
+            except Exception as e:
+                log.warning(f"Sunday Yahoo history backfill error (non-fatal): {e}")
+
         # Send daily Telegram digest at EOD
         if breadth:
             await send_daily_digest(session, processed, breadth)
