@@ -1193,6 +1193,7 @@ async def fetch_nse_results_numbers(session: aiohttp.ClientSession, headers: dic
 
     target_period = _norm_date(period_ended)
     available_periods = []
+    matching_items = []
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -1201,6 +1202,20 @@ async def fetch_nse_results_numbers(session: aiohttp.ClientSession, headers: dic
             available_periods.append(p)
         if p and target_period and _norm_date(p) != target_period:
             continue
+        matching_items.append(item)
+    if len(matching_items) > 1:
+        # This endpoint has NO confirmed standalone/consolidated field
+        # yet - if multiple items match the same period, this logs all
+        # of them so the actual distinguishing field can be identified
+        # from real data, rather than blindly using whichever NSE
+        # returns first (which may not be Consolidated, and may not be
+        # consistent across symbols/requests). Unconditional (not
+        # debug-gated) since this only fires on actual duplicates and
+        # the data-accuracy stakes justify always capturing it.
+        log.info(f"  ⚠️ results-comparision {symbol}: {len(matching_items)} items match period "
+                 f"{target_period} - possible standalone/consolidated duplicate, using first: "
+                 f"{json.dumps(matching_items)[:2000]}")
+    for item in matching_items[:1]:
         # Verified from raw response (VIDEOIND, 25-Jul log): fields are
         # re_-prefixed and values are in ₹ LAKHS (re_con_pro_loss
         # -248985.6 ≈ ₹-2,490 Cr matches Videocon's real losses), so
