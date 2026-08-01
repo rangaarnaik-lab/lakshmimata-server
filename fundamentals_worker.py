@@ -717,16 +717,19 @@ async def fetch_and_parse_xbrl(session: aiohttp.ClientSession, url: str,
         # all) since it actually confirms the value's context date
         # matches the period being saved.
         sales = value_near_date(_XBRL_SALES_TAGS, norm_period)
+        pbt = value_near_date(_XBRL_PBT_TAGS, norm_period)
         pat = value_near_date(_XBRL_PAT_TAGS, norm_period)
         eps = value_near_date(_XBRL_EPS_TAGS, norm_period)
     else:
-        sales, pat, eps = None, None, None
+        sales, pbt, pat, eps = None, None, None, None
     # Fall back to the old naive approach only for whatever the
     # context-aware pass didn't find (including entirely, if
     # period_ended wasn't given or no contexts existed) - preserves
     # prior behavior as a safety net rather than a regression.
     if sales is None:
         sales = first_matching(_XBRL_SALES_TAGS)
+    if pbt is None:
+        pbt = first_matching(_XBRL_PBT_TAGS)
     if pat is None:
         pat = first_matching(_XBRL_PAT_TAGS)
     if eps is None:
@@ -737,6 +740,8 @@ async def fetch_and_parse_xbrl(session: aiohttp.ClientSession, url: str,
     result = {}
     if sales is not None:
         result['sales'] = round(sales / 1e7, 2)
+    if pbt is not None:
+        result['pbt'] = round(pbt / 1e7, 2)
     if pat is not None:
         result['pat'] = round(pat / 1e7, 2)
     if eps is not None:
@@ -778,13 +783,16 @@ async def fetch_and_parse_xbrl(session: aiohttp.ClientSession, url: str,
             except (ValueError, TypeError):
                 continue
             c_sales = value_near_date(_XBRL_SALES_TAGS, comp_date)
+            c_pbt = value_near_date(_XBRL_PBT_TAGS, comp_date)
             c_pat = value_near_date(_XBRL_PAT_TAGS, comp_date)
             c_eps = value_near_date(_XBRL_EPS_TAGS, comp_date)
-            if c_sales is None and c_pat is None and c_eps is None:
+            if c_sales is None and c_pbt is None and c_pat is None and c_eps is None:
                 continue
             comp_row = {'period_ended': comp_date, '_comparison_type': label}
             if c_sales is not None:
                 comp_row['sales'] = round(c_sales / 1e7, 2)
+            if c_pbt is not None:
+                comp_row['pbt'] = round(c_pbt / 1e7, 2)
             if c_pat is not None:
                 comp_row['pat'] = round(c_pat / 1e7, 2)
             if c_eps is not None:
@@ -825,7 +833,7 @@ async def fetch_and_save_result_for_announcement(session: aiohttp.ClientSession,
         'symbol': symbol,
         'period_ended': period_ended,
         'result_type': 'Consolidated',
-        'sales': None, 'pat': None, 'eps': None,
+        'sales': None, 'pbt': None, 'pat': None, 'eps': None,
         'filed_at': row.get('announced_at'),
         'attachment_url': row.get('attachment_url'),
     }
@@ -842,7 +850,7 @@ async def fetch_and_save_result_for_announcement(session: aiohttp.ClientSession,
             'symbol': symbol,
             'period_ended': comp['period_ended'],
             'result_type': 'Consolidated',
-            'sales': comp.get('sales'), 'pat': comp.get('pat'), 'eps': comp.get('eps'),
+            'sales': comp.get('sales'), 'pbt': comp.get('pbt'), 'pat': comp.get('pat'), 'eps': comp.get('eps'),
             'filed_at': row.get('announced_at'),
             'attachment_url': row.get('attachment_url'),
         })
