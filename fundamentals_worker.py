@@ -751,6 +751,11 @@ async def fetch_and_parse_xbrl(session: aiohttp.ClientSession, url: str,
         result['pat'] = round(pat / 1e7, 2)
     if eps is not None:
         result['eps'] = round(eps, 2)
+    # OPM% = (PBT - Other Income) / Sales * 100 - strips out non-
+    # operating gains (interest income, one-time items) to show the
+    # margin the CORE business actually earned this period.
+    if result.get('sales') and result.get('pbt') is not None and result.get('other_income') is not None and result['sales'] != 0:
+        result['opm_pct'] = round((result['pbt'] - result['other_income']) / result['sales'] * 100, 2)
 
     # Comparison periods from THIS SAME filing (see docstring) - only
     # attempted when period_ended and real context dates are available.
@@ -805,6 +810,8 @@ async def fetch_and_parse_xbrl(session: aiohttp.ClientSession, url: str,
                 comp_row['pat'] = round(c_pat / 1e7, 2)
             if c_eps is not None:
                 comp_row['eps'] = round(c_eps, 2)
+            if comp_row.get('sales') and comp_row.get('pbt') is not None and comp_row.get('other_income') is not None and comp_row['sales'] != 0:
+                comp_row['opm_pct'] = round((comp_row['pbt'] - comp_row['other_income']) / comp_row['sales'] * 100, 2)
             comparisons.append(comp_row)
     if comparisons:
         result['comparisons'] = comparisons
@@ -841,7 +848,7 @@ async def fetch_and_save_result_for_announcement(session: aiohttp.ClientSession,
         'symbol': symbol,
         'period_ended': period_ended,
         'result_type': 'Consolidated',
-        'sales': None, 'other_income': None, 'pbt': None, 'pat': None, 'eps': None,
+        'sales': None, 'other_income': None, 'pbt': None, 'pat': None, 'eps': None, 'opm_pct': None,
         'filed_at': row.get('announced_at'),
         'attachment_url': row.get('attachment_url'),
     }
@@ -859,7 +866,7 @@ async def fetch_and_save_result_for_announcement(session: aiohttp.ClientSession,
             'period_ended': comp['period_ended'],
             'result_type': 'Consolidated',
             'sales': comp.get('sales'), 'other_income': comp.get('other_income'),
-            'pbt': comp.get('pbt'), 'pat': comp.get('pat'), 'eps': comp.get('eps'),
+            'pbt': comp.get('pbt'), 'pat': comp.get('pat'), 'eps': comp.get('eps'), 'opm_pct': comp.get('opm_pct'),
             'filed_at': row.get('announced_at'),
             'attachment_url': row.get('attachment_url'),
         })
