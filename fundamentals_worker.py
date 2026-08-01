@@ -1210,8 +1210,30 @@ async def fetch_nse_results_numbers(session: aiohttp.ClientSession, headers: dic
                        're_total_inc', 'income', 'net_sales', 'revenue', 'totalIncome')
         pat_l = _num(item, 're_con_pro_loss', 're_pro_loss_aft_tax', 'proLossAftTax',
                      'netProfitLoss', 'pat')
+        # PBT via a direct field if this endpoint happens to have one,
+        # otherwise derived from PAT + tax components - PBT = PAT +
+        # Current Tax + Deferred Tax is a reliable accounting identity
+        # (confirmed fields present in a real response: re_curr_tax,
+        # re_deff_tax), safer than guessing a PBT field name that may
+        # not exist on this particular endpoint at all.
+        pbt_direct_l = _num(item, 're_pbt', 're_profit_before_tax', 're_pro_bef_tax')
+        curr_tax_l = _num(item, 're_curr_tax')
+        deff_tax_l = _num(item, 're_deff_tax')
+        if pbt_direct_l is not None:
+            pbt_l = pbt_direct_l
+        elif pat_l is not None and curr_tax_l is not None:
+            pbt_l = pat_l + curr_tax_l + (deff_tax_l or 0)
+        else:
+            pbt_l = None
+        other_income_l = _num(item, 're_other_income', 're_oth_inc', 'otherIncome')
+        if debug:
+            log.info(f"  🔍 results-comparision {symbol} PBT/other_income fields: "
+                     f"pbt_direct={pbt_direct_l}, curr_tax={curr_tax_l}, deff_tax={deff_tax_l}, "
+                     f"other_income={other_income_l}")
         return {
             'sales': round(sales_l / 100.0, 2) if sales_l is not None else None,
+            'other_income': round(other_income_l / 100.0, 2) if other_income_l is not None else None,
+            'pbt': round(pbt_l / 100.0, 2) if pbt_l is not None else None,
             'pat': round(pat_l / 100.0, 2) if pat_l is not None else None,
             'eps': _num(item, 're_basic_eps', 're_basic_eps_for_cont_dic_opr', 'eps',
                         'basicEPS', 're_dil_eps', 'diluted_eps'),
