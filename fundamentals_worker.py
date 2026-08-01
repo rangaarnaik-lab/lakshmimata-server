@@ -362,11 +362,40 @@ async def _results_loop(session: aiohttp.ClientSession):
                              >= _RESULTS_ATTEMPT_COOLDOWN_SEC][:25]
                 for i, r in enumerate(to_fill):
                     _results_attempt_times[(r['symbol'], r['period_ended'])] = now_ts
-                    nums = await fetch_nse_results_numbers(
-                        session, headers, r['symbol'], r['period_ended'], debug=(debug and i < 2))
+                    nums = {}
+                    xbrl_url = r.get('xbrl_url')
+                    if not xbrl_url:
+                        xbrl_url = await fetch_xbrl_url_for_symbol(session, r['symbol'], r['period_ended'], debug=(debug and i < 2))
+                    if xbrl_url:
+                        nums = await fetch_and_parse_xbrl(session, xbrl_url, period_ended=r['period_ended'], debug=(debug and i < 2))
+                    if not nums:
+                        nums = await fetch_nse_results_numbers(
+                            session, headers, r['symbol'], r['period_ended'], debug=(debug and i < 2))
+                    comps = nums.pop('comparisons', []) if nums else []
+                    for comp in comps:
+                        rows.append({
+                            'symbol': r['symbol'], 'period_ended': comp['period_ended'],
+                            'result_type': r.get('result_type') or 'Consolidated',
+                            'sales': comp.get('sales'), 'other_income': comp.get('other_income'),
+                            'pbt': comp.get('pbt'), 'pat': comp.get('pat'), 'eps': comp.get('eps'),
+                            'opm_pct': comp.get('opm_pct'),
+                            'filed_at': r.get('filed_at'), 'attachment_url': r.get('attachment_url'),
+                        })
                     if nums:
                         r.update({k: v for k, v in nums.items() if v is not None})
+                    # xbrl_url was only ever an internal lookup hint, never
+                    # a real column - PostgREST rejects the entire batch
+                    # upsert if any row carries an unknown column.
+                    # Confirmed in production: this was silently failing
+                    # every save from this loop (400 PGRST204).
+                    r.pop('xbrl_url', None)
                     await asyncio.sleep(1.5)
+                # Strip xbrl_url from EVERY row, not just the to_fill
+                # subset above - rows skipped by the cooldown filter
+                # still carry it from fetch_nse_financial_results and
+                # still get saved below (just without updated numbers).
+                for r in rows:
+                    r.pop('xbrl_url', None)
                 await save_financial_results_to_db(session, rows)
             cycle += 1
         except Exception as e:
@@ -435,17 +464,60 @@ async def backfill_results_history(session: aiohttp.ClientSession, days: int = 3
     cap = int(os.getenv('RESULTS_NUMBERS_MAX', '400'))
     headers = random.choice(_NSE_ANNOUNCEMENTS_HEADER_SETS)
     filled = 0
+    all_comparisons = []
     for i, r in enumerate(rows[:cap]):
-        nums = await fetch_nse_results_numbers(session, headers, r['symbol'],
-                                               r['period_ended'], debug=(i < 2))
+        # XBRL-first, same as the live path (fetch_and_save_result_for_
+        # announcement) - this backfill previously only ever called the
+        # results-comparision fallback directly, meaning it could never
+        # get PBT/Other Income/comparison periods even after those were
+        # added, since XBRL was never attempted here at all. Reuses the
+        # xbrl_url already present on r from fetch_nse_financial_results
+        # (the results-list feed) when available, avoiding a redundant
+        # fetch_xbrl_url_for_symbol lookup call.
+        nums = {}
+        xbrl_url = r.get('xbrl_url')
+        if not xbrl_url:
+            xbrl_url = await fetch_xbrl_url_for_symbol(session, r['symbol'], r['period_ended'], debug=(i < 2))
+        if xbrl_url:
+            nums = await fetch_and_parse_xbrl(session, xbrl_url, period_ended=r['period_ended'], debug=(i < 2))
+        if not nums:
+            nums = await fetch_nse_results_numbers(session, headers, r['symbol'],
+                                                   r['period_ended'], debug=(i < 2))
+        comps = nums.pop('comparisons', []) if nums else []
+        for comp in comps:
+            all_comparisons.append({
+                'symbol': r['symbol'], 'period_ended': comp['period_ended'],
+                'result_type': r.get('result_type') or 'Consolidated',
+                'sales': comp.get('sales'), 'other_income': comp.get('other_income'),
+                'pbt': comp.get('pbt'), 'pat': comp.get('pat'), 'eps': comp.get('eps'),
+                'opm_pct': comp.get('opm_pct'),
+                'filed_at': r.get('filed_at'), 'attachment_url': r.get('attachment_url'),
+            })
         if nums:
             r.update({k: v for k, v in nums.items() if v is not None})
             filled += 1
+        # xbrl_url was only ever meant as an internal lookup hint (see
+        # fetch_nse_financial_results' docstring) - was never actually a
+        # real column, and PostgREST rejects the ENTIRE batch upsert if
+        # even one row carries an unknown column. Confirmed in
+        # production: this was silently failing every single backfill
+        # run's save step (400 PGRST204 "Could not find the 'xbrl_url'
+        # column"), so PBT/Other Income/comparisons never made it to the
+        # database even when the XBRL fetch above succeeded.
+        r.pop('xbrl_url', None)
         await asyncio.sleep(1.2)
         if (i + 1) % 50 == 0:
             log.info(f"  📚 Results backfill numbers: {i+1}/{min(cap,len(rows))} fetched…")
+    # Strip xbrl_url from EVERY row, not just rows[:cap] above - rows
+    # past the cap still carry it from fetch_nse_financial_results and
+    # still get saved below (just without updated numbers, per this
+    # function's own docstring on the cap's purpose).
+    for r in rows:
+        r.pop('xbrl_url', None)
     await save_financial_results_to_db(session, rows)
-    log.info(f"📚 Results backfill complete: {len(rows)} filings saved, numbers filled for {filled}")
+    if all_comparisons:
+        await save_financial_results_to_db(session, all_comparisons, skip_yoy_qoq=False)
+    log.info(f"📚 Results backfill complete: {len(rows)} filings saved ({len(all_comparisons)} comparison rows), numbers filled for {filled}")
 
 async def enrich_and_save_announcements(session: aiohttp.ClientSession, rows: list):
     """Wraps save_announcements_to_db with sector/industry/market_cap
