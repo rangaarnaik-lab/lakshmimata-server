@@ -653,10 +653,20 @@ async def fetch_and_parse_xbrl(session: aiohttp.ClientSession, url: str,
     # normal load in production logs across many different symbols, not
     # an isolated case - a longer timeout with one retry gives real but
     # slow responses a fair chance rather than giving up too early.
+    # Added proper browser-like headers (matching every other NSE call
+    # in this codebase) - this request was previously going out
+    # completely bare with NO headers at all, unlike every other
+    # successful NSE call here. NSE's anti-bot protection may silently
+    # hang rather than cleanly reject a headerless/non-browser-looking
+    # request, which would explain persistent timeouts even after
+    # raising the timeout duration and adding a retry - those fixes
+    # can't help if the actual problem is the request being detected
+    # and stalled, not genuinely slow.
+    xbrl_headers = random.choice(_NSE_ANNOUNCEMENTS_HEADER_SETS)
     content = None
     for attempt in range(2):
         try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=45)) as r:
+            async with session.get(url, headers=xbrl_headers, timeout=aiohttp.ClientTimeout(total=45)) as r:
                 if r.status != 200:
                     if debug:
                         log.info(f"  📄 XBRL fetch failed: status {r.status} for {url}")
