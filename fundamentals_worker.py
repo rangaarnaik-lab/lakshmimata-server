@@ -368,9 +368,13 @@ async def _results_loop(session: aiohttp.ClientSession):
                         xbrl_url = await fetch_xbrl_url_for_symbol(session, r['symbol'], r['period_ended'], debug=(debug and i < 2))
                     if xbrl_url:
                         nums = await fetch_and_parse_xbrl(session, xbrl_url, period_ended=r['period_ended'], debug=(debug and i < 2))
-                    if not nums:
-                        nums = await fetch_nse_results_numbers(
-                            session, headers, r['symbol'], r['period_ended'], debug=(debug and i < 2))
+                    # No fallback to fetch_nse_results_numbers - confirmed
+                    # in production to return numbers that don't match
+                    # EITHER Standalone or Consolidated figures from the
+                    # real filing (IPL case, verified against the actual
+                    # PDF) - genuinely wrong, not just a result-type mix-
+                    # up. Better to have no numbers than silently wrong
+                    # ones for financial data.
                     comps = nums.pop('comparisons', []) if nums else []
                     for comp in comps:
                         rows.append({
@@ -480,9 +484,8 @@ async def backfill_results_history(session: aiohttp.ClientSession, days: int = 3
             xbrl_url = await fetch_xbrl_url_for_symbol(session, r['symbol'], r['period_ended'], debug=(i < 2))
         if xbrl_url:
             nums = await fetch_and_parse_xbrl(session, xbrl_url, period_ended=r['period_ended'], debug=(i < 2))
-        if not nums:
-            nums = await fetch_nse_results_numbers(session, headers, r['symbol'],
-                                                   r['period_ended'], debug=(i < 2))
+        # No fallback to fetch_nse_results_numbers - see _results_loop's
+        # comment above for why (confirmed wrong data in production).
         comps = nums.pop('comparisons', []) if nums else []
         for comp in comps:
             all_comparisons.append({
@@ -901,7 +904,14 @@ async def fetch_and_save_result_for_announcement(session: aiohttp.ClientSession,
     public announcements by hours in some cases) if no XBRL is found or
     parsing yields nothing useful. Returns False (and saves nothing) if
     the period can't be parsed out of the subject text at all — better
-    to skip than guess wrong."""
+    to skip than guess wrong.
+
+    XBRL-only, no fallback to fetch_nse_results_numbers - that endpoint
+    was confirmed in production to return numbers that don't match
+    EITHER Standalone or Consolidated figures from the real filing (IPL
+    case, verified against the actual PDF), not just a result-type mix-
+    up. Better to save nothing for a period than silently wrong
+    financial numbers."""
     period_ended = _extract_period_ended_from_text(row.get('subject') or '')
     symbol = row.get('symbol')
     if not period_ended or not symbol:
@@ -911,8 +921,6 @@ async def fetch_and_save_result_for_announcement(session: aiohttp.ClientSession,
     xbrl_url = await fetch_xbrl_url_for_symbol(session, symbol, period_ended, debug=debug)
     if xbrl_url:
         nums = await fetch_and_parse_xbrl(session, xbrl_url, period_ended=period_ended, debug=debug)
-    if not nums:
-        nums = await fetch_nse_results_numbers(session, headers, symbol, period_ended, debug=debug)
 
     comparisons = nums.pop('comparisons', []) if nums else []
 
