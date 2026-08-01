@@ -1152,8 +1152,17 @@ async def compute_results_yoy_qoq(session: aiohttp.ClientSession, rows: list) ->
                  'pat': r.get('pat'), 'eps': r.get('eps')})
 
     def _find_comparison(sym, period_ended, target_days, tolerance_days):
+        # period_ended isn't reliably 'YYYY-MM-DD' - real data confirmed
+        # it's stored as e.g. '30-Jun-2024' (DD-Mon-YYYY), which made
+        # every strptime('%Y-%m-%d') call throw and get silently caught
+        # below, so EVERY comparison was failing (confirmed in
+        # production: 0 of 4110 existing rows got a YoY value despite
+        # some symbols having 8 quarters on file, more than enough
+        # depth). _norm_date already handles this exact format (built
+        # earlier for the same NSE date-format-variance problem) -
+        # normalize through it first rather than assuming one format.
         try:
-            this_date = datetime.strptime(period_ended, '%Y-%m-%d')
+            this_date = datetime.strptime(_norm_date(period_ended), '%Y-%m-%d')
         except (ValueError, TypeError):
             return None
         best, best_diff = None, None
@@ -1162,7 +1171,7 @@ async def compute_results_yoy_qoq(session: aiohttp.ClientSession, rows: list) ->
             if not hp or hp == period_ended:
                 continue
             try:
-                h_date = datetime.strptime(hp, '%Y-%m-%d')
+                h_date = datetime.strptime(_norm_date(hp), '%Y-%m-%d')
             except (ValueError, TypeError):
                 continue
             days_back = (this_date - h_date).days
