@@ -568,7 +568,20 @@ async def fetch_and_parse_xbrl(session: aiohttp.ClientSession, url: str,
     # SEBI's XBRL taxonomy requires comparative-period tagging, so this
     # data is normally present even when a company doesn't separately
     # file historical announcements for prior quarters.
-    contexts = {}  # context id -> (start_date, end_date) as date objects
+    #
+    # Also detects standalone vs consolidated - many filers report BOTH
+    # in the same document, distinguished not by a different tag name
+    # but by a dimension member (typically something like
+    # ConsolidatedOrStandaloneAxis / StandaloneMember) nested inside the
+    # context's <segment>/<scenario>. Rather than matching that exact
+    # dimension name (which varies by filer's taxonomy), searches the
+    # context's full text content for "standalone" - robust the same
+    # way local_name() ignoring namespaces is: this app only ever wants
+    # Consolidated (existing rows already hardcode result_type as
+    # such), so any context whose own text mentions "standalone"
+    # anywhere gets excluded from comparison-period matching rather
+    # than risk silently mixing standalone and consolidated figures.
+    contexts = {}  # context id -> (start_date, end_date, is_standalone)
     for ctx in root.iter():
         if local_name(ctx.tag) != 'context':
             continue
@@ -576,9 +589,12 @@ async def fetch_and_parse_xbrl(session: aiohttp.ClientSession, url: str,
         if not ctx_id:
             continue
         start_date = end_date = None
+        is_standalone = False
         for sub in ctx.iter():
             sname = local_name(sub.tag)
             text = (sub.text or '').strip()
+            if 'standalone' in text.lower() or 'standalone' in (sub.get('href') or '').lower():
+                is_standalone = True
             if not text:
                 continue
             if sname == 'startDate':
@@ -587,14 +603,17 @@ async def fetch_and_parse_xbrl(session: aiohttp.ClientSession, url: str,
                 end_date = _norm_date(text)
             elif sname == 'instant':
                 end_date = start_date = _norm_date(text)
+        # id itself sometimes carries the marker too (e.g. "...Standalone...")
+        if 'standalone' in ctx_id.lower():
+            is_standalone = True
         if end_date:
-            contexts[ctx_id] = (start_date, end_date)
+            contexts[ctx_id] = (start_date, end_date, is_standalone)
 
     # Collect values WITH their context, not just a flat list per tag -
     # all_tags stays as the flat debug view, tagged_values adds the
     # context-aware (value, end_date) pairs actual period-matching uses.
     all_tags = {}
-    tagged_values = {}  # tag name -> list of (float_value, end_date)
+    tagged_values = {}  # tag name -> list of (float_value, end_date, is_standalone)
     for el in root.iter():
         name = local_name(el.tag)
         text = (el.text or '').strip()
@@ -607,11 +626,12 @@ async def fetch_and_parse_xbrl(session: aiohttp.ClientSession, url: str,
                 val = float(text.replace(',', ''))
             except ValueError:
                 continue
-            tagged_values.setdefault(name, []).append((val, contexts[ctx_ref][1]))
+            tagged_values.setdefault(name, []).append((val, contexts[ctx_ref][1], contexts[ctx_ref][2]))
 
     if debug:
         sample = {k: v[0] for k, v in list(all_tags.items())[:40]}
-        log.info(f"  📄 XBRL tags found ({len(all_tags)} distinct, {len(contexts)} contexts): {json.dumps(sample)[:1500]}")
+        log.info(f"  📄 XBRL tags found ({len(all_tags)} distinct, {len(contexts)} contexts, "
+                 f"{sum(1 for c in contexts.values() if c[2])} standalone): {json.dumps(sample)[:1500]}")
 
     def first_matching(candidates):
         for c in candidates:
@@ -626,7 +646,10 @@ async def fetch_and_parse_xbrl(session: aiohttp.ClientSession, url: str,
         """Finds the value tagged with a context whose end date is
         closest to target_end_date, within tolerance - this is how a
         single XBRL fetch can recover the QoQ or YoY comparison figure
-        alongside the current one, using the SAME document."""
+        alongside the current one, using the SAME document. Skips
+        contexts flagged standalone (see the context-parsing comment
+        above) - this app only ever wants Consolidated, matching what
+        existing rows already hardcode as result_type."""
         if not target_end_date:
             return None
         try:
@@ -635,8 +658,8 @@ async def fetch_and_parse_xbrl(session: aiohttp.ClientSession, url: str,
             return None
         best_val, best_diff = None, None
         for c in candidates:
-            for val, end_date in tagged_values.get(c, []):
-                if not end_date:
+            for val, end_date, is_standalone in tagged_values.get(c, []):
+                if not end_date or is_standalone:
                     continue
                 try:
                     d = datetime.strptime(end_date, '%Y-%m-%d')
