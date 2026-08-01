@@ -718,7 +718,29 @@ async def fetch_and_parse_xbrl(session: aiohttp.ClientSession, url: str,
     # added, rather than saving an all-null row.
     comparisons = []
     if period_ended and contexts:
-        for label, target_days in (('yoy', 365), ('qoq', 90)):
+        # Detect actual reporting cadence from the current period's own
+        # context duration, rather than assuming quarterly (90 days) -
+        # some companies file half-yearly instead of quarterly (~180
+        # days), and a hardcoded 90-day target would miss their actual
+        # prior period entirely (falls outside the ±20 day tolerance).
+        # YoY stays at 365 days regardless of cadence - "same period
+        # last year" is meaningful either way. Prefers a Consolidated
+        # context if the current period has both, for the duration
+        # reading itself (duration doesn't differ between the two, but
+        # picking consistently avoids relying on dict ordering).
+        prior_period_days = 90  # default/fallback if duration can't be read
+        current_ctx_candidates = [c for c in contexts.values() if c[1] == norm_period]
+        if current_ctx_candidates:
+            current_ctx_candidates.sort(key=lambda c: c[2])  # False (consolidated) sorts first
+            c_start, c_end, _ = current_ctx_candidates[0]
+            if c_start:
+                try:
+                    duration = (datetime.strptime(c_end, '%Y-%m-%d') - datetime.strptime(c_start, '%Y-%m-%d')).days
+                    if duration > 0:
+                        prior_period_days = duration
+                except ValueError:
+                    pass
+        for label, target_days in (('yoy', 365), ('prior_period', prior_period_days)):
             try:
                 base = datetime.strptime(norm_period, '%Y-%m-%d')
                 comp_date = (base - timedelta(days=target_days)).strftime('%Y-%m-%d')
