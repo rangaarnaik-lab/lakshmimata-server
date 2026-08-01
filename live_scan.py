@@ -18,17 +18,6 @@ log = logging.getLogger('pocketrs')
 
 # ══ LIVE-SCAN-ONLY FUNCTIONS ══
 
-def _r2_put_object_sync(key: str, body: bytes, content_type: str, cache_seconds: int):
-    """The actual blocking boto3 call — only ever invoked inside
-    asyncio.to_thread() below, never directly on the event loop."""
-    _r2_client.put_object(
-        Bucket=R2_BUCKET_NAME,
-        Key=key,
-        Body=body,
-        ContentType=content_type,
-        CacheControl=f'public, max-age={cache_seconds}',
-    )
-
 def _template_pick_reasoning(r: dict) -> str:
     """Zero-cost fallback rationale when ANTHROPIC_API_KEY isn't set —
     lists whichever strong signals actually fired. Plain and mechanical
@@ -5492,35 +5481,6 @@ def tv_history_from_raw(raw_series: list, days: int = 15) -> list:
         end_idx = n - 1 - d
         hist.append(normalize_rs(raw_series[:end_idx + 1]) if end_idx >= 0 else None)
     return hist
-
-async def upload_snapshot_to_r2(key: str, data, cache_seconds: int = 60):
-    """Uploads a JSON snapshot to R2 for the frontend to read directly
-    instead of querying Supabase — same data, but served from Cloudflare's
-    CDN cache to everyone requesting it within cache_seconds of each other,
-    instead of every single user triggering their own database read.
-
-    Deliberately best-effort: any failure here (R2 down, not configured
-    yet, network hiccup) only logs a warning and returns — it must NEVER
-    interrupt or fail the scan loop, since Supabase remains the real
-    source of truth regardless of whether this succeeds. The frontend
-    also falls back to querying Supabase directly if the R2 file is
-    missing or stale, so a failed upload here degrades gracefully rather
-    than breaking anything.
-    """
-    global _r2_warned
-    if _r2_client is None:
-        if not _r2_warned:
-            log.warning("⚠️ R2 not configured (R2_ACCOUNT_ID/R2_ACCESS_KEY_ID/"
-                        "R2_SECRET_ACCESS_KEY/R2_BUCKET_NAME) — skipping snapshot "
-                        "upload, frontend will keep reading from Supabase directly")
-            _r2_warned = True
-        return
-    try:
-        body = json.dumps(data, default=str).encode('utf-8')
-        await asyncio.to_thread(_r2_put_object_sync, key, body, 'application/json', cache_seconds)
-        log.info(f"  ☁️ Uploaded {key} to R2 ({len(body)/1024:.1f} KB)")
-    except Exception as e:
-        log.warning(f"⚠️ R2 upload failed for {key}: {e}")
 
 def validate_hardcoded_symbol_lists():
     """

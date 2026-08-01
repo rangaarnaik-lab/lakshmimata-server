@@ -36,12 +36,43 @@ async def _announcements_loop(session: aiohttp.ClientSession):
             rows = await fetch_nse_announcements(session, debug=(cycle <= 3))
             if rows:
                 await enrich_and_save_announcements(session, rows)
+                await _upload_announcements_snapshot(session)
             else:
                 log.info("📢 No announcements fetched this cycle (empty result or fetch failed).")
         except Exception as e:
             import traceback
             log.error(f"Announcements loop cycle failed: {e}\n{traceback.format_exc()}")
         await asyncio.sleep(CHECK_INTERVAL)
+
+async def _upload_announcements_snapshot(session: aiohttp.ClientSession):
+    """Uploads the default/unfiltered announcements view (most recent
+    100, no category/sector/mcap filters) to R2, same pattern as
+    live_scan.py's stock snapshot - lets many users load the
+    Announcements tab's initial view from Cloudflare's cache instead of
+    each individually querying Supabase. Only covers this one default
+    case deliberately: fetchAnnouncements has many filter combinations
+    (category, sector, mcap, order-size, symbol, date), and caching
+    every combination isn't worth the complexity - this speeds up the
+    single most common case (first page, no filters) while anything
+    filtered/paginated still queries Supabase directly, same tradeoff
+    already accepted for the stocks R2 cache."""
+    headers = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/corporate_announcements",
+            headers=headers,
+            params={'select': 'symbol,category,subject,attachment_url,announced_at,sector,industry,market_cap,ai_rating,ai_summary,order_size',
+                    'order': 'announced_at.desc', 'limit': '100'},
+            timeout=aiohttp.ClientTimeout(total=20)
+        ) as r:
+            if r.status != 200:
+                log.warning(f"⚠️ Announcements snapshot fetch failed ({r.status}), skipping R2 upload this cycle")
+                return
+            rows = await r.json()
+    except Exception as e:
+        log.warning(f"⚠️ Announcements snapshot fetch error (non-fatal): {type(e).__name__}: {e}")
+        return
+    await upload_snapshot_to_r2('announcements-snapshot.json', rows, cache_seconds=120)
 
 def _dedupe_by_key(rows: list, keys: tuple) -> list:
     """NSE feeds sometimes contain the same item twice in one response;
