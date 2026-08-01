@@ -1430,7 +1430,7 @@ async def save_financial_results_to_db(session: aiohttp.ClientSession, rows: lis
     except Exception as e:
         log.warning(f"⚠️ Financial results upsert error: {type(e).__name__}: {e}")
 
-async def backfill_results_yoy_qoq(session: aiohttp.ClientSession):
+async def backfill_results_yoy_qoq(session: aiohttp.ClientSession, days: int = 7):
     """One-time backfill: computes YoY/QoQ for existing financial_results
     rows saved before that computation existed. Fetches only the fields
     needed (the upsert conflict keys + sales/pat/eps), then re-runs them
@@ -1440,8 +1440,17 @@ async def backfill_results_yoy_qoq(session: aiohttp.ClientSession):
     duplicates only touches columns present in the payload, so this
     can't accidentally null out any other column on these rows (raw
     text, announcement links, etc. — none of that is included here,
-    so none of it gets touched)."""
+    so none of it gets touched).
+
+    Limited to the last `days` (default 7) by filed_at, not the full
+    table - a genuine, deliberate safeguard: this env-var-gated
+    function is only meant to run once, but if the variable is
+    accidentally left set across a restart, a 7-day-scoped re-run costs
+    far less compute/DB load than silently reprocessing all 4000+ rows
+    again every single restart. Pass a larger `days` value directly if
+    a genuine wider backfill is wanted later."""
     headers = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     all_rows = []
     offset = 0
     page_size = 1000
@@ -1451,6 +1460,7 @@ async def backfill_results_yoy_qoq(session: aiohttp.ClientSession):
                 f"{SUPABASE_URL}/rest/v1/financial_results",
                 headers=headers,
                 params={'select': 'symbol,period_ended,result_type,sales,pat,eps',
+                        'filed_at': f'gt.{since}',
                         'order': 'symbol.asc,period_ended.asc',
                         'offset': str(offset), 'limit': str(page_size)},
                 timeout=aiohttp.ClientTimeout(total=30)
