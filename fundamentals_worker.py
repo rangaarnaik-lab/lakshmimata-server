@@ -1320,6 +1320,11 @@ async def fundamentals_worker_main():
                 await backfill_results_yoy_qoq(session)
             except Exception as e:
                 log.error(f"Results YoY/QoQ backfill failed: {e}")
+        if os.getenv('BACKFILL_PBT_DAYS'):
+            try:
+                await backfill_pbt_other_income(session, days=int(os.getenv('BACKFILL_PBT_DAYS')))
+            except Exception as e:
+                log.error(f"PBT/Other Income backfill failed: {e}")
         await asyncio.gather(
             _fundamentals_loop(session),
             _market_cap_catchup_loop(session),
@@ -1584,6 +1589,80 @@ async def save_financial_results_to_db(session: aiohttp.ClientSession, rows: lis
                 log.warning(f"⚠️ Financial results upsert failed ({r.status}): {body[:300]}")
     except Exception as e:
         log.warning(f"⚠️ Financial results upsert error: {type(e).__name__}: {e}")
+
+async def backfill_pbt_other_income(session: aiohttp.ClientSession, days: int = 7):
+    """Backfill PBT/Other Income/OPM% for EXISTING financial_results rows
+    that are missing pbt, sourced directly from the database rather than
+    NSE's results-list feed (unlike backfill_results_history). This
+    matters because that feed has confirmed coverage gaps in production
+    logs ('SPORTKING not found in results-list feed at all across the
+    last 3 days') - a symbol saved via the announcement-driven path may
+    never appear there, so backfill_results_history would silently skip
+    it forever regardless of how many times it's re-run. This function
+    instead re-attempts XBRL extraction directly for whatever's already
+    on file and still missing PBT, using fetch_xbrl_url_for_symbol to
+    find the real XBRL document fresh (the stored attachment_url is
+    often a PDF fallback, not guaranteed to be the XBRL file itself).
+    Gated behind BACKFILL_PBT_DAYS (separate from the other backfill
+    env vars) so it only runs when explicitly requested."""
+    headers = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/financial_results",
+            headers=headers,
+            params={'select': 'symbol,period_ended,result_type',
+                    'filed_at': f'gt.{since}', 'pbt': 'is.null',
+                    'order': 'symbol.asc', 'limit': '1000'},
+            timeout=aiohttp.ClientTimeout(total=30)
+        ) as r:
+            if r.status != 200:
+                log.warning(f"⚠️ PBT backfill: fetch failed ({r.status})")
+                return
+            rows = await r.json()
+    except Exception as e:
+        log.warning(f"⚠️ PBT backfill: fetch error: {type(e).__name__}: {e}")
+        return
+    if not rows:
+        log.info("📅 PBT backfill: no rows missing pbt in range")
+        return
+    log.info(f"📅 PBT backfill: {len(rows)} rows missing pbt to re-attempt via XBRL")
+
+    filled = 0
+    all_updates = []
+    all_comparisons = []
+    for i, r in enumerate(rows):
+        xbrl_url = await fetch_xbrl_url_for_symbol(session, r['symbol'], r['period_ended'], debug=(i < 2))
+        if not xbrl_url:
+            await asyncio.sleep(0.3)
+            continue
+        nums = await fetch_and_parse_xbrl(session, xbrl_url, period_ended=r['period_ended'], debug=(i < 2))
+        if nums:
+            comps = nums.pop('comparisons', [])
+            for comp in comps:
+                all_comparisons.append({
+                    'symbol': r['symbol'], 'period_ended': comp['period_ended'],
+                    'result_type': r.get('result_type') or 'Consolidated',
+                    'sales': comp.get('sales'), 'other_income': comp.get('other_income'),
+                    'pbt': comp.get('pbt'), 'pat': comp.get('pat'), 'eps': comp.get('eps'),
+                    'opm_pct': comp.get('opm_pct'),
+                })
+            if nums.get('pbt') is not None:
+                all_updates.append({
+                    'symbol': r['symbol'], 'period_ended': r['period_ended'],
+                    'result_type': r.get('result_type') or 'Consolidated',
+                    **{k: v for k, v in nums.items() if v is not None},
+                })
+                filled += 1
+        await asyncio.sleep(0.6)
+        if (i + 1) % 50 == 0:
+            log.info(f"  📅 PBT backfill: {i+1}/{len(rows)} attempted, {filled} filled so far…")
+
+    if all_updates:
+        await save_financial_results_to_db(session, all_updates)
+    if all_comparisons:
+        await save_financial_results_to_db(session, all_comparisons)
+    log.info(f"✅ PBT backfill complete: {filled}/{len(rows)} rows got PBT via XBRL ({len(all_comparisons)} comparison rows saved)")
 
 async def backfill_results_yoy_qoq(session: aiohttp.ClientSession, days: int = 7):
     """One-time backfill: computes YoY/QoQ for existing financial_results
