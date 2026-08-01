@@ -1093,12 +1093,104 @@ async def save_announcements_to_db(session: aiohttp.ClientSession, rows: list):
     except Exception as e:
         log.warning(f"⚠️ Announcements upsert exception: {e}")
 
+def _pct_change(new, old):
+    """Standard % change, guarding the usual edge cases (zero/None/
+    sign-flip base) that make a naive (new-old)/old blow up or mislead."""
+    if new is None or old is None:
+        return None
+    try:
+        new, old = float(new), float(old)
+    except (TypeError, ValueError):
+        return None
+    if old == 0:
+        return None  # can't express a meaningful % change from a zero base
+    return round((new - old) / abs(old) * 100, 2)
+
+async def compute_results_yoy_qoq(session: aiohttp.ClientSession, rows: list) -> list:
+    """Computes YoY and QoQ % change for sales/PAT/EPS and attaches them
+    directly on each row (sales_yoy_pct, pat_yoy_pct, eps_yoy_pct,
+    sales_qoq_pct, pat_qoq_pct) — same enrichment pattern as
+    tag_order_size, just needing a DB lookup first since the comparison
+    period usually isn't in the same batch being saved right now.
+    Fetches each symbol's recent history once, combines it with
+    whatever's in THIS batch (covers backfills where a quarter and its
+    year-ago comparison land in the same batch, before either is in the
+    DB yet), then matches each row to its best YoY (~365d back) and QoQ
+    (~90d back) comparison period."""
+    if not rows:
+        return rows
+    symbols = sorted({r['symbol'] for r in rows if r.get('symbol')})
+    history_by_symbol = {}
+    headers = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
+    for sym in symbols:
+        try:
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/financial_results",
+                headers=headers,
+                params={'symbol': f'eq.{sym}', 'select': 'period_ended,sales,pat,eps',
+                        'order': 'period_ended.desc', 'limit': '8'},
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as r:
+                history_by_symbol[sym] = await r.json() if r.status == 200 else []
+        except Exception:
+            history_by_symbol[sym] = []
+
+    # Combine DB history with the current batch itself, so a backfill
+    # that includes both a quarter and its year-ago comparison in the
+    # same call still finds the match (neither is in the DB yet in
+    # that case).
+    for r in rows:
+        sym = r.get('symbol')
+        if sym and r.get('period_ended'):
+            history_by_symbol.setdefault(sym, []).append(
+                {'period_ended': r['period_ended'], 'sales': r.get('sales'),
+                 'pat': r.get('pat'), 'eps': r.get('eps')})
+
+    def _find_comparison(sym, period_ended, target_days, tolerance_days):
+        try:
+            this_date = datetime.strptime(period_ended, '%Y-%m-%d')
+        except (ValueError, TypeError):
+            return None
+        best, best_diff = None, None
+        for h in history_by_symbol.get(sym, []):
+            hp = h.get('period_ended')
+            if not hp or hp == period_ended:
+                continue
+            try:
+                h_date = datetime.strptime(hp, '%Y-%m-%d')
+            except (ValueError, TypeError):
+                continue
+            days_back = (this_date - h_date).days
+            diff = abs(days_back - target_days)
+            if diff <= tolerance_days and (best_diff is None or diff < best_diff):
+                best, best_diff = h, diff
+        return best
+
+    for r in rows:
+        sym, period_ended = r.get('symbol'), r.get('period_ended')
+        if not sym or not period_ended:
+            continue
+        yoy = _find_comparison(sym, period_ended, 365, 25)
+        if yoy:
+            r['sales_yoy_pct'] = _pct_change(r.get('sales'), yoy.get('sales'))
+            r['pat_yoy_pct'] = _pct_change(r.get('pat'), yoy.get('pat'))
+            r['eps_yoy_pct'] = _pct_change(r.get('eps'), yoy.get('eps'))
+        qoq = _find_comparison(sym, period_ended, 90, 20)
+        if qoq:
+            r['sales_qoq_pct'] = _pct_change(r.get('sales'), qoq.get('sales'))
+            r['pat_qoq_pct'] = _pct_change(r.get('pat'), qoq.get('pat'))
+    return rows
+
 async def save_financial_results_to_db(session: aiohttp.ClientSession, rows: list):
     """Upserts structured quarterly results on (symbol, period_ended,
     result_type). Key-normalized for PostgREST's all-keys-must-match
-    requirement, same as announcements."""
+    requirement, same as announcements. Computes YoY/QoQ (see
+    compute_results_yoy_qoq) before saving, so the rating/trend display
+    can just read the stored value instead of re-fetching and
+    re-computing it client-side every time."""
     if not rows:
         return
+    rows = await compute_results_yoy_qoq(session, rows)
     rows = _dedupe_by_key(rows, ('symbol', 'period_ended', 'result_type'))
     all_keys = set()
     for r in rows:
