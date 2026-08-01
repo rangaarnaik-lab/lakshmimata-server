@@ -520,12 +520,25 @@ async def ensure_announcements_table(session: aiohttp.ClientSession,
             return False
     return False
 
-async def fetch_and_parse_xbrl(session: aiohttp.ClientSession, url: str, debug: bool = False) -> dict:
+async def fetch_and_parse_xbrl(session: aiohttp.ClientSession, url: str,
+                               period_ended: str = None, debug: bool = False) -> dict:
     """Downloads and parses an NSE XBRL filing directly — structured
     XML, no AI/PDF-OCR needed. Matches purely on local element name,
     ignoring namespace, for robustness across different filer
     taxonomies. Logs every distinct tag name found on debug calls so
-    the candidate lists above can be corrected against reality."""
+    the candidate lists above can be corrected against reality.
+
+    Also extracts YoY/QoQ comparison figures FROM THIS SAME FILING when
+    period_ended is given - Indian quarterly results always disclose
+    the corresponding prior-year and (for quarterly filings) prior-
+    quarter figures alongside the current period, per SEBI's listing
+    regulations, and XBRL tags each with its own contextRef pointing to
+    a <context> element with a real date range. Confirmed via a real
+    filing (LatentView Analytics Q1 FY27): the same document contained
+    30-Jun-26, 31-Mar-26, and 30-Jun-25 columns. Returns comparison
+    rows when found so one XBRL fetch can backfill history that would
+    otherwise need separate old announcements found and parsed one at
+    a time."""
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
             if r.status != 200:
@@ -548,16 +561,57 @@ async def fetch_and_parse_xbrl(session: aiohttp.ClientSession, url: str, debug: 
     def local_name(tag):
         return tag.split('}')[-1] if '}' in tag else tag
 
+    # Parse context elements to get each contextRef's actual date range -
+    # this is what lets us tell "this Revenue value is Q1 FY27" apart
+    # from "this Revenue value is Q1 FY26" even though both use the
+    # same tag name (RevenueFromOperations) elsewhere in the document.
+    # SEBI's XBRL taxonomy requires comparative-period tagging, so this
+    # data is normally present even when a company doesn't separately
+    # file historical announcements for prior quarters.
+    contexts = {}  # context id -> (start_date, end_date) as date objects
+    for ctx in root.iter():
+        if local_name(ctx.tag) != 'context':
+            continue
+        ctx_id = ctx.get('id')
+        if not ctx_id:
+            continue
+        start_date = end_date = None
+        for sub in ctx.iter():
+            sname = local_name(sub.tag)
+            text = (sub.text or '').strip()
+            if not text:
+                continue
+            if sname == 'startDate':
+                start_date = _norm_date(text)
+            elif sname == 'endDate':
+                end_date = _norm_date(text)
+            elif sname == 'instant':
+                end_date = start_date = _norm_date(text)
+        if end_date:
+            contexts[ctx_id] = (start_date, end_date)
+
+    # Collect values WITH their context, not just a flat list per tag -
+    # all_tags stays as the flat debug view, tagged_values adds the
+    # context-aware (value, end_date) pairs actual period-matching uses.
     all_tags = {}
+    tagged_values = {}  # tag name -> list of (float_value, end_date)
     for el in root.iter():
         name = local_name(el.tag)
         text = (el.text or '').strip()
-        if text:
-            all_tags.setdefault(name, []).append(text)
+        if not text:
+            continue
+        all_tags.setdefault(name, []).append(text)
+        ctx_ref = el.get('contextRef')
+        if ctx_ref and ctx_ref in contexts:
+            try:
+                val = float(text.replace(',', ''))
+            except ValueError:
+                continue
+            tagged_values.setdefault(name, []).append((val, contexts[ctx_ref][1]))
 
     if debug:
         sample = {k: v[0] for k, v in list(all_tags.items())[:40]}
-        log.info(f"  📄 XBRL tags found ({len(all_tags)} distinct): {json.dumps(sample)[:1500]}")
+        log.info(f"  📄 XBRL tags found ({len(all_tags)} distinct, {len(contexts)} contexts): {json.dumps(sample)[:1500]}")
 
     def first_matching(candidates):
         for c in candidates:
@@ -567,6 +621,31 @@ async def fetch_and_parse_xbrl(session: aiohttp.ClientSession, url: str, debug: 
                 except ValueError:
                     continue
         return None
+
+    def value_near_date(candidates, target_end_date, tolerance_days=20):
+        """Finds the value tagged with a context whose end date is
+        closest to target_end_date, within tolerance - this is how a
+        single XBRL fetch can recover the QoQ or YoY comparison figure
+        alongside the current one, using the SAME document."""
+        if not target_end_date:
+            return None
+        try:
+            target = datetime.strptime(target_end_date, '%Y-%m-%d')
+        except (ValueError, TypeError):
+            return None
+        best_val, best_diff = None, None
+        for c in candidates:
+            for val, end_date in tagged_values.get(c, []):
+                if not end_date:
+                    continue
+                try:
+                    d = datetime.strptime(end_date, '%Y-%m-%d')
+                except ValueError:
+                    continue
+                diff = abs((d - target).days)
+                if diff <= tolerance_days and (best_diff is None or diff < best_diff):
+                    best_val, best_diff = val, diff
+        return best_val
 
     sales, pat, eps = first_matching(_XBRL_SALES_TAGS), first_matching(_XBRL_PAT_TAGS), first_matching(_XBRL_EPS_TAGS)
     # XBRL reports raw currency units (INR), not crore — divide by 1e7
@@ -579,6 +658,39 @@ async def fetch_and_parse_xbrl(session: aiohttp.ClientSession, url: str, debug: 
         result['pat'] = round(pat / 1e7, 2)
     if eps is not None:
         result['eps'] = round(eps, 2)
+
+    # Comparison periods from THIS SAME filing (see docstring) - only
+    # attempted when period_ended and real context dates are available.
+    # A comparison row is only included if at least one metric was
+    # actually found for it; a target date with zero matches just isn't
+    # added, rather than saving an all-null row.
+    comparisons = []
+    if period_ended and contexts:
+        norm_period = _norm_date(period_ended)
+        for label, target_days in (('yoy', 365), ('qoq', 90)):
+            try:
+                base = datetime.strptime(norm_period, '%Y-%m-%d')
+                comp_date = (base - timedelta(days=target_days)).strftime('%Y-%m-%d')
+            except (ValueError, TypeError):
+                continue
+            c_sales = value_near_date(_XBRL_SALES_TAGS, comp_date)
+            c_pat = value_near_date(_XBRL_PAT_TAGS, comp_date)
+            c_eps = value_near_date(_XBRL_EPS_TAGS, comp_date)
+            if c_sales is None and c_pat is None and c_eps is None:
+                continue
+            comp_row = {'period_ended': comp_date, '_comparison_type': label}
+            if c_sales is not None:
+                comp_row['sales'] = round(c_sales / 1e7, 2)
+            if c_pat is not None:
+                comp_row['pat'] = round(c_pat / 1e7, 2)
+            if c_eps is not None:
+                comp_row['eps'] = round(c_eps, 2)
+            comparisons.append(comp_row)
+    if comparisons:
+        result['comparisons'] = comparisons
+        if debug:
+            log.info(f"  📄 XBRL comparisons found: {[(c['_comparison_type'], c['period_ended']) for c in comparisons]}")
+
     return result
 
 async def fetch_and_save_result_for_announcement(session: aiohttp.ClientSession, headers: dict,
@@ -599,9 +711,11 @@ async def fetch_and_save_result_for_announcement(session: aiohttp.ClientSession,
     nums = {}
     xbrl_url = await fetch_xbrl_url_for_symbol(session, symbol, period_ended, debug=debug)
     if xbrl_url:
-        nums = await fetch_and_parse_xbrl(session, xbrl_url, debug=debug)
+        nums = await fetch_and_parse_xbrl(session, xbrl_url, period_ended=period_ended, debug=debug)
     if not nums:
         nums = await fetch_nse_results_numbers(session, headers, symbol, period_ended, debug=debug)
+
+    comparisons = nums.pop('comparisons', []) if nums else []
 
     result_row = {
         'symbol': symbol,
@@ -613,7 +727,22 @@ async def fetch_and_save_result_for_announcement(session: aiohttp.ClientSession,
     }
     if nums:
         result_row.update({k: v for k, v in nums.items() if v is not None})
-    await save_financial_results_to_db(session, [result_row])
+
+    rows_to_save = [result_row]
+    for comp in comparisons:
+        # Same-filing comparison periods (see fetch_and_parse_xbrl's
+        # docstring) - filed_at/attachment_url point back to THIS
+        # filing since that's genuinely where this data came from, not
+        # a separate announcement for that period.
+        rows_to_save.append({
+            'symbol': symbol,
+            'period_ended': comp['period_ended'],
+            'result_type': 'Consolidated',
+            'sales': comp.get('sales'), 'pat': comp.get('pat'), 'eps': comp.get('eps'),
+            'filed_at': row.get('announced_at'),
+            'attachment_url': row.get('attachment_url'),
+        })
+    await save_financial_results_to_db(session, rows_to_save)
     return bool(nums)
 
 async def fetch_nse_announcements(session: aiohttp.ClientSession, debug: bool = False) -> list:
