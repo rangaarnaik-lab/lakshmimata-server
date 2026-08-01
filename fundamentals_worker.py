@@ -1397,16 +1397,22 @@ async def compute_results_yoy_qoq(session: aiohttp.ClientSession, rows: list) ->
             r['pat_qoq_pct'] = _pct_change(r.get('pat'), qoq.get('pat'))
     return rows
 
-async def save_financial_results_to_db(session: aiohttp.ClientSession, rows: list):
+async def save_financial_results_to_db(session: aiohttp.ClientSession, rows: list, skip_yoy_qoq: bool = False):
     """Upserts structured quarterly results on (symbol, period_ended,
     result_type). Key-normalized for PostgREST's all-keys-must-match
     requirement, same as announcements. Computes YoY/QoQ (see
     compute_results_yoy_qoq) before saving, so the rating/trend display
     can just read the stored value instead of re-fetching and
-    re-computing it client-side every time."""
+    re-computing it client-side every time.
+
+    skip_yoy_qoq=True lets a caller that already ran that computation
+    itself (e.g. backfill_results_yoy_qoq, batching the read/compute
+    step across many symbols before this write step) skip redoing it -
+    avoids computing twice for the same rows."""
     if not rows:
         return
-    rows = await compute_results_yoy_qoq(session, rows)
+    if not skip_yoy_qoq:
+        rows = await compute_results_yoy_qoq(session, rows)
     rows = _dedupe_by_key(rows, ('symbol', 'period_ended', 'result_type'))
     all_keys = set()
     for r in rows:
@@ -1490,13 +1496,30 @@ async def backfill_results_yoy_qoq(session: aiohttp.ClientSession, days: int = 7
     for r in all_rows:
         by_symbol.setdefault(r['symbol'], []).append(r)
 
+    # Phase 1: reads/compute only, for every symbol, before any writes -
+    # separates the read-heavy and write-heavy phases (per user
+    # request) rather than interleaving read->write->read->write per
+    # symbol. Collects the fully-enriched rows in memory.
+    enriched_rows = []
     done = 0
     for sym, rows in by_symbol.items():
-        await save_financial_results_to_db(session, rows)
+        enriched = await compute_results_yoy_qoq(session, rows)
+        enriched_rows.extend(enriched)
         done += len(rows)
         if done % 500 < len(rows):
-            log.info(f"  ...{done}/{len(all_rows)} results recomputed so far")
+            log.info(f"  ...{done}/{len(all_rows)} results computed so far (read phase)")
         await asyncio.sleep(0.05)  # polite pacing, this hits Supabase ~2400 times
+
+    # Phase 2: writes only, in fixed-size chunks - a single POST with
+    # every row in memory risks payload-size/timeout issues that
+    # per-symbol calls never hit; save_financial_results_to_db itself
+    # has no chunking built in, so it's done here instead.
+    CHUNK_SIZE = 200
+    for i in range(0, len(enriched_rows), CHUNK_SIZE):
+        chunk = enriched_rows[i:i + CHUNK_SIZE]
+        await save_financial_results_to_db(session, chunk, skip_yoy_qoq=True)
+        log.info(f"  ...{min(i+CHUNK_SIZE, len(enriched_rows))}/{len(enriched_rows)} results saved so far (write phase)")
+        await asyncio.sleep(0.05)
 
     log.info(f"✅ YoY/QoQ backfill complete: {len(all_rows)} results rows recomputed")
 
