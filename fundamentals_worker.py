@@ -964,6 +964,11 @@ async def fundamentals_worker_main():
                 await backfill_results_history(session, days=int(os.getenv('BACKFILL_RESULTS_DAYS')))
             except Exception as e:
                 log.error(f"Results backfill failed: {e}")
+        if os.getenv('BACKFILL_RESULTS_YOY_QOQ'):
+            try:
+                await backfill_results_yoy_qoq(session)
+            except Exception as e:
+                log.error(f"Results YoY/QoQ backfill failed: {e}")
         await asyncio.gather(
             _fundamentals_loop(session),
             _market_cap_catchup_loop(session),
@@ -1213,6 +1218,67 @@ async def save_financial_results_to_db(session: aiohttp.ClientSession, rows: lis
                 log.warning(f"⚠️ Financial results upsert failed ({r.status}): {body[:300]}")
     except Exception as e:
         log.warning(f"⚠️ Financial results upsert error: {type(e).__name__}: {e}")
+
+async def backfill_results_yoy_qoq(session: aiohttp.ClientSession):
+    """One-time backfill: computes YoY/QoQ for existing financial_results
+    rows saved before that computation existed. Fetches only the fields
+    needed (the upsert conflict keys + sales/pat/eps), then re-runs them
+    through save_financial_results_to_db - reuses the SAME, already-
+    tested compute_results_yoy_qoq + upsert logic used for new results,
+    rather than duplicating that logic here. PostgREST's merge-
+    duplicates only touches columns present in the payload, so this
+    can't accidentally null out any other column on these rows (raw
+    text, announcement links, etc. — none of that is included here,
+    so none of it gets touched)."""
+    headers = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
+    all_rows = []
+    offset = 0
+    page_size = 1000
+    while True:
+        try:
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/financial_results",
+                headers=headers,
+                params={'select': 'symbol,period_ended,result_type,sales,pat,eps',
+                        'order': 'symbol.asc,period_ended.asc',
+                        'offset': str(offset), 'limit': str(page_size)},
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as r:
+                if r.status != 200:
+                    log.warning(f"⚠️ YoY/QoQ backfill: page fetch failed ({r.status})")
+                    break
+                page = await r.json()
+        except Exception as e:
+            log.warning(f"⚠️ YoY/QoQ backfill: page fetch error: {type(e).__name__}: {e}")
+            break
+        if not page:
+            break
+        all_rows.extend(page)
+        if len(page) < page_size:
+            break
+        offset += page_size
+
+    log.info(f"📅 YoY/QoQ backfill: {len(all_rows)} existing results rows to recompute")
+    if not all_rows:
+        return
+
+    # Batch per-symbol so compute_results_yoy_qoq's one history-fetch
+    # per symbol stays cheap (~1-8 rows typically) rather than one
+    # enormous mixed-symbol batch.
+    by_symbol = {}
+    for r in all_rows:
+        by_symbol.setdefault(r['symbol'], []).append(r)
+
+    done = 0
+    for sym, rows in by_symbol.items():
+        await save_financial_results_to_db(session, rows)
+        done += len(rows)
+        if done % 500 < len(rows):
+            log.info(f"  ...{done}/{len(all_rows)} results recomputed so far")
+        await asyncio.sleep(0.05)  # polite pacing, this hits Supabase ~2400 times
+
+    log.info(f"✅ YoY/QoQ backfill complete: {len(all_rows)} results rows recomputed")
+
 
 def tag_order_size(rows: list) -> list:
     """For business order-win announcements, tags order_size as
