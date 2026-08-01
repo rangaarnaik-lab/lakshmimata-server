@@ -645,16 +645,34 @@ async def fetch_and_parse_xbrl(session: aiohttp.ClientSession, url: str,
     rows when found so one XBRL fetch can backfill history that would
     otherwise need separate old announcements found and parsed one at
     a time."""
-    try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
-            if r.status != 200:
+    # Timeout raised from 20s to 45s, plus one retry on timeout
+    # specifically - XBRL is now the ONLY data source (fallback removed
+    # after it was found to return unverifiable/wrong numbers), so a
+    # timeout here means zero data for that result rather than degraded
+    # data. NSE's servers have been observed timing out at 20s under
+    # normal load in production logs across many different symbols, not
+    # an isolated case - a longer timeout with one retry gives real but
+    # slow responses a fair chance rather than giving up too early.
+    content = None
+    for attempt in range(2):
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=45)) as r:
+                if r.status != 200:
+                    if debug:
+                        log.info(f"  📄 XBRL fetch failed: status {r.status} for {url}")
+                    return {}
+                content = await r.read()
+            break
+        except Exception as e:
+            if attempt == 0:
                 if debug:
-                    log.info(f"  📄 XBRL fetch failed: status {r.status} for {url}")
-                return {}
-            content = await r.read()
-    except Exception as e:
-        if debug:
-            log.info(f"  📄 XBRL fetch exception: {type(e).__name__}: {e}")
+                    log.info(f"  📄 XBRL fetch exception (attempt 1, retrying): {type(e).__name__}: {e}")
+                await asyncio.sleep(2)
+                continue
+            if debug:
+                log.info(f"  📄 XBRL fetch exception (attempt 2, giving up): {type(e).__name__}: {e}")
+            return {}
+    if content is None:
         return {}
 
     try:
