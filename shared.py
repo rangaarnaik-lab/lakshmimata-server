@@ -89,6 +89,7 @@ __all__ = [
     '_RESULTS_ATTEMPT_COOLDOWN_SEC',
     '_SCREENER_HEADER_SETS',
     '_XBRL_EPS_TAGS',
+    '_XBRL_OTHER_INCOME_TAGS',
     '_XBRL_PAT_TAGS',
     '_XBRL_PBT_TAGS',
     '_XBRL_SALES_TAGS',
@@ -662,6 +663,7 @@ _MONTH_NAMES = {
 # verified/corrected against a real filing, same pattern used for
 # every other NSE field-mapping in this file.
 _XBRL_SALES_TAGS = ['RevenueFromOperations', 'Revenue', 'TotalIncome', 'IncomeFromOperations']
+_XBRL_OTHER_INCOME_TAGS = ['OtherIncome']
 _XBRL_PBT_TAGS = ['ProfitBeforeExceptionalItemsAndTax', 'ProfitBeforeTax',
                   'ProfitLossBeforeExceptionalItemsAndTax', 'ProfitLossBeforeTax',
                   'ProfitBeforeTaxAndExceptionalItems']
