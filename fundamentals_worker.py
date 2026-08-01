@@ -646,31 +646,60 @@ async def fetch_and_parse_xbrl(session: aiohttp.ClientSession, url: str,
         """Finds the value tagged with a context whose end date is
         closest to target_end_date, within tolerance - this is how a
         single XBRL fetch can recover the QoQ or YoY comparison figure
-        alongside the current one, using the SAME document. Skips
-        contexts flagged standalone (see the context-parsing comment
-        above) - this app only ever wants Consolidated, matching what
-        existing rows already hardcode as result_type."""
+        alongside the current one, using the SAME document.
+
+        Two-pass: prefers Consolidated, but falls back to Standalone if
+        no Consolidated context matches at all - some companies
+        (typically ones without subsidiaries) only ever file
+        Standalone, and leaving the field empty in that case would lose
+        real, correct data rather than protect against wrong data."""
         if not target_end_date:
             return None
         try:
             target = datetime.strptime(target_end_date, '%Y-%m-%d')
         except (ValueError, TypeError):
             return None
-        best_val, best_diff = None, None
-        for c in candidates:
-            for val, end_date, is_standalone in tagged_values.get(c, []):
-                if not end_date or is_standalone:
-                    continue
-                try:
-                    d = datetime.strptime(end_date, '%Y-%m-%d')
-                except ValueError:
-                    continue
-                diff = abs((d - target).days)
-                if diff <= tolerance_days and (best_diff is None or diff < best_diff):
-                    best_val, best_diff = val, diff
-        return best_val
+        for require_consolidated in (True, False):
+            best_val, best_diff = None, None
+            for c in candidates:
+                for val, end_date, is_standalone in tagged_values.get(c, []):
+                    if not end_date:
+                        continue
+                    if require_consolidated and is_standalone:
+                        continue
+                    try:
+                        d = datetime.strptime(end_date, '%Y-%m-%d')
+                    except ValueError:
+                        continue
+                    diff = abs((d - target).days)
+                    if diff <= tolerance_days and (best_diff is None or diff < best_diff):
+                        best_val, best_diff = val, diff
+            if best_val is not None:
+                return best_val
+        return None
 
-    sales, pat, eps = first_matching(_XBRL_SALES_TAGS), first_matching(_XBRL_PAT_TAGS), first_matching(_XBRL_EPS_TAGS)
+    norm_period = _norm_date(period_ended) if period_ended else None
+    if norm_period and contexts:
+        # Context-aware, same prefer-consolidated/fallback-standalone
+        # logic as comparisons below - more accurate than first_matching
+        # (which has zero standalone/consolidated or date awareness at
+        # all) since it actually confirms the value's context date
+        # matches the period being saved.
+        sales = value_near_date(_XBRL_SALES_TAGS, norm_period)
+        pat = value_near_date(_XBRL_PAT_TAGS, norm_period)
+        eps = value_near_date(_XBRL_EPS_TAGS, norm_period)
+    else:
+        sales, pat, eps = None, None, None
+    # Fall back to the old naive approach only for whatever the
+    # context-aware pass didn't find (including entirely, if
+    # period_ended wasn't given or no contexts existed) - preserves
+    # prior behavior as a safety net rather than a regression.
+    if sales is None:
+        sales = first_matching(_XBRL_SALES_TAGS)
+    if pat is None:
+        pat = first_matching(_XBRL_PAT_TAGS)
+    if eps is None:
+        eps = first_matching(_XBRL_EPS_TAGS)
     # XBRL reports raw currency units (INR), not crore — divide by 1e7
     # to match the rest of the app's crore-based fields. EPS is already
     # a per-share rupee value, no scaling needed.
@@ -689,7 +718,6 @@ async def fetch_and_parse_xbrl(session: aiohttp.ClientSession, url: str,
     # added, rather than saving an all-null row.
     comparisons = []
     if period_ended and contexts:
-        norm_period = _norm_date(period_ended)
         for label, target_days in (('yoy', 365), ('qoq', 90)):
             try:
                 base = datetime.strptime(norm_period, '%Y-%m-%d')
