@@ -1382,6 +1382,13 @@ async def fundamentals_worker_main():
             except Exception as e:
                 import traceback
                 log.error(f"BSE test failed: {e}\n{traceback.format_exc()}")
+        if os.getenv('BACKFILL_BSE_SYMBOLS'):
+            try:
+                syms = [s.strip().upper() for s in os.getenv('BACKFILL_BSE_SYMBOLS').split(',') if s.strip()]
+                await backfill_from_bse(session, syms)
+            except Exception as e:
+                import traceback
+                log.error(f"BSE backfill failed: {e}\n{traceback.format_exc()}")
         await asyncio.gather(
             _fundamentals_loop(session),
             _market_cap_catchup_loop(session),
@@ -1646,6 +1653,104 @@ async def save_financial_results_to_db(session: aiohttp.ClientSession, rows: lis
                 log.warning(f"⚠️ Financial results upsert failed ({r.status}): {body[:300]}")
     except Exception as e:
         log.warning(f"⚠️ Financial results upsert error: {type(e).__name__}: {e}")
+
+def _bse_period_to_period_ended(period_label: str):
+    """Converts BSE's period label like 'Jun-26' to our period_ended
+    format '30-Jun-2026' (last calendar day of that month - BSE's
+    quarterly labels name the quarter-end month). Returns None for
+    FY-style labels (e.g. 'FY25-26') since those are annual figures,
+    not quarterly, and mixing them into period_ended would confuse
+    the QoQ/YoY comparison logic which assumes quarterly cadence."""
+    import calendar
+    m = re.match(r'^([A-Za-z]{3})-(\d{2})$', period_label.strip())
+    if not m:
+        return None
+    mon_str, yy = m.groups()
+    month_map = {'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4, 'May': 5, 'Jun': 6,
+                 'Jul': 7, 'Aug': 8, 'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12}
+    month = month_map.get(mon_str.title())
+    if not month:
+        return None
+    year = 2000 + int(yy)
+    last_day = calendar.monthrange(year, month)[1]
+    return datetime(year, month, last_day).strftime('%d-%b-%Y')
+
+def _parse_bse_resultsSnapshot(symbol: str, snapshot: dict) -> list:
+    """Parses BSE's resultsSnapshot() response into row dicts matching
+    our financial_results schema. Deliberately does NOT include
+    'pbt' or 'other_income' keys at all (not even as None) - BSE's
+    snapshot doesn't carry those fields, and save_financial_results_to_db
+    only fills in keys that appear somewhere in the batch being saved,
+    so omitting them here means the upsert won't touch (and can't
+    accidentally null out) any existing NSE-XBRL-sourced pbt/other_income
+    values for the same symbol+period_ended+result_type row.
+
+    result_type is marked 'Consolidated' as a working assumption -
+    BSE's snapshot doesn't label which basis it uses, but our one
+    verified spot-check (IPL) matched the Consolidated figures from
+    the real filing, not Standalone."""
+    rows = []
+    table = (snapshot.get('results_in_crores') or {}).get('data') or []
+    periods = snapshot.get('periods') or []
+    field_map = {'revenue': 'sales', 'net profit': 'pat', 'eps': 'eps', 'opm %': 'opm_pct'}
+    by_period = {}
+    for period_idx, period_label in enumerate(periods[:2]):  # LQ and SQ only, skip FY
+        period_ended = _bse_period_to_period_ended(period_label)
+        if not period_ended:
+            continue
+        by_period[period_idx] = {'symbol': symbol, 'period_ended': period_ended,
+                                  'result_type': 'Consolidated'}
+    for title_row in table:
+        if not title_row:
+            continue
+        title = (title_row[0] or '').strip().lower()
+        col = field_map.get(title)
+        if not col:
+            continue
+        for period_idx in by_period:
+            raw_val = title_row[1 + period_idx] if len(title_row) > 1 + period_idx else None
+            if raw_val in (None, '', '--'):
+                continue
+            try:
+                by_period[period_idx][col] = float(str(raw_val).replace(',', ''))
+            except ValueError:
+                pass
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for period_idx, row in by_period.items():
+        # filed_at set to fetch-time, not the true original filing date
+        # (BSE's snapshot doesn't expose that) - needed so the row falls
+        # inside the frontend's 90-day filed_at window and actually shows up.
+        row['filed_at'] = now_iso
+        rows.append(row)
+    return rows
+
+async def backfill_from_bse(session: aiohttp.ClientSession, symbols: list):
+    """Targeted, symbol-list-driven backfill using BSE's resultsSnapshot
+    (verified today against real filings for IPL/VSTTILLERS/SPORTKING/
+    LATENTVIEW). Populates sales/pat/eps/opm_pct only - NOT pbt or
+    other_income, which stay NSE-XBRL-only for now since BSE's snapshot
+    doesn't carry those fields. Intentionally scoped to an explicit
+    symbol list rather than all stocks, matching today's
+    verify-before-widening approach."""
+    from bse import BSE
+    bse_client = await asyncio.to_thread(BSE, '/tmp')
+    all_rows = []
+    try:
+        for symbol in symbols:
+            try:
+                scripcode = await asyncio.to_thread(bse_client.getScripCode, symbol)
+                snapshot = await asyncio.to_thread(bse_client.resultsSnapshot, scripcode)
+                rows = _parse_bse_resultsSnapshot(symbol, snapshot)
+                log.info(f"  🏛️ BSE backfill {symbol}: scripcode={scripcode}, {len(rows)} period(s) parsed")
+                all_rows.extend(rows)
+            except Exception as e:
+                log.info(f"  🏛️ BSE backfill {symbol} FAILED: {type(e).__name__}: {e}")
+            await asyncio.sleep(1)
+    finally:
+        await asyncio.to_thread(bse_client.exit)
+    if all_rows:
+        await save_financial_results_to_db(session, all_rows)
+    log.info(f"🏛️ BSE backfill complete: {len(all_rows)} period-rows from {len(symbols)} symbol(s)")
 
 async def test_bse_resultsSnapshot():
     """One-off verification test, NOT part of the regular pipeline -
