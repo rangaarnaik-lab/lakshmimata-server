@@ -1890,6 +1890,49 @@ _SCREENER_CSV_COL_MAP = {
     'opm_pct': 'OPM preceding year quarter',
 }
 
+_SCREENER_CSV_FUNDAMENTALS_MAP = {
+    'market_cap': 'Market Capitalization',
+    'pe': 'Price to Earning',
+    'industry_pe': 'Industry PE',
+    'roce': 'Return on capital employed',
+    'roe': 'Return on equity',
+    'debt_eq': 'Debt to equity',
+    'current_ratio': 'Current ratio',
+    'interest_coverage': 'Interest Coverage Ratio',
+    'promoter': 'Promoter holding',
+    'fii_pct': 'FII holding',
+    'dii_pct': 'DII holding',
+    'receivables_to_sales': 'Receivables to Sales Ratio',
+}
+
+async def _save_screener_fundamentals(session: aiohttp.ClientSession, rows: list):
+    """Upserts the current-snapshot fundamentals columns (market cap,
+    PE, ROCE, receivables-to-sales, etc.) to stock_fundamentals - a
+    plain upsert keyed on 'sym', no date-anchoring needed since these
+    aren't period-specific like the YoY results data."""
+    if not rows:
+        return
+    url = f"{SUPABASE_URL}/rest/v1/stock_fundamentals?on_conflict=sym"
+    headers = {
+        'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}',
+        'Content-Type': 'application/json', 'Prefer': 'resolution=merge-duplicates',
+    }
+    # Batch in chunks of 200 to keep individual requests reasonably sized.
+    saved = 0
+    for i in range(0, len(rows), 200):
+        chunk = rows[i:i+200]
+        try:
+            async with session.post(url, headers=headers, json=chunk,
+                                    timeout=aiohttp.ClientTimeout(total=30)) as r:
+                if r.status in (200, 201, 204):
+                    saved += len(chunk)
+                else:
+                    body = await r.text()
+                    log.warning(f"⚠️ Screener fundamentals upsert failed ({r.status}): {body[:300]}")
+        except Exception as e:
+            log.warning(f"⚠️ Screener fundamentals upsert error: {type(e).__name__}: {e}")
+    log.info(f"📥 Screener CSV: {saved}/{len(rows)} fundamentals row(s) upserted to stock_fundamentals")
+
 async def import_screener_yoy_csv(session: aiohttp.ClientSession, csv_url: str):
     """One-off historical import: Screener's export includes
     'preceding year quarter' figures (the YoY comparison period) -
@@ -1961,6 +2004,7 @@ async def import_screener_yoy_csv(session: aiohttp.ClientSession, csv_url: str):
     tracked = set(ALL_STOCKS)
     reader = csv_module.DictReader(io.StringIO(text))
     rows_to_save = []
+    fundamentals_rows = []
     skipped_no_anchor = 0
     skipped_not_tracked = 0
     for csv_row in reader:
@@ -1968,6 +2012,25 @@ async def import_screener_yoy_csv(session: aiohttp.ClientSession, csv_url: str):
         if not sym or sym not in tracked:
             skipped_not_tracked += 1
             continue
+
+        # Fundamentals snapshot - no anchor/date dependency, always
+        # attempted for every tracked symbol in the file.
+        f_row = {'sym': sym}
+        f_any = False
+        for db_col, csv_col in _SCREENER_CSV_FUNDAMENTALS_MAP.items():
+            raw = (csv_row.get(csv_col) or '').strip()
+            if raw == '':
+                continue
+            try:
+                f_row[db_col] = float(raw)
+                f_any = True
+            except ValueError:
+                pass
+        if f_any:
+            fundamentals_rows.append(f_row)
+
+        # YoY results comparison row - needs a known current-period
+        # anchor to place the correct date, so it's skipped without one.
         anchor = anchors.get(sym)
         if not anchor:
             skipped_no_anchor += 1
@@ -1992,14 +2055,17 @@ async def import_screener_yoy_csv(session: aiohttp.ClientSession, csv_url: str):
         if any_value:
             rows_to_save.append(row)
 
-    log.info(f"📥 Screener CSV import: {len(rows_to_save)} row(s) ready to save "
+    log.info(f"📥 Screener CSV import: {len(rows_to_save)} YoY row(s) ready to save "
               f"({skipped_no_anchor} skipped - no current-period anchor yet, "
-              f"{skipped_not_tracked} skipped - not in tracked stock list)")
+              f"{skipped_not_tracked} skipped - not in tracked stock list), "
+              f"{len(fundamentals_rows)} fundamentals row(s) ready to save")
     if rows_to_save:
         await save_financial_results_to_db(session, rows_to_save, skip_yoy_qoq=True)
         # Now that comparison rows exist, recompute YoY/QoQ on the
         # existing current-quarter rows so they pick up the match.
         await backfill_results_yoy_qoq(session, days=30)
+    if fundamentals_rows:
+        await _save_screener_fundamentals(session, fundamentals_rows)
     log.info("📥 Screener CSV import complete")
 
 async def test_bse_resultsSnapshot():
