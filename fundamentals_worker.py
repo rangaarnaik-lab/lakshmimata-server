@@ -1400,6 +1400,8 @@ async def fundamentals_worker_main():
             _market_cap_catchup_loop(session),
             _announcements_loop(session),
             _results_loop(session),
+            _bse_calendar_refresh_loop(session),
+            _bse_targeted_results_loop(session),
         )
 
 def rate_announcements_free(rows: list) -> list:
@@ -1757,6 +1759,57 @@ async def backfill_from_bse(session: aiohttp.ClientSession, symbols: list):
     if all_rows:
         await save_financial_results_to_db(session, all_rows)
     log.info(f"🏛️ BSE backfill complete: {len(all_rows)} period-rows from {len(symbols)} symbol(s)")
+
+async def _bse_calendar_refresh_loop(session: aiohttp.ClientSession):
+    """Refreshes the upcoming_results calendar once a day - this data
+    (which companies have scheduled result dates) doesn't change often
+    enough to warrant more frequent checks, and it's one single BSE
+    call regardless of how many stocks are tracked."""
+    CHECK_INTERVAL = 86400  # 24 hours
+    while True:
+        try:
+            await fetch_and_save_upcoming_results_calendar(session)
+        except Exception as e:
+            import traceback
+            log.error(f"BSE calendar refresh failed: {e}\n{traceback.format_exc()}")
+        await asyncio.sleep(CHECK_INTERVAL)
+
+async def _bse_targeted_results_loop(session: aiohttp.ClientSession):
+    """Checks resultsSnapshot only for stocks whose scheduled BSE
+    meeting_date is today or within the last 2 days (covers slightly
+    delayed filings without polling everything). This is the
+    verify-what-you-need approach discussed with the user - a handful
+    of targeted stocks checked every 10 min, not thousands checked
+    per second, to stay well clear of BSE's rate limiting."""
+    CHECK_INTERVAL = 600  # 10 minutes
+    while True:
+        try:
+            today = datetime.now(timezone.utc).date()
+            since = (today - timedelta(days=2)).isoformat()
+            url = f"{SUPABASE_URL}/rest/v1/upcoming_results"
+            # PostgREST needs the two-sided date range combined via 'and',
+            # not two separate 'meeting_date' query params (which would
+            # collide - only the last one would apply).
+            params = {'select': 'symbol',
+                      'and': f'(meeting_date.gte.{since},meeting_date.lte.{today.isoformat()})'}
+            headers = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
+            symbols = []
+            try:
+                async with session.get(url, headers=headers, params=params,
+                                        timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    if r.status == 200:
+                        symbols = [row['symbol'] for row in await r.json()]
+                    else:
+                        log.warning(f"⚠️ Upcoming-results query failed ({r.status})")
+            except Exception as e:
+                log.warning(f"⚠️ Upcoming-results query error: {type(e).__name__}: {e}")
+            if symbols:
+                log.info(f"📅 BSE targeted check: {len(symbols)} stock(s) with a result date in range")
+                await backfill_from_bse(session, symbols)
+        except Exception as e:
+            import traceback
+            log.error(f"BSE targeted results loop failed: {e}\n{traceback.format_exc()}")
+        await asyncio.sleep(CHECK_INTERVAL)
 
 def _parse_bse_meeting_date(date_str: str):
     """Converts BSE's 'meeting_date' format ('23 Oct 2023') to
