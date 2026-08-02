@@ -1389,6 +1389,12 @@ async def fundamentals_worker_main():
             except Exception as e:
                 import traceback
                 log.error(f"BSE backfill failed: {e}\n{traceback.format_exc()}")
+        if os.getenv('TEST_BSE_CALENDAR'):
+            try:
+                await fetch_and_save_upcoming_results_calendar(session)
+            except Exception as e:
+                import traceback
+                log.error(f"BSE result calendar test failed: {e}\n{traceback.format_exc()}")
         await asyncio.gather(
             _fundamentals_loop(session),
             _market_cap_catchup_loop(session),
@@ -1751,6 +1757,70 @@ async def backfill_from_bse(session: aiohttp.ClientSession, symbols: list):
     if all_rows:
         await save_financial_results_to_db(session, all_rows)
     log.info(f"🏛️ BSE backfill complete: {len(all_rows)} period-rows from {len(symbols)} symbol(s)")
+
+def _parse_bse_meeting_date(date_str: str):
+    """Converts BSE's 'meeting_date' format ('23 Oct 2023') to
+    ISO 'YYYY-MM-DD' for the upcoming_results date column."""
+    try:
+        return datetime.strptime(date_str.strip(), '%d %b %Y').strftime('%Y-%m-%d')
+    except (ValueError, AttributeError):
+        return None
+
+async def fetch_and_save_upcoming_results_calendar(session: aiohttp.ClientSession):
+    """Fetches BSE's forthcoming-results calendar in a SINGLE call
+    (resultCalendar with no args returns every upcoming result date
+    across all of BSE, not per-stock), then filters locally down to
+    symbols in ALL_STOCKS (~2400 tracked). Matches on BSE's
+    'short_name' against our NSE-sourced symbols - this is a real,
+    unverified assumption (BSE and NSE trading symbols aren't
+    guaranteed to always match exactly for every company), so some
+    tracked stocks may not get matched even if they do have an
+    upcoming date on BSE. Upserts one row per symbol (primary key),
+    so each stock holds only its most recently known upcoming date."""
+    from bse import BSE
+    bse_client = await asyncio.to_thread(BSE, '/tmp')
+    try:
+        calendar = await asyncio.to_thread(bse_client.resultCalendar)
+    except Exception as e:
+        log.error(f"📅 BSE result calendar fetch failed: {type(e).__name__}: {e}")
+        return
+    finally:
+        await asyncio.to_thread(bse_client.exit)
+    tracked = set(ALL_STOCKS)
+    rows = []
+    for item in (calendar or []):
+        sym = (item.get('short_name') or '').strip().upper()
+        if sym not in tracked:
+            continue
+        meeting_date = _parse_bse_meeting_date(item.get('meeting_date'))
+        if not meeting_date:
+            continue
+        rows.append({
+            'symbol': sym,
+            'company_name': item.get('Long_Name'),
+            'meeting_date': meeting_date,
+            'bse_scripcode': item.get('scrip_Code'),
+            'bse_url': item.get('URL'),
+            'fetched_at': datetime.now(timezone.utc).isoformat(),
+        })
+    log.info(f"📅 BSE result calendar: {len(calendar or [])} total entries, {len(rows)} matched to tracked stocks")
+    if not rows:
+        return
+    url = f"{SUPABASE_URL}/rest/v1/upcoming_results?on_conflict=symbol"
+    headers = {
+        'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}',
+        'Content-Type': 'application/json', 'Prefer': 'resolution=merge-duplicates',
+    }
+    try:
+        async with session.post(url, headers=headers, json=rows,
+                                timeout=aiohttp.ClientTimeout(total=30)) as r:
+            if r.status in (200, 201, 204):
+                log.info(f"📅 Upserted {len(rows)} upcoming results to Supabase")
+            else:
+                body = await r.text()
+                log.warning(f"⚠️ Upcoming results upsert failed ({r.status}): {body[:300]}")
+    except Exception as e:
+        log.warning(f"⚠️ Upcoming results upsert error: {type(e).__name__}: {e}")
 
 async def test_bse_resultsSnapshot():
     """One-off verification test, NOT part of the regular pipeline -
