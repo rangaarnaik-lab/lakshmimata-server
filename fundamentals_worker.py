@@ -1395,6 +1395,12 @@ async def fundamentals_worker_main():
             except Exception as e:
                 import traceback
                 log.error(f"BSE result calendar test failed: {e}\n{traceback.format_exc()}")
+        if os.getenv('IMPORT_SCREENER_CSV_URL'):
+            try:
+                await import_screener_yoy_csv(session, os.getenv('IMPORT_SCREENER_CSV_URL'))
+            except Exception as e:
+                import traceback
+                log.error(f"Screener CSV import failed: {e}\n{traceback.format_exc()}")
         await asyncio.gather(
             _fundamentals_loop(session),
             _market_cap_catchup_loop(session),
@@ -1874,6 +1880,127 @@ async def fetch_and_save_upcoming_results_calendar(session: aiohttp.ClientSessio
                 log.warning(f"⚠️ Upcoming results upsert failed ({r.status}): {body[:300]}")
     except Exception as e:
         log.warning(f"⚠️ Upcoming results upsert error: {type(e).__name__}: {e}")
+
+_SCREENER_CSV_COL_MAP = {
+    'sales': 'Sales preceding year quarter',
+    'pat': 'Net Profit preceding year quarter',
+    'pbt': 'Profit before tax preceding year quarter',
+    'other_income': 'Other income preceding year quarter',
+    'eps': 'EPS preceding year quarter',
+    'opm_pct': 'OPM preceding year quarter',
+}
+
+async def import_screener_yoy_csv(session: aiohttp.ClientSession, csv_url: str):
+    """One-off historical import: Screener's export includes
+    'preceding year quarter' figures (the YoY comparison period) -
+    genuinely including PBT and Other Income, which BSE's
+    resultsSnapshot can't provide at all. The CSV has no explicit
+    date column, so the exact period_ended for 'preceding year
+    quarter' has to be derived: for each symbol, we look up the most
+    recent period_ended we already have on file (from BSE/XBRL) and
+    subtract exactly one year. This ONLY works for symbols we already
+    have a current-quarter anchor for - symbols with no existing
+    financial_results row are skipped for now and will naturally get
+    a real current-quarter row (and become eligible for this import
+    on a future re-run) once they next report via the ongoing
+    pipeline. This is a deliberate scope limit, not an oversight -
+    guessing an anchor date without a known current period would risk
+    silently wrong dates, the same class of mistake as the IPL
+    fallback-data issue from earlier today."""
+    import csv as csv_module
+    import io
+    headers = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
+
+    # Fetch current anchor period per tracked symbol (single paginated
+    # fetch, not one query per symbol - much faster for ~2400 stocks).
+    anchors = {}  # symbol -> most recent period_ended (datetime)
+    offset = 0
+    while True:
+        try:
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/financial_results",
+                headers=headers,
+                params={'select': 'symbol,period_ended', 'order': 'period_ended.desc',
+                        'limit': '1000', 'offset': str(offset)},
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as r:
+                if r.status != 200:
+                    log.warning(f"⚠️ Screener CSV import: anchor fetch failed ({r.status})")
+                    break
+                batch = await r.json()
+        except Exception as e:
+            log.warning(f"⚠️ Screener CSV import: anchor fetch error: {type(e).__name__}: {e}")
+            break
+        if not batch:
+            break
+        for row in batch:
+            sym, pe = row.get('symbol'), row.get('period_ended')
+            if not sym or not pe:
+                continue
+            try:
+                d = datetime.strptime(_norm_date(pe), '%Y-%m-%d')
+            except (ValueError, TypeError):
+                continue
+            if sym not in anchors or d > anchors[sym]:
+                anchors[sym] = d
+        offset += 1000
+        if len(batch) < 1000:
+            break
+    log.info(f"📥 Screener CSV import: {len(anchors)} symbols have a known current-period anchor")
+
+    try:
+        async with session.get(csv_url, timeout=aiohttp.ClientTimeout(total=60)) as r:
+            if r.status != 200:
+                log.error(f"📥 Screener CSV import: fetch failed ({r.status})")
+                return
+            text = await r.text()
+    except Exception as e:
+        log.error(f"📥 Screener CSV import: fetch error: {type(e).__name__}: {e}")
+        return
+
+    tracked = set(ALL_STOCKS)
+    reader = csv_module.DictReader(io.StringIO(text))
+    rows_to_save = []
+    skipped_no_anchor = 0
+    skipped_not_tracked = 0
+    for csv_row in reader:
+        sym = (csv_row.get('NSE Code') or '').strip().upper()
+        if not sym or sym not in tracked:
+            skipped_not_tracked += 1
+            continue
+        anchor = anchors.get(sym)
+        if not anchor:
+            skipped_no_anchor += 1
+            continue
+        try:
+            preceding_year_date = anchor.replace(year=anchor.year - 1)
+        except ValueError:
+            # Feb 29 anchor with no Feb 29 the year before - fall back to Feb 28.
+            preceding_year_date = anchor.replace(year=anchor.year - 1, day=28)
+        row = {'symbol': sym, 'period_ended': preceding_year_date.strftime('%d-%b-%Y'),
+               'result_type': 'Consolidated'}
+        any_value = False
+        for db_col, csv_col in _SCREENER_CSV_COL_MAP.items():
+            raw = (csv_row.get(csv_col) or '').strip()
+            if raw == '':
+                continue
+            try:
+                row[db_col] = float(raw)
+                any_value = True
+            except ValueError:
+                pass
+        if any_value:
+            rows_to_save.append(row)
+
+    log.info(f"📥 Screener CSV import: {len(rows_to_save)} row(s) ready to save "
+              f"({skipped_no_anchor} skipped - no current-period anchor yet, "
+              f"{skipped_not_tracked} skipped - not in tracked stock list)")
+    if rows_to_save:
+        await save_financial_results_to_db(session, rows_to_save, skip_yoy_qoq=True)
+        # Now that comparison rows exist, recompute YoY/QoQ on the
+        # existing current-quarter rows so they pick up the match.
+        await backfill_results_yoy_qoq(session, days=30)
+    log.info("📥 Screener CSV import complete")
 
 async def test_bse_resultsSnapshot():
     """One-off verification test, NOT part of the regular pipeline -
