@@ -1376,6 +1376,12 @@ async def fundamentals_worker_main():
                 await backfill_pbt_other_income(session, days=int(os.getenv('BACKFILL_PBT_DAYS')))
             except Exception as e:
                 log.error(f"PBT/Other Income backfill failed: {e}")
+        if os.getenv('TEST_BSE'):
+            try:
+                await test_bse_resultsSnapshot()
+            except Exception as e:
+                import traceback
+                log.error(f"BSE test failed: {e}\n{traceback.format_exc()}")
         await asyncio.gather(
             _fundamentals_loop(session),
             _market_cap_catchup_loop(session),
@@ -1640,6 +1646,40 @@ async def save_financial_results_to_db(session: aiohttp.ClientSession, rows: lis
                 log.warning(f"⚠️ Financial results upsert failed ({r.status}): {body[:300]}")
     except Exception as e:
         log.warning(f"⚠️ Financial results upsert error: {type(e).__name__}: {e}")
+
+async def test_bse_resultsSnapshot():
+    """One-off verification test, NOT part of the regular pipeline -
+    checks whether BSE's unofficial-but-maintained 'bse' package
+    (https://github.com/BennyThadikaran/BseIndiaApi) can actually
+    resolve symbols and return results data for a handful of symbols
+    we've already manually verified numbers for today (IPL, VSTTILLERS)
+    plus a couple more from today's session. Logs everything for
+    inspection - this is purely exploratory, gated behind TEST_BSE, and
+    intentionally does NOT save anything to the database. The bse
+    package's own network calls are synchronous (requests-based), so
+    each call runs in a thread to avoid blocking the event loop."""
+    from bse import BSE
+    test_symbols = ['IPL', 'VSTTILLERS', 'SPORTKING', 'LATENTVIEW']
+    # download_folder is a required argument in this version (3.3.0) -
+    # not actually used for anything here since this test doesn't
+    # download reports, just uses /tmp as a harmless placeholder.
+    bse_client = await asyncio.to_thread(BSE, '/tmp')
+    try:
+        for symbol in test_symbols:
+            try:
+                scripcode = await asyncio.to_thread(bse_client.getScripCode, symbol)
+                log.info(f"  🧪 BSE test {symbol}: scripcode={scripcode}")
+                if not scripcode:
+                    log.info(f"  🧪 BSE test {symbol}: no scripcode found, skipping resultsSnapshot")
+                    continue
+                snapshot = await asyncio.to_thread(bse_client.resultsSnapshot, scripcode)
+                log.info(f"  🧪 BSE test {symbol} resultsSnapshot: {json.dumps(snapshot)[:2000]}")
+            except Exception as e:
+                log.info(f"  🧪 BSE test {symbol} FAILED: {type(e).__name__}: {e}")
+            await asyncio.sleep(1)
+    finally:
+        await asyncio.to_thread(bse_client.exit)
+    log.info("🧪 BSE test complete")
 
 async def backfill_pbt_other_income(session: aiohttp.ClientSession, days: int = 7):
     """Backfill PBT/Other Income/OPM% for EXISTING financial_results rows
