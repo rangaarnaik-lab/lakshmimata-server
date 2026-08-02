@@ -2055,7 +2055,8 @@ async def import_screener_yoy_csv(session: aiohttp.ClientSession, csv_url: str):
             # Feb 29 anchor with no Feb 29 the year before - fall back to Feb 28.
             preceding_year_date = anchor.replace(year=anchor.year - 1, day=28)
         row = {'symbol': sym, 'period_ended': preceding_year_date.strftime('%d-%b-%Y'),
-               'result_type': 'Consolidated'}
+               'result_type': 'Consolidated',
+               'filed_at': datetime.now(timezone.utc).isoformat()}
         any_value = False
         for db_col, csv_col in _SCREENER_CSV_COL_MAP.items():
             raw = (csv_row.get(csv_col) or '').strip()
