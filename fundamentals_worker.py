@@ -1909,9 +1909,23 @@ async def _save_screener_fundamentals(session: aiohttp.ClientSession, rows: list
     """Upserts the current-snapshot fundamentals columns (market cap,
     PE, ROCE, receivables-to-sales, etc.) to stock_fundamentals - a
     plain upsert keyed on 'sym', no date-anchoring needed since these
-    aren't period-specific like the YoY results data."""
+    aren't period-specific like the YoY results data.
+
+    PostgREST rejects a bulk upsert if the objects in the array don't
+    all share the exact same set of keys (PGRST102 'All object keys
+    must match') - confirmed in production logs, every row failed
+    because different stocks have different missing/blank CSV fields.
+    Normalize every row to the same key set (missing values -> None)
+    before posting, same pattern already used in
+    save_financial_results_to_db for the same reason."""
     if not rows:
         return
+    all_keys = set()
+    for r in rows:
+        all_keys.update(r.keys())
+    for r in rows:
+        for k in all_keys:
+            r.setdefault(k, None)
     url = f"{SUPABASE_URL}/rest/v1/stock_fundamentals?on_conflict=sym"
     headers = {
         'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}',
