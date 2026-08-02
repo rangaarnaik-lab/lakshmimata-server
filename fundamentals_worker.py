@@ -1389,6 +1389,12 @@ async def fundamentals_worker_main():
             except Exception as e:
                 import traceback
                 log.error(f"BSE backfill failed: {e}\n{traceback.format_exc()}")
+        if os.getenv('BACKFILL_BSE_MISSING_LIMIT'):
+            try:
+                await backfill_from_bse_missing(session, limit=int(os.getenv('BACKFILL_BSE_MISSING_LIMIT')))
+            except Exception as e:
+                import traceback
+                log.error(f"BSE-missing backfill failed: {e}\n{traceback.format_exc()}")
         if os.getenv('TEST_BSE_CALENDAR'):
             try:
                 await fetch_and_save_upcoming_results_calendar(session)
@@ -1737,6 +1743,50 @@ def _parse_bse_resultsSnapshot(symbol: str, snapshot: dict) -> list:
         row['filed_at'] = now_iso
         rows.append(row)
     return rows
+
+async def backfill_from_bse_missing(session: aiohttp.ClientSession, limit: int = 200):
+    """Finds tracked symbols (ALL_STOCKS) with NO financial_results row
+    at all yet - these are stocks that reported earlier this quarter,
+    before today's BSE/XBRL pipeline existed, so they never got picked
+    up (same situation GHCL was found in). Processes up to `limit` of
+    them via BSE's resultsSnapshot (same as the targeted IPL backfill),
+    establishing a current-period anchor for each. Deliberately gradual
+    rather than all ~2400 at once, to stay well clear of BSE's rate
+    limiting - same reasoning discussed with the user for the targeted
+    polling loop. Symbols with no BSE match just get skipped (logged,
+    not saved) and naturally retried on the next run since they'll
+    still show as missing."""
+    headers = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
+    existing = set()
+    offset = 0
+    while True:
+        try:
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/financial_results",
+                headers=headers,
+                params={'select': 'symbol', 'limit': '1000', 'offset': str(offset)},
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as r:
+                if r.status != 200:
+                    log.warning(f"⚠️ BSE-missing backfill: existing-symbols fetch failed ({r.status})")
+                    break
+                batch = await r.json()
+        except Exception as e:
+            log.warning(f"⚠️ BSE-missing backfill: existing-symbols fetch error: {type(e).__name__}: {e}")
+            break
+        if not batch:
+            break
+        existing.update(row['symbol'] for row in batch if row.get('symbol'))
+        offset += 1000
+        if len(batch) < 1000:
+            break
+    missing = [s for s in ALL_STOCKS if s not in existing]
+    batch = missing[:limit]
+    log.info(f"🏛️ BSE-missing backfill: {len(missing)} tracked symbol(s) have no financial_results row yet, "
+              f"processing {len(batch)} this run")
+    if batch:
+        await backfill_from_bse(session, batch)
+    log.info("🏛️ BSE-missing backfill complete")
 
 async def backfill_from_bse(session: aiohttp.ClientSession, symbols: list):
     """Targeted, symbol-list-driven backfill using BSE's resultsSnapshot
