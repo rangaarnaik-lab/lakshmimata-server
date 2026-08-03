@@ -16,6 +16,13 @@ from shared import *
 
 log = logging.getLogger('pocketrs')
 
+# Symbols confirmed to have no BSE scrip code at all (mostly ETFs/indices) -
+# tracked in-memory so the incremental BSE-missing backfill loop doesn't
+# keep wasting batch slots re-attempting the same permanently-doomed
+# symbols every 20-minute cycle. Resets on process restart, which is fine -
+# worst case is one wasted retry per restart, not an ongoing drag.
+_BSE_NO_SCRIP_CODE = set()
+
 # ══ FUNDAMENTALS-WORKER-ONLY FUNCTIONS ══
 
 async def _announcements_loop(session: aiohttp.ClientSession):
@@ -1781,10 +1788,10 @@ async def backfill_from_bse_missing(session: aiohttp.ClientSession, limit: int =
         offset += 1000
         if len(batch) < 1000:
             break
-    missing = [s for s in ALL_STOCKS if s not in existing]
+    missing = [s for s in ALL_STOCKS if s not in existing and s not in _BSE_NO_SCRIP_CODE]
     batch = missing[:limit]
-    log.info(f"🏛️ BSE-missing backfill: {len(missing)} tracked symbol(s) have no financial_results row yet, "
-              f"processing {len(batch)} this run")
+    log.info(f"🏛️ BSE-missing backfill: {len(missing)} tracked symbol(s) have no financial_results row yet "
+              f"({len(_BSE_NO_SCRIP_CODE)} confirmed no-BSE-match, excluded), processing {len(batch)} this run")
     if batch:
         await backfill_from_bse(session, batch)
     log.info("🏛️ BSE-missing backfill complete")
@@ -1803,12 +1810,25 @@ async def backfill_from_bse(session: aiohttp.ClientSession, symbols: list):
     all_rows = []
     try:
         for symbol in symbols:
+            if symbol in _BSE_NO_SCRIP_CODE:
+                continue  # confirmed no BSE listing earlier this process run - don't waste a retry
             try:
                 scripcode = await asyncio.to_thread(bse_client.getScripCode, symbol)
                 snapshot = await asyncio.to_thread(bse_client.resultsSnapshot, scripcode)
                 rows = _parse_bse_resultsSnapshot(symbol, snapshot)
                 log.info(f"  🏛️ BSE backfill {symbol}: scripcode={scripcode}, {len(rows)} period(s) parsed")
                 all_rows.extend(rows)
+            except ValueError:
+                # getScripCode raises ValueError (not None) when no match
+                # exists - confirmed via source inspection earlier today.
+                # This is permanent (mostly ETFs/indices with no BSE
+                # listing at all), not a transient failure, so remember
+                # it and skip on every future batch this process runs -
+                # otherwise the incremental backfill loop would keep
+                # re-wasting slots on the same doomed symbols every cycle
+                # instead of progressing through the rest of the backlog.
+                _BSE_NO_SCRIP_CODE.add(symbol)
+                log.info(f"  🏛️ BSE backfill {symbol}: no BSE scrip code - will skip on future batches this run")
             except Exception as e:
                 log.info(f"  🏛️ BSE backfill {symbol} FAILED: {type(e).__name__}: {e}")
             await asyncio.sleep(1)
