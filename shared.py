@@ -638,7 +638,7 @@ _RESULTS_ATTEMPT_COOLDOWN_SEC = 1800  # 30 min between retries of the same (symb
 _RESULTS_ANN_KEYWORDS = ['financial result', 'quarterly result', 'results for the quarter',
                          'unaudited results', 'audited results']
 _RESULTS_ANN_EXCLUDE = ['newspaper publication', 'newspaper advertisement', 'transcript', 'press release',
-                        'investor meet', 'con. call', 'con call', 'conference call']
+                        'investor meet', 'con. call', 'con call', 'conference call', 'clarification']
 _MONTH_NAMES = {
     'jan': 1, 'january': 1, 'feb': 2, 'february': 2, 'mar': 3, 'march': 3,
     'apr': 4, 'april': 4, 'may': 5, 'jun': 6, 'june': 6, 'jul': 7, 'july': 7,

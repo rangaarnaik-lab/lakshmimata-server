@@ -1746,6 +1746,20 @@ def _parse_bse_resultsSnapshot(symbol: str, snapshot: dict) -> list:
                 pass
     now_iso = datetime.now(timezone.utc).isoformat()
     for period_idx, row in by_period.items():
+        # If BSE hasn't populated ANY of the actual financial fields yet
+        # for this period (common right after a fresh announcement - the
+        # PDF/filing is out before BSE indexes the structured snapshot
+        # table), skip saving it entirely rather than writing a row with
+        # symbol/period_ended set but every financial field NULL. A
+        # missing row is fine - the stale-results refresh loop will
+        # naturally retry this symbol later since its latest saved
+        # period is still the older one. A blank row is actively
+        # misleading: it looks like a populated result in resultsMap
+        # while showing nothing but dashes.
+        if not any(k in row for k in ('sales', 'pat', 'eps', 'opm_pct')):
+            log.info(f"  🏛️ BSE backfill {symbol}: {row['period_ended']} has no financial fields yet on BSE "
+                      f"(likely just announced, not yet indexed) - skipping this period for now")
+            continue
         # filed_at set to fetch-time, not the true original filing date
         # (BSE's snapshot doesn't expose that) - needed so the row falls
         # inside the frontend's 90-day filed_at window and actually shows up.
