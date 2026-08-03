@@ -1422,6 +1422,7 @@ async def fundamentals_worker_main():
             _bse_calendar_refresh_loop(session),
             _bse_targeted_results_loop(session),
             _bse_missing_backfill_loop(session),
+            _bse_stale_results_loop(session),
         )
 
 def rate_announcements_free(rows: list) -> list:
@@ -1752,6 +1753,67 @@ def _parse_bse_resultsSnapshot(symbol: str, snapshot: dict) -> list:
         rows.append(row)
     return rows
 
+async def backfill_from_bse_stale(session: aiohttp.ClientSession, limit: int = 200, stale_days: int = 100):
+    """Finds tracked symbols that DO have a financial_results row, but
+    whose most recent saved period_ended is older than `stale_days` -
+    catches the case backfill_from_bse_missing can't: a stock that
+    already had (say) a 31-Mar-2026 result saved before today's BSE
+    pipeline existed, but has since announced its 30-Jun-2026 result,
+    which we'd otherwise never pick up (the missing-backfill only looks
+    at symbols with NO row at all, and the targeted polling loop only
+    watches meeting dates from today/the last 2 days - it never had a
+    chance to catch an announcement from weeks ago). Re-fetches via BSE
+    resultsSnapshot, same as backfill_from_bse - if a newer quarter
+    exists, it gets added as a new row via the normal upsert; if not,
+    nothing changes and the symbol will be checked again next run.
+    Deliberately gradual (limit-based) for the same rate-limit reasons
+    as the missing-backfill."""
+    headers = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
+    latest_by_symbol = {}  # symbol -> most recent period_ended (datetime)
+    offset = 0
+    while True:
+        try:
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/financial_results",
+                headers=headers,
+                params={'select': 'symbol,period_ended', 'order': 'period_ended.desc',
+                        'limit': '1000', 'offset': str(offset)},
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as r:
+                if r.status != 200:
+                    log.warning(f"⚠️ BSE-stale refresh: existing-rows fetch failed ({r.status})")
+                    break
+                batch = await r.json()
+        except Exception as e:
+            log.warning(f"⚠️ BSE-stale refresh: existing-rows fetch error: {type(e).__name__}: {e}")
+            break
+        if not batch:
+            break
+        for row in batch:
+            sym, pe = row.get('symbol'), row.get('period_ended')
+            if not sym or not pe:
+                continue
+            try:
+                d = datetime.strptime(_norm_date(pe), '%Y-%m-%d')
+            except (ValueError, TypeError):
+                continue
+            if sym not in latest_by_symbol or d > latest_by_symbol[sym]:
+                latest_by_symbol[sym] = d
+        offset += 1000
+        if len(batch) < 1000:
+            break
+
+    now = datetime.now(timezone.utc)
+    stale = [sym for sym, d in latest_by_symbol.items()
+             if sym in ALL_STOCKS and (now - d.replace(tzinfo=timezone.utc)).days > stale_days]
+    batch = stale[:limit]
+    log.info(f"🏛️ BSE-stale refresh: {len(stale)} tracked symbol(s) have a result older than {stale_days} days, "
+              f"processing {len(batch)} this run")
+    if batch:
+        await backfill_from_bse(session, batch)
+    log.info("🏛️ BSE-stale refresh complete")
+    return len(stale)
+
 async def backfill_from_bse_missing(session: aiohttp.ClientSession, limit: int = 200):
     """Finds tracked symbols (ALL_STOCKS) with NO financial_results row
     at all yet - these are stocks that reported earlier this quarter,
@@ -1837,6 +1899,28 @@ async def backfill_from_bse(session: aiohttp.ClientSession, symbols: list):
     if all_rows:
         await save_financial_results_to_db(session, all_rows)
     log.info(f"🏛️ BSE backfill complete: {len(all_rows)} period-rows from {len(symbols)} symbol(s)")
+
+async def _bse_stale_results_loop(session: aiohttp.ClientSession):
+    """Companion to _bse_missing_backfill_loop - that one only fills in
+    symbols with NO result at all; this one re-checks symbols that DO
+    have one, but it's aging (>100 days), to catch newly-announced
+    quarters for stocks whose result predates today's BSE pipeline.
+    Runs every 6 hours (staleness accumulates over ~90-day reporting
+    cycles, not something that needs 20-minute polling like the missing-
+    backfill) while a backlog remains, dropping to a 24h check once
+    cleared."""
+    ACTIVE_INTERVAL = 21600  # 6 hours while a stale backlog remains
+    IDLE_INTERVAL = 86400    # 24 hours once cleared
+    REMAINDER_THRESHOLD = 10
+    while True:
+        try:
+            remaining = await backfill_from_bse_stale(session, limit=200)
+        except Exception as e:
+            import traceback
+            log.error(f"BSE-stale refresh loop failed: {e}\n{traceback.format_exc()}")
+            remaining = None
+        sleep_for = IDLE_INTERVAL if (remaining is not None and remaining <= REMAINDER_THRESHOLD) else ACTIVE_INTERVAL
+        await asyncio.sleep(sleep_for)
 
 async def _bse_missing_backfill_loop(session: aiohttp.ClientSession):
     """Automatically clears the backlog of tracked stocks with no
