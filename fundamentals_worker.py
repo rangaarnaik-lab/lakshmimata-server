@@ -2251,7 +2251,23 @@ async def import_screener_yoy_csv(session: aiohttp.ClientSession, csv_url: str):
             # Feb 29 anchor with no Feb 29 the year before - fall back to Feb 28.
             preceding_year_date = anchor.replace(year=anchor.year - 1, day=28)
         row = {'symbol': sym, 'period_ended': preceding_year_date.strftime('%d-%b-%Y'),
-               'result_type': 'Consolidated',
+               # Confirmed by user (2026-08-03): Screener's export gives
+               # Standalone figures for many stocks, and this CSV format
+               # has no per-row column indicating which basis applies to
+               # a given company - so there's no way to know per-symbol
+               # whether it's actually Standalone or Consolidated.
+               # Mislabeling this 'Consolidated' (the previous, wrong
+               # assumption) was a real data-integrity risk: the upsert
+               # key is (symbol, period_ended, result_type), so a
+               # mislabeled Standalone row could silently overwrite a
+               # genuine Consolidated row sourced from NSE XBRL for the
+               # same symbol+period with wrong numbers. Labeling
+               # 'Standalone' instead keeps this data on its own key,
+               # separate from any genuine Consolidated row - the
+               # dedupe-preferring-Consolidated logic in the frontend
+               # will still surface real NSE Consolidated data first
+               # wherever it exists.
+               'result_type': 'Standalone',
                'filed_at': datetime.now(timezone.utc).isoformat()}
         any_value = False
         for db_col, csv_col in _SCREENER_CSV_COL_MAP.items():
