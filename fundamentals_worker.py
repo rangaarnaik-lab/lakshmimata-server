@@ -1919,13 +1919,13 @@ async def _bse_stale_results_loop(session: aiohttp.ClientSession):
     symbols with NO result at all; this one re-checks symbols that DO
     have one, but it's aging (>100 days), to catch newly-announced
     quarters for stocks whose result predates today's BSE pipeline.
-    Runs every 6 hours (staleness accumulates over ~90-day reporting
-    cycles, not something that needs 20-minute polling like the missing-
-    backfill) while a backlog remains, dropping to a 24h check once
-    cleared."""
-    ACTIVE_INTERVAL = 300    # 5 minutes while a stale backlog remains (user requested faster cadence to clear current backlog)
-    IDLE_INTERVAL = 86400    # 24 hours once cleared
-    REMAINDER_THRESHOLD = 10
+    Adaptive interval: >30 stocks still stale -> check every 5 min
+    (clear a real backlog fast); 30 or fewer -> check every 30 min
+    (steady-state trickle, no need to hammer BSE for a handful of
+    stragglers)."""
+    BUSY_INTERVAL = 300      # 5 min when backlog > threshold
+    QUIET_INTERVAL = 1800    # 30 min otherwise
+    BACKLOG_THRESHOLD = 30
     while True:
         try:
             remaining = await backfill_from_bse_stale(session, limit=200)
@@ -1933,7 +1933,7 @@ async def _bse_stale_results_loop(session: aiohttp.ClientSession):
             import traceback
             log.error(f"BSE-stale refresh loop failed: {e}\n{traceback.format_exc()}")
             remaining = None
-        sleep_for = IDLE_INTERVAL if (remaining is not None and remaining <= REMAINDER_THRESHOLD) else ACTIVE_INTERVAL
+        sleep_for = BUSY_INTERVAL if (remaining is not None and remaining > BACKLOG_THRESHOLD) else QUIET_INTERVAL
         await asyncio.sleep(sleep_for)
 
 async def _bse_missing_backfill_loop(session: aiohttp.ClientSession):
@@ -1943,16 +1943,15 @@ async def _bse_missing_backfill_loop(session: aiohttp.ClientSession):
     previously a one-off manual process (set BACKFILL_BSE_MISSING_LIMIT,
     redeploy, repeat ~12 times for 200 stocks/round) - this replaces that
     with a permanent background loop so results actually finish
-    backfilling without manual steps. Runs every 20 min while a backlog
-    remains (matches the ~5-6 min observed processing time for a 200-
-    stock batch, with buffer to stay clear of BSE rate limits), then
-    drops to a 24h check once the backlog clears (a few stragglers with
-    no BSE match at all - mostly ETFs/indices - will always show as
-    'missing', so the loop treats a small remainder as effectively done
-    rather than polling every 20 min forever)."""
-    ACTIVE_INTERVAL = 1200   # 20 minutes while backlog remains
-    IDLE_INTERVAL = 86400    # 24 hours once backlog is cleared
-    REMAINDER_THRESHOLD = 10  # a handful of permanent non-matches is expected
+    backfilling without manual steps. Adaptive interval, same pattern as
+    _bse_stale_results_loop: >30 stocks still missing -> check every 5
+    min; 30 or fewer -> check every 30 min (a handful of permanent
+    non-matches - mostly ETFs/indices - is expected long-term, so a
+    small remainder shouldn't be polled as aggressively as a real
+    backlog)."""
+    BUSY_INTERVAL = 300      # 5 min when backlog > threshold
+    QUIET_INTERVAL = 1800    # 30 min otherwise
+    BACKLOG_THRESHOLD = 30
     while True:
         try:
             remaining = await backfill_from_bse_missing(session, limit=200)
@@ -1960,7 +1959,7 @@ async def _bse_missing_backfill_loop(session: aiohttp.ClientSession):
             import traceback
             log.error(f"BSE-missing backfill loop failed: {e}\n{traceback.format_exc()}")
             remaining = None
-        sleep_for = IDLE_INTERVAL if (remaining is not None and remaining <= REMAINDER_THRESHOLD) else ACTIVE_INTERVAL
+        sleep_for = BUSY_INTERVAL if (remaining is not None and remaining > BACKLOG_THRESHOLD) else QUIET_INTERVAL
         await asyncio.sleep(sleep_for)
 
 async def _bse_calendar_refresh_loop(session: aiohttp.ClientSession):
