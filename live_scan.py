@@ -2932,6 +2932,15 @@ async def incremental_eod_update(session: aiohttp.ClientSession):
         recovered = len(retry_list) - len(failed_syms)
         failed = len(failed_syms)  # authoritative count — see comment in fetch_full_history_for_symbols
         log.info(f"🔁 Retry pass complete: {recovered} recovered, {len(failed_syms)} still failing")
+        if failed_syms:
+            # Log the actual symbols, not just a count - these are the ones
+            # whose stored history stays stuck at yesterday's (or older)
+            # date, producing a wrong true_prev_close and an implausible
+            # chg% until a future day's run succeeds for them. Confirmed
+            # in production (2026-08-03): UEL, YASHO, TRANSPEK, DCI,
+            # INDOTHAI, AARTISURF, KABRAEXTRU all showed this exact pattern.
+            log.warning(f"⚠️ Stocks with stale history after EOD update failure "
+                        f"(will show wrong chg% until a future run succeeds): {failed_syms}")
 
     if rows:
         await save_full_history_batch_to_db(session, rows)
