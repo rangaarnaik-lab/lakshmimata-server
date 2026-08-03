@@ -1414,6 +1414,7 @@ async def fundamentals_worker_main():
             _results_loop(session),
             _bse_calendar_refresh_loop(session),
             _bse_targeted_results_loop(session),
+            _bse_missing_backfill_loop(session),
         )
 
 def rate_announcements_free(rows: list) -> list:
@@ -1787,6 +1788,7 @@ async def backfill_from_bse_missing(session: aiohttp.ClientSession, limit: int =
     if batch:
         await backfill_from_bse(session, batch)
     log.info("🏛️ BSE-missing backfill complete")
+    return len(missing)
 
 async def backfill_from_bse(session: aiohttp.ClientSession, symbols: list):
     """Targeted, symbol-list-driven backfill using BSE's resultsSnapshot
@@ -1815,6 +1817,33 @@ async def backfill_from_bse(session: aiohttp.ClientSession, symbols: list):
     if all_rows:
         await save_financial_results_to_db(session, all_rows)
     log.info(f"🏛️ BSE backfill complete: {len(all_rows)} period-rows from {len(symbols)} symbol(s)")
+
+async def _bse_missing_backfill_loop(session: aiohttp.ClientSession):
+    """Automatically clears the backlog of tracked stocks with no
+    financial_results row at all (the ones that reported before today's
+    BSE/XBRL pipeline existed - confirmed ~2412 of them earlier). Was
+    previously a one-off manual process (set BACKFILL_BSE_MISSING_LIMIT,
+    redeploy, repeat ~12 times for 200 stocks/round) - this replaces that
+    with a permanent background loop so results actually finish
+    backfilling without manual steps. Runs every 20 min while a backlog
+    remains (matches the ~5-6 min observed processing time for a 200-
+    stock batch, with buffer to stay clear of BSE rate limits), then
+    drops to a 24h check once the backlog clears (a few stragglers with
+    no BSE match at all - mostly ETFs/indices - will always show as
+    'missing', so the loop treats a small remainder as effectively done
+    rather than polling every 20 min forever)."""
+    ACTIVE_INTERVAL = 1200   # 20 minutes while backlog remains
+    IDLE_INTERVAL = 86400    # 24 hours once backlog is cleared
+    REMAINDER_THRESHOLD = 10  # a handful of permanent non-matches is expected
+    while True:
+        try:
+            remaining = await backfill_from_bse_missing(session, limit=200)
+        except Exception as e:
+            import traceback
+            log.error(f"BSE-missing backfill loop failed: {e}\n{traceback.format_exc()}")
+            remaining = None
+        sleep_for = IDLE_INTERVAL if (remaining is not None and remaining <= REMAINDER_THRESHOLD) else ACTIVE_INTERVAL
+        await asyncio.sleep(sleep_for)
 
 async def _bse_calendar_refresh_loop(session: aiohttp.ClientSession):
     """Refreshes the upcoming_results calendar once a day - this data
