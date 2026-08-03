@@ -1923,7 +1923,7 @@ async def _bse_stale_results_loop(session: aiohttp.ClientSession):
     cycles, not something that needs 20-minute polling like the missing-
     backfill) while a backlog remains, dropping to a 24h check once
     cleared."""
-    ACTIVE_INTERVAL = 21600  # 6 hours while a stale backlog remains
+    ACTIVE_INTERVAL = 300    # 5 minutes while a stale backlog remains (user requested faster cadence to clear current backlog)
     IDLE_INTERVAL = 86400    # 24 hours once cleared
     REMAINDER_THRESHOLD = 10
     while True:
