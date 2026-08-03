@@ -4079,6 +4079,7 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             prev = prices[n-2] if n > 1 else last
 
         chg = round((last - prev) / prev * 100, 2) if prev else 0
+        _chg_raw = chg  # kept for debug logging below even if guards zero out chg
         # Staleness guard — the ~72 Yahoo-failing symbols had prev closes
         # months old, producing absurd chg like +896% (live price vs a
         # pre-corporate-action stale close). If the last stored bar is
@@ -4096,6 +4097,28 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
                     chg = 0
             except Exception:
                 pass
+        # Magnitude guard — the date-based guard above only catches STALE
+        # (old) reference prices, but confirmed in production logs (2026-08-03)
+        # this doesn't cover every case: several symbols (UEL, INDOTHAI,
+        # AARTISURF, DCI, TRANSPEK, YASHO, KABRAEXTRU) showed a persistent
+        # 20-44% chg holding steady for over an hour of scans, with a
+        # last-stored-bar age of only ~4 days (well under the 7-day
+        # threshold above) - some had a completely FROZEN live_price
+        # (identical value every single scan, which a genuinely-trading
+        # stock shouldn't do over an hour), others had live_price updating
+        # normally but structurally offset from the stored history (the
+        # signature of a corporate action - split/bonus - reflected on one
+        # side but not the other). NSE stocks are circuit-limited to ±20%
+        # in almost all cases, so a move beyond that holding steady across
+        # scans is far more likely to be this data bug than a real price
+        # move. Zero it out and log clearly rather than silently trusting
+        # (and displaying, and feeding into RS/AI-picks) an implausible number.
+        _magnitude_guard_triggered = bool(chg and abs(chg) > 20)
+        if _magnitude_guard_triggered:
+            log.warning(f"  ⚠️ {sym}: chg={chg}% exceeds ±20% sanity threshold "
+                        f"(live_price={live_price}, true_prev_close={true_prev_close}) — "
+                        f"suppressing to 0, likely frozen live quote or unadjusted corporate action")
+            chg = 0
         vol = live.get('volume') if live.get('volume') else (volumes[n-1] if volumes else 0)
 
         # Weekly/monthly % change per stock — needed for sector breadth
@@ -4111,7 +4134,7 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         # whether the live-quote-first fix is actually taking effect or
         # falling back to the local cache because live_ohlc_close simply
         # isn't present in the quote for these symbols.
-        if sym in ('RRKABEL', 'GRSE') or (chg is not None and abs(chg) > 20) or \
+        if sym in ('RRKABEL', 'GRSE') or _magnitude_guard_triggered or (chg is not None and abs(chg) > 20) or \
            (chg == 0 and _zero_chg_debug_count < 8):
             if chg == 0:
                 _zero_chg_debug_count += 1
@@ -4119,7 +4142,7 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
                      f"today_str={today_str}, prices_last_is_today={prices_last_is_today}, "
                      f"prices_last3={prices[-3:]}, true_prev_close={true_prev_close}, "
                      f"live_ohlc_close={live_ohlc_close}, "
-                     f"live_price={live_price}, last={last}, prev={prev}, chg={chg}")
+                     f"live_price={live_price}, last={last}, prev={prev}, chg={chg}, chg_raw={_chg_raw}")
 
         # PP — needs to trigger intraday, not just at EOD. detect_pp reads
         # only the static historical prices/volumes, which during live
