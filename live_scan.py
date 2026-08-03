@@ -4078,9 +4078,39 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         # no longer used for the actual calculation.
         live_ohlc_close = live.get('ohlc', {}).get('close') if isinstance(live.get('ohlc'), dict) else None
 
+        # net_change is a DIFFERENT field from ohlc.close, not another name
+        # for the same broken value above — confirmed via Upstox's official
+        # docs (Full Market Quotes API): "net_change: the absolute change
+        # from yesterday's close to last traded price," computed by the
+        # exchange itself at request time. Unlike our own stored history,
+        # this can't go stale for a symbol whose incremental EOD update
+        # failed - confirmed in production (2026-08-03) that several
+        # symbols (UEL, YASHO, TRANSPEK, DCI, INDOTHAI, AARTISURF,
+        # KABRAEXTRU) had exactly this problem: our stored true_prev_close
+        # was one or more trading days behind, producing a wrong chg% that
+        # combined multiple days of movement into one number. Deriving
+        # prev_close from net_change (prev = last - net_change) sidesteps
+        # that entirely by trusting the exchange's own reference instead of
+        # our potentially-stale copy. Falls back to true_prev_close only
+        # when net_change isn't present (e.g. market closed, or a symbol
+        # missing from the quote response).
+        net_change = live.get('net_change')
+        exchange_prev_close = None
+        if isinstance(net_change, (int, float)) and live_price and live_price > 0:
+            exchange_prev_close = live_price - net_change
+            # Sanity: exchange_prev_close should be positive and in the
+            # right ballpark vs our own stored value - if it's wildly off
+            # (or non-positive), something's wrong with net_change itself
+            # (e.g. missing/zero from the quote), so don't trust it blindly.
+            if exchange_prev_close <= 0:
+                exchange_prev_close = None
+
         if live_price and live_price > 0:
             last = live_price
-            prev = true_prev_close
+            if exchange_prev_close is not None:
+                prev = exchange_prev_close
+            else:
+                prev = true_prev_close
         else:
             # No live data (market closed / fetch failed) — show last completed
             # close vs the one before it, exactly like EOD.
@@ -4150,6 +4180,7 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             log.info(f"  🔍 {sym} chg-calc: n={n}, dates_last3={dates_for_sym[-3:] if dates_for_sym else None}, "
                      f"today_str={today_str}, prices_last_is_today={prices_last_is_today}, "
                      f"prices_last3={prices[-3:]}, true_prev_close={true_prev_close}, "
+                     f"net_change={net_change}, exchange_prev_close={exchange_prev_close}, "
                      f"live_ohlc_close={live_ohlc_close}, "
                      f"live_price={live_price}, last={last}, prev={prev}, chg={chg}, chg_raw={_chg_raw}")
 
