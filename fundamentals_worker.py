@@ -64,58 +64,73 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
     api_key = os.getenv('GEMINI_API_KEY', '')
     if not api_key or not attachment_url:
         return empty
+    # Stage 1: download the PDF. Separate try/except so a timeout here
+    # is clearly distinguishable in logs from a Gemini-side timeout -
+    # confirmed in production (2026-08-04) that a generic "TimeoutError:"
+    # with no stage info made this impossible to diagnose (4/4 failures
+    # in one batch, no way to tell if it was consistently one stage or
+    # varying).
     try:
         async with session.get(attachment_url, timeout=aiohttp.ClientTimeout(total=30)) as r:
             if r.status != 200:
                 log.warning(f"⚠️ Results PDF fetch failed for {symbol} ({r.status})")
                 return empty
             pdf_bytes = await r.read()
-        if len(pdf_bytes) > 15_000_000:  # sanity cap
-            log.warning(f"⚠️ Results PDF too large for {symbol} ({len(pdf_bytes)} bytes) - skipping")
-            return empty
-        pdf_b64 = base64.b64encode(pdf_bytes).decode('ascii')
-        prompt = (
-            "This is a quarterly/annual financial results filing for an Indian listed company, "
-            "filed with NSE/BSE. Extract data as follows:\n\n"
-            "FINANCIAL FIGURES: If the document contains an actual results table with numbers "
-            "(not just a schedule/notice), extract these fields. Filings often show BOTH "
-            "Standalone and Consolidated tables side by side or in separate sections - ALWAYS "
-            "extract from the CONSOLIDATED table specifically if one is present; only use "
-            "Standalone if no Consolidated table exists at all in the document (set result_type "
-            "accordingly). All rupee figures in Rs Crore, rounded to match the document's own "
-            "units (convert from Rs Lakh or Rs Thousand to Rs Crore if that's what the document "
-            "uses). If a field isn't present in the document, leave it null rather than guessing "
-            "or calculating it yourself.\n\n"
-            "SUMMARY: Separately, summarize for a retail investor in under 200 words what the "
-            "numbers alone wouldn't tell them: management's own commentary or explanation for "
-            "the quarter's performance if present, segment-wise/product-wise breakdown if "
-            "disclosed, any one-off/exceptional items or write-offs affecting results, and "
-            "forward outlook/guidance if mentioned. If the filing is purely financial statements/"
-            "schedules with no qualitative commentary of this kind (common for smaller "
-            "companies), leave summary null. Do not add commentary or opinions beyond what's "
-            "stated in the document."
-        )
-        schema = {
-            "type": "object",
-            "properties": {
-                "has_results_table": {"type": "boolean",
-                    "description": "true if the document contains an actual results table with financial figures"},
-                "period_ended": {"type": "string", "nullable": True,
-                    "description": "Quarter/year end date this result covers, YYYY-MM-DD format"},
-                "result_type": {"type": "string", "enum": ["Consolidated", "Standalone"], "nullable": True},
-                "sales": {"type": "number", "nullable": True, "description": "Revenue from operations, Rs Crore"},
-                "other_income": {"type": "number", "nullable": True, "description": "Rs Crore"},
-                "pbt": {"type": "number", "nullable": True, "description": "Profit before tax, Rs Crore"},
-                "pat": {"type": "number", "nullable": True, "description": "Profit after tax / net profit, Rs Crore"},
-                "eps": {"type": "number", "nullable": True, "description": "Basic EPS, Rs"},
-                "summary": {"type": "string", "nullable": True},
-            },
-            "required": ["has_results_table"],
-        }
-        # gemini-3.1-flash-lite: current actively-supported Lite-tier
-        # model as of Aug 2026 (gemini-2.5-flash is being deprecated
-        # Oct 16 2026) - cheap, fast, and handles PDF input natively.
-        model = os.getenv('GEMINI_CONCALL_MODEL', 'gemini-3.1-flash-lite')
+    except asyncio.TimeoutError:
+        log.warning(f"⚠️ Results PDF download timed out for {symbol} (30s limit)")
+        return empty
+    except Exception as e:
+        log.warning(f"⚠️ Results PDF download failed for {symbol}: {type(e).__name__}: {e}")
+        return empty
+    if len(pdf_bytes) > 15_000_000:  # sanity cap
+        log.warning(f"⚠️ Results PDF too large for {symbol} ({len(pdf_bytes)} bytes) - skipping")
+        return empty
+    pdf_b64 = base64.b64encode(pdf_bytes).decode('ascii')
+    prompt = (
+        "This is a quarterly/annual financial results filing for an Indian listed company, "
+        "filed with NSE/BSE. Extract data as follows:\n\n"
+        "FINANCIAL FIGURES: If the document contains an actual results table with numbers "
+        "(not just a schedule/notice), extract these fields. Filings often show BOTH "
+        "Standalone and Consolidated tables side by side or in separate sections - ALWAYS "
+        "extract from the CONSOLIDATED table specifically if one is present; only use "
+        "Standalone if no Consolidated table exists at all in the document (set result_type "
+        "accordingly). All rupee figures in Rs Crore, rounded to match the document's own "
+        "units (convert from Rs Lakh or Rs Thousand to Rs Crore if that's what the document "
+        "uses). If a field isn't present in the document, leave it null rather than guessing "
+        "or calculating it yourself.\n\n"
+        "SUMMARY: Separately, summarize for a retail investor in under 200 words what the "
+        "numbers alone wouldn't tell them: management's own commentary or explanation for "
+        "the quarter's performance if present, segment-wise/product-wise breakdown if "
+        "disclosed, any one-off/exceptional items or write-offs affecting results, and "
+        "forward outlook/guidance if mentioned. If the filing is purely financial statements/"
+        "schedules with no qualitative commentary of this kind (common for smaller "
+        "companies), leave summary null. Do not add commentary or opinions beyond what's "
+        "stated in the document."
+    )
+    schema = {
+        "type": "object",
+        "properties": {
+            "has_results_table": {"type": "boolean",
+                "description": "true if the document contains an actual results table with financial figures"},
+            "period_ended": {"type": "string", "nullable": True,
+                "description": "Quarter/year end date this result covers, YYYY-MM-DD format"},
+            "result_type": {"type": "string", "enum": ["Consolidated", "Standalone"], "nullable": True},
+            "sales": {"type": "number", "nullable": True, "description": "Revenue from operations, Rs Crore"},
+            "other_income": {"type": "number", "nullable": True, "description": "Rs Crore"},
+            "pbt": {"type": "number", "nullable": True, "description": "Profit before tax, Rs Crore"},
+            "pat": {"type": "number", "nullable": True, "description": "Profit after tax / net profit, Rs Crore"},
+            "eps": {"type": "number", "nullable": True, "description": "Basic EPS, Rs"},
+            "summary": {"type": "string", "nullable": True},
+        },
+        "required": ["has_results_table"],
+    }
+    # gemini-3.1-flash-lite: current actively-supported Lite-tier
+    # model as of Aug 2026 (gemini-2.5-flash is being deprecated
+    # Oct 16 2026) - cheap, fast, and handles PDF input natively.
+    model = os.getenv('GEMINI_CONCALL_MODEL', 'gemini-3.1-flash-lite')
+    gemini_timeout = int(os.getenv('GEMINI_TIMEOUT_SECONDS', '120'))
+    # Stage 2: the Gemini call itself.
+    try:
         async with session.post(
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
             headers={"Content-Type": "application/json"},
@@ -126,13 +141,23 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
                 ]}],
                 "generationConfig": {"responseMimeType": "application/json", "responseSchema": schema},
             },
-            timeout=aiohttp.ClientTimeout(total=120),  # PDF + structured schema extraction can genuinely take longer than a plain text prompt - confirmed via production timeout on TEXRAIL at 60s
+            timeout=aiohttp.ClientTimeout(total=gemini_timeout),
         ) as r:
             if r.status != 200:
                 body = await r.text()
                 log.warning(f"⚠️ Gemini results extraction failed for {symbol} ({r.status}): {body[:200]}")
                 return empty
             data = await r.json()
+    except asyncio.TimeoutError:
+        log.warning(f"⚠️ Gemini call timed out for {symbol} ({gemini_timeout}s limit, "
+                     f"PDF was {len(pdf_bytes)} bytes) - consider raising GEMINI_TIMEOUT_SECONDS "
+                     f"if this recurs consistently, since it's a separate stage from the PDF download")
+        return empty
+    except Exception as e:
+        log.warning(f"⚠️ Gemini call failed for {symbol}: {type(e).__name__}: {e}")
+        return empty
+    # Stage 3: parse the response.
+    try:
         candidates = data.get('candidates', [])
         if not candidates:
             log.warning(f"⚠️ Gemini returned no candidates for {symbol} results extraction")
