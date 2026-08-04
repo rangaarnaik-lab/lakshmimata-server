@@ -126,7 +126,7 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
                 ]}],
                 "generationConfig": {"responseMimeType": "application/json", "responseSchema": schema},
             },
-            timeout=aiohttp.ClientTimeout(total=60),
+            timeout=aiohttp.ClientTimeout(total=120),  # PDF + structured schema extraction can genuinely take longer than a plain text prompt - confirmed via production timeout on TEXRAIL at 60s
         ) as r:
             if r.status != 200:
                 body = await r.text()
