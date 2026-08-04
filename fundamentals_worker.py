@@ -483,30 +483,6 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
                     session, raw_fd, row['symbol'], row['attachment_url'])
                 comp = await _sanity_check_sales_outlier(
                     session, raw_comp, row['symbol'], row['attachment_url'])
-            if fd:
-                # Saved one stock at a time, not batched together, on
-                # purpose: save_financial_results_to_db's setdefault(k,
-                # None) applies across the WHOLE batch's key union, not
-                # per-row - batching different stocks (each with
-                # different fields extracted from their own PDF) would
-                # risk one stock's missing field silently nulling out
-                # another stock's genuine existing value for the same
-                # symbol+period_ended+result_type key.
-                await save_financial_results_to_db(session, [fd])
-                log.info(f"  🎙️ {row['symbol']}: extracted {fd['period_ended']} "
-                          f"{fd['result_type']} figures from PDF")
-            if comp:
-                # Comparison (prior quarter) row - see extract_results_from_pdf's
-                # docstring for why this is worth saving even though the
-                # current period already covers the announcement: it
-                # naturally overwrites a mislabeled-as-Consolidated
-                # Standalone row from the older XBRL mechanism for that
-                # same period, since Gemini reads the document's own
-                # explicit labels directly.
-                await save_financial_results_to_db(session, [comp])
-                log.info(f"  🎙️ {row['symbol']}: also extracted comparison period {comp['period_ended']} "
-                          f"{comp['result_type']} figures from same PDF")
-
             # YoY (same quarter, year ago) row - added 2026-08-04 so the
             # app's 3-column results table (current/prior-quarter/YoY)
             # has a real YoY figure to show instead of a blank column,
@@ -526,8 +502,38 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
                 yoy_consistent = False
             yoy = raw_yoy if yoy_consistent else await _sanity_check_sales_outlier(
                 session, raw_yoy, row['symbol'], row['attachment_url'])
+
+            # All three periods saved together in ONE batch, not three
+            # separate calls, specifically so compute_results_yoy_qoq
+            # (called inside save_financial_results_to_db) can see all
+            # three at once when computing sales_qoq_pct/sales_yoy_pct/
+            # etc - for a symbol with no prior DB history at all, three
+            # separate single-row calls couldn't find each other to
+            # compute a %, since compute_results_yoy_qoq only combines
+            # the DB's existing history with whatever's in the SAME
+            # batch. Safe to batch here (unlike the earlier per-stock
+            # save calls elsewhere in this file): this is one symbol
+            # across three periods, not multiple different stocks, so
+            # save_financial_results_to_db's setdefault(k, None)
+            # batch-wide key union can't cross-contaminate a different
+            # stock's data.
+            to_save = [r for r in (fd, comp, yoy) if r]
+            if to_save:
+                await save_financial_results_to_db(session, to_save)
+            if fd:
+                log.info(f"  🎙️ {row['symbol']}: extracted {fd['period_ended']} "
+                          f"{fd['result_type']} figures from PDF")
+            if comp:
+                # See extract_results_from_pdf's docstring for why this
+                # is worth saving even though the current period
+                # already covers the announcement: it naturally
+                # overwrites a mislabeled-as-Consolidated Standalone
+                # row from the older XBRL mechanism for that same
+                # period, since Gemini reads the document's own
+                # explicit labels directly.
+                log.info(f"  🎙️ {row['symbol']}: also extracted comparison period {comp['period_ended']} "
+                          f"{comp['result_type']} figures from same PDF")
             if yoy:
-                await save_financial_results_to_db(session, [yoy])
                 log.info(f"  🎙️ {row['symbol']}: also extracted YoY period {yoy['period_ended']} "
                           f"{yoy['result_type']} figures from same PDF")
 
