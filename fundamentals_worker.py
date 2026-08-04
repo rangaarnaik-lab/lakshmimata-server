@@ -430,9 +430,12 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
                 # batch sizes (RESULTS_PDF_BATCH_SIZE, raised for the
                 # full-history backfill) can otherwise blast through the
                 # free tier's per-minute quota in seconds, wasting most
-                # of the batch to 429s. Default 4s keeps e.g. a 30-item
-                # batch comfortably under a ~15 RPM free-tier limit.
-                await asyncio.sleep(float(os.getenv('RESULTS_PDF_PACING_SECONDS', '4')))
+                # of the batch to 429s. User confirmed the exact limit:
+                # 15 RPM, so 4s is the bare minimum spacing with zero
+                # margin for timing jitter - default 5s gives real
+                # headroom (12 RPM effective) while still keeping a
+                # 30-item batch's total pacing time reasonable.
+                await asyncio.sleep(float(os.getenv('RESULTS_PDF_PACING_SECONDS', '5')))
             # Prefer the dedicated financial-results feed's PDF link
             # over the general announcement's attachment when available -
             # that feed only contains actual results filings (unlike the
