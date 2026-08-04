@@ -288,7 +288,28 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
             log.info(f"🎙️ Results extraction loop: checked {len(candidates)} recent announcement(s) "
                       f"({len(concall_rows)} matched results filters), nothing new to process")
         for row in todo:
-            result = await extract_results_from_pdf(session, row['symbol'], row['attachment_url'])
+            # Prefer the dedicated financial-results feed's PDF link
+            # over the general announcement's attachment when available -
+            # that feed only contains actual results filings (unlike the
+            # general announcements feed, which mixes cover letters/
+            # board-outcome notices under the same 'results' category),
+            # so it's far less likely to hand back a cover-letter-only
+            # document. Falls back to the general announcement's
+            # attachment if the dedicated feed hasn't synced this
+            # filing yet (confirmed lag of up to a few days) or has
+            # nothing for this symbol+period.
+            pdf_url = row['attachment_url']
+            period_ended_guess = _extract_period_ended_from_text(row.get('subject') or '')
+            if period_ended_guess:
+                try:
+                    better_url = await fetch_results_pdf_url_for_symbol(
+                        session, row['symbol'], period_ended_guess, debug=False)
+                    if better_url:
+                        pdf_url = better_url
+                except Exception as e:
+                    log.warning(f"⚠️ Dedicated results-feed lookup failed for {row['symbol']}: "
+                                 f"{type(e).__name__}: {e}")
+            result = await extract_results_from_pdf(session, row['symbol'], pdf_url)
             if result['error']:
                 # Transient failure (timeout, network, API error) - don't
                 # save any row at all, so this symbol still shows as
@@ -1691,6 +1712,39 @@ async def fetch_xbrl_url_for_symbol(session: aiohttp.ClientSession, symbol: str,
     if debug and not any_symbol_match:
         log.info(f"  📄 {symbol} not found in results-list feed at all across the last 3 days — "
                  f"either it hasn't synced there yet, or this filing type isn't in that feed.")
+    return None
+
+async def fetch_results_pdf_url_for_symbol(session: aiohttp.ClientSession, symbol: str,
+                                            period_ended: str, debug: bool = False) -> str:
+    """Companion to fetch_xbrl_url_for_symbol, but for the PDF link
+    instead of the XBRL link - useful when no XBRL exists (smaller
+    companies, or when it hasn't synced yet) but the DEDICATED
+    financial-results feed still has this filing's attachment. This
+    matters because that dedicated feed only contains actual results
+    filings (unlike the general corporate_announcements feed, which
+    mixes in cover letters/board-outcome notices/newspaper notices
+    etc. under the same 'results' category) - so its attachment is
+    much more likely to be the real results table than whatever single
+    attachment happened to be on the general announcement. Confirmed in
+    production (2026-08-04): a KSB announcement correctly categorized
+    as 'results' still had a cover-letter-only PDF as its attachment,
+    causing an extraction failure that this dedicated-feed lookup is
+    meant to reduce. Same 3-day search window as fetch_xbrl_url_for_symbol,
+    since this feed lags the general announcements feed by a day or two."""
+    today = datetime.now(timezone.utc)
+    target_norm = _norm_date(period_ended)
+    for days_back in range(3):
+        day_str = (today - timedelta(days=days_back)).strftime('%d-%m-%Y')
+        rows = await fetch_nse_financial_results(session, debug=False, from_date=day_str, to_date=day_str)
+        for r in rows:
+            if r.get('symbol') != symbol:
+                continue
+            if r.get('attachment_url') and _norm_date(r.get('period_ended') or '') == target_norm:
+                if debug:
+                    log.info(f"  📄 Found dedicated results-feed PDF for {symbol} ({period_ended}): "
+                             f"{r['attachment_url']}")
+                return r['attachment_url']
+        await asyncio.sleep(0.3)
     return None
 
 async def fundamentals_worker_main():
