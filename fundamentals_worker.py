@@ -2221,6 +2221,9 @@ async def _bse_stale_results_loop(session: aiohttp.ClientSession):
     QUIET_INTERVAL = 1800    # 30 min otherwise
     BACKLOG_THRESHOLD = 30
     while True:
+        if os.getenv('PAUSE_BSE_LOOPS'):
+            await asyncio.sleep(60)
+            continue
         try:
             remaining = await backfill_from_bse_stale(session, limit=200)
         except Exception as e:
@@ -2247,6 +2250,9 @@ async def _bse_missing_backfill_loop(session: aiohttp.ClientSession):
     QUIET_INTERVAL = 1800    # 30 min otherwise
     BACKLOG_THRESHOLD = 30
     while True:
+        if os.getenv('PAUSE_BSE_LOOPS'):
+            await asyncio.sleep(60)
+            continue
         try:
             remaining = await backfill_from_bse_missing(session, limit=200)
         except Exception as e:
@@ -2263,6 +2269,9 @@ async def _bse_calendar_refresh_loop(session: aiohttp.ClientSession):
     call regardless of how many stocks are tracked."""
     CHECK_INTERVAL = 86400  # 24 hours
     while True:
+        if os.getenv('PAUSE_BSE_LOOPS'):
+            await asyncio.sleep(60)
+            continue
         try:
             await fetch_and_save_upcoming_results_calendar(session)
         except Exception as e:
@@ -2279,6 +2288,9 @@ async def _bse_targeted_results_loop(session: aiohttp.ClientSession):
     per second, to stay well clear of BSE's rate limiting."""
     CHECK_INTERVAL = 600  # 10 minutes
     while True:
+        if os.getenv('PAUSE_BSE_LOOPS'):
+            await asyncio.sleep(60)
+            continue
         try:
             today = datetime.now(timezone.utc).date()
             since = (today - timedelta(days=2)).isoformat()
