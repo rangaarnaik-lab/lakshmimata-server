@@ -80,7 +80,9 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
     # in one batch, no way to tell if it was consistently one stage or
     # varying).
     try:
-        async with session.get(attachment_url, timeout=aiohttp.ClientTimeout(total=30)) as r:
+        async with session.get(attachment_url,
+            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.nseindia.com"},
+            timeout=aiohttp.ClientTimeout(total=30)) as r:
             if r.status != 200:
                 log.warning(f"⚠️ Results PDF fetch failed for {symbol} ({r.status})")
                 return error_result
