@@ -68,8 +68,8 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
     hit a Gemini timeout got stuck marked 'skipped' forever and were
     never retried, since the old code treated every failure the same as
     genuine no-content."""
-    error_result = {'financial_data': None, 'comparison_data': None, 'summary': None, 'error': True}
-    no_content_result = {'financial_data': None, 'comparison_data': None, 'summary': None, 'error': False}
+    error_result = {'financial_data': None, 'comparison_data': None, 'yoy_data': None, 'summary': None, 'error': True}
+    no_content_result = {'financial_data': None, 'comparison_data': None, 'yoy_data': None, 'summary': None, 'error': False}
     api_key = os.getenv('GEMINI_API_KEY', '')
     if not api_key or not attachment_url:
         return error_result  # not a real "no content" case - just not configured/no URL, don't mark as processed
@@ -125,14 +125,16 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
         "near it for the stated unit before extracting any figure. If a specific field isn't "
         "present in the table, leave that field null rather than guessing or calculating it "
         "yourself.\n\n"
-        "COMPARISON PERIOD: Indian quarterly results tables always show the immediately "
-        "preceding quarter's figures in an adjacent column of the SAME Consolidated table "
-        "(e.g. if the current column is 'Quarter ended June 30, 2026', there is normally a "
-        "'Quarter ended March 31, 2026' column right next to it). Extract that comparison "
-        "column's figures too, from the SAME Consolidated table, with the same rules as "
-        "above (leave null if a field isn't shown, never estimate). This is a separate, "
-        "real data point already visible in the document, not a calculation. If no such "
-        "comparison column exists in the table, leave all comparison_* fields null.\n\n"
+        "COMPARISON PERIODS: Indian quarterly results tables typically show up to 3 "
+        "columns of actual data side by side in the SAME Consolidated table: the current "
+        "quarter, the immediately preceding (sequential) quarter, and the same quarter one "
+        "year ago (YoY) - e.g. for a 'Quarter ended June 30, 2026' current column, look for "
+        "both a 'Quarter ended March 31, 2026' column (sequential) and a 'Quarter ended "
+        "June 30, 2025' column (YoY) nearby. Extract BOTH comparison columns' figures if "
+        "present, using the same rules as above (leave null if a field isn't shown, never "
+        "estimate) - these are separate, real data points already visible in the document, "
+        "not calculations. If only one or neither comparison column exists in the table, "
+        "leave the corresponding fields null rather than guessing which one is missing.\n\n"
         "SUMMARY: Separately, summarize for a retail investor in under 200 words what the "
         "numbers alone wouldn't tell them: management's own commentary or explanation for "
         "the quarter's performance if present, segment-wise/product-wise breakdown if "
@@ -157,12 +159,19 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
             "pat": {"type": "number", "nullable": True, "description": "Profit after tax / net profit, Rs Crore"},
             "eps": {"type": "number", "nullable": True, "description": "Basic EPS, Rs"},
             "comparison_period_ended": {"type": "string", "nullable": True,
-                "description": "The immediately preceding quarter shown in an adjacent column of the SAME Consolidated table, YYYY-MM-DD format. Null if no such column exists."},
+                "description": "The immediately preceding (sequential) quarter shown in an adjacent column of the SAME Consolidated table, YYYY-MM-DD format. Null if no such column exists."},
             "comparison_sales": {"type": "number", "nullable": True},
             "comparison_other_income": {"type": "number", "nullable": True},
             "comparison_pbt": {"type": "number", "nullable": True},
             "comparison_pat": {"type": "number", "nullable": True},
             "comparison_eps": {"type": "number", "nullable": True},
+            "yoy_period_ended": {"type": "string", "nullable": True,
+                "description": "The same quarter one year ago, shown in another column of the SAME Consolidated table, YYYY-MM-DD format. Null if no such column exists."},
+            "yoy_sales": {"type": "number", "nullable": True},
+            "yoy_other_income": {"type": "number", "nullable": True},
+            "yoy_pbt": {"type": "number", "nullable": True},
+            "yoy_pat": {"type": "number", "nullable": True},
+            "yoy_eps": {"type": "number", "nullable": True},
             "summary": {"type": "string", "nullable": True},
         },
         "required": ["has_results_table"],
@@ -236,39 +245,49 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
                     if parsed.get(k) is not None:
                         financial_data[k] = parsed[k]
 
-        # Comparison (prior quarter) row, from the same Consolidated
-        # table Gemini already read for the current period. Added
-        # 2026-08-04 specifically because this naturally overwrites a
-        # mislabeled XBRL row for the same period going forward - the
-        # older XBRL mechanism's Standalone/Consolidated detection is
-        # confirmed unreliable for some filers (see fetch_and_parse_xbrl's
-        # docstring), but Gemini reads the document's own explicit
-        # labels directly rather than inferring from XBRL taxonomy
-        # conventions, so it's a more trustworthy source for the same
-        # period whenever it happens to also be visible in this document.
-        comparison_data = None
-        if parsed.get('comparison_period_ended'):
+        # Comparison rows (sequential prior quarter and YoY), from the
+        # same Consolidated table Gemini already read for the current
+        # period. Added 2026-08-04 specifically because these naturally
+        # overwrite mislabeled XBRL rows for the same periods going
+        # forward - the older XBRL mechanism's Standalone/Consolidated
+        # detection is confirmed unreliable for some filers (see
+        # fetch_and_parse_xbrl's docstring), but Gemini reads the
+        # document's own explicit labels directly rather than inferring
+        # from XBRL taxonomy conventions, so it's a more trustworthy
+        # source for the same period whenever it happens to also be
+        # visible in this document. YoY added separately (also
+        # 2026-08-04) because the app's results table needs 3 periods
+        # (current, sequential prior, YoY) to show all its columns, and
+        # the YoY figure is typically already visible as a third column
+        # in the same table - previously not asked for at all.
+        def _build_period_row(prefix: str):
+            period_key = f'{prefix}_period_ended' if prefix else 'period_ended'
+            if not parsed.get(period_key):
+                return None
             try:
-                comp_period_fmt = datetime.strptime(
-                    parsed['comparison_period_ended'], '%Y-%m-%d').strftime('%d-%b-%Y')
+                period_fmt = datetime.strptime(
+                    parsed[period_key], '%Y-%m-%d').strftime('%d-%b-%Y')
             except (ValueError, TypeError):
-                comp_period_fmt = None
-            if comp_period_fmt and any(
-                parsed.get(f'comparison_{k}') is not None for k in ('sales', 'pat', 'eps')
-            ):
-                comparison_data = {
-                    'symbol': symbol,
-                    'period_ended': comp_period_fmt,
-                    'result_type': parsed.get('result_type') or 'Consolidated',
-                    'filed_at': datetime.now(timezone.utc).isoformat(),
-                }
-                for k in ('sales', 'other_income', 'pbt', 'pat', 'eps'):
-                    v = parsed.get(f'comparison_{k}')
-                    if v is not None:
-                        comparison_data[k] = v
+                return None
+            field = (lambda k: f'{prefix}_{k}') if prefix else (lambda k: k)
+            if not any(parsed.get(field(k)) is not None for k in ('sales', 'pat', 'eps')):
+                return None
+            out = {
+                'symbol': symbol, 'period_ended': period_fmt,
+                'result_type': parsed.get('result_type') or 'Consolidated',
+                'filed_at': datetime.now(timezone.utc).isoformat(),
+            }
+            for k in ('sales', 'other_income', 'pbt', 'pat', 'eps'):
+                v = parsed.get(field(k))
+                if v is not None:
+                    out[k] = v
+            return out
+
+        comparison_data = _build_period_row('comparison')
+        yoy_data = _build_period_row('yoy')
         summary = (parsed.get('summary') or '').strip()[:2000] or None
         return {'financial_data': financial_data, 'comparison_data': comparison_data,
-                'summary': summary, 'error': False}
+                'yoy_data': yoy_data, 'summary': summary, 'error': False}
     except Exception as e:
         log.warning(f"⚠️ Results PDF extraction failed for {symbol}: {type(e).__name__}: {e}")
         return error_result
@@ -487,6 +506,31 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
                 await save_financial_results_to_db(session, [comp])
                 log.info(f"  🎙️ {row['symbol']}: also extracted comparison period {comp['period_ended']} "
                           f"{comp['result_type']} figures from same PDF")
+
+            # YoY (same quarter, year ago) row - added 2026-08-04 so the
+            # app's 3-column results table (current/prior-quarter/YoY)
+            # has a real YoY figure to show instead of a blank column,
+            # for any symbol where this pipeline is the source. Same
+            # cross-validation approach as the sequential comparison:
+            # a genuine YoY swing can be large in either direction for
+            # smaller/growth companies, so this checks internal
+            # consistency against the CURRENT period specifically
+            # (not the DB baseline) before falling back to the sanity
+            # check, since the current period was just independently
+            # verified via its own cross-check or DB comparison above.
+            raw_yoy = result['yoy_data']
+            if raw_yoy and raw_yoy.get('sales') is not None and fd and fd.get('sales'):
+                yoy_ratio = fd['sales'] / raw_yoy['sales'] if raw_yoy['sales'] > 0 else None
+                yoy_consistent = yoy_ratio is not None and 0.2 <= yoy_ratio <= 5
+            else:
+                yoy_consistent = False
+            yoy = raw_yoy if yoy_consistent else await _sanity_check_sales_outlier(
+                session, raw_yoy, row['symbol'], row['attachment_url'])
+            if yoy:
+                await save_financial_results_to_db(session, [yoy])
+                log.info(f"  🎙️ {row['symbol']}: also extracted YoY period {yoy['period_ended']} "
+                          f"{yoy['result_type']} figures from same PDF")
+
             payload = {
                 'symbol': row['symbol'], 'announced_at': row['announced_at'],
                 'attachment_url': row['attachment_url'],
