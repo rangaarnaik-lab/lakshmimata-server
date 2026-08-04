@@ -417,10 +417,53 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
                 log.info(f"  🎙️ {row['symbol']}: will retry next cycle (transient error, not saved)")
                 continue
             summary = result['summary']
-            fd = await _sanity_check_sales_outlier(
-                session, result['financial_data'], row['symbol'], row['attachment_url'])
-            comp = await _sanity_check_sales_outlier(
-                session, result['comparison_data'], row['symbol'], row['attachment_url'])
+            raw_fd = result['financial_data']
+            raw_comp = result['comparison_data']
+            # Cross-validate current vs comparison period before falling
+            # back to the DB-baseline check: both come from the SAME PDF
+            # read in the SAME call, so if their sales figures are
+            # internally consistent with each other (plausible quarter-
+            # over-quarter range), that's strong evidence both are
+            # genuinely correct - a hallucination or unit-conversion
+            # error would be unlikely to coincidentally produce two
+            # self-consistent-but-wrong numbers. This matters because
+            # the DB baseline being compared against can itself be
+            # wrong: confirmed in production (2026-08-04) that
+            # VAIBHAVGBL's existing baseline (from the older XBRL path,
+            # which has a documented Standalone/Consolidated mislabeling
+            # bug) was itself incorrect, causing two genuinely correct
+            # new Gemini values to be wrongly rejected as "outliers".
+            cross_consistent = False
+            if (raw_fd and raw_comp and raw_fd.get('sales') is not None
+                    and raw_comp.get('sales') is not None and raw_comp['sales'] > 0):
+                pair_ratio = raw_fd['sales'] / raw_comp['sales']
+                cross_consistent = 0.3 <= pair_ratio <= 3
+            if cross_consistent:
+                fd, comp = raw_fd, raw_comp
+                try:
+                    headers3 = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
+                    async with session.get(
+                        f"{SUPABASE_URL}/rest/v1/financial_results", headers=headers3,
+                        params={'select': 'sales,period_ended', 'symbol': f"eq.{row['symbol']}",
+                                'sales': 'not.is.null', 'order': 'period_ended.desc', 'limit': '1'},
+                        timeout=aiohttp.ClientTimeout(total=15)
+                    ) as r3:
+                        prior = await r3.json() if r3.status == 200 else []
+                    if prior and prior[0].get('sales'):
+                        db_ratio = raw_fd['sales'] / prior[0]['sales']
+                        if db_ratio > 4 or db_ratio < 0.25:
+                            log.info(f"  ℹ️ {row['symbol']}: sales {raw_fd['sales']} diverges from DB "
+                                      f"baseline {prior[0]['sales']} ({db_ratio:.1f}x) but matches its own "
+                                      f"comparison-period figure ({raw_comp['sales']}) - trusting the PDF "
+                                      f"read over the DB baseline, saving anyway. Worth a spot-check: "
+                                      f"{row['attachment_url']}")
+                except Exception as e:
+                    log.warning(f"⚠️ Cross-validation baseline check failed for {row['symbol']}: {type(e).__name__}: {e}")
+            else:
+                fd = await _sanity_check_sales_outlier(
+                    session, raw_fd, row['symbol'], row['attachment_url'])
+                comp = await _sanity_check_sales_outlier(
+                    session, raw_comp, row['symbol'], row['attachment_url'])
             if fd:
                 # Saved one stock at a time, not batched together, on
                 # purpose: save_financial_results_to_db's setdefault(k,
