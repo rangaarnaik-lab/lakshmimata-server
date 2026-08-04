@@ -570,6 +570,26 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
             if yoy:
                 log.info(f"  🎙️ {row['symbol']}: also extracted YoY period {yoy['period_ended']} "
                           f"{yoy['result_type']} figures from same PDF")
+            # Gap visibility: flag when the current period succeeded but
+            # comparison/YoY didn't extract at all, so these silent
+            # misses are easy to spot and manually backfill (confirmed
+            # real case: JAYBARMARU's March 2026 comparison period was
+            # genuinely present and readable in the source PDF, just
+            # missed by Gemini - likely a split/multi-page table
+            # structure combined with OCR noise in that column
+            # specifically). Deliberately not loosening the "leave null
+            # if uncertain" instruction to force extraction here, since
+            # that guardrail is what prevents the more serious KSB-style
+            # fabrication problem - this just makes the resulting gaps
+            # visible instead of silent.
+            if fd and not comp:
+                log.info(f"  ℹ️ {row['symbol']}: current period extracted but no sequential "
+                          f"comparison period found in the same PDF - may be a genuine one-column "
+                          f"filing, or a missed extraction worth a manual check. PDF: {pdf_url}")
+            if fd and not yoy:
+                log.info(f"  ℹ️ {row['symbol']}: current period extracted but no YoY period found "
+                          f"in the same PDF - may be a genuine gap, or a missed extraction worth a "
+                          f"manual check. PDF: {pdf_url}")
 
             payload = {
                 'symbol': row['symbol'], 'announced_at': row['announced_at'],
