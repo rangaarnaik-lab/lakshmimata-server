@@ -33,7 +33,12 @@ def _is_concall_announcement(row: dict) -> bool:
     """Same keyword set used to EXCLUDE these from the Results filter
     (they're not results filings themselves) - here we use it the other
     way, to POSITIVELY identify concall/transcript announcements worth
-    summarizing."""
+    summarizing.
+    NOTE: currently unused - the summary loop targets results
+    announcements instead (per user request, 2026-08-04: results are
+    filed by every company every quarter, concalls are comparatively
+    rare). Kept defined so switching back (or running both) later is a
+    one-line change in _concall_summary_loop rather than rewriting this."""
     text = ((row.get('category') or '') + ' ' + (row.get('subject') or '')).lower()
     return any(x in text for x in _CONCALL_KEYWORDS)
 
@@ -59,15 +64,18 @@ async def summarize_concall_pdf(session: aiohttp.ClientSession, symbol: str, att
             return None
         pdf_b64 = base64.b64encode(pdf_bytes).decode('ascii')
         prompt = (
-            "This is an earnings conference call transcript or investor call notice for an "
-            "Indian listed company. If it is a full transcript, summarize it for a retail "
-            "investor in under 200 words, covering: (1) key business/financial highlights "
-            "management called out, (2) forward guidance or outlook if mentioned, (3) any "
-            "notable risks, concerns, or challenges discussed. Use specific numbers/percentages "
-            "mentioned in the call where relevant. If this document is just a call SCHEDULE/"
-            "invitation notice with no actual discussion content (common - the transcript "
-            "itself is often a separate, later filing), respond with exactly: NO_CONTENT. "
-            "Do not add commentary or opinions beyond what's stated in the document."
+            "This is a quarterly/annual financial results filing (or an attached press release/"
+            "board commentary alongside it) for an Indian listed company, filed with NSE/BSE. "
+            "The raw numbers (sales, profit, EPS, etc.) are already tracked separately - do NOT "
+            "just restate the headline figures. Instead, summarize for a retail investor in under "
+            "200 words what the numbers alone wouldn't tell them: (1) management's own commentary "
+            "or explanation for the quarter's performance, if present, (2) segment-wise or "
+            "product-wise performance breakdown, if disclosed, (3) any one-off/exceptional items, "
+            "write-offs, or unusual items affecting the results, (4) forward outlook or guidance, "
+            "if mentioned. If the filing is purely the financial statements/schedules with no "
+            "qualitative commentary of this kind at all (common for smaller companies - just "
+            "tables of numbers), respond with exactly: NO_CONTENT. Do not add commentary or "
+            "opinions beyond what's stated in the document."
         )
         # gemini-3.1-flash-lite: current actively-supported Lite-tier
         # model as of Aug 2026 (gemini-2.5-flash is being deprecated
@@ -128,7 +136,7 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
         except Exception as e:
             log.warning(f"⚠️ Concall loop: announcements fetch failed: {type(e).__name__}: {e}")
             candidates = []
-        concall_rows = [row for row in candidates if row.get('attachment_url') and _is_concall_announcement(row)]
+        concall_rows = [row for row in candidates if row.get('attachment_url') and _is_results_announcement(row)]
 
         # Skip ones already processed (any status - pending/done/failed/
         # skipped all mean "don't retry automatically"; a failed fetch
