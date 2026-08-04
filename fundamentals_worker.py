@@ -197,7 +197,13 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
         ) as r:
             if r.status != 200:
                 body = await r.text()
-                log.warning(f"⚠️ Gemini results extraction failed for {symbol} ({r.status}): {body[:200]}")
+                if r.status == 429:
+                    log.warning(f"⚠️ Gemini rate-limit hit for {symbol} (429) - free tier's per-minute "
+                                 f"quota exceeded. Pausing this loop briefly to back off; if this recurs "
+                                 f"often, lower RESULTS_PDF_BATCH_SIZE and/or raise RESULTS_PDF_PACING_SECONDS.")
+                    await asyncio.sleep(int(os.getenv('GEMINI_429_BACKOFF_SECONDS', '30')))
+                else:
+                    log.warning(f"⚠️ Gemini results extraction failed for {symbol} ({r.status}): {body[:200]}")
                 return error_result
             data = await r.json()
     except asyncio.TimeoutError:
@@ -417,7 +423,16 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
         else:
             log.info(f"🎙️ Results extraction loop: checked {len(candidates)} recent announcement(s) "
                       f"({len(concall_rows)} matched results filters), nothing new to process")
-        for row in todo:
+        for i, row in enumerate(todo):
+            if i > 0:
+                # Pacing between calls, not just relying on natural
+                # request latency - added specifically because larger
+                # batch sizes (RESULTS_PDF_BATCH_SIZE, raised for the
+                # full-history backfill) can otherwise blast through the
+                # free tier's per-minute quota in seconds, wasting most
+                # of the batch to 429s. Default 4s keeps e.g. a 30-item
+                # batch comfortably under a ~15 RPM free-tier limit.
+                await asyncio.sleep(float(os.getenv('RESULTS_PDF_PACING_SECONDS', '4')))
             # Prefer the dedicated financial-results feed's PDF link
             # over the general announcement's attachment when available -
             # that feed only contains actual results filings (unlike the
