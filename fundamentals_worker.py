@@ -188,10 +188,13 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
             await asyncio.sleep(300)  # check again in 5 min in case the key gets added
             continue
         try:
-            # Recent results announcements (last 14 days is plenty -
-            # older ones would already be covered by the BSE/XBRL
-            # pipeline running elsewhere).
-            since = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
+            # Recent results announcements - configurable via
+            # RESULTS_PDF_LOOKBACK_DAYS (e.g. set to 1 for a quick,
+            # small test run rather than processing the full default
+            # backlog). Defaults to 14 days - older ones would already
+            # be covered by the BSE/XBRL pipeline running elsewhere.
+            lookback_days = int(os.getenv('RESULTS_PDF_LOOKBACK_DAYS', '14'))
+            since = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat()
             async with session.get(
                 f"{SUPABASE_URL}/rest/v1/corporate_announcements", headers=headers,
                 params={'select': 'symbol,category,subject,attachment_url,announced_at',
