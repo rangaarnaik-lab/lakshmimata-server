@@ -183,10 +183,19 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
     the BSE loops needed."""
     headers = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
     BATCH_SIZE = 10
+    _key_status_logged = False
     while True:
         if not os.getenv('GEMINI_API_KEY'):
+            if not _key_status_logged:
+                log.warning("🎙️ Results extraction loop: GEMINI_API_KEY not set - loop is idle, "
+                            "checking every 5 min in case it gets added")
+                _key_status_logged = True
             await asyncio.sleep(300)  # check again in 5 min in case the key gets added
             continue
+        if not _key_status_logged:
+            log.info(f"🎙️ Results extraction loop: GEMINI_API_KEY detected, active "
+                      f"(lookback={os.getenv('RESULTS_PDF_LOOKBACK_DAYS', '14')}d, batch={BATCH_SIZE})")
+            _key_status_logged = True
         try:
             # Recent results announcements - configurable via
             # RESULTS_PDF_LOOKBACK_DAYS (e.g. set to 1 for a quick,
@@ -226,6 +235,9 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
         todo = [row for row in concall_rows if (row['symbol'], row['announced_at']) not in already][:BATCH_SIZE]
         if todo:
             log.info(f"🎙️ Results extraction loop: {len(todo)} new results announcement(s) to process")
+        else:
+            log.info(f"🎙️ Results extraction loop: checked {len(candidates)} recent announcement(s) "
+                      f"({len(concall_rows)} matched results filters), nothing new to process")
         for row in todo:
             result = await extract_results_from_pdf(session, row['symbol'], row['attachment_url'])
             summary = result['summary']
