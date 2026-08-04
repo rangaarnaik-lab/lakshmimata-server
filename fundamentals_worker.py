@@ -1253,27 +1253,25 @@ async def fetch_and_parse_xbrl(session: aiohttp.ClientSession, url: str,
     # anywhere gets excluded from comparison-period matching rather
     # than risk silently mixing standalone and consolidated figures.
     #
-    # KNOWN LIMITATION (confirmed 2026-08-04): this literal-word-search
-    # heuristic does NOT catch every filer's convention - verified via
-    # two real cases (METROBRAND, TREJHARA) where the actual source PDF
-    # confirmed the XBRL-derived row saved as result_type='Consolidated'
-    # was genuinely Standalone data, because that filer's XBRL didn't
-    # contain the literal word "standalone" anywhere the checks below
-    # look for it. When detection silently fails like this, is_standalone
-    # stays False and the value gets accepted into the Consolidated pass
-    # in value_near_date() below without ever being caught. This wasn't
-    # fixed on the spot (XBRL taxonomy conventions vary enough across
-    # filers that a confident fix needs more real samples than were
-    # available to validate against, and a wrong guess here risks
-    # breaking currently-working cases). The new Gemini PDF-reading
-    # pipeline (extract_results_from_pdf) reads each document's own
-    # explicit Standalone/Consolidated labels directly rather than
-    # inferring from XBRL dimension conventions, and upserts onto the
-    # same (symbol, period_ended, result_type) key - so any period it
-    # successfully processes will naturally overwrite a mislabeled XBRL
-    # row for that same period going forward, without needing this
-    # function fixed first.
+    # KNOWN LIMITATION, ROOT-CAUSED AND PARTIALLY FIXED (2026-08-04): this
+    # literal-word-search heuristic missed genuine Standalone contexts for
+    # several real filers - confirmed via 4 production cases (METROBRAND,
+    # TREJHARA, VAIBHAVGBL, AVALON), each cross-checked against its actual
+    # source PDF. Root cause, per IFRS/Ind-AS taxonomy research: the
+    # standard dimension for this is "Consolidated and separate financial
+    # statements axis" with member names built around "Separate" (e.g.
+    # SeparateMember), not "Standalone" at all - India's MCA-specific
+    # taxonomy extensions have also been seen using "Individual" for the
+    # same concept. Widened the check below to include all three terms.
+    # Not guaranteed exhaustive (taxonomy naming isn't perfectly
+    # standardized across every filer/software vendor), so still worth
+    # spot-checking new symbols this pipeline processes against their
+    # source PDFs occasionally. The Gemini PDF-reading pipeline
+    # (extract_results_from_pdf) remains a useful independent check either
+    # way, since it reads each document's own explicit labels directly and
+    # upserts onto the same (symbol, period_ended, result_type) key.
     contexts = {}  # context id -> (start_date, end_date, is_standalone)
+    _STANDALONE_MARKERS = ('standalone', 'separate', 'individual')
     for ctx in root.iter():
         if local_name(ctx.tag) != 'context':
             continue
@@ -1285,7 +1283,8 @@ async def fetch_and_parse_xbrl(session: aiohttp.ClientSession, url: str,
         for sub in ctx.iter():
             sname = local_name(sub.tag)
             text = (sub.text or '').strip()
-            if 'standalone' in text.lower() or 'standalone' in (sub.get('href') or '').lower():
+            text_l, href_l = text.lower(), (sub.get('href') or '').lower()
+            if any(m in text_l or m in href_l for m in _STANDALONE_MARKERS):
                 is_standalone = True
             if not text:
                 continue
@@ -1296,7 +1295,7 @@ async def fetch_and_parse_xbrl(session: aiohttp.ClientSession, url: str,
             elif sname == 'instant':
                 end_date = start_date = _norm_date(text)
         # id itself sometimes carries the marker too (e.g. "...Standalone...")
-        if 'standalone' in ctx_id.lower():
+        if any(m in ctx_id.lower() for m in _STANDALONE_MARKERS):
             is_standalone = True
         if end_date:
             contexts[ctx_id] = (start_date, end_date, is_standalone)
