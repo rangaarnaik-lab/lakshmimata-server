@@ -1308,14 +1308,23 @@ async def fetch_and_save_result_for_announcement(session: aiohttp.ClientSession,
         'symbol': symbol,
         'period_ended': period_ended,
         'result_type': 'Consolidated',
-        'sales': None, 'other_income': None, 'pbt': None, 'pat': None, 'eps': None, 'opm_pct': None,
         'filed_at': row.get('announced_at'),
         'attachment_url': row.get('attachment_url'),
     }
     if nums:
         result_row.update({k: v for k, v in nums.items() if v is not None})
 
-    rows_to_save = [result_row]
+    # Only save the primary row if we actually got at least one real
+    # number - confirmed in production (2026-08-04) that saving this
+    # unconditionally created a blank row (every financial field
+    # explicitly None) when the XBRL fetch found nothing, which is
+    # worse than just not saving: an explicit None in the upsert
+    # payload risks overwriting a genuine existing value from another
+    # source for the same symbol+period_ended+result_type key. Same
+    # fix already applied to the BSE parser and the Gemini pipeline.
+    rows_to_save = [result_row] if any(
+        result_row.get(k) is not None for k in ('sales', 'pat', 'eps')
+    ) else []
     for comp in comparisons:
         # Same-filing comparison periods (see fetch_and_parse_xbrl's
         # docstring) - filed_at/attachment_url point back to THIS
