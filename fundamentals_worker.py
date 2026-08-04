@@ -1099,7 +1099,7 @@ async def enrich_and_save_announcements(session: aiohttp.ClientSession, rows: li
     # fetch itself, just missing backoff. _results_attempt_times is
     # shared with _results_loop below so neither path duplicates the
     # other's work.
-    results_rows = [r for r in enriched if _is_results_announcement(r)]
+    results_rows = [r for r in enriched if _is_results_announcement(r)] if not os.getenv('GEMINI_ONLY_RESULTS') else []
     if results_rows:
         headers = random.choice(_NSE_ANNOUNCEMENTS_HEADER_SETS)
         filled = 0
