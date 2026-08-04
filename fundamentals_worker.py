@@ -68,8 +68,8 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
     hit a Gemini timeout got stuck marked 'skipped' forever and were
     never retried, since the old code treated every failure the same as
     genuine no-content."""
-    error_result = {'financial_data': None, 'summary': None, 'error': True}
-    no_content_result = {'financial_data': None, 'summary': None, 'error': False}
+    error_result = {'financial_data': None, 'comparison_data': None, 'summary': None, 'error': True}
+    no_content_result = {'financial_data': None, 'comparison_data': None, 'summary': None, 'error': False}
     api_key = os.getenv('GEMINI_API_KEY', '')
     if not api_key or not attachment_url:
         return error_result  # not a real "no content" case - just not configured/no URL, don't mark as processed
@@ -121,6 +121,14 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
         "units (convert from Rs Lakh or Rs Thousand to Rs Crore if that's what the document "
         "uses). If a specific field isn't present in the table, leave that field null rather "
         "than guessing or calculating it yourself.\n\n"
+        "COMPARISON PERIOD: Indian quarterly results tables always show the immediately "
+        "preceding quarter's figures in an adjacent column of the SAME Consolidated table "
+        "(e.g. if the current column is 'Quarter ended June 30, 2026', there is normally a "
+        "'Quarter ended March 31, 2026' column right next to it). Extract that comparison "
+        "column's figures too, from the SAME Consolidated table, with the same rules as "
+        "above (leave null if a field isn't shown, never estimate). This is a separate, "
+        "real data point already visible in the document, not a calculation. If no such "
+        "comparison column exists in the table, leave all comparison_* fields null.\n\n"
         "SUMMARY: Separately, summarize for a retail investor in under 200 words what the "
         "numbers alone wouldn't tell them: management's own commentary or explanation for "
         "the quarter's performance if present, segment-wise/product-wise breakdown if "
@@ -144,6 +152,13 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
             "pbt": {"type": "number", "nullable": True, "description": "Profit before tax, Rs Crore"},
             "pat": {"type": "number", "nullable": True, "description": "Profit after tax / net profit, Rs Crore"},
             "eps": {"type": "number", "nullable": True, "description": "Basic EPS, Rs"},
+            "comparison_period_ended": {"type": "string", "nullable": True,
+                "description": "The immediately preceding quarter shown in an adjacent column of the SAME Consolidated table, YYYY-MM-DD format. Null if no such column exists."},
+            "comparison_sales": {"type": "number", "nullable": True},
+            "comparison_other_income": {"type": "number", "nullable": True},
+            "comparison_pbt": {"type": "number", "nullable": True},
+            "comparison_pat": {"type": "number", "nullable": True},
+            "comparison_eps": {"type": "number", "nullable": True},
             "summary": {"type": "string", "nullable": True},
         },
         "required": ["has_results_table"],
@@ -216,11 +231,87 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
                 for k in ('sales', 'other_income', 'pbt', 'pat', 'eps'):
                     if parsed.get(k) is not None:
                         financial_data[k] = parsed[k]
+
+        # Comparison (prior quarter) row, from the same Consolidated
+        # table Gemini already read for the current period. Added
+        # 2026-08-04 specifically because this naturally overwrites a
+        # mislabeled XBRL row for the same period going forward - the
+        # older XBRL mechanism's Standalone/Consolidated detection is
+        # confirmed unreliable for some filers (see fetch_and_parse_xbrl's
+        # docstring), but Gemini reads the document's own explicit
+        # labels directly rather than inferring from XBRL taxonomy
+        # conventions, so it's a more trustworthy source for the same
+        # period whenever it happens to also be visible in this document.
+        comparison_data = None
+        if parsed.get('comparison_period_ended'):
+            try:
+                comp_period_fmt = datetime.strptime(
+                    parsed['comparison_period_ended'], '%Y-%m-%d').strftime('%d-%b-%Y')
+            except (ValueError, TypeError):
+                comp_period_fmt = None
+            if comp_period_fmt and any(
+                parsed.get(f'comparison_{k}') is not None for k in ('sales', 'pat', 'eps')
+            ):
+                comparison_data = {
+                    'symbol': symbol,
+                    'period_ended': comp_period_fmt,
+                    'result_type': parsed.get('result_type') or 'Consolidated',
+                    'filed_at': datetime.now(timezone.utc).isoformat(),
+                }
+                for k in ('sales', 'other_income', 'pbt', 'pat', 'eps'):
+                    v = parsed.get(f'comparison_{k}')
+                    if v is not None:
+                        comparison_data[k] = v
         summary = (parsed.get('summary') or '').strip()[:2000] or None
-        return {'financial_data': financial_data, 'summary': summary, 'error': False}
+        return {'financial_data': financial_data, 'comparison_data': comparison_data,
+                'summary': summary, 'error': False}
     except Exception as e:
         log.warning(f"⚠️ Results PDF extraction failed for {symbol}: {type(e).__name__}: {e}")
         return error_result
+
+async def _sanity_check_sales_outlier(session: aiohttp.ClientSession, fd: dict,
+                                       symbol: str, attachment_url: str) -> dict:
+    """Compares fd['sales'] against the most recent existing value for
+    this symbol, as a safety net against LLM hallucination - confirmed
+    in production (2026-08-04) that Gemini fabricated a plausible-
+    looking sales figure (~9-11x the real quarterly range) for a KSB
+    filing that was actually just a cover letter with zero financial
+    figures in it, despite the prompt's has_results_table guard
+    existing specifically to prevent this. A real quarter-over-quarter
+    swing of >4x or <0.25x is rare enough for an established listed
+    company that it's more likely a misread/hallucination than a
+    genuine result - skip saving and flag for manual review rather
+    than silently accepting it. Returns fd unchanged if it passes, or
+    None if it's flagged as suspicious. Shared by both the primary and
+    comparison-period rows (added 2026-08-04) so the same check applies
+    to both without duplicating the logic."""
+    if not fd or fd.get('sales') is None:
+        return fd
+    try:
+        headers2 = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/financial_results", headers=headers2,
+            params={'select': 'sales,period_ended', 'symbol': f"eq.{fd['symbol']}",
+                    'sales': 'not.is.null', 'order': 'period_ended.desc', 'limit': '3'},
+            timeout=aiohttp.ClientTimeout(total=15)
+        ) as r2:
+            existing = await r2.json() if r2.status == 200 else []
+        for e in existing:
+            if e['period_ended'] == fd['period_ended']:
+                continue  # don't compare against itself if this is an update
+            prior_sales = e.get('sales')
+            if prior_sales and prior_sales > 0:
+                ratio = fd['sales'] / prior_sales
+                if ratio > 4 or ratio < 0.25:
+                    log.warning(f"⚠️ {symbol}: extracted sales {fd['sales']} looks like an outlier "
+                                 f"vs prior {prior_sales} ({e['period_ended']}, {ratio:.1f}x) - "
+                                 f"likely misread/hallucination, skipping save for manual review. "
+                                 f"PDF: {attachment_url}")
+                    return None
+                break  # only need the single most recent comparable value
+    except Exception as e:
+        log.warning(f"⚠️ Sanity check fetch failed for {symbol}: {type(e).__name__}: {e}")
+    return fd
 
 async def _concall_summary_loop(session: aiohttp.ClientSession):
     """Finds results announcements that haven't been processed yet and
@@ -322,45 +413,10 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
                 log.info(f"  🎙️ {row['symbol']}: will retry next cycle (transient error, not saved)")
                 continue
             summary = result['summary']
-            fd = result['financial_data']
-            if fd:
-                # Sanity check against the most recent existing value for
-                # this symbol, as a safety net against LLM hallucination -
-                # confirmed in production (2026-08-04) that Gemini
-                # fabricated a plausible-looking sales figure (~9-11x the
-                # real quarterly range) for a KSB filing that was actually
-                # just a cover letter with zero financial figures in it,
-                # despite the prompt's has_results_table guard existing
-                # specifically to prevent this. A real quarter-over-quarter
-                # swing of >4x or <0.25x is rare enough for an established
-                # listed company that it's more likely a misread/
-                # hallucination than a genuine result - skip saving and
-                # flag for manual review rather than silently accepting it.
-                if fd.get('sales') is not None:
-                    try:
-                        headers2 = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
-                        async with session.get(
-                            f"{SUPABASE_URL}/rest/v1/financial_results", headers=headers2,
-                            params={'select': 'sales,period_ended', 'symbol': f"eq.{fd['symbol']}",
-                                    'sales': 'not.is.null', 'order': 'period_ended.desc', 'limit': '3'},
-                            timeout=aiohttp.ClientTimeout(total=15)
-                        ) as r2:
-                            existing = await r2.json() if r2.status == 200 else []
-                        for e in existing:
-                            if e['period_ended'] == fd['period_ended']:
-                                continue  # don't compare against itself if this is an update
-                            prior_sales = e.get('sales')
-                            if prior_sales and prior_sales > 0:
-                                ratio = fd['sales'] / prior_sales
-                                if ratio > 4 or ratio < 0.25:
-                                    log.warning(f"⚠️ {row['symbol']}: extracted sales {fd['sales']} looks "
-                                                 f"like an outlier vs prior {prior_sales} ({e['period_ended']}, "
-                                                 f"{ratio:.1f}x) - likely misread/hallucination, skipping save "
-                                                 f"for manual review. PDF: {row['attachment_url']}")
-                                    fd = None
-                                break  # only need the single most recent comparable value
-                    except Exception as e:
-                        log.warning(f"⚠️ Sanity check fetch failed for {row['symbol']}: {type(e).__name__}: {e}")
+            fd = await _sanity_check_sales_outlier(
+                session, result['financial_data'], row['symbol'], row['attachment_url'])
+            comp = await _sanity_check_sales_outlier(
+                session, result['comparison_data'], row['symbol'], row['attachment_url'])
             if fd:
                 # Saved one stock at a time, not batched together, on
                 # purpose: save_financial_results_to_db's setdefault(k,
@@ -373,6 +429,17 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
                 await save_financial_results_to_db(session, [fd])
                 log.info(f"  🎙️ {row['symbol']}: extracted {fd['period_ended']} "
                           f"{fd['result_type']} figures from PDF")
+            if comp:
+                # Comparison (prior quarter) row - see extract_results_from_pdf's
+                # docstring for why this is worth saving even though the
+                # current period already covers the announcement: it
+                # naturally overwrites a mislabeled-as-Consolidated
+                # Standalone row from the older XBRL mechanism for that
+                # same period, since Gemini reads the document's own
+                # explicit labels directly.
+                await save_financial_results_to_db(session, [comp])
+                log.info(f"  🎙️ {row['symbol']}: also extracted comparison period {comp['period_ended']} "
+                          f"{comp['result_type']} figures from same PDF")
             payload = {
                 'symbol': row['symbol'], 'announced_at': row['announced_at'],
                 'attachment_url': row['attachment_url'],
