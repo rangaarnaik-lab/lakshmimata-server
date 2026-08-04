@@ -1088,6 +1088,27 @@ async def fetch_and_parse_xbrl(session: aiohttp.ClientSession, url: str,
     # such), so any context whose own text mentions "standalone"
     # anywhere gets excluded from comparison-period matching rather
     # than risk silently mixing standalone and consolidated figures.
+    #
+    # KNOWN LIMITATION (confirmed 2026-08-04): this literal-word-search
+    # heuristic does NOT catch every filer's convention - verified via
+    # two real cases (METROBRAND, TREJHARA) where the actual source PDF
+    # confirmed the XBRL-derived row saved as result_type='Consolidated'
+    # was genuinely Standalone data, because that filer's XBRL didn't
+    # contain the literal word "standalone" anywhere the checks below
+    # look for it. When detection silently fails like this, is_standalone
+    # stays False and the value gets accepted into the Consolidated pass
+    # in value_near_date() below without ever being caught. This wasn't
+    # fixed on the spot (XBRL taxonomy conventions vary enough across
+    # filers that a confident fix needs more real samples than were
+    # available to validate against, and a wrong guess here risks
+    # breaking currently-working cases). The new Gemini PDF-reading
+    # pipeline (extract_results_from_pdf) reads each document's own
+    # explicit Standalone/Consolidated labels directly rather than
+    # inferring from XBRL dimension conventions, and upserts onto the
+    # same (symbol, period_ended, result_type) key - so any period it
+    # successfully processes will naturally overwrite a mislabeled XBRL
+    # row for that same period going forward, without needing this
+    # function fixed first.
     contexts = {}  # context id -> (start_date, end_date, is_standalone)
     for ctx in root.iter():
         if local_name(ctx.tag) != 'context':
