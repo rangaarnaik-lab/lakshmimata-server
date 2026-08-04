@@ -1682,20 +1682,20 @@ async def fundamentals_worker_main():
             except Exception as e:
                 import traceback
                 log.error(f"BSE test failed: {e}\n{traceback.format_exc()}")
-        if os.getenv('BACKFILL_BSE_SYMBOLS'):
+        if os.getenv('BACKFILL_BSE_SYMBOLS') and not os.getenv('PAUSE_BSE_LOOPS'):
             try:
                 syms = [s.strip().upper() for s in os.getenv('BACKFILL_BSE_SYMBOLS').split(',') if s.strip()]
                 await backfill_from_bse(session, syms)
             except Exception as e:
                 import traceback
                 log.error(f"BSE backfill failed: {e}\n{traceback.format_exc()}")
-        if os.getenv('BACKFILL_BSE_MISSING_LIMIT'):
+        if os.getenv('BACKFILL_BSE_MISSING_LIMIT') and not os.getenv('PAUSE_BSE_LOOPS'):
             try:
                 await backfill_from_bse_missing(session, limit=int(os.getenv('BACKFILL_BSE_MISSING_LIMIT')))
             except Exception as e:
                 import traceback
                 log.error(f"BSE-missing backfill failed: {e}\n{traceback.format_exc()}")
-        if os.getenv('TEST_BSE_CALENDAR'):
+        if os.getenv('TEST_BSE_CALENDAR') and not os.getenv('PAUSE_BSE_LOOPS'):
             try:
                 await fetch_and_save_upcoming_results_calendar(session)
             except Exception as e:
