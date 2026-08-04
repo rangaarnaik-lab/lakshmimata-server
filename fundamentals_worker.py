@@ -42,41 +42,76 @@ def _is_concall_announcement(row: dict) -> bool:
     text = ((row.get('category') or '') + ' ' + (row.get('subject') or '')).lower()
     return any(x in text for x in _CONCALL_KEYWORDS)
 
-async def summarize_concall_pdf(session: aiohttp.ClientSession, symbol: str, attachment_url: str):
-    """Downloads a concall/transcript PDF and summarizes it via Gemini
-    (native PDF understanding - no separate text-extraction step
-    needed, unlike a text-only LLM). Entirely optional, same graceful-
-    degradation philosophy as rate_announcements_with_ai: no
-    GEMINI_API_KEY set, or any failure at any step, just means no
-    summary gets saved - never blocks or delays the rest of the
-    pipeline. Returns the summary text, or None."""
+async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, attachment_url: str):
+    """Downloads a results-filing PDF and, via Gemini (native PDF
+    understanding), both (1) extracts the actual Consolidated financial
+    figures directly from the document, and (2) writes a qualitative
+    summary. This is a more authoritative source than Screener's CSV
+    (which has no per-row Standalone/Consolidated indicator - confirmed
+    by the user it was returning Standalone for many stocks) and than
+    BSE's resultsSnapshot (confirmed via source inspection to only ever
+    return the latest ~2-3 periods, no deep history) - the PDF itself
+    explicitly labels which basis each table is, so asking Gemini to
+    specifically read the Consolidated section removes that ambiguity
+    entirely, and reading each quarter's PDF as it's filed builds our
+    own history incrementally over time.
+    Entirely optional, same graceful-degradation philosophy as
+    rate_announcements_with_ai: no GEMINI_API_KEY set, or any failure at
+    any step, just means nothing gets saved - never blocks or delays
+    the rest of the pipeline. Returns {'financial_data': dict|None,
+    'summary': str|None}."""
+    empty = {'financial_data': None, 'summary': None}
     api_key = os.getenv('GEMINI_API_KEY', '')
     if not api_key or not attachment_url:
-        return None
+        return empty
     try:
         async with session.get(attachment_url, timeout=aiohttp.ClientTimeout(total=30)) as r:
             if r.status != 200:
-                log.warning(f"⚠️ Concall PDF fetch failed for {symbol} ({r.status})")
-                return None
+                log.warning(f"⚠️ Results PDF fetch failed for {symbol} ({r.status})")
+                return empty
             pdf_bytes = await r.read()
-        if len(pdf_bytes) > 15_000_000:  # sanity cap, concall PDFs are typically a few hundred KB
-            log.warning(f"⚠️ Concall PDF too large for {symbol} ({len(pdf_bytes)} bytes) - skipping")
-            return None
+        if len(pdf_bytes) > 15_000_000:  # sanity cap
+            log.warning(f"⚠️ Results PDF too large for {symbol} ({len(pdf_bytes)} bytes) - skipping")
+            return empty
         pdf_b64 = base64.b64encode(pdf_bytes).decode('ascii')
         prompt = (
-            "This is a quarterly/annual financial results filing (or an attached press release/"
-            "board commentary alongside it) for an Indian listed company, filed with NSE/BSE. "
-            "The raw numbers (sales, profit, EPS, etc.) are already tracked separately - do NOT "
-            "just restate the headline figures. Instead, summarize for a retail investor in under "
-            "200 words what the numbers alone wouldn't tell them: (1) management's own commentary "
-            "or explanation for the quarter's performance, if present, (2) segment-wise or "
-            "product-wise performance breakdown, if disclosed, (3) any one-off/exceptional items, "
-            "write-offs, or unusual items affecting the results, (4) forward outlook or guidance, "
-            "if mentioned. If the filing is purely the financial statements/schedules with no "
-            "qualitative commentary of this kind at all (common for smaller companies - just "
-            "tables of numbers), respond with exactly: NO_CONTENT. Do not add commentary or "
-            "opinions beyond what's stated in the document."
+            "This is a quarterly/annual financial results filing for an Indian listed company, "
+            "filed with NSE/BSE. Extract data as follows:\n\n"
+            "FINANCIAL FIGURES: If the document contains an actual results table with numbers "
+            "(not just a schedule/notice), extract these fields. Filings often show BOTH "
+            "Standalone and Consolidated tables side by side or in separate sections - ALWAYS "
+            "extract from the CONSOLIDATED table specifically if one is present; only use "
+            "Standalone if no Consolidated table exists at all in the document (set result_type "
+            "accordingly). All rupee figures in Rs Crore, rounded to match the document's own "
+            "units (convert from Rs Lakh or Rs Thousand to Rs Crore if that's what the document "
+            "uses). If a field isn't present in the document, leave it null rather than guessing "
+            "or calculating it yourself.\n\n"
+            "SUMMARY: Separately, summarize for a retail investor in under 200 words what the "
+            "numbers alone wouldn't tell them: management's own commentary or explanation for "
+            "the quarter's performance if present, segment-wise/product-wise breakdown if "
+            "disclosed, any one-off/exceptional items or write-offs affecting results, and "
+            "forward outlook/guidance if mentioned. If the filing is purely financial statements/"
+            "schedules with no qualitative commentary of this kind (common for smaller "
+            "companies), leave summary null. Do not add commentary or opinions beyond what's "
+            "stated in the document."
         )
+        schema = {
+            "type": "object",
+            "properties": {
+                "has_results_table": {"type": "boolean",
+                    "description": "true if the document contains an actual results table with financial figures"},
+                "period_ended": {"type": "string", "nullable": True,
+                    "description": "Quarter/year end date this result covers, YYYY-MM-DD format"},
+                "result_type": {"type": "string", "enum": ["Consolidated", "Standalone"], "nullable": True},
+                "sales": {"type": "number", "nullable": True, "description": "Revenue from operations, Rs Crore"},
+                "other_income": {"type": "number", "nullable": True, "description": "Rs Crore"},
+                "pbt": {"type": "number", "nullable": True, "description": "Profit before tax, Rs Crore"},
+                "pat": {"type": "number", "nullable": True, "description": "Profit after tax / net profit, Rs Crore"},
+                "eps": {"type": "number", "nullable": True, "description": "Basic EPS, Rs"},
+                "summary": {"type": "string", "nullable": True},
+            },
+            "required": ["has_results_table"],
+        }
         # gemini-3.1-flash-lite: current actively-supported Lite-tier
         # model as of Aug 2026 (gemini-2.5-flash is being deprecated
         # Oct 16 2026) - cheap, fast, and handles PDF input natively.
@@ -84,37 +119,68 @@ async def summarize_concall_pdf(session: aiohttp.ClientSession, symbol: str, att
         async with session.post(
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
             headers={"Content-Type": "application/json"},
-            json={"contents": [{"parts": [
-                {"inline_data": {"mime_type": "application/pdf", "data": pdf_b64}},
-                {"text": prompt},
-            ]}]},
+            json={
+                "contents": [{"parts": [
+                    {"inline_data": {"mime_type": "application/pdf", "data": pdf_b64}},
+                    {"text": prompt},
+                ]}],
+                "generationConfig": {"responseMimeType": "application/json", "responseSchema": schema},
+            },
             timeout=aiohttp.ClientTimeout(total=60),
         ) as r:
             if r.status != 200:
                 body = await r.text()
-                log.warning(f"⚠️ Gemini concall summary failed for {symbol} ({r.status}): {body[:200]}")
-                return None
+                log.warning(f"⚠️ Gemini results extraction failed for {symbol} ({r.status}): {body[:200]}")
+                return empty
             data = await r.json()
         candidates = data.get('candidates', [])
         if not candidates:
-            log.warning(f"⚠️ Gemini returned no candidates for {symbol} concall")
-            return None
+            log.warning(f"⚠️ Gemini returned no candidates for {symbol} results extraction")
+            return empty
         parts = candidates[0].get('content', {}).get('parts', [])
-        summary = ''.join(p.get('text', '') for p in parts).strip()
-        if not summary or summary == 'NO_CONTENT':
-            return None
-        return summary[:2000]
+        raw_text = ''.join(p.get('text', '') for p in parts).strip()
+        parsed = json.loads(raw_text)
+
+        financial_data = None
+        if parsed.get('has_results_table') and parsed.get('period_ended'):
+            try:
+                period_ended_fmt = datetime.strptime(parsed['period_ended'], '%Y-%m-%d').strftime('%d-%b-%Y')
+            except (ValueError, TypeError):
+                period_ended_fmt = None
+            # Only worth saving if we got a valid date AND at least one
+            # real number - a row with just period_ended/result_type and
+            # everything else null is the same "blank row" problem fixed
+            # earlier for the BSE pipeline - same rule applied here.
+            if period_ended_fmt and any(parsed.get(k) is not None for k in ('sales', 'pat', 'eps')):
+                financial_data = {
+                    'symbol': symbol,
+                    'period_ended': period_ended_fmt,
+                    'result_type': parsed.get('result_type') or 'Consolidated',
+                    'filed_at': datetime.now(timezone.utc).isoformat(),
+                }
+                # Only include fields Gemini actually found a value for -
+                # omit entirely (not even as None) rather than risk
+                # nulling out a genuine existing value from another
+                # source (e.g. NSE XBRL) for the same
+                # symbol+period_ended+result_type row. Same reasoning as
+                # the BSE resultsSnapshot parser's blank-field handling.
+                for k in ('sales', 'other_income', 'pbt', 'pat', 'eps'):
+                    if parsed.get(k) is not None:
+                        financial_data[k] = parsed[k]
+        summary = (parsed.get('summary') or '').strip()[:2000] or None
+        return {'financial_data': financial_data, 'summary': summary}
     except Exception as e:
-        log.warning(f"⚠️ Concall summarization failed for {symbol}: {type(e).__name__}: {e}")
-        return None
+        log.warning(f"⚠️ Results PDF extraction failed for {symbol}: {type(e).__name__}: {e}")
+        return empty
 
 async def _concall_summary_loop(session: aiohttp.ClientSession):
-    """Finds concall/transcript announcements that haven't been
-    summarized yet and processes a small batch. Entirely skipped (no
-    API calls, no wasted cycles) if GEMINI_API_KEY isn't set - checked
-    once per loop iteration so the feature activates automatically as
-    soon as the key is added, without needing a restart-triggered
-    one-off backfill like the BSE loops needed."""
+    """Finds results announcements that haven't been processed yet and
+    extracts both structured financial data and a qualitative summary
+    from each PDF via Gemini. Entirely skipped (no API calls, no wasted
+    cycles) if GEMINI_API_KEY isn't set - checked once per loop
+    iteration so the feature activates automatically as soon as the key
+    is added, without needing a restart-triggered one-off backfill like
+    the BSE loops needed."""
     headers = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
     BATCH_SIZE = 10
     while True:
@@ -122,9 +188,9 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
             await asyncio.sleep(300)  # check again in 5 min in case the key gets added
             continue
         try:
-            # Recent concall/transcript announcements (last 14 days is
-            # plenty - older ones are no longer actionable for a
-            # retail investor reading the feed today).
+            # Recent results announcements (last 14 days is plenty -
+            # older ones would already be covered by the BSE/XBRL
+            # pipeline running elsewhere).
             since = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
             async with session.get(
                 f"{SUPABASE_URL}/rest/v1/corporate_announcements", headers=headers,
@@ -156,9 +222,15 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
 
         todo = [row for row in concall_rows if (row['symbol'], row['announced_at']) not in already][:BATCH_SIZE]
         if todo:
-            log.info(f"🎙️ Concall summary loop: {len(todo)} new concall/transcript announcement(s) to summarize")
+            log.info(f"🎙️ Results extraction loop: {len(todo)} new results announcement(s) to process")
+        financial_rows_to_save = []
         for row in todo:
-            summary = await summarize_concall_pdf(session, row['symbol'], row['attachment_url'])
+            result = await extract_results_from_pdf(session, row['symbol'], row['attachment_url'])
+            summary = result['summary']
+            if result['financial_data']:
+                financial_rows_to_save.append(result['financial_data'])
+                log.info(f"  🎙️ {row['symbol']}: extracted {result['financial_data']['period_ended']} "
+                          f"{result['financial_data']['result_type']} figures from PDF")
             payload = {
                 'symbol': row['symbol'], 'announced_at': row['announced_at'],
                 'attachment_url': row['attachment_url'],
@@ -173,8 +245,10 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
             except Exception as e:
                 log.warning(f"⚠️ Concall loop: save failed for {row['symbol']}: {type(e).__name__}: {e}")
             await asyncio.sleep(2)  # small gap between Gemini calls
+        if financial_rows_to_save:
+            await save_financial_results_to_db(session, financial_rows_to_save)
         if todo:
-            log.info(f"🎙️ Concall summary loop: batch complete")
+            log.info(f"🎙️ Results extraction loop: batch complete")
         await asyncio.sleep(900)  # 15 min, flat interval per user request
 
 async def _announcements_loop(session: aiohttp.ClientSession):
