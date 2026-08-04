@@ -223,12 +223,19 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
         todo = [row for row in concall_rows if (row['symbol'], row['announced_at']) not in already][:BATCH_SIZE]
         if todo:
             log.info(f"🎙️ Results extraction loop: {len(todo)} new results announcement(s) to process")
-        financial_rows_to_save = []
         for row in todo:
             result = await extract_results_from_pdf(session, row['symbol'], row['attachment_url'])
             summary = result['summary']
             if result['financial_data']:
-                financial_rows_to_save.append(result['financial_data'])
+                # Saved one stock at a time, not batched together, on
+                # purpose: save_financial_results_to_db's setdefault(k,
+                # None) applies across the WHOLE batch's key union, not
+                # per-row - batching different stocks (each with
+                # different fields extracted from their own PDF) would
+                # risk one stock's missing field silently nulling out
+                # another stock's genuine existing value for the same
+                # symbol+period_ended+result_type key.
+                await save_financial_results_to_db(session, [result['financial_data']])
                 log.info(f"  🎙️ {row['symbol']}: extracted {result['financial_data']['period_ended']} "
                           f"{result['financial_data']['result_type']} figures from PDF")
             payload = {
@@ -245,8 +252,6 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
             except Exception as e:
                 log.warning(f"⚠️ Concall loop: save failed for {row['symbol']}: {type(e).__name__}: {e}")
             await asyncio.sleep(2)  # small gap between Gemini calls
-        if financial_rows_to_save:
-            await save_financial_results_to_db(session, financial_rows_to_save)
         if todo:
             log.info(f"🎙️ Results extraction loop: batch complete")
         await asyncio.sleep(900)  # 15 min, flat interval per user request
