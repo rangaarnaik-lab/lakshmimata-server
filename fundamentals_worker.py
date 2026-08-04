@@ -7,6 +7,7 @@ import gc
 import sys
 import time
 import json
+import base64
 import asyncio
 import aiohttp
 import logging
@@ -24,6 +25,149 @@ log = logging.getLogger('pocketrs')
 _BSE_NO_SCRIP_CODE = set()
 
 # ══ FUNDAMENTALS-WORKER-ONLY FUNCTIONS ══
+
+_CONCALL_KEYWORDS = ['transcript', 'con. call', 'con call', 'conference call', 'investor meet',
+                     'earnings call']
+
+def _is_concall_announcement(row: dict) -> bool:
+    """Same keyword set used to EXCLUDE these from the Results filter
+    (they're not results filings themselves) - here we use it the other
+    way, to POSITIVELY identify concall/transcript announcements worth
+    summarizing."""
+    text = ((row.get('category') or '') + ' ' + (row.get('subject') or '')).lower()
+    return any(x in text for x in _CONCALL_KEYWORDS)
+
+async def summarize_concall_pdf(session: aiohttp.ClientSession, symbol: str, attachment_url: str):
+    """Downloads a concall/transcript PDF and summarizes it via Gemini
+    (native PDF understanding - no separate text-extraction step
+    needed, unlike a text-only LLM). Entirely optional, same graceful-
+    degradation philosophy as rate_announcements_with_ai: no
+    GEMINI_API_KEY set, or any failure at any step, just means no
+    summary gets saved - never blocks or delays the rest of the
+    pipeline. Returns the summary text, or None."""
+    api_key = os.getenv('GEMINI_API_KEY', '')
+    if not api_key or not attachment_url:
+        return None
+    try:
+        async with session.get(attachment_url, timeout=aiohttp.ClientTimeout(total=30)) as r:
+            if r.status != 200:
+                log.warning(f"⚠️ Concall PDF fetch failed for {symbol} ({r.status})")
+                return None
+            pdf_bytes = await r.read()
+        if len(pdf_bytes) > 15_000_000:  # sanity cap, concall PDFs are typically a few hundred KB
+            log.warning(f"⚠️ Concall PDF too large for {symbol} ({len(pdf_bytes)} bytes) - skipping")
+            return None
+        pdf_b64 = base64.b64encode(pdf_bytes).decode('ascii')
+        prompt = (
+            "This is an earnings conference call transcript or investor call notice for an "
+            "Indian listed company. If it is a full transcript, summarize it for a retail "
+            "investor in under 200 words, covering: (1) key business/financial highlights "
+            "management called out, (2) forward guidance or outlook if mentioned, (3) any "
+            "notable risks, concerns, or challenges discussed. Use specific numbers/percentages "
+            "mentioned in the call where relevant. If this document is just a call SCHEDULE/"
+            "invitation notice with no actual discussion content (common - the transcript "
+            "itself is often a separate, later filing), respond with exactly: NO_CONTENT. "
+            "Do not add commentary or opinions beyond what's stated in the document."
+        )
+        # gemini-3.1-flash-lite: current actively-supported Lite-tier
+        # model as of Aug 2026 (gemini-2.5-flash is being deprecated
+        # Oct 16 2026) - cheap, fast, and handles PDF input natively.
+        model = os.getenv('GEMINI_CONCALL_MODEL', 'gemini-3.1-flash-lite')
+        async with session.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
+            headers={"Content-Type": "application/json"},
+            json={"contents": [{"parts": [
+                {"inline_data": {"mime_type": "application/pdf", "data": pdf_b64}},
+                {"text": prompt},
+            ]}]},
+            timeout=aiohttp.ClientTimeout(total=60),
+        ) as r:
+            if r.status != 200:
+                body = await r.text()
+                log.warning(f"⚠️ Gemini concall summary failed for {symbol} ({r.status}): {body[:200]}")
+                return None
+            data = await r.json()
+        candidates = data.get('candidates', [])
+        if not candidates:
+            log.warning(f"⚠️ Gemini returned no candidates for {symbol} concall")
+            return None
+        parts = candidates[0].get('content', {}).get('parts', [])
+        summary = ''.join(p.get('text', '') for p in parts).strip()
+        if not summary or summary == 'NO_CONTENT':
+            return None
+        return summary[:2000]
+    except Exception as e:
+        log.warning(f"⚠️ Concall summarization failed for {symbol}: {type(e).__name__}: {e}")
+        return None
+
+async def _concall_summary_loop(session: aiohttp.ClientSession):
+    """Finds concall/transcript announcements that haven't been
+    summarized yet and processes a small batch. Entirely skipped (no
+    API calls, no wasted cycles) if GEMINI_API_KEY isn't set - checked
+    once per loop iteration so the feature activates automatically as
+    soon as the key is added, without needing a restart-triggered
+    one-off backfill like the BSE loops needed."""
+    headers = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
+    BATCH_SIZE = 15
+    while True:
+        if not os.getenv('GEMINI_API_KEY'):
+            await asyncio.sleep(300)  # check again in 5 min in case the key gets added
+            continue
+        try:
+            # Recent concall/transcript announcements (last 14 days is
+            # plenty - older ones are no longer actionable for a
+            # retail investor reading the feed today).
+            since = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/corporate_announcements", headers=headers,
+                params={'select': 'symbol,category,subject,attachment_url,announced_at',
+                        'announced_at': f'gt.{since}', 'order': 'announced_at.desc', 'limit': '500'},
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as r:
+                candidates = await r.json() if r.status == 200 else []
+        except Exception as e:
+            log.warning(f"⚠️ Concall loop: announcements fetch failed: {type(e).__name__}: {e}")
+            candidates = []
+        concall_rows = [row for row in candidates if row.get('attachment_url') and _is_concall_announcement(row)]
+
+        # Skip ones already processed (any status - pending/done/failed/
+        # skipped all mean "don't retry automatically"; a failed fetch
+        # is usually a dead link, not worth hammering repeatedly).
+        already = set()
+        if concall_rows:
+            try:
+                async with session.get(
+                    f"{SUPABASE_URL}/rest/v1/concall_summaries", headers=headers,
+                    params={'select': 'symbol,announced_at'},
+                    timeout=aiohttp.ClientTimeout(total=30)
+                ) as r:
+                    if r.status == 200:
+                        already = {(row['symbol'], row['announced_at']) for row in await r.json()}
+            except Exception as e:
+                log.warning(f"⚠️ Concall loop: existing-summaries fetch failed: {type(e).__name__}: {e}")
+
+        todo = [row for row in concall_rows if (row['symbol'], row['announced_at']) not in already][:BATCH_SIZE]
+        if todo:
+            log.info(f"🎙️ Concall summary loop: {len(todo)} new concall/transcript announcement(s) to summarize")
+        for row in todo:
+            summary = await summarize_concall_pdf(session, row['symbol'], row['attachment_url'])
+            payload = {
+                'symbol': row['symbol'], 'announced_at': row['announced_at'],
+                'attachment_url': row['attachment_url'],
+                'summary': summary, 'status': 'done' if summary else 'skipped',
+            }
+            try:
+                await session.post(
+                    f"{SUPABASE_URL}/rest/v1/concall_summaries", headers={**headers,
+                        'Content-Type': 'application/json', 'Prefer': 'resolution=merge-duplicates'},
+                    json=payload, timeout=aiohttp.ClientTimeout(total=15)
+                )
+            except Exception as e:
+                log.warning(f"⚠️ Concall loop: save failed for {row['symbol']}: {type(e).__name__}: {e}")
+            await asyncio.sleep(2)  # small gap between Gemini calls
+        if todo:
+            log.info(f"🎙️ Concall summary loop: batch complete")
+        await asyncio.sleep(600 if todo else 1800)  # 10 min if actively working through a backlog, else 30 min
 
 async def _announcements_loop(session: aiohttp.ClientSession):
     """Fetches NSE's corporate announcements feed (all equities in one
@@ -1423,6 +1567,7 @@ async def fundamentals_worker_main():
             _bse_targeted_results_loop(session),
             _bse_missing_backfill_loop(session),
             _bse_stale_results_loop(session),
+            _concall_summary_loop(session),
         )
 
 def rate_announcements_free(rows: list) -> list:
