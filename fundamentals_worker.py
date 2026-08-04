@@ -108,7 +108,7 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
     soon as the key is added, without needing a restart-triggered
     one-off backfill like the BSE loops needed."""
     headers = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
-    BATCH_SIZE = 15
+    BATCH_SIZE = 10
     while True:
         if not os.getenv('GEMINI_API_KEY'):
             await asyncio.sleep(300)  # check again in 5 min in case the key gets added
@@ -167,7 +167,7 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
             await asyncio.sleep(2)  # small gap between Gemini calls
         if todo:
             log.info(f"🎙️ Concall summary loop: batch complete")
-        await asyncio.sleep(600 if todo else 1800)  # 10 min if actively working through a backlog, else 30 min
+        await asyncio.sleep(900)  # 15 min, flat interval per user request
 
 async def _announcements_loop(session: aiohttp.ClientSession):
     """Fetches NSE's corporate announcements feed (all equities in one
