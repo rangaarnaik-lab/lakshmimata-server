@@ -607,7 +607,7 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
             await asyncio.sleep(2)  # small gap between Gemini calls
         if todo:
             log.info(f"🎙️ Results extraction loop: batch complete")
-        await asyncio.sleep(900)  # 15 min, flat interval per user request
+        await asyncio.sleep(int(os.getenv('RESULTS_PDF_LOOP_INTERVAL_SECONDS', '900')))
 
 async def _announcements_loop(session: aiohttp.ClientSession):
     """Fetches NSE's corporate announcements feed (all equities in one
