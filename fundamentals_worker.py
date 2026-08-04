@@ -56,14 +56,23 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
     entirely, and reading each quarter's PDF as it's filed builds our
     own history incrementally over time.
     Entirely optional, same graceful-degradation philosophy as
-    rate_announcements_with_ai: no GEMINI_API_KEY set, or any failure at
-    any step, just means nothing gets saved - never blocks or delays
-    the rest of the pipeline. Returns {'financial_data': dict|None,
-    'summary': str|None}."""
-    empty = {'financial_data': None, 'summary': None}
+    rate_announcements_with_ai: no GEMINI_API_KEY set just means nothing
+    gets saved. Returns {'financial_data': dict|None, 'summary': str|None,
+    'error': bool}. 'error'=True means a TRANSIENT failure (timeout,
+    network, API error) - the caller should NOT save any row for this,
+    so it gets retried next cycle, rather than permanently marking the
+    symbol as processed. 'error'=False with both fields None means
+    Gemini genuinely processed the PDF and found nothing worth saving -
+    that IS safe to mark as done/skipped permanently. Confirmed in
+    production (2026-08-04): without this distinction, 4/4 symbols that
+    hit a Gemini timeout got stuck marked 'skipped' forever and were
+    never retried, since the old code treated every failure the same as
+    genuine no-content."""
+    error_result = {'financial_data': None, 'summary': None, 'error': True}
+    no_content_result = {'financial_data': None, 'summary': None, 'error': False}
     api_key = os.getenv('GEMINI_API_KEY', '')
     if not api_key or not attachment_url:
-        return empty
+        return error_result  # not a real "no content" case - just not configured/no URL, don't mark as processed
     # Stage 1: download the PDF. Separate try/except so a timeout here
     # is clearly distinguishable in logs from a Gemini-side timeout -
     # confirmed in production (2026-08-04) that a generic "TimeoutError:"
@@ -74,17 +83,17 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
         async with session.get(attachment_url, timeout=aiohttp.ClientTimeout(total=30)) as r:
             if r.status != 200:
                 log.warning(f"⚠️ Results PDF fetch failed for {symbol} ({r.status})")
-                return empty
+                return error_result
             pdf_bytes = await r.read()
     except asyncio.TimeoutError:
         log.warning(f"⚠️ Results PDF download timed out for {symbol} (30s limit)")
-        return empty
+        return error_result
     except Exception as e:
         log.warning(f"⚠️ Results PDF download failed for {symbol}: {type(e).__name__}: {e}")
-        return empty
-    if len(pdf_bytes) > 15_000_000:  # sanity cap
+        return error_result
+    if len(pdf_bytes) > 15_000_000:  # sanity cap - this one IS a genuine "won't process" case, safe to mark done
         log.warning(f"⚠️ Results PDF too large for {symbol} ({len(pdf_bytes)} bytes) - skipping")
-        return empty
+        return no_content_result
     pdf_b64 = base64.b64encode(pdf_bytes).decode('ascii')
     prompt = (
         "This is a quarterly/annual financial results filing for an Indian listed company, "
@@ -146,22 +155,22 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
             if r.status != 200:
                 body = await r.text()
                 log.warning(f"⚠️ Gemini results extraction failed for {symbol} ({r.status}): {body[:200]}")
-                return empty
+                return error_result
             data = await r.json()
     except asyncio.TimeoutError:
         log.warning(f"⚠️ Gemini call timed out for {symbol} ({gemini_timeout}s limit, "
                      f"PDF was {len(pdf_bytes)} bytes) - consider raising GEMINI_TIMEOUT_SECONDS "
                      f"if this recurs consistently, since it's a separate stage from the PDF download")
-        return empty
+        return error_result
     except Exception as e:
         log.warning(f"⚠️ Gemini call failed for {symbol}: {type(e).__name__}: {e}")
-        return empty
+        return error_result
     # Stage 3: parse the response.
     try:
         candidates = data.get('candidates', [])
         if not candidates:
             log.warning(f"⚠️ Gemini returned no candidates for {symbol} results extraction")
-            return empty
+            return error_result
         parts = candidates[0].get('content', {}).get('parts', [])
         raw_text = ''.join(p.get('text', '') for p in parts).strip()
         parsed = json.loads(raw_text)
@@ -193,10 +202,10 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
                     if parsed.get(k) is not None:
                         financial_data[k] = parsed[k]
         summary = (parsed.get('summary') or '').strip()[:2000] or None
-        return {'financial_data': financial_data, 'summary': summary}
+        return {'financial_data': financial_data, 'summary': summary, 'error': False}
     except Exception as e:
         log.warning(f"⚠️ Results PDF extraction failed for {symbol}: {type(e).__name__}: {e}")
-        return empty
+        return error_result
 
 async def _concall_summary_loop(session: aiohttp.ClientSession):
     """Finds results announcements that haven't been processed yet and
@@ -265,6 +274,17 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
                       f"({len(concall_rows)} matched results filters), nothing new to process")
         for row in todo:
             result = await extract_results_from_pdf(session, row['symbol'], row['attachment_url'])
+            if result['error']:
+                # Transient failure (timeout, network, API error) - don't
+                # save any row at all, so this symbol still shows as
+                # "not yet processed" and gets retried next cycle.
+                # Confirmed in production (2026-08-04): saving a
+                # 'skipped' row here for a timeout permanently stuck 4/4
+                # failed symbols as "already done", so they were never
+                # retried even though we never actually got an answer
+                # from Gemini for them.
+                log.info(f"  🎙️ {row['symbol']}: will retry next cycle (transient error, not saved)")
+                continue
             summary = result['summary']
             if result['financial_data']:
                 # Saved one stock at a time, not batched together, on
