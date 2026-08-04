@@ -98,25 +98,38 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
         return no_content_result
     pdf_b64 = base64.b64encode(pdf_bytes).decode('ascii')
     prompt = (
-        "This is a quarterly/annual financial results filing for an Indian listed company, "
-        "filed with NSE/BSE. Extract data as follows:\n\n"
-        "FINANCIAL FIGURES: If the document contains an actual results table with numbers "
-        "(not just a schedule/notice), extract these fields. Filings often show BOTH "
-        "Standalone and Consolidated tables side by side or in separate sections - ALWAYS "
-        "extract from the CONSOLIDATED table specifically if one is present; only use "
+        "This is a document filed with NSE/BSE for an Indian listed company, related to "
+        "quarterly/annual financial results. IMPORTANT: many filings under this category are "
+        "just a short cover letter or board-meeting-outcome notice announcing that results "
+        "were approved, WITHOUT the actual results table itself (the table is often a "
+        "separate attachment you don't have access to). Read the ENTIRE document carefully "
+        "before extracting anything.\n\n"
+        "FINANCIAL FIGURES: Only extract a figure if you can see the literal number printed "
+        "in a results/financial-statements table in THIS document. If this document is a "
+        "cover letter, transmittal notice, or board-outcome announcement that merely "
+        "mentions or refers to results being enclosed/approved/attached, WITHOUT itself "
+        "containing a table of actual figures, set has_results_table to false and leave "
+        "every financial field null - do not estimate, infer, or reconstruct numbers from "
+        "context, prior knowledge, or typical figures for a company this size. Fabricating "
+        "a plausible-looking number when the real one isn't visible in the document is a "
+        "serious error - if in doubt, leave the field null rather than guess.\n\n"
+        "If the document DOES contain an actual results table with numbers: Filings often "
+        "show BOTH Standalone and Consolidated tables side by side or in separate sections - "
+        "ALWAYS extract from the CONSOLIDATED table specifically if one is present; only use "
         "Standalone if no Consolidated table exists at all in the document (set result_type "
         "accordingly). All rupee figures in Rs Crore, rounded to match the document's own "
         "units (convert from Rs Lakh or Rs Thousand to Rs Crore if that's what the document "
-        "uses). If a field isn't present in the document, leave it null rather than guessing "
-        "or calculating it yourself.\n\n"
+        "uses). If a specific field isn't present in the table, leave that field null rather "
+        "than guessing or calculating it yourself.\n\n"
         "SUMMARY: Separately, summarize for a retail investor in under 200 words what the "
         "numbers alone wouldn't tell them: management's own commentary or explanation for "
         "the quarter's performance if present, segment-wise/product-wise breakdown if "
         "disclosed, any one-off/exceptional items or write-offs affecting results, and "
         "forward outlook/guidance if mentioned. If the filing is purely financial statements/"
         "schedules with no qualitative commentary of this kind (common for smaller "
-        "companies), leave summary null. Do not add commentary or opinions beyond what's "
-        "stated in the document."
+        "companies), or if it's just a cover letter with no real content to summarize, leave "
+        "summary null. Do not add commentary or opinions beyond what's stated in the "
+        "document, and never invent facts, figures, or context not literally present in it."
     )
     schema = {
         "type": "object",
@@ -288,7 +301,46 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
                 log.info(f"  🎙️ {row['symbol']}: will retry next cycle (transient error, not saved)")
                 continue
             summary = result['summary']
-            if result['financial_data']:
+            fd = result['financial_data']
+            if fd:
+                # Sanity check against the most recent existing value for
+                # this symbol, as a safety net against LLM hallucination -
+                # confirmed in production (2026-08-04) that Gemini
+                # fabricated a plausible-looking sales figure (~9-11x the
+                # real quarterly range) for a KSB filing that was actually
+                # just a cover letter with zero financial figures in it,
+                # despite the prompt's has_results_table guard existing
+                # specifically to prevent this. A real quarter-over-quarter
+                # swing of >4x or <0.25x is rare enough for an established
+                # listed company that it's more likely a misread/
+                # hallucination than a genuine result - skip saving and
+                # flag for manual review rather than silently accepting it.
+                if fd.get('sales') is not None:
+                    try:
+                        headers2 = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
+                        async with session.get(
+                            f"{SUPABASE_URL}/rest/v1/financial_results", headers=headers2,
+                            params={'select': 'sales,period_ended', 'symbol': f"eq.{fd['symbol']}",
+                                    'sales': 'not.is.null', 'order': 'period_ended.desc', 'limit': '3'},
+                            timeout=aiohttp.ClientTimeout(total=15)
+                        ) as r2:
+                            existing = await r2.json() if r2.status == 200 else []
+                        for e in existing:
+                            if e['period_ended'] == fd['period_ended']:
+                                continue  # don't compare against itself if this is an update
+                            prior_sales = e.get('sales')
+                            if prior_sales and prior_sales > 0:
+                                ratio = fd['sales'] / prior_sales
+                                if ratio > 4 or ratio < 0.25:
+                                    log.warning(f"⚠️ {row['symbol']}: extracted sales {fd['sales']} looks "
+                                                 f"like an outlier vs prior {prior_sales} ({e['period_ended']}, "
+                                                 f"{ratio:.1f}x) - likely misread/hallucination, skipping save "
+                                                 f"for manual review. PDF: {row['attachment_url']}")
+                                    fd = None
+                                break  # only need the single most recent comparable value
+                    except Exception as e:
+                        log.warning(f"⚠️ Sanity check fetch failed for {row['symbol']}: {type(e).__name__}: {e}")
+            if fd:
                 # Saved one stock at a time, not batched together, on
                 # purpose: save_financial_results_to_db's setdefault(k,
                 # None) applies across the WHOLE batch's key union, not
@@ -297,9 +349,9 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
                 # risk one stock's missing field silently nulling out
                 # another stock's genuine existing value for the same
                 # symbol+period_ended+result_type key.
-                await save_financial_results_to_db(session, [result['financial_data']])
-                log.info(f"  🎙️ {row['symbol']}: extracted {result['financial_data']['period_ended']} "
-                          f"{result['financial_data']['result_type']} figures from PDF")
+                await save_financial_results_to_db(session, [fd])
+                log.info(f"  🎙️ {row['symbol']}: extracted {fd['period_ended']} "
+                          f"{fd['result_type']} figures from PDF")
             payload = {
                 'symbol': row['symbol'], 'announced_at': row['announced_at'],
                 'attachment_url': row['attachment_url'],
