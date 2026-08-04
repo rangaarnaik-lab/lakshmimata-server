@@ -345,7 +345,6 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
     is added, without needing a restart-triggered one-off backfill like
     the BSE loops needed."""
     headers = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
-    BATCH_SIZE = 10
     _key_status_logged = False
     while True:
         if not os.getenv('GEMINI_API_KEY'):
@@ -355,22 +354,39 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
                 _key_status_logged = True
             await asyncio.sleep(300)  # check again in 5 min in case the key gets added
             continue
+        # Configurable per-cycle batch size and query row cap - defaults
+        # (10, 500) assumed only a small recent-announcements backlog.
+        # Covering ALL stocks (not just recent announcements) needs both
+        # raised significantly: RESULTS_PDF_LOOKBACK_DAYS alone isn't
+        # enough, since the query below is also capped at
+        # RESULTS_PDF_CANDIDATES_LIMIT rows ordered by announced_at.desc -
+        # if there are more results-type announcements in the lookback
+        # window than that cap, anything past the most recent N would
+        # never even be fetched, no matter how many cycles run.
+        BATCH_SIZE = int(os.getenv('RESULTS_PDF_BATCH_SIZE', '10'))
+        candidates_limit = int(os.getenv('RESULTS_PDF_CANDIDATES_LIMIT', '500'))
         if not _key_status_logged:
             log.info(f"🎙️ Results extraction loop: GEMINI_API_KEY detected, active "
-                      f"(lookback={os.getenv('RESULTS_PDF_LOOKBACK_DAYS', '14')}d, batch={BATCH_SIZE})")
+                      f"(lookback={os.getenv('RESULTS_PDF_LOOKBACK_DAYS', '14')}d, batch={BATCH_SIZE}, "
+                      f"candidates_limit={candidates_limit})")
             _key_status_logged = True
         try:
             # Recent results announcements - configurable via
             # RESULTS_PDF_LOOKBACK_DAYS (e.g. set to 1 for a quick,
             # small test run rather than processing the full default
             # backlog). Defaults to 14 days - older ones would already
-            # be covered by the BSE/XBRL pipeline running elsewhere.
+            # be covered by the BSE/XBRL pipeline running elsewhere,
+            # unless that pipeline has been disabled (GEMINI_ONLY_RESULTS/
+            # PAUSE_BSE_LOOPS), in which case both this and
+            # RESULTS_PDF_CANDIDATES_LIMIT need raising to actually reach
+            # older announcements.
             lookback_days = int(os.getenv('RESULTS_PDF_LOOKBACK_DAYS', '14'))
             since = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat()
             async with session.get(
                 f"{SUPABASE_URL}/rest/v1/corporate_announcements", headers=headers,
                 params={'select': 'symbol,category,subject,attachment_url,announced_at',
-                        'announced_at': f'gt.{since}', 'order': 'announced_at.desc', 'limit': '500'},
+                        'announced_at': f'gt.{since}', 'order': 'announced_at.desc',
+                        'limit': str(candidates_limit)},
                 timeout=aiohttp.ClientTimeout(total=30)
             ) as r:
                 candidates = await r.json() if r.status == 200 else []
