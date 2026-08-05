@@ -90,9 +90,16 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
         "prepared management remarks AND the Q&A session with analysts, and produce a "
         "structured summary in your own words - never quote verbatim, always paraphrase. "
         "Base every field ONLY on what's literally said in the transcript - never infer, "
-        "estimate, or add outside context. If the document isn't actually a usable "
-        "transcript (e.g. corrupted, blank, or just a cover letter), set has_content to "
-        "false and leave every other field null.\n\n"
+        "estimate, or add outside context.\n\n"
+        "IMPORTANT: some documents filed as 'transcript' announcements are actually just a "
+        "cover letter, board notice, call invite, or a slide deck/presentation - NOT an "
+        "actual transcript with real dialogue between management and analysts. If this "
+        "document does not contain actual spoken dialogue (a moderator, named speakers, "
+        "and back-and-forth Q&A), set has_content to false and leave every other field "
+        "null - do NOT invent or reconstruct what the call might plausibly have covered "
+        "based on the company's name, sector, or a cover letter mentioning the call took "
+        "place. If in doubt whether this is genuinely a transcript, treat it as false rather "
+        "than guess.\n\n"
         "FINANCIAL_HIGHLIGHTS: What management said about this quarter's headline numbers "
         "and what drove them (revenue/profit growth, margin trends, volume/pricing "
         "drivers) - 2-4 sentences. Null if not discussed.\n\n"
@@ -1184,6 +1191,11 @@ async def _transcript_summary_loop(session: aiohttp.ClientSession):
                 )
                 if summary:
                     log.info(f"  🎙️ {row['symbol']}: transcript summarized")
+                    missing = [k for k, v in summary.items() if v is None]
+                    if missing:
+                        log.info(f"  ℹ️ {row['symbol']}: transcript summary missing {', '.join(missing)} "
+                                  f"- may be a genuine gap (not every call covers every topic) or worth a "
+                                  f"manual check. PDF: {row['attachment_url']}")
                 else:
                     log.info(f"  🎙️ {row['symbol']}: transcript had no usable content, marked skipped")
             except Exception as e:
