@@ -122,7 +122,12 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
         "(divide by 100), Rs Thousand (divide by 100,000), or Rs Million/'Rupees in millions' "
         "(divide by 10 - some companies, especially those with international operations, use "
         "this Western convention instead of Lakh/Crore). Check the table's header or a note "
-        "near it for the stated unit before extracting any figure. If a specific field isn't "
+        "near it for the stated unit before extracting any figure. Many tables show a separate "
+        "'Exceptional Item' line between profit-before-exceptional-items and PBT (asset sale "
+        "gains, impairments, one-time write-offs, VRS costs, insurance claims, tax reversals, "
+        "etc.) - extract this into exceptional_item when the table shows it as its own line, "
+        "positive if it increased profit and negative if it reduced it; leave null if the table "
+        "has no such separate line (most quarters don't have one). If a specific field isn't "
         "present in the table, leave that field null rather than guessing or calculating it "
         "yourself.\n\n"
         "COMPARISON PERIODS: Indian quarterly results tables typically show up to 3 "
@@ -156,6 +161,8 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
             "sales": {"type": "number", "nullable": True, "description": "Revenue from operations, Rs Crore"},
             "other_income": {"type": "number", "nullable": True, "description": "Rs Crore"},
             "pbt": {"type": "number", "nullable": True, "description": "Profit before tax, Rs Crore"},
+            "exceptional_item": {"type": "number", "nullable": True,
+                "description": "Any exceptional/extraordinary item shown as a SEPARATE line in the table between PBT-before-exceptional-items and PBT (e.g. asset sale gain, impairment, one-time write-off, VRS cost, insurance claim, tax reversal). Rs Crore, positive if it INCREASED profit, negative if it REDUCED profit. Null if the table has no such separate line - most filings don't."},
             "pat": {"type": "number", "nullable": True, "description": "Profit after tax / net profit, Rs Crore"},
             "eps": {"type": "number", "nullable": True, "description": "Basic EPS, Rs"},
             "comparison_period_ended": {"type": "string", "nullable": True,
@@ -163,6 +170,7 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
             "comparison_sales": {"type": "number", "nullable": True},
             "comparison_other_income": {"type": "number", "nullable": True},
             "comparison_pbt": {"type": "number", "nullable": True},
+            "comparison_exceptional_item": {"type": "number", "nullable": True},
             "comparison_pat": {"type": "number", "nullable": True},
             "comparison_eps": {"type": "number", "nullable": True},
             "yoy_period_ended": {"type": "string", "nullable": True,
@@ -170,6 +178,7 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
             "yoy_sales": {"type": "number", "nullable": True},
             "yoy_other_income": {"type": "number", "nullable": True},
             "yoy_pbt": {"type": "number", "nullable": True},
+            "yoy_exceptional_item": {"type": "number", "nullable": True},
             "yoy_pat": {"type": "number", "nullable": True},
             "yoy_eps": {"type": "number", "nullable": True},
             "summary": {"type": "string", "nullable": True},
@@ -247,7 +256,7 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
                 # source (e.g. NSE XBRL) for the same
                 # symbol+period_ended+result_type row. Same reasoning as
                 # the BSE resultsSnapshot parser's blank-field handling.
-                for k in ('sales', 'other_income', 'pbt', 'pat', 'eps'):
+                for k in ('sales', 'other_income', 'pbt', 'exceptional_item', 'pat', 'eps'):
                     if parsed.get(k) is not None:
                         financial_data[k] = parsed[k]
 
@@ -283,7 +292,7 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
                 'result_type': parsed.get('result_type') or 'Consolidated',
                 'filed_at': datetime.now(timezone.utc).isoformat(),
             }
-            for k in ('sales', 'other_income', 'pbt', 'pat', 'eps'):
+            for k in ('sales', 'other_income', 'pbt', 'exceptional_item', 'pat', 'eps'):
                 v = parsed.get(field(k))
                 if v is not None:
                     out[k] = v
@@ -341,6 +350,55 @@ async def _sanity_check_sales_outlier(session: aiohttp.ClientSession, fd: dict,
     except Exception as e:
         log.warning(f"⚠️ Sanity check fetch failed for {symbol}: {type(e).__name__}: {e}")
     return fd
+
+async def backfill_exceptional_items(session: aiohttp.ClientSession, limit: int = 200):
+    """One-time backfill for the exceptional_item field added 2026-08-04,
+    for symbols the Gemini pipeline already processed BEFORE that field
+    existed. Reuses the attachment_url already saved in concall_summaries
+    (no need to re-discover the PDF link), re-runs extraction (now
+    including exceptional_item), and re-saves - the upsert on
+    (symbol, period_ended, result_type) merges into the existing rows
+    rather than creating duplicates, so the already-correct sales/PAT/EPS
+    data is untouched, just filled in with this one new field. Reuses
+    the same sanity-check and cross-validation safety nets as the main
+    loop. Gated behind BACKFILL_EXCEPTIONAL_ITEMS - one-off, remove
+    after running once the backlog clears."""
+    headers = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
+    async with session.get(
+        f"{SUPABASE_URL}/rest/v1/concall_summaries", headers=headers,
+        params={'select': 'symbol,attachment_url,created_at', 'status': 'eq.done',
+                'attachment_url': 'not.is.null', 'order': 'created_at.desc', 'limit': str(limit)},
+        timeout=aiohttp.ClientTimeout(total=30)
+    ) as r:
+        rows = await r.json() if r.status == 200 else []
+    log.info(f"🔁 Exceptional-items backfill: {len(rows)} already-processed symbol(s) to re-check")
+    done = 0
+    for i, row in enumerate(rows):
+        if i > 0:
+            await asyncio.sleep(float(os.getenv('RESULTS_PDF_PACING_SECONDS', '5')))
+        result = await extract_results_from_pdf(session, row['symbol'], row['attachment_url'])
+        if result['error']:
+            log.info(f"  🔁 {row['symbol']}: transient error re-fetching, skipping this pass")
+            continue
+        raw_fd, raw_comp, raw_yoy = result['financial_data'], result['comparison_data'], result['yoy_data']
+        cross_consistent = (raw_fd and raw_comp and raw_fd.get('sales') is not None
+                             and raw_comp.get('sales') is not None and raw_comp['sales'] > 0
+                             and 0.3 <= raw_fd['sales'] / raw_comp['sales'] <= 3)
+        if cross_consistent:
+            fd, comp = raw_fd, raw_comp
+        else:
+            fd = await _sanity_check_sales_outlier(session, raw_fd, row['symbol'], row['attachment_url'])
+            comp = await _sanity_check_sales_outlier(session, raw_comp, row['symbol'], row['attachment_url'])
+        yoy_consistent = (raw_yoy and raw_yoy.get('sales') is not None and fd and fd.get('sales')
+                           and raw_yoy['sales'] > 0 and 0.2 <= fd['sales'] / raw_yoy['sales'] <= 5)
+        yoy = raw_yoy if yoy_consistent else await _sanity_check_sales_outlier(
+            session, raw_yoy, row['symbol'], row['attachment_url'])
+        to_save = [r for r in (fd, comp, yoy) if r and r.get('exceptional_item') is not None]
+        if to_save:
+            await save_financial_results_to_db(session, to_save)
+            done += 1
+            log.info(f"  🔁 {row['symbol']}: found exceptional_item on {len(to_save)} period(s), updated")
+    log.info(f"🔁 Exceptional-items backfill complete: {done}/{len(rows)} symbol(s) had an exceptional item")
 
 async def _concall_summary_loop(session: aiohttp.ClientSession):
     """Finds results announcements that haven't been processed yet and
@@ -2029,6 +2087,12 @@ async def fundamentals_worker_main():
                 await backfill_pbt_other_income(session, days=int(os.getenv('BACKFILL_PBT_DAYS')))
             except Exception as e:
                 log.error(f"PBT/Other Income backfill failed: {e}")
+        if os.getenv('BACKFILL_EXCEPTIONAL_ITEMS'):
+            try:
+                await backfill_exceptional_items(
+                    session, limit=int(os.getenv('BACKFILL_EXCEPTIONAL_ITEMS_LIMIT', '200')))
+            except Exception as e:
+                log.error(f"Exceptional-items backfill failed: {e}")
         if os.getenv('TEST_BSE'):
             try:
                 await test_bse_resultsSnapshot()
