@@ -42,6 +42,147 @@ def _is_concall_announcement(row: dict) -> bool:
     text = ((row.get('category') or '') + ' ' + (row.get('subject') or '')).lower()
     return any(x in text for x in _CONCALL_KEYWORDS)
 
+async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str, attachment_url: str):
+    """Downloads an earnings-call TRANSCRIPT PDF (a different filing type
+    from results PDFs - filed separately under 'Transcript of the
+    Earnings/Analyst/Investor Call', identified by _is_transcript_announcement)
+    and asks Gemini to produce a structured summary covering what a
+    results PDF alone can't: management's own explanation of the
+    quarter, cost/margin commentary, forward guidance, and the specific
+    concerns analysts raised in Q&A. Same graceful-degradation contract
+    as extract_results_from_pdf: 'error'=True means transient failure,
+    don't mark processed, retry next cycle; 'error'=False with
+    summary=None means Gemini genuinely found nothing worth
+    summarizing (e.g. a garbled/corrupted PDF), safe to mark done.
+    Separate function (not a generalized version of
+    extract_results_from_pdf) specifically so the already-stabilized
+    results pipeline can't be affected by changes here."""
+    error_result = {'summary': None, 'error': True}
+    no_content_result = {'summary': None, 'error': False}
+    api_key = os.getenv('GEMINI_API_KEY', '')
+    if not api_key or not attachment_url:
+        return error_result
+    try:
+        async with session.get(attachment_url,
+            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.nseindia.com"},
+            timeout=aiohttp.ClientTimeout(total=30)) as r:
+            if r.status != 200:
+                log.warning(f"⚠️ Transcript PDF fetch failed for {symbol} ({r.status})")
+                return error_result
+            pdf_bytes = await r.read()
+    except asyncio.TimeoutError:
+        log.warning(f"⚠️ Transcript PDF download timed out for {symbol} (30s limit)")
+        return error_result
+    except Exception as e:
+        log.warning(f"⚠️ Transcript PDF download failed for {symbol}: {type(e).__name__}: {e}")
+        return error_result
+    # Transcripts run much longer than results PDFs (NALCO's Q1 FY27
+    # call transcript was 20 pages) - same 15MB sanity cap as results,
+    # but a separate, more generous timeout below since Gemini needs
+    # more time to process a longer document.
+    if len(pdf_bytes) > 15_000_000:
+        log.warning(f"⚠️ Transcript PDF too large for {symbol} ({len(pdf_bytes)} bytes) - skipping")
+        return no_content_result
+    pdf_b64 = base64.b64encode(pdf_bytes).decode('ascii')
+    prompt = (
+        "This is a transcript of an earnings/analyst/investor conference call for an Indian "
+        "listed company, filed with NSE/BSE. Read the full transcript, including the "
+        "prepared management remarks AND the Q&A session with analysts, and produce a "
+        "structured summary in your own words - never quote verbatim, always paraphrase. "
+        "Base every field ONLY on what's literally said in the transcript - never infer, "
+        "estimate, or add outside context. If the document isn't actually a usable "
+        "transcript (e.g. corrupted, blank, or just a cover letter), set has_content to "
+        "false and leave every other field null.\n\n"
+        "FINANCIAL_HIGHLIGHTS: What management said about this quarter's headline numbers "
+        "and what drove them (revenue/profit growth, margin trends, volume/pricing "
+        "drivers) - 2-4 sentences. Null if not discussed.\n\n"
+        "COST_MARGIN_COMMENTARY: Specific commentary on input costs, pricing realizations, "
+        "or margin trajectory - especially any concrete numbers management gave for cost "
+        "trends or price outlook. 2-4 sentences. Null if not discussed.\n\n"
+        "EXPANSION_CAPEX: Any expansion projects, capacity additions, or capex plans "
+        "discussed, including specific timelines, costs, or delays management mentioned. "
+        "2-4 sentences. Null if not discussed.\n\n"
+        "OUTLOOK_GUIDANCE: Management's own forward-looking statements - guidance for "
+        "upcoming quarters, full-year targets, or stated expectations. 2-3 sentences. "
+        "Null if not discussed.\n\n"
+        "KEY_CONCERNS: The most substantive concerns, pushback, or skeptical questions "
+        "analysts raised during Q&A, and how management responded - this is often the "
+        "most informative part of a transcript. 2-4 sentences. Null if the Q&A was routine "
+        "with no notable pushback.\n\n"
+        "OVERALL_SUMMARY: A balanced 100-150 word summary of the call for a retail "
+        "investor, covering what a results PDF alone wouldn't tell them. Do not add your "
+        "own opinion or investment view - describe what was said, not what to do about it."
+    )
+    schema = {
+        "type": "object",
+        "properties": {
+            "has_content": {"type": "boolean"},
+            "financial_highlights": {"type": "string", "nullable": True},
+            "cost_margin_commentary": {"type": "string", "nullable": True},
+            "expansion_capex": {"type": "string", "nullable": True},
+            "outlook_guidance": {"type": "string", "nullable": True},
+            "key_concerns": {"type": "string", "nullable": True},
+            "overall_summary": {"type": "string", "nullable": True},
+        },
+        "required": ["has_content"],
+    }
+    model = os.getenv('GEMINI_CONCALL_MODEL', 'gemini-3.1-flash-lite')
+    # Separate, more generous default timeout than results PDFs
+    # (GEMINI_TIMEOUT_SECONDS) since transcripts run much longer -
+    # Gemini needs more time to read and synthesize a 20-page document
+    # than a results table.
+    gemini_timeout = int(os.getenv('GEMINI_TRANSCRIPT_TIMEOUT_SECONDS', '180'))
+    try:
+        async with session.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
+            headers={"Content-Type": "application/json"},
+            json={
+                "contents": [{"parts": [
+                    {"inline_data": {"mime_type": "application/pdf", "data": pdf_b64}},
+                    {"text": prompt},
+                ]}],
+                "generationConfig": {"responseMimeType": "application/json", "responseSchema": schema},
+            },
+            timeout=aiohttp.ClientTimeout(total=gemini_timeout),
+        ) as r:
+            if r.status != 200:
+                body = await r.text()
+                if r.status == 429:
+                    log.warning(f"⚠️ Gemini rate-limit hit for {symbol} transcript (429) - backing off")
+                    await asyncio.sleep(int(os.getenv('GEMINI_429_BACKOFF_SECONDS', '30')))
+                else:
+                    log.warning(f"⚠️ Gemini transcript extraction failed for {symbol} ({r.status}): {body[:200]}")
+                return error_result
+            data = await r.json()
+    except asyncio.TimeoutError:
+        log.warning(f"⚠️ Gemini call timed out for {symbol} transcript ({gemini_timeout}s limit, "
+                     f"PDF was {len(pdf_bytes)} bytes) - consider raising GEMINI_TRANSCRIPT_TIMEOUT_SECONDS")
+        return error_result
+    except Exception as e:
+        log.warning(f"⚠️ Gemini call failed for {symbol} transcript: {type(e).__name__}: {e}")
+        return error_result
+    try:
+        candidates = data.get('candidates', [])
+        if not candidates:
+            log.warning(f"⚠️ Gemini returned no candidates for {symbol} transcript extraction")
+            return error_result
+        parts = candidates[0].get('content', {}).get('parts', [])
+        raw_text = ''.join(p.get('text', '') for p in parts).strip()
+        parsed = json.loads(raw_text)
+    except Exception as e:
+        log.warning(f"⚠️ Failed to parse Gemini transcript response for {symbol}: {type(e).__name__}: {e}")
+        return error_result
+    if not parsed.get('has_content'):
+        return no_content_result
+    summary = {
+        k: (parsed.get(k) or '').strip()[:1500] or None
+        for k in ('financial_highlights', 'cost_margin_commentary', 'expansion_capex',
+                  'outlook_guidance', 'key_concerns', 'overall_summary')
+    }
+    if not any(summary.values()):
+        return no_content_result
+    return {'summary': summary, 'error': False}
+
 async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, attachment_url: str):
     """Downloads a results-filing PDF and, via Gemini (native PDF
     understanding), both (1) extracts the actual Consolidated financial
@@ -956,6 +1097,100 @@ def _nse_local_to_utc_iso(raw) -> str:
         except ValueError:
             continue
     return raw
+
+async def _transcript_summary_loop(session: aiohttp.ClientSession):
+    """Finds earnings-call TRANSCRIPT announcements (a different filing
+    type from results PDFs - see _is_transcript_announcement) that
+    haven't been summarized yet, and extracts a structured summary via
+    Gemini covering what a results PDF alone can't: management's own
+    commentary, cost/margin discussion, forward guidance, and the
+    concerns analysts raised in Q&A. Deliberately simpler than
+    _concall_summary_loop - no numeric cross-validation/sanity-checking
+    needed since this is qualitative text, not financial figures
+    requiring validation against a database baseline. Shares the same
+    GEMINI_API_KEY / rate limit as the results loop, so entirely idle
+    (no API calls) if that key isn't set, same graceful-degradation
+    pattern as everywhere else Gemini is used."""
+    headers = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
+    _key_status_logged = False
+    while True:
+        if not os.getenv('GEMINI_API_KEY'):
+            if not _key_status_logged:
+                log.warning("🎙️ Transcript summary loop: GEMINI_API_KEY not set - loop is idle")
+                _key_status_logged = True
+            await asyncio.sleep(300)
+            continue
+        BATCH_SIZE = int(os.getenv('TRANSCRIPT_BATCH_SIZE', '10'))
+        candidates_limit = int(os.getenv('TRANSCRIPT_CANDIDATES_LIMIT', '500'))
+        if not _key_status_logged:
+            log.info(f"🎙️ Transcript summary loop: GEMINI_API_KEY detected, active "
+                      f"(lookback={os.getenv('TRANSCRIPT_LOOKBACK_DAYS', '14')}d, batch={BATCH_SIZE}, "
+                      f"candidates_limit={candidates_limit})")
+            _key_status_logged = True
+        try:
+            lookback_days = int(os.getenv('TRANSCRIPT_LOOKBACK_DAYS', '14'))
+            since = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat()
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/corporate_announcements", headers=headers,
+                params={'select': 'symbol,category,subject,attachment_url,announced_at',
+                        'announced_at': f'gt.{since}', 'order': 'announced_at.desc',
+                        'limit': str(candidates_limit)},
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as r:
+                candidates = await r.json() if r.status == 200 else []
+        except Exception as e:
+            log.warning(f"⚠️ Transcript loop: announcements fetch failed: {type(e).__name__}: {e}")
+            candidates = []
+        transcript_rows = [row for row in candidates if row.get('attachment_url') and _is_transcript_announcement(row)]
+
+        already = set()
+        if transcript_rows:
+            try:
+                async with session.get(
+                    f"{SUPABASE_URL}/rest/v1/transcript_summaries", headers=headers,
+                    params={'select': 'symbol,announced_at'},
+                    timeout=aiohttp.ClientTimeout(total=30)
+                ) as r:
+                    if r.status == 200:
+                        already = {(row['symbol'], row['announced_at']) for row in await r.json()}
+            except Exception as e:
+                log.warning(f"⚠️ Transcript loop: already-processed fetch failed: {type(e).__name__}: {e}")
+
+        todo = [row for row in transcript_rows if (row['symbol'], row['announced_at']) not in already][:BATCH_SIZE]
+        if todo:
+            log.info(f"🎙️ Transcript summary loop: {len(todo)} new transcript(s) to process")
+        else:
+            log.info(f"🎙️ Transcript summary loop: checked {len(candidates)} recent announcement(s) "
+                      f"({len(transcript_rows)} matched transcript filter), nothing new to process")
+        for i, row in enumerate(todo):
+            if i > 0:
+                await asyncio.sleep(float(os.getenv('RESULTS_PDF_PACING_SECONDS', '5')))
+            result = await extract_transcript_summary(session, row['symbol'], row['attachment_url'])
+            if result['error']:
+                log.info(f"  🎙️ {row['symbol']}: will retry transcript next cycle (transient error, not saved)")
+                continue
+            summary = result['summary']
+            payload = {
+                'symbol': row['symbol'], 'announced_at': row['announced_at'],
+                'attachment_url': row['attachment_url'],
+                'status': 'done' if summary else 'skipped',
+                **(summary or {}),
+            }
+            try:
+                await session.post(
+                    f"{SUPABASE_URL}/rest/v1/transcript_summaries", headers={**headers,
+                        'Content-Type': 'application/json', 'Prefer': 'resolution=merge-duplicates'},
+                    json=payload, timeout=aiohttp.ClientTimeout(total=15)
+                )
+                if summary:
+                    log.info(f"  🎙️ {row['symbol']}: transcript summarized")
+                else:
+                    log.info(f"  🎙️ {row['symbol']}: transcript had no usable content, marked skipped")
+            except Exception as e:
+                log.warning(f"⚠️ Transcript loop: save failed for {row['symbol']}: {type(e).__name__}: {e}")
+        if todo:
+            log.info("🎙️ Transcript summary loop: batch complete")
+        await asyncio.sleep(300)  # 5 min, matching the results loop's cadence
 
 async def _results_loop(session: aiohttp.ClientSession):
     """Polls NSE's structured financial-results feed every 30 min — new
@@ -2134,6 +2369,7 @@ async def fundamentals_worker_main():
             _bse_missing_backfill_loop(session),
             _bse_stale_results_loop(session),
             _concall_summary_loop(session),
+            _transcript_summary_loop(session),
         )
 
 def rate_announcements_free(rows: list) -> list:
