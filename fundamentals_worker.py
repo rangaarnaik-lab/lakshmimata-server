@@ -112,6 +112,24 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
         "OUTLOOK_GUIDANCE: Management's own forward-looking statements - guidance for "
         "upcoming quarters, full-year targets, or stated expectations. 2-3 sentences. "
         "Null if not discussed.\n\n"
+        "GUIDANCE_DIRECTION: Did management explicitly raise, lower, maintain, or simply "
+        "reiterate previous guidance during this call? Use 'raised' only if they said "
+        "numbers/targets are now higher than previously communicated, 'lowered' only if "
+        "explicitly walked back or cut, 'maintained' if they explicitly confirmed no "
+        "change, 'reiterated' if they repeated existing targets without a clear prior "
+        "comparison being discussed, or 'not_discussed' if guidance/targets weren't "
+        "addressed on this call at all. Base this only on what management explicitly "
+        "said, not your own inference from the numbers.\n\n"
+        "MANAGEMENT_CHANGES: Any new appointments, resignations, retirements, or "
+        "succession-planning discussed on the call (e.g. a new CFO, MD change, director "
+        "retiring). 1-3 sentences. Null if not discussed.\n\n"
+        "CAPITAL_ALLOCATION: Any commentary on dividends, buybacks, debt "
+        "reduction/repayment plans, or other capital-return/balance-sheet decisions "
+        "discussed - separate from growth/expansion capex. 1-3 sentences. Null if not "
+        "discussed.\n\n"
+        "COMPETITIVE_POSITIONING: Anything management said about competitors, market "
+        "share gains or losses, or how the company sees its position within the "
+        "industry. 1-3 sentences. Null if not discussed.\n\n"
         "KEY_CONCERNS: The most substantive concerns, pushback, or skeptical questions "
         "analysts raised during Q&A, and how management responded - this is often the "
         "most informative part of a transcript. 2-4 sentences. Null if the Q&A was routine "
@@ -128,6 +146,11 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
             "cost_margin_commentary": {"type": "string", "nullable": True},
             "expansion_capex": {"type": "string", "nullable": True},
             "outlook_guidance": {"type": "string", "nullable": True},
+            "guidance_direction": {"type": "string",
+                "enum": ["raised", "lowered", "maintained", "reiterated", "not_discussed"], "nullable": True},
+            "management_changes": {"type": "string", "nullable": True},
+            "capital_allocation": {"type": "string", "nullable": True},
+            "competitive_positioning": {"type": "string", "nullable": True},
             "key_concerns": {"type": "string", "nullable": True},
             "overall_summary": {"type": "string", "nullable": True},
         },
@@ -184,9 +207,17 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
     summary = {
         k: (parsed.get(k) or '').strip()[:1500] or None
         for k in ('financial_highlights', 'cost_margin_commentary', 'expansion_capex',
-                  'outlook_guidance', 'key_concerns', 'overall_summary')
+                  'outlook_guidance', 'management_changes', 'capital_allocation',
+                  'competitive_positioning', 'key_concerns', 'overall_summary')
     }
-    if not any(summary.values()):
+    # guidance_direction is a categorical field, not free text - validate
+    # against the allowed enum rather than applying the same string
+    # trimming, and treat an unexpected/missing value as None rather
+    # than saving something outside the expected set.
+    gd = parsed.get('guidance_direction')
+    summary['guidance_direction'] = gd if gd in (
+        'raised', 'lowered', 'maintained', 'reiterated', 'not_discussed') else None
+    if not any(v for k, v in summary.items() if k != 'guidance_direction'):
         return no_content_result
     return {'summary': summary, 'error': False}
 
