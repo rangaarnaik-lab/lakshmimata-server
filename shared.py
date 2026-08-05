@@ -639,6 +639,20 @@ _RESULTS_ANN_KEYWORDS = ['financial result', 'quarterly result', 'results for th
                          'unaudited results', 'audited results']
 _RESULTS_ANN_EXCLUDE = ['newspaper publication', 'newspaper advertisement', 'transcript', 'press release',
                         'investor meet', 'con. call', 'con call', 'conference call', 'clarification']
+# Earnings-call transcript filings - a different document type from
+# results filings entirely (management/analyst Q&A, not financial
+# statements), filed separately by companies. "transcript" is already
+# a reliable, distinct signal - confirmed via a real filing (NALCO,
+# 2026-08-04) whose subject line was literally "Transcript of the
+# Earnings Conference Call held on...". Deliberately narrow (just this
+# one word) rather than also matching "con. call"/"conference call"
+# generically, since those also cover call-invite/notice filings that
+# aren't the actual post-call transcript document.
+_TRANSCRIPT_ANN_KEYWORDS = ['transcript']
+def _is_transcript_announcement(row: dict) -> bool:
+    text = ((row.get('category') or '') + ' ' + (row.get('subject') or '')).lower()
+    return any(x in text for x in _TRANSCRIPT_ANN_KEYWORDS)
+
 _MONTH_NAMES = {
     'jan': 1, 'january': 1, 'feb': 2, 'february': 2, 'mar': 3, 'march': 3,
     'apr': 4, 'april': 4, 'may': 5, 'jun': 6, 'june': 6, 'jul': 7, 'july': 7,
