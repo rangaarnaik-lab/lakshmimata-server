@@ -1326,6 +1326,10 @@ async def _ppt_summary_loop(session: aiohttp.ClientSession):
                 ) as r:
                     if r.status == 200:
                         already = {(row['symbol'], row['announced_at']) for row in await r.json()}
+                    else:
+                        body = await r.text()
+                        log.warning(f"⚠️ PPT loop: already-processed query returned {r.status} "
+                                     f"(is the ppt_summaries table created?): {body[:200]}")
             except Exception as e:
                 log.warning(f"⚠️ PPT loop: already-processed fetch failed: {type(e).__name__}: {e}")
 
@@ -1350,11 +1354,16 @@ async def _ppt_summary_loop(session: aiohttp.ClientSession):
                 **(summary or {}),
             }
             try:
-                await session.post(
+                async with session.post(
                     f"{SUPABASE_URL}/rest/v1/ppt_summaries", headers={**headers,
                         'Content-Type': 'application/json', 'Prefer': 'resolution=merge-duplicates'},
                     json=payload, timeout=aiohttp.ClientTimeout(total=15)
-                )
+                ) as r:
+                    if r.status not in (200, 201, 204):
+                        body = await r.text()
+                        log.warning(f"⚠️ PPT loop: save returned {r.status} for {row['symbol']} "
+                                     f"(is the ppt_summaries table created?): {body[:200]}")
+                        continue
                 if summary:
                     log.info(f"  🎙️ {row['symbol']}: presentation summarized")
                     missing = [k for k, v in summary.items() if v is None]
@@ -1424,6 +1433,10 @@ async def _transcript_summary_loop(session: aiohttp.ClientSession):
                 ) as r:
                     if r.status == 200:
                         already = {(row['symbol'], row['announced_at']) for row in await r.json()}
+                    else:
+                        body = await r.text()
+                        log.warning(f"⚠️ Transcript loop: already-processed query returned {r.status} "
+                                     f"(is the transcript_summaries table created?): {body[:200]}")
             except Exception as e:
                 log.warning(f"⚠️ Transcript loop: already-processed fetch failed: {type(e).__name__}: {e}")
 
@@ -1448,11 +1461,16 @@ async def _transcript_summary_loop(session: aiohttp.ClientSession):
                 **(summary or {}),
             }
             try:
-                await session.post(
+                async with session.post(
                     f"{SUPABASE_URL}/rest/v1/transcript_summaries", headers={**headers,
                         'Content-Type': 'application/json', 'Prefer': 'resolution=merge-duplicates'},
                     json=payload, timeout=aiohttp.ClientTimeout(total=15)
-                )
+                ) as r:
+                    if r.status not in (200, 201, 204):
+                        body = await r.text()
+                        log.warning(f"⚠️ Transcript loop: save returned {r.status} for {row['symbol']} "
+                                     f"(is the transcript_summaries table created?): {body[:200]}")
+                        continue
                 if summary:
                     log.info(f"  🎙️ {row['symbol']}: transcript summarized")
                     missing = [k for k, v in summary.items() if v is None]
