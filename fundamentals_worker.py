@@ -42,6 +42,20 @@ def _is_concall_announcement(row: dict) -> bool:
     text = ((row.get('category') or '') + ' ' + (row.get('subject') or '')).lower()
     return any(x in text for x in _CONCALL_KEYWORDS)
 
+def _clean_bullets(v):
+    """Validates/cleans a bullet-point array field from a Gemini
+    response (used by both extract_ppt_summary and
+    extract_transcript_summary): filters out empty/non-string items,
+    trims each bullet, caps both bullet length and count so a
+    misbehaving response can't produce an unbounded field. Returns
+    None (not an empty list) when there's nothing usable, consistent
+    with how every other optional field in this pipeline represents
+    "not discussed"."""
+    if not isinstance(v, list):
+        return None
+    bullets = [str(b).strip()[:200] for b in v if b and str(b).strip()]
+    return bullets[:6] or None
+
 async def extract_ppt_summary(session: aiohttp.ClientSession, symbol: str, attachment_url: str):
     """Downloads an investor/analyst PRESENTATION PDF (a third distinct
     filing type - see _is_ppt_announcement) and asks Gemini to produce
@@ -92,34 +106,41 @@ async def extract_ppt_summary(session: aiohttp.ClientSession, symbol: str, attac
         "visually), set has_content to false and leave every other field null. If in doubt, "
         "treat it as false rather than guess.\n\n"
         "FINANCIAL_HIGHLIGHTS: The headline financial figures and trends shown in the deck "
-        "(revenue/profit/margin charts, growth rates) - 2-4 sentences. Null if not shown.\n\n"
+        "(revenue/profit/margin charts, growth rates). Return 2-5 short bullet-point "
+        "phrases (not full sentences) - e.g. 'Revenue up 39% YoY to Rs 5,400 Cr'. Each "
+        "bullet should be a self-contained fact a reader could scan in under 2 seconds. "
+        "Null/empty array if not shown.\n\n"
         "BUSINESS_SEGMENTS: Any segment-wise, product-wise, or geography-wise performance "
-        "breakdown shown. 2-4 sentences. Null if not shown.\n\n"
+        "breakdown shown. Same short bullet-phrase format, 2-5 bullets. Null/empty array "
+        "if not shown.\n\n"
         "STRATEGIC_INITIATIVES: Growth strategy, expansion plans, new products/markets, or "
-        "other forward-looking strategic initiatives presented. 2-4 sentences. Null if not "
-        "shown.\n\n"
+        "other forward-looking strategic initiatives presented. Same short bullet-phrase "
+        "format, 2-5 bullets. Null/empty array if not shown.\n\n"
         "CAPITAL_ALLOCATION: Any commentary on dividends, buybacks, debt reduction, or "
-        "capital-return plans shown - separate from growth/expansion initiatives. 1-3 "
-        "sentences. Null if not shown.\n\n"
+        "capital-return plans shown - separate from growth/expansion initiatives. Same "
+        "short bullet-phrase format, 1-3 bullets. Null/empty array if not shown.\n\n"
         "INDUSTRY_OUTLOOK: Any industry/macro context, market-size data, or competitive "
-        "positioning presented. 2-3 sentences. Null if not shown.\n\n"
+        "positioning presented. Same short bullet-phrase format, 2-3 bullets. Null/empty "
+        "array if not shown.\n\n"
         "GUIDANCE_DIRECTION: Did the deck explicitly present raised, lowered, maintained, "
         "or simply reiterated guidance/targets versus what was previously communicated? "
         "Use 'raised'/'lowered'/'maintained'/'reiterated' only when the deck is explicit "
         "about the comparison, or 'not_discussed' if guidance/targets aren't addressed.\n\n"
         "OVERALL_SUMMARY: A balanced 100-150 word summary of the presentation for a retail "
-        "investor. Do not add your own opinion or investment view - describe what was "
+        "investor. This one stays as flowing prose, not bullets - it's the narrative "
+        "overview. Do not add your own opinion or investment view - describe what was "
         "shown, not what to do about it."
     )
+    _bullet_field = {"type": "array", "items": {"type": "string"}, "nullable": True}
     schema = {
         "type": "object",
         "properties": {
             "has_content": {"type": "boolean"},
-            "financial_highlights": {"type": "string", "nullable": True},
-            "business_segments": {"type": "string", "nullable": True},
-            "strategic_initiatives": {"type": "string", "nullable": True},
-            "capital_allocation": {"type": "string", "nullable": True},
-            "industry_outlook": {"type": "string", "nullable": True},
+            "financial_highlights": _bullet_field,
+            "business_segments": _bullet_field,
+            "strategic_initiatives": _bullet_field,
+            "capital_allocation": _bullet_field,
+            "industry_outlook": _bullet_field,
             "guidance_direction": {"type": "string",
                 "enum": ["raised", "lowered", "maintained", "reiterated", "not_discussed"], "nullable": True},
             "overall_summary": {"type": "string", "nullable": True},
@@ -171,10 +192,11 @@ async def extract_ppt_summary(session: aiohttp.ClientSession, symbol: str, attac
     if not parsed.get('has_content'):
         return no_content_result
     summary = {
-        k: (parsed.get(k) or '').strip()[:1500] or None
+        k: _clean_bullets(parsed.get(k))
         for k in ('financial_highlights', 'business_segments', 'strategic_initiatives',
-                  'capital_allocation', 'industry_outlook', 'overall_summary')
+                  'capital_allocation', 'industry_outlook')
     }
+    summary['overall_summary'] = (parsed.get('overall_summary') or '').strip()[:1500] or None
     gd = parsed.get('guidance_direction')
     summary['guidance_direction'] = gd if gd in (
         'raised', 'lowered', 'maintained', 'reiterated', 'not_discussed') else None
@@ -242,16 +264,20 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
         "than guess.\n\n"
         "FINANCIAL_HIGHLIGHTS: What management said about this quarter's headline numbers "
         "and what drove them (revenue/profit growth, margin trends, volume/pricing "
-        "drivers) - 2-4 sentences. Null if not discussed.\n\n"
+        "drivers). Return 2-5 short bullet-point phrases (not full sentences, no trailing "
+        "period needed) - e.g. 'Revenue up 39% YoY to Rs 5,400 Cr', not a paragraph. Each "
+        "bullet should be a self-contained fact a reader could scan in under 2 seconds. "
+        "Null/empty array if not discussed.\n\n"
         "COST_MARGIN_COMMENTARY: Specific commentary on input costs, pricing realizations, "
         "or margin trajectory - especially any concrete numbers management gave for cost "
-        "trends or price outlook. 2-4 sentences. Null if not discussed.\n\n"
+        "trends or price outlook. Same short bullet-phrase format as above, 2-5 bullets. "
+        "Null/empty array if not discussed.\n\n"
         "EXPANSION_CAPEX: Any expansion projects, capacity additions, or capex plans "
         "discussed, including specific timelines, costs, or delays management mentioned. "
-        "2-4 sentences. Null if not discussed.\n\n"
+        "Same short bullet-phrase format, 2-5 bullets. Null/empty array if not discussed.\n\n"
         "OUTLOOK_GUIDANCE: Management's own forward-looking statements - guidance for "
-        "upcoming quarters, full-year targets, or stated expectations. 2-3 sentences. "
-        "Null if not discussed.\n\n"
+        "upcoming quarters, full-year targets, or stated expectations. Same short "
+        "bullet-phrase format, 2-4 bullets. Null/empty array if not discussed.\n\n"
         "GUIDANCE_DIRECTION: Did management explicitly raise, lower, maintain, or simply "
         "reiterate previous guidance during this call? Use 'raised' only if they said "
         "numbers/targets are now higher than previously communicated, 'lowered' only if "
@@ -262,36 +288,41 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
         "said, not your own inference from the numbers.\n\n"
         "MANAGEMENT_CHANGES: Any new appointments, resignations, retirements, or "
         "succession-planning discussed on the call (e.g. a new CFO, MD change, director "
-        "retiring). 1-3 sentences. Null if not discussed.\n\n"
+        "retiring). Same short bullet-phrase format, 1-3 bullets. Null/empty array if not "
+        "discussed.\n\n"
         "CAPITAL_ALLOCATION: Any commentary on dividends, buybacks, debt "
         "reduction/repayment plans, or other capital-return/balance-sheet decisions "
-        "discussed - separate from growth/expansion capex. 1-3 sentences. Null if not "
-        "discussed.\n\n"
+        "discussed - separate from growth/expansion capex. Same short bullet-phrase "
+        "format, 1-3 bullets. Null/empty array if not discussed.\n\n"
         "COMPETITIVE_POSITIONING: Anything management said about competitors, market "
         "share gains or losses, or how the company sees its position within the "
-        "industry. 1-3 sentences. Null if not discussed.\n\n"
+        "industry. Same short bullet-phrase format, 1-3 bullets. Null/empty array if not "
+        "discussed.\n\n"
         "KEY_CONCERNS: The most substantive concerns, pushback, or skeptical questions "
         "analysts raised during Q&A, and how management responded - this is often the "
-        "most informative part of a transcript. 2-4 sentences. Null if the Q&A was routine "
-        "with no notable pushback.\n\n"
+        "most informative part of a transcript. Same short bullet-phrase format, 2-5 "
+        "bullets, each capturing one concern+response pair concisely. Null/empty array if "
+        "the Q&A was routine with no notable pushback.\n\n"
         "OVERALL_SUMMARY: A balanced 100-150 word summary of the call for a retail "
-        "investor, covering what a results PDF alone wouldn't tell them. Do not add your "
-        "own opinion or investment view - describe what was said, not what to do about it."
+        "investor, covering what a results PDF alone wouldn't tell them. This one stays as "
+        "flowing prose, not bullets - it's the narrative overview. Do not add your own "
+        "opinion or investment view - describe what was said, not what to do about it."
     )
+    _bullet_field = {"type": "array", "items": {"type": "string"}, "nullable": True}
     schema = {
         "type": "object",
         "properties": {
             "has_content": {"type": "boolean"},
-            "financial_highlights": {"type": "string", "nullable": True},
-            "cost_margin_commentary": {"type": "string", "nullable": True},
-            "expansion_capex": {"type": "string", "nullable": True},
-            "outlook_guidance": {"type": "string", "nullable": True},
+            "financial_highlights": _bullet_field,
+            "cost_margin_commentary": _bullet_field,
+            "expansion_capex": _bullet_field,
+            "outlook_guidance": _bullet_field,
             "guidance_direction": {"type": "string",
                 "enum": ["raised", "lowered", "maintained", "reiterated", "not_discussed"], "nullable": True},
-            "management_changes": {"type": "string", "nullable": True},
-            "capital_allocation": {"type": "string", "nullable": True},
-            "competitive_positioning": {"type": "string", "nullable": True},
-            "key_concerns": {"type": "string", "nullable": True},
+            "management_changes": _bullet_field,
+            "capital_allocation": _bullet_field,
+            "competitive_positioning": _bullet_field,
+            "key_concerns": _bullet_field,
             "overall_summary": {"type": "string", "nullable": True},
         },
         "required": ["has_content"],
@@ -345,11 +376,12 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
     if not parsed.get('has_content'):
         return no_content_result
     summary = {
-        k: (parsed.get(k) or '').strip()[:1500] or None
+        k: _clean_bullets(parsed.get(k))
         for k in ('financial_highlights', 'cost_margin_commentary', 'expansion_capex',
                   'outlook_guidance', 'management_changes', 'capital_allocation',
-                  'competitive_positioning', 'key_concerns', 'overall_summary')
+                  'competitive_positioning', 'key_concerns')
     }
+    summary['overall_summary'] = (parsed.get('overall_summary') or '').strip()[:1500] or None
     # guidance_direction is a categorical field, not free text - validate
     # against the allowed enum rather than applying the same string
     # trimming, and treat an unexpected/missing value as None rather
