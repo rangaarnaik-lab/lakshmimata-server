@@ -781,20 +781,27 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
         # Skip ones already processed (any status - pending/done/failed/
         # skipped all mean "don't retry automatically"; a failed fetch
         # is usually a dead link, not worth hammering repeatedly).
+        # Matched on attachment_url, not announced_at - confirmed via
+        # production data (2026-08-06) that NSE's announcement feed can
+        # return slightly different announced_at timestamps for the
+        # SAME underlying filing across different polls (FSL: two
+        # values 76 seconds apart), which caused the PPT loop to
+        # reprocess the same presentations every cycle indefinitely.
+        # attachment_url stays stable for the same document regardless.
         already = set()
         if concall_rows:
             try:
                 async with session.get(
                     f"{SUPABASE_URL}/rest/v1/concall_summaries", headers=headers,
-                    params={'select': 'symbol,announced_at'},
+                    params={'select': 'symbol,attachment_url'},
                     timeout=aiohttp.ClientTimeout(total=30)
                 ) as r:
                     if r.status == 200:
-                        already = {(row['symbol'], row['announced_at']) for row in await r.json()}
+                        already = {(row['symbol'], row['attachment_url']) for row in await r.json()}
             except Exception as e:
                 log.warning(f"⚠️ Concall loop: existing-summaries fetch failed: {type(e).__name__}: {e}")
 
-        todo = [row for row in concall_rows if (row['symbol'], row['announced_at']) not in already][:BATCH_SIZE]
+        todo = [row for row in concall_rows if (row['symbol'], row['attachment_url']) not in already][:BATCH_SIZE]
         if todo:
             log.info(f"🎙️ Results extraction loop: {len(todo)} new results announcement(s) to process")
         else:
@@ -1321,11 +1328,11 @@ async def _ppt_summary_loop(session: aiohttp.ClientSession):
             try:
                 async with session.get(
                     f"{SUPABASE_URL}/rest/v1/ppt_summaries", headers=headers,
-                    params={'select': 'symbol,announced_at'},
+                    params={'select': 'symbol,attachment_url'},
                     timeout=aiohttp.ClientTimeout(total=30)
                 ) as r:
                     if r.status == 200:
-                        already = {(row['symbol'], row['announced_at']) for row in await r.json()}
+                        already = {(row['symbol'], row['attachment_url']) for row in await r.json()}
                     else:
                         body = await r.text()
                         log.warning(f"⚠️ PPT loop: already-processed query returned {r.status} "
@@ -1333,7 +1340,7 @@ async def _ppt_summary_loop(session: aiohttp.ClientSession):
             except Exception as e:
                 log.warning(f"⚠️ PPT loop: already-processed fetch failed: {type(e).__name__}: {e}")
 
-        todo = [row for row in ppt_rows if (row['symbol'], row['announced_at']) not in already][:BATCH_SIZE]
+        todo = [row for row in ppt_rows if (row['symbol'], row['attachment_url']) not in already][:BATCH_SIZE]
         if todo:
             log.info(f"🎙️ PPT summary loop: {len(todo)} new presentation(s) to process")
         else:
@@ -1428,11 +1435,11 @@ async def _transcript_summary_loop(session: aiohttp.ClientSession):
             try:
                 async with session.get(
                     f"{SUPABASE_URL}/rest/v1/transcript_summaries", headers=headers,
-                    params={'select': 'symbol,announced_at'},
+                    params={'select': 'symbol,attachment_url'},
                     timeout=aiohttp.ClientTimeout(total=30)
                 ) as r:
                     if r.status == 200:
-                        already = {(row['symbol'], row['announced_at']) for row in await r.json()}
+                        already = {(row['symbol'], row['attachment_url']) for row in await r.json()}
                     else:
                         body = await r.text()
                         log.warning(f"⚠️ Transcript loop: already-processed query returned {r.status} "
@@ -1440,7 +1447,7 @@ async def _transcript_summary_loop(session: aiohttp.ClientSession):
             except Exception as e:
                 log.warning(f"⚠️ Transcript loop: already-processed fetch failed: {type(e).__name__}: {e}")
 
-        todo = [row for row in transcript_rows if (row['symbol'], row['announced_at']) not in already][:BATCH_SIZE]
+        todo = [row for row in transcript_rows if (row['symbol'], row['attachment_url']) not in already][:BATCH_SIZE]
         if todo:
             log.info(f"🎙️ Transcript summary loop: {len(todo)} new transcript(s) to process")
         else:
