@@ -89,6 +89,7 @@ __all__ = [
     '_RESULTS_ATTEMPT_COOLDOWN_SEC',
     '_SCREENER_HEADER_SETS',
     '_TRANSCRIPT_ANN_KEYWORDS',
+    '_PPT_ANN_KEYWORDS',
     '_XBRL_EPS_TAGS',
     '_XBRL_OTHER_INCOME_TAGS',
     '_XBRL_PAT_TAGS',
@@ -98,6 +99,7 @@ __all__ = [
     '_fetch_error_counts',
     '_fundamentals_debug_count',
     '_is_transcript_announcement',
+    '_is_ppt_announcement',
     '_industry_endpoint_path',
     '_live_index_debug_count',
     '_live_nifty_debug_count',
@@ -654,6 +656,15 @@ _TRANSCRIPT_ANN_KEYWORDS = ['transcript']
 def _is_transcript_announcement(row: dict) -> bool:
     text = ((row.get('category') or '') + ' ' + (row.get('subject') or '')).lower()
     return any(x in text for x in _TRANSCRIPT_ANN_KEYWORDS)
+# Investor presentation filings (slide decks presented alongside or
+# instead of an earnings call) - a third distinct document type,
+# separate from both results PDFs and transcripts. "presentation" is a
+# similarly narrow, reliable signal - NSE/BSE filings of this type are
+# consistently titled "Investor Presentation" or "Analyst Presentation".
+_PPT_ANN_KEYWORDS = ['presentation']
+def _is_ppt_announcement(row: dict) -> bool:
+    text = ((row.get('category') or '') + ' ' + (row.get('subject') or '')).lower()
+    return any(x in text for x in _PPT_ANN_KEYWORDS)
 
 _MONTH_NAMES = {
     'jan': 1, 'january': 1, 'feb': 2, 'february': 2, 'mar': 3, 'march': 3,

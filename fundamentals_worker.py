@@ -42,6 +42,146 @@ def _is_concall_announcement(row: dict) -> bool:
     text = ((row.get('category') or '') + ' ' + (row.get('subject') or '')).lower()
     return any(x in text for x in _CONCALL_KEYWORDS)
 
+async def extract_ppt_summary(session: aiohttp.ClientSession, symbol: str, attachment_url: str):
+    """Downloads an investor/analyst PRESENTATION PDF (a third distinct
+    filing type - see _is_ppt_announcement) and asks Gemini to produce
+    a structured summary. Presentations are slide-deck content (bullet
+    points, charts, KPI tables) rather than the prose dialogue a
+    transcript has, so the schema below is adapted accordingly -
+    business-segment breakdowns and strategic initiatives are common
+    in presentations and worth their own fields, while the Q&A-specific
+    fields from the transcript pipeline (key_concerns) don't apply
+    here since there's no Q&A in a slide deck. Same graceful-
+    degradation contract as extract_transcript_summary/
+    extract_results_from_pdf: 'error'=True is transient (retry next
+    cycle), 'error'=False with summary=None means genuinely nothing
+    usable was found (safe to mark done)."""
+    error_result = {'summary': None, 'error': True}
+    no_content_result = {'summary': None, 'error': False}
+    api_key = os.getenv('GEMINI_API_KEY', '')
+    if not api_key or not attachment_url:
+        return error_result
+    try:
+        async with session.get(attachment_url,
+            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.nseindia.com"},
+            timeout=aiohttp.ClientTimeout(total=30)) as r:
+            if r.status != 200:
+                log.warning(f"⚠️ Presentation PDF fetch failed for {symbol} ({r.status})")
+                return error_result
+            pdf_bytes = await r.read()
+    except asyncio.TimeoutError:
+        log.warning(f"⚠️ Presentation PDF download timed out for {symbol} (30s limit)")
+        return error_result
+    except Exception as e:
+        log.warning(f"⚠️ Presentation PDF download failed for {symbol}: {type(e).__name__}: {e}")
+        return error_result
+    if len(pdf_bytes) > 15_000_000:
+        log.warning(f"⚠️ Presentation PDF too large for {symbol} ({len(pdf_bytes)} bytes) - skipping")
+        return no_content_result
+    pdf_b64 = base64.b64encode(pdf_bytes).decode('ascii')
+    prompt = (
+        "This is an investor/analyst presentation (slide deck) filed by an Indian listed "
+        "company with NSE/BSE. Read the full deck - text, tables, and any charts you can "
+        "interpret - and produce a structured summary in your own words, never quoting "
+        "verbatim. Base every field ONLY on what's literally shown in the slides - never "
+        "infer, estimate, or add outside context.\n\n"
+        "IMPORTANT: some documents filed as 'presentation' announcements turn out to be "
+        "just a cover letter, a notice that a presentation will be held, or an unrelated "
+        "document. If this document is not actually a substantive presentation deck (i.e. "
+        "it has no real slide content - company/business/financial information presented "
+        "visually), set has_content to false and leave every other field null. If in doubt, "
+        "treat it as false rather than guess.\n\n"
+        "FINANCIAL_HIGHLIGHTS: The headline financial figures and trends shown in the deck "
+        "(revenue/profit/margin charts, growth rates) - 2-4 sentences. Null if not shown.\n\n"
+        "BUSINESS_SEGMENTS: Any segment-wise, product-wise, or geography-wise performance "
+        "breakdown shown. 2-4 sentences. Null if not shown.\n\n"
+        "STRATEGIC_INITIATIVES: Growth strategy, expansion plans, new products/markets, or "
+        "other forward-looking strategic initiatives presented. 2-4 sentences. Null if not "
+        "shown.\n\n"
+        "CAPITAL_ALLOCATION: Any commentary on dividends, buybacks, debt reduction, or "
+        "capital-return plans shown - separate from growth/expansion initiatives. 1-3 "
+        "sentences. Null if not shown.\n\n"
+        "INDUSTRY_OUTLOOK: Any industry/macro context, market-size data, or competitive "
+        "positioning presented. 2-3 sentences. Null if not shown.\n\n"
+        "GUIDANCE_DIRECTION: Did the deck explicitly present raised, lowered, maintained, "
+        "or simply reiterated guidance/targets versus what was previously communicated? "
+        "Use 'raised'/'lowered'/'maintained'/'reiterated' only when the deck is explicit "
+        "about the comparison, or 'not_discussed' if guidance/targets aren't addressed.\n\n"
+        "OVERALL_SUMMARY: A balanced 100-150 word summary of the presentation for a retail "
+        "investor. Do not add your own opinion or investment view - describe what was "
+        "shown, not what to do about it."
+    )
+    schema = {
+        "type": "object",
+        "properties": {
+            "has_content": {"type": "boolean"},
+            "financial_highlights": {"type": "string", "nullable": True},
+            "business_segments": {"type": "string", "nullable": True},
+            "strategic_initiatives": {"type": "string", "nullable": True},
+            "capital_allocation": {"type": "string", "nullable": True},
+            "industry_outlook": {"type": "string", "nullable": True},
+            "guidance_direction": {"type": "string",
+                "enum": ["raised", "lowered", "maintained", "reiterated", "not_discussed"], "nullable": True},
+            "overall_summary": {"type": "string", "nullable": True},
+        },
+        "required": ["has_content"],
+    }
+    model = os.getenv('GEMINI_CONCALL_MODEL', 'gemini-3.1-flash-lite')
+    gemini_timeout = int(os.getenv('GEMINI_PPT_TIMEOUT_SECONDS', '120'))
+    try:
+        async with session.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
+            headers={"Content-Type": "application/json"},
+            json={
+                "contents": [{"parts": [
+                    {"inline_data": {"mime_type": "application/pdf", "data": pdf_b64}},
+                    {"text": prompt},
+                ]}],
+                "generationConfig": {"responseMimeType": "application/json", "responseSchema": schema},
+            },
+            timeout=aiohttp.ClientTimeout(total=gemini_timeout),
+        ) as r:
+            if r.status != 200:
+                body = await r.text()
+                if r.status == 429:
+                    log.warning(f"⚠️ Gemini rate-limit hit for {symbol} presentation (429) - backing off")
+                    await asyncio.sleep(int(os.getenv('GEMINI_429_BACKOFF_SECONDS', '30')))
+                else:
+                    log.warning(f"⚠️ Gemini presentation extraction failed for {symbol} ({r.status}): {body[:200]}")
+                return error_result
+            data = await r.json()
+    except asyncio.TimeoutError:
+        log.warning(f"⚠️ Gemini call timed out for {symbol} presentation ({gemini_timeout}s limit, "
+                     f"PDF was {len(pdf_bytes)} bytes) - consider raising GEMINI_PPT_TIMEOUT_SECONDS")
+        return error_result
+    except Exception as e:
+        log.warning(f"⚠️ Gemini call failed for {symbol} presentation: {type(e).__name__}: {e}")
+        return error_result
+    try:
+        candidates = data.get('candidates', [])
+        if not candidates:
+            log.warning(f"⚠️ Gemini returned no candidates for {symbol} presentation extraction")
+            return error_result
+        parts = candidates[0].get('content', {}).get('parts', [])
+        raw_text = ''.join(p.get('text', '') for p in parts).strip()
+        parsed = json.loads(raw_text)
+    except Exception as e:
+        log.warning(f"⚠️ Failed to parse Gemini presentation response for {symbol}: {type(e).__name__}: {e}")
+        return error_result
+    if not parsed.get('has_content'):
+        return no_content_result
+    summary = {
+        k: (parsed.get(k) or '').strip()[:1500] or None
+        for k in ('financial_highlights', 'business_segments', 'strategic_initiatives',
+                  'capital_allocation', 'industry_outlook', 'overall_summary')
+    }
+    gd = parsed.get('guidance_direction')
+    summary['guidance_direction'] = gd if gd in (
+        'raised', 'lowered', 'maintained', 'reiterated', 'not_discussed') else None
+    if not any(v for k, v in summary.items() if k != 'guidance_direction'):
+        return no_content_result
+    return {'summary': summary, 'error': False}
+
 async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str, attachment_url: str):
     """Downloads an earnings-call TRANSCRIPT PDF (a different filing type
     from results PDFs - filed separately under 'Transcript of the
@@ -1135,6 +1275,99 @@ def _nse_local_to_utc_iso(raw) -> str:
         except ValueError:
             continue
     return raw
+
+async def _ppt_summary_loop(session: aiohttp.ClientSession):
+    """Finds investor/analyst PRESENTATION announcements (a third
+    distinct filing type - see _is_ppt_announcement) that haven't been
+    summarized yet, and extracts a structured summary via Gemini.
+    Modeled directly on _transcript_summary_loop's structure - own
+    table (ppt_summaries), own env vars, but otherwise the same
+    graceful-degradation and pacing pattern, sharing the same
+    GEMINI_API_KEY / rate limit budget as the other two Gemini loops."""
+    headers = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
+    _key_status_logged = False
+    while True:
+        if not os.getenv('GEMINI_API_KEY'):
+            if not _key_status_logged:
+                log.warning("🎙️ PPT summary loop: GEMINI_API_KEY not set - loop is idle")
+                _key_status_logged = True
+            await asyncio.sleep(300)
+            continue
+        BATCH_SIZE = int(os.getenv('PPT_BATCH_SIZE', '10'))
+        candidates_limit = int(os.getenv('PPT_CANDIDATES_LIMIT', '500'))
+        if not _key_status_logged:
+            log.info(f"🎙️ PPT summary loop: GEMINI_API_KEY detected, active "
+                      f"(lookback={os.getenv('PPT_LOOKBACK_DAYS', '14')}d, batch={BATCH_SIZE}, "
+                      f"candidates_limit={candidates_limit})")
+            _key_status_logged = True
+        try:
+            lookback_days = int(os.getenv('PPT_LOOKBACK_DAYS', '14'))
+            since = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat()
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/corporate_announcements", headers=headers,
+                params={'select': 'symbol,category,subject,attachment_url,announced_at',
+                        'announced_at': f'gt.{since}', 'order': 'announced_at.desc',
+                        'limit': str(candidates_limit)},
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as r:
+                candidates = await r.json() if r.status == 200 else []
+        except Exception as e:
+            log.warning(f"⚠️ PPT loop: announcements fetch failed: {type(e).__name__}: {e}")
+            candidates = []
+        ppt_rows = [row for row in candidates if row.get('attachment_url') and _is_ppt_announcement(row)]
+
+        already = set()
+        if ppt_rows:
+            try:
+                async with session.get(
+                    f"{SUPABASE_URL}/rest/v1/ppt_summaries", headers=headers,
+                    params={'select': 'symbol,announced_at'},
+                    timeout=aiohttp.ClientTimeout(total=30)
+                ) as r:
+                    if r.status == 200:
+                        already = {(row['symbol'], row['announced_at']) for row in await r.json()}
+            except Exception as e:
+                log.warning(f"⚠️ PPT loop: already-processed fetch failed: {type(e).__name__}: {e}")
+
+        todo = [row for row in ppt_rows if (row['symbol'], row['announced_at']) not in already][:BATCH_SIZE]
+        if todo:
+            log.info(f"🎙️ PPT summary loop: {len(todo)} new presentation(s) to process")
+        else:
+            log.info(f"🎙️ PPT summary loop: checked {len(candidates)} recent announcement(s) "
+                      f"({len(ppt_rows)} matched presentation filter), nothing new to process")
+        for i, row in enumerate(todo):
+            if i > 0:
+                await asyncio.sleep(float(os.getenv('RESULTS_PDF_PACING_SECONDS', '5')))
+            result = await extract_ppt_summary(session, row['symbol'], row['attachment_url'])
+            if result['error']:
+                log.info(f"  🎙️ {row['symbol']}: will retry presentation next cycle (transient error, not saved)")
+                continue
+            summary = result['summary']
+            payload = {
+                'symbol': row['symbol'], 'announced_at': row['announced_at'],
+                'attachment_url': row['attachment_url'],
+                'status': 'done' if summary else 'skipped',
+                **(summary or {}),
+            }
+            try:
+                await session.post(
+                    f"{SUPABASE_URL}/rest/v1/ppt_summaries", headers={**headers,
+                        'Content-Type': 'application/json', 'Prefer': 'resolution=merge-duplicates'},
+                    json=payload, timeout=aiohttp.ClientTimeout(total=15)
+                )
+                if summary:
+                    log.info(f"  🎙️ {row['symbol']}: presentation summarized")
+                    missing = [k for k, v in summary.items() if v is None]
+                    if missing:
+                        log.info(f"  ℹ️ {row['symbol']}: presentation summary missing {', '.join(missing)} "
+                                  f"- may be a genuine gap or worth a manual check. PDF: {row['attachment_url']}")
+                else:
+                    log.info(f"  🎙️ {row['symbol']}: presentation had no usable content, marked skipped")
+            except Exception as e:
+                log.warning(f"⚠️ PPT loop: save failed for {row['symbol']}: {type(e).__name__}: {e}")
+        if todo:
+            log.info("🎙️ PPT summary loop: batch complete")
+        await asyncio.sleep(300)
 
 async def _transcript_summary_loop(session: aiohttp.ClientSession):
     """Finds earnings-call TRANSCRIPT announcements (a different filing
@@ -2413,6 +2646,7 @@ async def fundamentals_worker_main():
             _bse_stale_results_loop(session),
             _concall_summary_loop(session),
             _transcript_summary_loop(session),
+            _ppt_summary_loop(session),
         )
 
 def rate_announcements_free(rows: list) -> list:
