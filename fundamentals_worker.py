@@ -765,11 +765,23 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
             # older announcements.
             lookback_days = int(os.getenv('RESULTS_PDF_LOOKBACK_DAYS', '14'))
             since = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat()
+            # DB-level pre-filter on subject/category keywords - confirmed
+            # via production data (GRSE, 2026-08-06) that without this,
+            # candidates_limit gets exhausted by the sheer volume of
+            # ALL announcement types (director changes, newspaper
+            # notices, etc.), pushing genuinely recent results filings
+            # out of the window entirely even when well within
+            # lookback_days. Full include/exclude logic (_is_results_
+            # announcement) still applies in Python below on the
+            # resulting, much smaller candidate set - this is a coarse
+            # pre-filter, not a replacement for it.
+            or_filter = '(' + ','.join(
+                f'subject.ilike.*{kw}*' for kw in _RESULTS_ANN_KEYWORDS) + ')'
             async with session.get(
                 f"{SUPABASE_URL}/rest/v1/corporate_announcements", headers=headers,
                 params={'select': 'symbol,category,subject,attachment_url,announced_at',
                         'announced_at': f'gt.{since}', 'order': 'announced_at.desc',
-                        'limit': str(candidates_limit)},
+                        'limit': str(candidates_limit), 'or': or_filter},
                 timeout=aiohttp.ClientTimeout(total=30)
             ) as r:
                 candidates = await r.json() if r.status == 200 else []
@@ -1310,11 +1322,13 @@ async def _ppt_summary_loop(session: aiohttp.ClientSession):
         try:
             lookback_days = int(os.getenv('PPT_LOOKBACK_DAYS', '14'))
             since = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat()
+            or_filter = '(' + ','.join(
+                f'subject.ilike.*{kw}*' for kw in _PPT_ANN_KEYWORDS) + ')'
             async with session.get(
                 f"{SUPABASE_URL}/rest/v1/corporate_announcements", headers=headers,
                 params={'select': 'symbol,category,subject,attachment_url,announced_at',
                         'announced_at': f'gt.{since}', 'order': 'announced_at.desc',
-                        'limit': str(candidates_limit)},
+                        'limit': str(candidates_limit), 'or': or_filter},
                 timeout=aiohttp.ClientTimeout(total=30)
             ) as r:
                 candidates = await r.json() if r.status == 200 else []
@@ -1417,11 +1431,13 @@ async def _transcript_summary_loop(session: aiohttp.ClientSession):
         try:
             lookback_days = int(os.getenv('TRANSCRIPT_LOOKBACK_DAYS', '14'))
             since = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat()
+            or_filter = '(' + ','.join(
+                f'subject.ilike.*{kw}*' for kw in _TRANSCRIPT_ANN_KEYWORDS) + ')'
             async with session.get(
                 f"{SUPABASE_URL}/rest/v1/corporate_announcements", headers=headers,
                 params={'select': 'symbol,category,subject,attachment_url,announced_at',
                         'announced_at': f'gt.{since}', 'order': 'announced_at.desc',
-                        'limit': str(candidates_limit)},
+                        'limit': str(candidates_limit), 'or': or_filter},
                 timeout=aiohttp.ClientTimeout(total=30)
             ) as r:
                 candidates = await r.json() if r.status == 200 else []
