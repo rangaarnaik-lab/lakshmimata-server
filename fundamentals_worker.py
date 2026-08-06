@@ -122,6 +122,16 @@ async def extract_ppt_summary(session: aiohttp.ClientSession, symbol: str, attac
         "INDUSTRY_OUTLOOK: Any industry/macro context, market-size data, or competitive "
         "positioning presented. Same short bullet-phrase format, 2-3 bullets. Null/empty "
         "array if not shown.\n\n"
+        "OPERATIONAL_KPIS: Sector-specific operational metrics shown beyond revenue/profit "
+        "- e.g. order book size, capacity/utilization, unit volumes, subscriber counts, "
+        "same-store sales, project pipeline. Same short bullet-phrase format, 2-5 bullets, "
+        "each a concrete number where given. Null/empty array if not shown.\n\n"
+        "RISKS_FLAGGED: Risks or headwinds the deck itself presented (e.g. a dedicated "
+        "'risk factors' slide) - not your own inference. Same short bullet-phrase format, "
+        "1-4 bullets. Null/empty array if not shown.\n\n"
+        "REGULATORY_LEGAL: Any litigation, regulatory approvals/rejections, compliance "
+        "matters, or government policy impacts shown. Same short bullet-phrase format, "
+        "1-3 bullets. Null/empty array if not shown.\n\n"
         "GUIDANCE_DIRECTION: Did the deck explicitly present raised, lowered, maintained, "
         "or simply reiterated guidance/targets versus what was previously communicated? "
         "Use 'raised'/'lowered'/'maintained'/'reiterated' only when the deck is explicit "
@@ -141,6 +151,9 @@ async def extract_ppt_summary(session: aiohttp.ClientSession, symbol: str, attac
             "strategic_initiatives": _bullet_field,
             "capital_allocation": _bullet_field,
             "industry_outlook": _bullet_field,
+            "operational_kpis": _bullet_field,
+            "risks_flagged": _bullet_field,
+            "regulatory_legal": _bullet_field,
             "guidance_direction": {"type": "string",
                 "enum": ["raised", "lowered", "maintained", "reiterated", "not_discussed"], "nullable": True},
             "overall_summary": {"type": "string", "nullable": True},
@@ -194,7 +207,8 @@ async def extract_ppt_summary(session: aiohttp.ClientSession, symbol: str, attac
     summary = {
         k: _clean_bullets(parsed.get(k))
         for k in ('financial_highlights', 'business_segments', 'strategic_initiatives',
-                  'capital_allocation', 'industry_outlook')
+                  'capital_allocation', 'industry_outlook', 'operational_kpis',
+                  'risks_flagged', 'regulatory_legal')
     }
     summary['overall_summary'] = (parsed.get('overall_summary') or '').strip()[:1500] or None
     gd = parsed.get('guidance_direction')
@@ -298,6 +312,20 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
         "share gains or losses, or how the company sees its position within the "
         "industry. Same short bullet-phrase format, 1-3 bullets. Null/empty array if not "
         "discussed.\n\n"
+        "OPERATIONAL_KPIS: Sector-specific operational metrics management gave beyond "
+        "revenue/profit - e.g. order book size, capacity/utilization, unit volumes, "
+        "subscriber counts, same-store sales, project pipeline. Same short bullet-phrase "
+        "format, 2-5 bullets, each a concrete number where given (e.g. 'Order book at Rs "
+        "13,596 Cr'). Null/empty array if not discussed.\n\n"
+        "RISKS_FLAGGED: Risks or headwinds management THEMSELVES volunteered during "
+        "prepared remarks or Q&A (not analyst-raised concerns, which go in KEY_CONCERNS - "
+        "this is what management proactively flagged as a risk to their own outlook). "
+        "Same short bullet-phrase format, 1-4 bullets. Report only what was explicitly "
+        "stated as a risk/challenge/headwind - null/empty array if management didn't "
+        "volunteer any.\n\n"
+        "REGULATORY_LEGAL: Any litigation, regulatory approvals/rejections, compliance "
+        "matters, or government policy impacts discussed. Same short bullet-phrase "
+        "format, 1-3 bullets. Null/empty array if not discussed.\n\n"
         "KEY_CONCERNS: The most substantive concerns, pushback, or skeptical questions "
         "analysts raised during Q&A, and how management responded - this is often the "
         "most informative part of a transcript. Same short bullet-phrase format, 2-5 "
@@ -322,6 +350,9 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
             "management_changes": _bullet_field,
             "capital_allocation": _bullet_field,
             "competitive_positioning": _bullet_field,
+            "operational_kpis": _bullet_field,
+            "risks_flagged": _bullet_field,
+            "regulatory_legal": _bullet_field,
             "key_concerns": _bullet_field,
             "overall_summary": {"type": "string", "nullable": True},
         },
@@ -379,7 +410,8 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
         k: _clean_bullets(parsed.get(k))
         for k in ('financial_highlights', 'cost_margin_commentary', 'expansion_capex',
                   'outlook_guidance', 'management_changes', 'capital_allocation',
-                  'competitive_positioning', 'key_concerns')
+                  'competitive_positioning', 'operational_kpis', 'risks_flagged',
+                  'regulatory_legal', 'key_concerns')
     }
     summary['overall_summary'] = (parsed.get('overall_summary') or '').strip()[:1500] or None
     # guidance_direction is a categorical field, not free text - validate
