@@ -98,6 +98,8 @@ __all__ = [
     '__all__',
     '_fetch_error_counts',
     '_fundamentals_debug_count',
+    '_fundamentals_fetch_paused',
+    '_screener_disabled',
     '_is_transcript_announcement',
     '_is_ppt_announcement',
     '_industry_endpoint_path',
