@@ -3761,6 +3761,445 @@ async def _stock_themes_loop(session: aiohttp.ClientSession):
         await asyncio.sleep(CHECK_INTERVAL)
 
 
+def _clean_mgmt_flags(v):
+    """Normalize [{tone,title,detail}] flags from Gemini."""
+    if isinstance(v, str):
+        try:
+            v = json.loads(v)
+        except Exception:
+            return None
+    if not isinstance(v, list):
+        return None
+    out = []
+    for item in v:
+        if not isinstance(item, dict):
+            continue
+        tone = str(item.get('tone') or item.get('type') or '').strip().lower()
+        if tone in ('green', 'positive', 'good'):
+            tone = 'green'
+        elif tone in ('red', 'negative', 'bad', 'risk'):
+            tone = 'red'
+        elif tone in ('watch', 'yellow', 'caution', 'amber'):
+            tone = 'watch'
+        else:
+            continue
+        title = str(item.get('title') or '').strip()[:120]
+        detail = str(item.get('detail') or item.get('evidence') or '').strip()[:280]
+        if len(title) < 3:
+            continue
+        out.append({'tone': tone, 'title': title, 'detail': detail or None})
+    return out[:8] or None
+
+
+def _clean_mgmt_verdict(v):
+    allowed = ('trustworthy', 'mixed', 'caution', 'unknown')
+    if not v:
+        return 'unknown'
+    t = str(v).strip().lower().replace(' ', '_')
+    aliases = {
+        'trustworthy': 'trustworthy', 'credible': 'trustworthy', 'good': 'trustworthy',
+        'mixed': 'mixed', 'neutral': 'mixed', 'okay': 'mixed',
+        'caution': 'caution', 'cautious': 'caution', 'weak': 'caution', 'untrustworthy': 'caution',
+        'unknown': 'unknown', 'unclear': 'unknown',
+    }
+    return aliases.get(t, t if t in allowed else 'unknown')
+
+
+async def _gather_stock_ask_context(session, headers, symbol: str):
+    """Collect PPT/concall/about snippets for Ask AI / management flags."""
+    ppt = tx = about = None
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/ppt_summaries", headers=headers,
+            params={'select': 'announced_at,attachment_url,overall_summary,business_segments,'
+                    'strategic_initiatives,financial_highlights,risks_flagged,outlook_guidance,'
+                    'emerging_themes,theme_evidence,management_tone,watch_next',
+                    'symbol': f'eq.{symbol}', 'status': 'eq.done',
+                    'order': 'announced_at.desc', 'limit': '2'},
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as r:
+            rows = await r.json() if r.status == 200 else []
+            ppt = rows[0] if isinstance(rows, list) and rows else None
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/transcript_summaries", headers=headers,
+            params={'select': 'announced_at,attachment_url,overall_summary,competitive_positioning,'
+                    'expansion_capex,outlook_guidance,financial_highlights,risks_flagged,'
+                    'key_concerns,emerging_themes,theme_evidence,management_tone,watch_next',
+                    'symbol': f'eq.{symbol}', 'status': 'eq.done',
+                    'order': 'announced_at.desc', 'limit': '2'},
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as r:
+            rows = await r.json() if r.status == 200 else []
+            tx = rows[0] if isinstance(rows, list) and rows else None
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/company_abouts", headers=headers,
+            params={'select': 'overall_brief,what_they_do,customers,segments,innovation,sources',
+                    'symbol': f'eq.{symbol}', 'status': 'eq.done', 'limit': '1'},
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as r:
+            rows = await r.json() if r.status == 200 else []
+            about = rows[0] if isinstance(rows, list) and rows else None
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/stock_fundamentals", headers=headers,
+            params={'select': 'industry,sector,pe,roe,roce,debt_eq,promoter,promoter_trend,'
+                    'cfo,fcf,cfo_pat,eps_yoy,sales_yoy,fundamental_label,emerging_themes',
+                    'sym': f'eq.{symbol}', 'limit': '1'},
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as r:
+            rows = await r.json() if r.status == 200 else []
+            fund = rows[0] if isinstance(rows, list) and rows else {}
+    except Exception as e:
+        log.warning(f"⚠️ Ask-context fetch failed for {symbol}: {type(e).__name__}: {e}")
+        fund = {}
+    parts = []
+    if fund:
+        parts.append('FUNDAMENTALS SNAPSHOT:\n' + json.dumps(
+            {k: v for k, v in fund.items() if v is not None}, default=str)[:2500])
+    if about:
+        about_bits = []
+        for k in ('overall_brief', 'what_they_do'):
+            if about.get(k):
+                about_bits.append(str(about[k]))
+        for k, label in (('segments', 'SEGMENTS'), ('innovation', 'INNOVATION'),
+                         ('customers', 'CUSTOMERS')):
+            bullets = _clean_bullets(about.get(k))
+            if bullets:
+                about_bits.append(label + ':\n- ' + '\n- '.join(bullets))
+        if about_bits:
+            parts.append('COMPANY BRIEF:\n' + '\n'.join(about_bits)[:5000])
+    for label, row in (('INVESTOR PRESENTATION', ppt), ('EARNINGS CALL', tx)):
+        ctx = _fmt_filing_context(label, row)
+        if ctx:
+            parts.append(ctx[:7000])
+    return '\n\n'.join(parts), fund or {}, ppt, tx, about
+
+
+async def extract_management_flags(session: aiohttp.ClientSession, symbol: str, context: str,
+                                   industry=None, sector=None):
+    """Precompute green/red/watch flags + verdict for a stock."""
+    api_key = os.getenv('GEMINI_API_KEY', '')
+    if not api_key:
+        return None
+    sector_bit = ' / '.join(x for x in [industry, sector] if x) or 'NSE-listed company'
+    prompt = (
+        f"You are doing management diligence for Indian NSE stock {symbol} ({sector_bit}).\n"
+        "Compare what management promises vs what filings/news imply about execution. "
+        "Use Google Search for public filings, concalls, annual reports, and reputable news.\n"
+        "Also use the LOCAL CONTEXT below when present (PPT/concall summaries we already extracted).\n\n"
+        "Return ONLY JSON with:\n"
+        '- "verdict": one of trustworthy | mixed | caution | unknown\n'
+        '- "summary": 2-4 sentences, neutral, no buy/sell advice\n'
+        '- "flags": array of 2-6 objects {tone, title, detail} where tone is green|red|watch\n'
+        "  green = consistent delivery / alignment; red = broken promise, governance risk, "
+        "accounting concern; watch = needs monitoring.\n"
+        "Prefer evidence with dates/numbers. If evidence is thin, verdict=unknown and fewer flags.\n\n"
+    )
+    if context:
+        prompt += f"LOCAL CONTEXT:\n{context[:14000]}\n"
+    model = os.getenv('GEMINI_ABOUT_MODEL') or os.getenv('GEMINI_CONCALL_MODEL', 'gemini-3.1-flash-lite')
+    use_search = os.getenv('MGMT_FLAGS_WEB_SEARCH', '1').strip() not in ('0', 'false', 'False')
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.2},
+    }
+    if use_search:
+        body["tools"] = [{"google_search": {}}]
+    try:
+        async with session.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
+            headers={"Content-Type": "application/json"},
+            json=body,
+            timeout=aiohttp.ClientTimeout(total=120),
+        ) as r:
+            if r.status != 200:
+                txt = await r.text()
+                if use_search and r.status in (400, 404):
+                    body.pop('tools', None)
+                    async with session.post(
+                        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
+                        headers={"Content-Type": "application/json"},
+                        json=body,
+                        timeout=aiohttp.ClientTimeout(total=90),
+                    ) as r2:
+                        if r2.status != 200:
+                            return None
+                        data = await r2.json()
+                elif r.status == 429:
+                    await asyncio.sleep(int(os.getenv('GEMINI_429_BACKOFF_SECONDS', '30')))
+                    return None
+                else:
+                    log.warning(f"⚠️ Mgmt-flags AI failed for {symbol} ({r.status}): {txt[:160]}")
+                    return None
+            else:
+                data = await r.json()
+        parts = (data.get('candidates') or [{}])[0].get('content', {}).get('parts', [])
+        raw = ''.join(p.get('text', '') for p in parts).strip()
+        parsed = _parse_json_object(raw)
+        if not parsed:
+            return None
+        flags = _clean_mgmt_flags(parsed.get('flags'))
+        summary = str(parsed.get('summary') or '').strip()[:900] or None
+        verdict = _clean_mgmt_verdict(parsed.get('verdict'))
+        if not flags and not summary:
+            return None
+        return {
+            'mgmt_verdict': verdict,
+            'mgmt_summary': summary,
+            'mgmt_flags': flags,
+            'mgmt_flags_at': datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        log.warning(f"⚠️ Mgmt-flags error for {symbol}: {type(e).__name__}: {e}")
+        return None
+
+
+async def answer_stock_ai_ask(session: aiohttp.ClientSession, symbol: str, question: str,
+                              context: str, industry=None, sector=None):
+    """Answer one free-form diligence question with flags."""
+    api_key = os.getenv('GEMINI_API_KEY', '')
+    if not api_key:
+        return None
+    sector_bit = ' / '.join(x for x in [industry, sector] if x) or 'NSE-listed company'
+    prompt = (
+        f"Answer this investor diligence question about Indian NSE stock {symbol} ({sector_bit}).\n"
+        f"QUESTION: {question.strip()}\n\n"
+        "Use Google Search across annual reports, concalls, filings, and reputable news. "
+        "Also use LOCAL CONTEXT below (PPT/concall/about summaries already on file).\n"
+        "Compare management promises vs execution when relevant. No buy/sell recommendation.\n\n"
+        "Return ONLY JSON:\n"
+        '- "answer": 120-220 words, clear and specific\n'
+        '- "verdict": short label e.g. trustworthy | mixed | caution | unknown | n/a\n'
+        '- "flags": 2-6 objects {tone: green|red|watch, title, detail}\n'
+        "If evidence is weak, say so explicitly.\n\n"
+    )
+    if context:
+        prompt += f"LOCAL CONTEXT:\n{context[:14000]}\n"
+    model = os.getenv('GEMINI_ABOUT_MODEL') or os.getenv('GEMINI_CONCALL_MODEL', 'gemini-3.1-flash-lite')
+    use_search = os.getenv('STOCK_ASK_WEB_SEARCH', '1').strip() not in ('0', 'false', 'False')
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.25},
+    }
+    if use_search:
+        body["tools"] = [{"google_search": {}}]
+    try:
+        async with session.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
+            headers={"Content-Type": "application/json"},
+            json=body,
+            timeout=aiohttp.ClientTimeout(total=130),
+        ) as r:
+            if r.status != 200:
+                txt = await r.text()
+                if use_search and r.status in (400, 404):
+                    body.pop('tools', None)
+                    async with session.post(
+                        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
+                        headers={"Content-Type": "application/json"},
+                        json=body,
+                        timeout=aiohttp.ClientTimeout(total=100),
+                    ) as r2:
+                        if r2.status != 200:
+                            return None
+                        data = await r2.json()
+                elif r.status == 429:
+                    await asyncio.sleep(int(os.getenv('GEMINI_429_BACKOFF_SECONDS', '30')))
+                    return None
+                else:
+                    log.warning(f"⚠️ Ask-AI failed for {symbol} ({r.status}): {txt[:160]}")
+                    return None
+            else:
+                data = await r.json()
+        parts = (data.get('candidates') or [{}])[0].get('content', {}).get('parts', [])
+        raw = ''.join(p.get('text', '') for p in parts).strip()
+        parsed = _parse_json_object(raw)
+        if not parsed:
+            return None
+        answer = str(parsed.get('answer') or '').strip()
+        if len(answer) < 40:
+            return None
+        sources = _grounding_source_urls(data, limit=6)
+        return {
+            'answer': answer[:2500],
+            'verdict': str(parsed.get('verdict') or 'n/a')[:40],
+            'flags': _clean_mgmt_flags(parsed.get('flags')),
+            'sources': sources,
+        }
+    except Exception as e:
+        log.warning(f"⚠️ Ask-AI error for {symbol}: {type(e).__name__}: {e}")
+        return None
+
+
+async def _mgmt_flags_loop(session: aiohttp.ClientSession):
+    """Precompute management Flags for large/active stocks."""
+    headers = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
+    CHECK_INTERVAL = int(os.getenv('MGMT_FLAGS_INTERVAL_SEC', '720'))
+    BATCH = int(os.getenv('MGMT_FLAGS_BATCH', '6'))
+    STALE_DAYS = int(os.getenv('MGMT_FLAGS_STALE_DAYS', '30'))
+    _key_logged = False
+    while True:
+        if not os.getenv('GEMINI_API_KEY'):
+            if not _key_logged:
+                log.warning("🚩 Mgmt-flags loop: GEMINI_API_KEY not set - idle")
+                _key_logged = True
+            await asyncio.sleep(300)
+            continue
+        if not _key_logged:
+            log.info(f"🚩 Mgmt-flags loop: active (batch={BATCH})")
+            _key_logged = True
+        try:
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/stock_fundamentals", headers=headers,
+                params={
+                    'select': 'sym,industry,sector,market_cap,mgmt_flags,mgmt_flags_at,mgmt_verdict',
+                    'order': 'market_cap.desc.nullslast',
+                    'limit': str(BATCH * 10),
+                },
+                timeout=aiohttp.ClientTimeout(total=40),
+            ) as r:
+                if r.status != 200:
+                    body = await r.text()
+                    if r.status == 400 and 'mgmt_flags' in body:
+                        log.warning("🚩 Mgmt-flags: run add_stock_ai_asks.sql")
+                        await asyncio.sleep(600)
+                        continue
+                    await asyncio.sleep(CHECK_INTERVAL)
+                    continue
+                rows = await r.json()
+            cutoff = datetime.now(timezone.utc) - timedelta(days=STALE_DAYS)
+            todo = []
+            for row in rows or []:
+                sym = row.get('sym')
+                if not sym:
+                    continue
+                at = row.get('mgmt_flags_at')
+                stale = True
+                if at and row.get('mgmt_flags'):
+                    try:
+                        ts = datetime.fromisoformat(str(at).replace('Z', '+00:00'))
+                        stale = ts < cutoff
+                    except Exception:
+                        stale = True
+                if not stale:
+                    continue
+                todo.append(row)
+                if len(todo) >= BATCH:
+                    break
+            if not todo:
+                log.info("🚩 Mgmt-flags loop: nothing to generate")
+                await asyncio.sleep(CHECK_INTERVAL)
+                continue
+            log.info(f"🚩 Mgmt-flags loop: generating for {len(todo)} stock(s)")
+            saved = 0
+            for i, row in enumerate(todo):
+                sym = row['sym']
+                if i > 0:
+                    await asyncio.sleep(float(os.getenv('MGMT_FLAGS_PACING_SECONDS', '10')))
+                context, fund, *_ = await _gather_stock_ask_context(session, headers, sym)
+                result = await extract_management_flags(
+                    session, sym, context,
+                    industry=row.get('industry') or fund.get('industry'),
+                    sector=row.get('sector') or fund.get('sector'))
+                if not result:
+                    continue
+                try:
+                    await save_fundamentals_batch_to_db(session, [{'sym': sym, **result}])
+                    saved += 1
+                    n = len(result.get('mgmt_flags') or [])
+                    log.info(f"  🚩 {sym}: verdict={result.get('mgmt_verdict')} flags={n}")
+                except Exception as e:
+                    log.warning(f"⚠️ Mgmt-flags save failed for {sym}: {type(e).__name__}: {e}")
+            log.info(f"🚩 Mgmt-flags loop: saved {saved}/{len(todo)}")
+        except Exception as e:
+            log.error(f"Mgmt-flags loop failed: {type(e).__name__}: {e}")
+        await asyncio.sleep(CHECK_INTERVAL)
+
+
+async def _stock_ai_asks_loop(session: aiohttp.ClientSession):
+    """Answer pending free-form Ask AI questions from the UI."""
+    headers = {
+        'apikey': SUPABASE_KEY,
+        'Authorization': f'Bearer {SUPABASE_KEY}',
+        'Content-Type': 'application/json',
+    }
+    _key_logged = False
+    while True:
+        if not os.getenv('GEMINI_API_KEY'):
+            if not _key_logged:
+                log.warning("💬 Ask-AI loop: GEMINI_API_KEY not set - idle")
+                _key_logged = True
+            await asyncio.sleep(60)
+            continue
+        if not _key_logged:
+            log.info("💬 Ask-AI loop: active — polling stock_ai_asks")
+            _key_logged = True
+        try:
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/stock_ai_asks", headers=headers,
+                params={
+                    'select': 'id,symbol,question,created_at',
+                    'status': 'eq.pending',
+                    'order': 'created_at.asc',
+                    'limit': '3',
+                },
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as r:
+                if r.status != 200:
+                    body = await r.text()
+                    if r.status == 404 or (r.status == 400 and 'stock_ai_asks' in body):
+                        log.warning("💬 Ask-AI: run add_stock_ai_asks.sql")
+                        await asyncio.sleep(600)
+                        continue
+                    log.warning(f"💬 Ask-AI poll failed ({r.status}): {body[:160]}")
+                    await asyncio.sleep(30)
+                    continue
+                pending = await r.json()
+            if not pending:
+                await asyncio.sleep(8)
+                continue
+            for row in pending:
+                ask_id = row.get('id')
+                sym = (row.get('symbol') or '').strip().upper()
+                question = (row.get('question') or '').strip()
+                if not ask_id or not sym or len(question) < 8:
+                    continue
+                log.info(f"💬 Ask-AI answering {sym}: {question[:80]}")
+                context, fund, *_ = await _gather_stock_ask_context(session, headers, sym)
+                result = await answer_stock_ai_ask(
+                    session, sym, question, context,
+                    industry=fund.get('industry'), sector=fund.get('sector'))
+                if result:
+                    patch = {
+                        'status': 'done',
+                        'answer': result['answer'],
+                        'verdict': result.get('verdict'),
+                        'flags': result.get('flags'),
+                        'sources': result.get('sources'),
+                        'answered_at': datetime.now(timezone.utc).isoformat(),
+                        'error': None,
+                    }
+                else:
+                    patch = {
+                        'status': 'error',
+                        'error': 'AI could not produce an answer — try again shortly',
+                        'answered_at': datetime.now(timezone.utc).isoformat(),
+                    }
+                async with session.patch(
+                    f"{SUPABASE_URL}/rest/v1/stock_ai_asks?id=eq.{ask_id}",
+                    headers={**headers, 'Prefer': 'return=minimal'},
+                    json=patch,
+                    timeout=aiohttp.ClientTimeout(total=20),
+                ) as pr:
+                    if pr.status not in (200, 204):
+                        log.warning(f"⚠️ Ask-AI patch {pr.status} for {ask_id}: {(await pr.text())[:160]}")
+                    else:
+                        log.info(f"  💬 {sym}: ask {ask_id[:8]}… → {patch['status']}")
+                await asyncio.sleep(float(os.getenv('STOCK_ASK_PACING_SECONDS', '6')))
+        except Exception as e:
+            log.error(f"Ask-AI loop failed: {type(e).__name__}: {e}")
+            await asyncio.sleep(20)
+
+
 async def extract_fundamentals_highlights(session: aiohttp.ClientSession, row: dict):
     """Ask Gemini which metrics matter most for this stock and write short
     takeaways for the Fundamentals tab. Numbers come from our DB row — the
@@ -4223,6 +4662,8 @@ async def fundamentals_worker_main():
             _about_company_loop(session),
             _fundamentals_ai_highlights_loop(session),
             _stock_themes_loop(session),
+            _mgmt_flags_loop(session),
+            _stock_ai_asks_loop(session),
         )
 
 def rate_announcements_free(rows: list) -> list:
