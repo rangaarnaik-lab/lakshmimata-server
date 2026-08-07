@@ -4,6 +4,7 @@ PocketRS Pro — Fundamentals + Announcements Worker (worthy-simplicity)
 """
 import os
 import gc
+import re
 import sys
 import time
 import json
@@ -24,6 +25,36 @@ log = logging.getLogger('pocketrs')
 # symbols every 20-minute cycle. Resets on process restart, which is fine -
 # worst case is one wasted retry per restart, not an ongoing drag.
 _BSE_NO_SCRIP_CODE = set()
+
+# Cap concurrent Gemini calls across About/PPT/Transcript/Highlights/Themes.
+# Without this, all loops fire together at Railway boot and burn the free
+# tier RPM (seen 2026-08-07: mass 429s within the first seconds).
+def _gemini_semaphore() -> asyncio.Semaphore:
+    n = max(1, int(os.getenv('GEMINI_MAX_CONCURRENT', '2')))
+    sem = getattr(_gemini_semaphore, '_sem', None)
+    if sem is None or getattr(_gemini_semaphore, '_n', None) != n:
+        _gemini_semaphore._sem = asyncio.Semaphore(n)
+        _gemini_semaphore._n = n
+    return _gemini_semaphore._sem
+
+
+async def _gemini_generate(session: aiohttp.ClientSession, url: str, body: dict,
+                           timeout_s: float = 120):
+    """POST to Gemini with a process-wide concurrency cap."""
+    async with _gemini_semaphore():
+        async with session.post(
+            url,
+            headers={"Content-Type": "application/json"},
+            json=body,
+            timeout=aiohttp.ClientTimeout(total=timeout_s),
+        ) as r:
+            text = await r.text()
+            status = r.status
+    try:
+        data = json.loads(text) if text else {}
+    except Exception:
+        data = {'raw': text[:500]}
+    return status, data, text
 
 # ══ FUNDAMENTALS-WORKER-ONLY FUNCTIONS ══
 
@@ -3474,15 +3505,20 @@ async def extract_about_company(session: aiohttp.ClientSession, symbol: str, ppt
     return {'about': about, 'error': False}
 
 
-# Do NOT include `sector` — stock_fundamentals has no sector column in prod
-# (lives on stocks). Selecting it 400s the whole highlights loop forever.
-_FUND_HIGHLIGHT_FIELDS = (
+# Core ratio fields used for AI Fundamentals takeaways. Optional columns
+# (fundamental_score/label) are NOT selected by default — they are missing
+# on some prod schemas and 400 the whole loop (seen 2026-08-07).
+_FUND_HIGHLIGHT_CORE_FIELDS = (
     'pe', 'pb', 'roe', 'roce', 'peg_ratio', 'debt_eq', 'eps', 'eps_yoy', 'eps_qoq',
     'sales_yoy', 'sales_qoq', 'opm_pct', 'opm_trend', 'cfo', 'fcf', 'cfo_pat',
     'div_yield', 'promoter', 'promoter_trend', 'fii_pct', 'fii_trend', 'dii_pct',
     'dii_trend', 'industry_pe', 'market_cap', 'nim', 'gnpa', 'nnpa', 'car', 'casa',
-    'fundamental_score', 'fundamental_label', 'industry',
+    'industry',
 )
+_FUND_HIGHLIGHT_OPTIONAL_FIELDS = ('fundamental_score', 'fundamental_label')
+_FUND_HIGHLIGHT_FIELDS = _FUND_HIGHLIGHT_CORE_FIELDS + _FUND_HIGHLIGHT_OPTIONAL_FIELDS
+# Runtime-narrowed select list after first successful probe (avoids 400 loops).
+_fund_highlight_select_fields = list(_FUND_HIGHLIGHT_CORE_FIELDS)
 
 
 async def extract_stock_themes_ai(session: aiohttp.ClientSession, symbol: str,
@@ -3892,8 +3928,9 @@ async def _gather_stock_ask_context(session, headers, symbol: str):
             about = rows[0] if isinstance(rows, list) and rows else None
         async with session.get(
             f"{SUPABASE_URL}/rest/v1/stock_fundamentals", headers=headers,
-            params={'select': 'industry,sector,pe,roe,roce,debt_eq,promoter,promoter_trend,'
-                    'cfo,fcf,cfo_pat,eps_yoy,sales_yoy,fundamental_label,emerging_themes',
+            # No sector / fundamental_label — missing on some prod schemas.
+            params={'select': 'industry,pe,roe,roce,debt_eq,promoter,promoter_trend,'
+                    'cfo,fcf,cfo_pat,eps_yoy,sales_yoy,emerging_themes',
                     'sym': f'eq.{symbol}', 'limit': '1'},
             timeout=aiohttp.ClientTimeout(total=15),
         ) as r:
@@ -4454,7 +4491,9 @@ async def _fundamentals_ai_highlights_loop(session: aiohttp.ClientSession):
             log.info(f"📌 Fund-highlights loop: active (batch={BATCH}, stale={STALE_DAYS}d)")
             _key_logged = True
         try:
-            select_cols = 'sym,' + ','.join(_FUND_HIGHLIGHT_FIELDS) + ',ai_highlights,ai_highlights_at,fetched_at'
+            global _fund_highlight_select_fields
+            select_cols = ('sym,' + ','.join(_fund_highlight_select_fields)
+                           + ',ai_highlights,ai_highlights_at,fetched_at')
             # Prefer missing highlights — otherwise top-by-mcap rows with sparse
             # ratios starve the queue and ai_highlights stayed at 0 in prod.
             rows = []
@@ -4480,6 +4519,19 @@ async def _fundamentals_ai_highlights_loop(session: aiohttp.ClientSession):
                             await asyncio.sleep(600)
                             rows = None
                             break
+                        # Drop any missing column named in the error and retry
+                        # (prod lacked fundamental_score — one bad col stalled forever).
+                        m = re.search(r'column stock_fundamentals\.(\w+) does not exist', body or '')
+                        if r.status == 400 and m:
+                            bad = m.group(1)
+                            if bad in _fund_highlight_select_fields:
+                                _fund_highlight_select_fields = [
+                                    c for c in _fund_highlight_select_fields if c != bad]
+                                select_cols = ('sym,' + ','.join(_fund_highlight_select_fields)
+                                               + ',ai_highlights,ai_highlights_at,fetched_at')
+                                log.warning(f"📌 Fund-highlights: dropping missing column "
+                                            f"'{bad}' from select; retrying")
+                                continue
                         log.warning(f"📌 Fund-highlights query failed ({r.status}): {body[:200]}")
                         continue
                     chunk = await r.json()
@@ -4834,15 +4886,22 @@ async def fundamentals_worker_main():
             _bse_targeted_results_loop(session),
             _bse_missing_backfill_loop(session),
             _bse_stale_results_loop(session),
-            _concall_summary_loop(session),
-            _transcript_summary_loop(session),
-            _ppt_summary_loop(session),
-            _about_company_loop(session),
-            _fundamentals_ai_highlights_loop(session),
-            _stock_themes_loop(session),
-            _mgmt_flags_loop(session),
-            _stock_ai_asks_loop(session),
+            # Stagger Gemini-heavy loops so boot doesn't stampede free-tier RPM.
+            _delayed(0, _concall_summary_loop(session)),
+            _delayed(20, _transcript_summary_loop(session)),
+            _delayed(40, _ppt_summary_loop(session)),
+            _delayed(60, _about_company_loop(session)),
+            _delayed(80, _fundamentals_ai_highlights_loop(session)),
+            _delayed(10, _stock_themes_loop(session)),  # sync-first is cheap
+            _delayed(100, _mgmt_flags_loop(session)),
+            _delayed(30, _stock_ai_asks_loop(session)),
         )
+
+
+async def _delayed(seconds: float, coro):
+    if seconds > 0:
+        await asyncio.sleep(seconds)
+    await coro
 
 def rate_announcements_free(rows: list) -> list:
     """Zero-cost rule-based fallback for when ANTHROPIC_API_KEY isn't
