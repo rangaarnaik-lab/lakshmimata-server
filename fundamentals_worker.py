@@ -1471,6 +1471,12 @@ async def _fundamentals_loop(session: aiohttp.ClientSession):
         log.error("stock_fundamentals table unavailable — fundamentals loop cannot proceed.")
         return
     while True:
+        if _fundamentals_fetch_paused():
+            if not getattr(_fundamentals_loop, '_paused_logged', False):
+                log.info("⏸️ Fundamentals loop: paused (PAUSE_FUNDAMENTALS_FETCH / GEMINI_FOCUS=about)")
+                _fundamentals_loop._paused_logged = True
+            await asyncio.sleep(300)
+            continue
         if is_market_open():
             await asyncio.sleep(300)
             continue
@@ -1627,6 +1633,12 @@ async def _market_cap_catchup_loop(session: aiohttp.ClientSession):
                           # climbing noticeably after this, dial back to
                           # 100-150 rather than push further.
     while True:
+        if _fundamentals_fetch_paused():
+            if not getattr(_market_cap_catchup_loop, '_paused_logged', False):
+                log.info("⏸️ Market-cap catchup: paused (PAUSE_FUNDAMENTALS_FETCH / GEMINI_FOCUS=about)")
+                _market_cap_catchup_loop._paused_logged = True
+            await asyncio.sleep(300)
+            continue
         if is_market_open():
             await asyncio.sleep(300)  # check back every 5 min while open
             continue
@@ -1670,6 +1682,8 @@ def _html_to_compact_text(html: str, limit: int = 90000) -> str:
     return text[:limit]
 
 async def _fetch_screener_html(session: aiohttp.ClientSession, sym: str) -> str:
+    if _screener_disabled():
+        return ''
     url = f"https://www.screener.in/company/{sym}/consolidated/"
     headers = random.choice(_SCREENER_HEADER_SETS)
     try:

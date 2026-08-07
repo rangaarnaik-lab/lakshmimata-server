@@ -806,6 +806,27 @@ async def ensure_fundamentals_table(session: aiohttp.ClientSession,
     log.error("     add column if not exists peg_ratio numeric;")
     return False
 
+def _screener_disabled() -> bool:
+    """SKIP_SCREENER=1 (or PAUSE_SCREENER) skips all Screener.in scrapes.
+    Also auto-skips while GEMINI_FOCUS=about so About backfill isn't starved
+    by fundamentals scrape noise on Railway."""
+    v = (os.getenv('SKIP_SCREENER') or os.getenv('PAUSE_SCREENER') or '').strip().lower()
+    if v in ('1', 'true', 'yes', 'on'):
+        return True
+    focus = (os.getenv('GEMINI_FOCUS') or '').strip().lower()
+    return focus == 'about'
+
+
+def _fundamentals_fetch_paused() -> bool:
+    """PAUSE_FUNDAMENTALS_FETCH=1 parks Upstox+Screener batch fetches.
+    Auto-pauses while GEMINI_FOCUS=about."""
+    v = (os.getenv('PAUSE_FUNDAMENTALS_FETCH') or '').strip().lower()
+    if v in ('1', 'true', 'yes', 'on'):
+        return True
+    focus = (os.getenv('GEMINI_FOCUS') or '').strip().lower()
+    return focus == 'about'
+
+
 async def fetch_fundamentals_screener(session: aiohttp.ClientSession, sym: str, debug: bool = False) -> dict:
     """
     Scrape fundamental data from Screener.in company page.
@@ -825,8 +846,6 @@ async def fetch_fundamentals_screener(session: aiohttp.ClientSession, sym: str, 
     realistic full browser header sets (UA + Accept-Language + sec-ch-ua
     etc.) to look more like normal traffic.
     """
-    url = f"https://www.screener.in/company/{sym}/consolidated/"
-    headers = random.choice(_SCREENER_HEADER_SETS)
     result = {
         'market_cap': None, 'pe': None, 'roe': None, 'eps': None, 'debt_eq': None, 'promoter': None,
         'eps_qoq': None, 'eps_yoy': None, 'sales_qoq': None, 'sales_yoy': None,
@@ -838,6 +857,10 @@ async def fetch_fundamentals_screener(session: aiohttp.ClientSession, sym: str, 
         'cfo': None, 'fcf': None, 'cfo_pat': None,
         'nim': None, 'gnpa': None, 'nnpa': None, 'car': None, 'casa': None,
     }
+    if _screener_disabled():
+        return result
+    url = f"https://www.screener.in/company/{sym}/consolidated/"
+    headers = random.choice(_SCREENER_HEADER_SETS)
     try:
         async with session.get(url, headers=headers,
                                timeout=aiohttp.ClientTimeout(total=10)) as r:
