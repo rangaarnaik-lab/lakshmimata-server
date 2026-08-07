@@ -1105,6 +1105,75 @@ async def backfill_exceptional_items(session: aiohttp.ClientSession, limit: int 
             log.info(f"  🔁 {row['symbol']}: found exceptional_item on {len(to_save)} period(s), updated")
     log.info(f"🔁 Exceptional-items backfill complete: {done}/{len(rows)} symbol(s) had an exceptional item")
 
+async def _symbols_with_financial_results(session: aiohttp.ClientSession, headers: dict) -> set[str]:
+    """Symbols that already have at least one financial_results row."""
+    have: set[str] = set()
+    page_size, offset = 1000, 0
+    while offset < 20000:
+        try:
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/financial_results", headers=headers,
+                params={'select': 'symbol', 'order': 'symbol',
+                        'limit': str(page_size), 'offset': str(offset)},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as r:
+                if r.status != 200:
+                    break
+                rows = await r.json()
+        except Exception:
+            break
+        if not rows:
+            break
+        for row in rows:
+            if row.get('symbol'):
+                have.add(row['symbol'])
+        if len(rows) < page_size:
+            break
+        offset += page_size
+    return have
+
+
+async def _fetch_results_announcement_candidates(
+        session: aiohttp.ClientSession, headers: dict,
+        since: str, candidates_limit: int) -> list:
+    """Page through results-like announcements (PostgREST caps ~1000/req)."""
+    or_filter = '(' + ','.join(
+        f'subject.ilike.*{kw}*' for kw in _RESULTS_ANN_KEYWORDS) + ')'
+    out, page_size, offset = [], min(1000, candidates_limit), 0
+    while len(out) < candidates_limit:
+        take = min(page_size, candidates_limit - len(out))
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/corporate_announcements", headers=headers,
+            params={'select': 'symbol,category,subject,attachment_url,announced_at',
+                    'announced_at': f'gt.{since}', 'order': 'announced_at.desc',
+                    'limit': str(take), 'offset': str(offset), 'or': or_filter},
+            timeout=aiohttp.ClientTimeout(total=45),
+        ) as r:
+            if r.status != 200:
+                body = await r.text()
+                log.warning(f"⚠️ Results candidates page offset={offset} "
+                            f"returned {r.status}: {body[:200]}")
+                break
+            page = await r.json()
+        if not isinstance(page, list) or not page:
+            break
+        out.extend(page)
+        if len(page) < take:
+            break
+        offset += len(page)
+    return out
+
+
+def _results_catchup_boosted() -> bool:
+    """High-throughput Results PDF mode: About hard-pause handoff, or
+    RESULTS_PDF_CATCHUP=1 for a dedicated catchup deploy."""
+    v = (os.getenv('RESULTS_PDF_CATCHUP') or '').strip().lower()
+    if v in ('1', 'true', 'yes', 'on'):
+        return True
+    until = _ABOUT_YIELD_TO_RESULTS_UNTIL
+    return bool(until and time.time() < until)
+
+
 async def _concall_summary_loop(session: aiohttp.ClientSession):
     """Finds results announcements that haven't been processed yet and
     extracts both structured financial data and a qualitative summary
@@ -1125,49 +1194,37 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
                 _key_status_logged = True
             await asyncio.sleep(300)  # check again in 5 min in case the key gets added
             continue
-        # Configurable per-cycle batch size and query row cap - defaults
-        # (10, 500) assumed only a small recent-announcements backlog.
-        # Covering ALL stocks (not just recent announcements) needs both
-        # raised significantly: RESULTS_PDF_LOOKBACK_DAYS alone isn't
-        # enough, since the query below is also capped at
-        # RESULTS_PDF_CANDIDATES_LIMIT rows ordered by announced_at.desc -
-        # if there are more results-type announcements in the lookback
-        # window than that cap, anything past the most recent N would
-        # never even be fetched, no matter how many cycles run.
-        BATCH_SIZE = int(os.getenv('RESULTS_PDF_BATCH_SIZE', '5'))
-        candidates_limit = int(os.getenv('RESULTS_PDF_CANDIDATES_LIMIT', '2000'))
-        if not _key_status_logged:
-            log.info(f"🎙️ Results extraction loop: GEMINI_API_KEY detected, active "
-                      f"(lookback={os.getenv('RESULTS_PDF_LOOKBACK_DAYS', '90')}d, batch={BATCH_SIZE}, "
-                      f"candidates_limit={candidates_limit})")
+        # Catchup / About-yield: pull many stocks fast (wide lookback,
+        # big batch, one filing per symbol). Steady-state stays modest.
+        catchup = _results_catchup_boosted()
+        if catchup:
+            BATCH_SIZE = int(os.getenv('RESULTS_PDF_CATCHUP_BATCH_SIZE',
+                                       os.getenv('RESULTS_PDF_BATCH_SIZE', '25')))
+            candidates_limit = int(os.getenv('RESULTS_PDF_CATCHUP_CANDIDATES_LIMIT',
+                                             os.getenv('RESULTS_PDF_CANDIDATES_LIMIT', '10000')))
+            lookback_days = int(os.getenv('RESULTS_PDF_CATCHUP_LOOKBACK_DAYS',
+                                          os.getenv('RESULTS_PDF_LOOKBACK_DAYS', '365')))
+            pacing = float(os.getenv('RESULTS_PDF_CATCHUP_PACING_SECONDS',
+                                     os.getenv('RESULTS_PDF_PACING_SECONDS', '6')))
+        else:
+            BATCH_SIZE = int(os.getenv('RESULTS_PDF_BATCH_SIZE', '5'))
+            candidates_limit = int(os.getenv('RESULTS_PDF_CANDIDATES_LIMIT', '2000'))
+            lookback_days = int(os.getenv('RESULTS_PDF_LOOKBACK_DAYS', '90'))
+            pacing = float(os.getenv('RESULTS_PDF_PACING_SECONDS', '8'))
+        if not _key_status_logged or catchup:
+            log.info(f"🎙️ Results extraction loop: active "
+                      f"(catchup={catchup}, lookback={lookback_days}d, batch={BATCH_SIZE}, "
+                      f"candidates_limit={candidates_limit}, pacing={pacing}s)")
             _key_status_logged = True
         try:
-            # Recent results announcements - configurable via
-            # RESULTS_PDF_LOOKBACK_DAYS. Default raised to 90 days so
-            # earnings-season backlog isn't dropped after two weeks
-            # (confirmed gap: 14d lookback left most Jul filings unprocessed).
-            lookback_days = int(os.getenv('RESULTS_PDF_LOOKBACK_DAYS', '90'))
             since = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat()
             # DB-level pre-filter on subject/category keywords - confirmed
             # via production data (GRSE, 2026-08-06) that without this,
             # candidates_limit gets exhausted by the sheer volume of
-            # ALL announcement types (director changes, newspaper
-            # notices, etc.), pushing genuinely recent results filings
-            # out of the window entirely even when well within
-            # lookback_days. Full include/exclude logic (_is_results_
-            # announcement) still applies in Python below on the
-            # resulting, much smaller candidate set - this is a coarse
-            # pre-filter, not a replacement for it.
-            or_filter = '(' + ','.join(
-                f'subject.ilike.*{kw}*' for kw in _RESULTS_ANN_KEYWORDS) + ')'
-            async with session.get(
-                f"{SUPABASE_URL}/rest/v1/corporate_announcements", headers=headers,
-                params={'select': 'symbol,category,subject,attachment_url,announced_at',
-                        'announced_at': f'gt.{since}', 'order': 'announced_at.desc',
-                        'limit': str(candidates_limit), 'or': or_filter},
-                timeout=aiohttp.ClientTimeout(total=30)
-            ) as r:
-                candidates = await r.json() if r.status == 200 else []
+            # ALL announcement types. Full _is_results_announcement
+            # still applies in Python below.
+            candidates = await _fetch_results_announcement_candidates(
+                session, headers, since, candidates_limit)
         except Exception as e:
             log.warning(f"⚠️ Concall loop: announcements fetch failed: {type(e).__name__}: {e}")
             candidates = []
@@ -1186,26 +1243,43 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
         already, _thin = await _fetch_processed_attachment_keys(
             session, 'concall_summaries', headers)
 
-        todo = [row for row in concall_rows if (row['symbol'], row['attachment_url']) not in already][:BATCH_SIZE]
+        pending = [row for row in concall_rows
+                   if (row['symbol'], row['attachment_url']) not in already]
+        have_fr: set[str] = set()
+        if catchup and pending:
+            have_fr = await _symbols_with_financial_results(session, headers)
+            # Missing financial_results first, then newest filing — cover
+            # many stocks, not many filings for the same few names.
+            pending.sort(key=lambda r: (
+                0 if r.get('symbol') not in have_fr else 1,
+                -( _parse_iso_ts(r.get('announced_at')).timestamp()
+                   if _parse_iso_ts(r.get('announced_at')) else 0),
+            ))
+        todo = []
+        seen_sym: set[str] = set()
+        for row in pending:
+            sym = row.get('symbol')
+            if catchup and sym in seen_sym:
+                continue
+            if catchup and sym:
+                seen_sym.add(sym)
+            todo.append(row)
+            if len(todo) >= BATCH_SIZE:
+                break
+        missing_n = sum(1 for r in todo if r.get('symbol') not in have_fr) if have_fr else 0
         if todo:
-            log.info(f"🎙️ Results extraction loop: {len(todo)} new results announcement(s) to process "
-                      f"(candidates={len(candidates)}, matched={len(concall_rows)}, already={len(already)})")
+            log.info(f"🎙️ Results extraction loop: {len(todo)} stock(s) to process "
+                      f"(catchup={catchup}, missing_fr≈{missing_n}, "
+                      f"candidates={len(candidates)}, matched={len(concall_rows)}, "
+                      f"pending={len(pending)}, already={len(already)})")
         else:
-            log.info(f"🎙️ Results extraction loop: checked {len(candidates)} recent announcement(s) "
-                      f"({len(concall_rows)} matched results filters, already={len(already)}), nothing new to process")
+            log.info(f"🎙️ Results extraction loop: checked {len(candidates)} announcement(s) "
+                      f"({len(concall_rows)} matched, already={len(already)}), nothing new")
         for i, row in enumerate(todo):
             if i > 0:
-                # Pacing between calls, not just relying on natural
-                # request latency - added specifically because larger
-                # batch sizes (RESULTS_PDF_BATCH_SIZE, raised for the
-                # full-history backfill) can otherwise blast through the
-                # free tier's per-minute quota in seconds, wasting most
-                # of the batch to 429s. User confirmed the exact limit:
-                # 15 RPM, so 4s is the bare minimum spacing with zero
-                # margin for timing jitter - default 5s gives real
-                # headroom (12 RPM effective) while still keeping a
-                # 30-item batch's total pacing time reasonable.
-                await asyncio.sleep(float(os.getenv('RESULTS_PDF_PACING_SECONDS', '8')))
+                # Pacing between calls — free tier ~15 RPM; catchup uses
+                # slightly tighter spacing (default 6s) to clear backlog.
+                await asyncio.sleep(pacing)
             # Prefer the dedicated financial-results feed's PDF link
             # over the general announcement's attachment when available -
             # that feed only contains actual results filings (unlike the
@@ -1385,9 +1459,13 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
                 log.warning(f"⚠️ Concall loop: save failed for {row['symbol']}: {type(e).__name__}: {e}")
             await asyncio.sleep(2)  # small gap between Gemini calls
         if todo:
-            log.info(f"🎙️ Results extraction loop: batch complete")
-        # Faster cadence while backlog exists (todo was non-empty this cycle)
-        await asyncio.sleep(120 if todo else 300)
+            log.info(f"🎙️ Results extraction loop: batch complete"
+                      f"{' (catchup)' if catchup else ''}")
+        # Catchup: keep churning; steady-state: polite idle.
+        if catchup:
+            await asyncio.sleep(20 if todo else 60)
+        else:
+            await asyncio.sleep(120 if todo else 300)
 
 async def _announcements_loop(session: aiohttp.ClientSession):
     """Fetches NSE's corporate announcements feed (all equities in one
