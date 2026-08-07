@@ -26,11 +26,11 @@ log = logging.getLogger('pocketrs')
 # worst case is one wasted retry per restart, not an ongoing drag.
 _BSE_NO_SCRIP_CODE = set()
 
-# Cap concurrent Gemini calls across About/PPT/Transcript/Highlights/Themes.
-# Without this, all loops fire together at Railway boot and burn the free
-# tier RPM (seen 2026-08-07: mass 429s within the first seconds).
+# Cap concurrent Gemini calls across About/PPT/Transcript/Highlights/Themes/
+# Results/Valuation. Free tier is typically ~15 RPM — default to 1 in-flight
+# call so parallel loops can't stampede the quota.
 def _gemini_semaphore() -> asyncio.Semaphore:
-    n = max(1, int(os.getenv('GEMINI_MAX_CONCURRENT', '2')))
+    n = max(1, int(os.getenv('GEMINI_MAX_CONCURRENT', '1')))
     sem = getattr(_gemini_semaphore, '_sem', None)
     if sem is None or getattr(_gemini_semaphore, '_n', None) != n:
         _gemini_semaphore._sem = asyncio.Semaphore(n)
@@ -40,7 +40,7 @@ def _gemini_semaphore() -> asyncio.Semaphore:
 
 async def _gemini_generate(session: aiohttp.ClientSession, url: str, body: dict,
                            timeout_s: float = 120):
-    """POST to Gemini with a process-wide concurrency cap."""
+    """POST to Gemini with a process-wide concurrency cap (+ small gap after)."""
     async with _gemini_semaphore():
         async with session.post(
             url,
@@ -50,10 +50,13 @@ async def _gemini_generate(session: aiohttp.ClientSession, url: str, body: dict,
         ) as r:
             text = await r.text()
             status = r.status
+        # Leave a beat between calls so RPM stays under free-tier caps even
+        # when many loops wake at once.
+        await asyncio.sleep(float(os.getenv('GEMINI_MIN_GAP_SECONDS', '4')))
     try:
         data = json.loads(text) if text else {}
     except Exception:
-        data = {'raw': text[:500]}
+        data = {'raw': (text or '')[:500]}
     return status, data, text
 
 # ══ FUNDAMENTALS-WORKER-ONLY FUNCTIONS ══
@@ -375,27 +378,25 @@ async def extract_ppt_summary(session: aiohttp.ClientSession, symbol: str, attac
     model = os.getenv('GEMINI_CONCALL_MODEL', 'gemini-3.1-flash-lite')
     gemini_timeout = int(os.getenv('GEMINI_PPT_TIMEOUT_SECONDS', '120'))
     try:
-        async with session.post(
+        status, data, body = await _gemini_generate(
+            session,
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
-            headers={"Content-Type": "application/json"},
-            json={
+            {
                 "contents": [{"parts": [
                     {"inline_data": {"mime_type": "application/pdf", "data": pdf_b64}},
                     {"text": prompt},
                 ]}],
                 "generationConfig": {"responseMimeType": "application/json", "responseSchema": schema},
             },
-            timeout=aiohttp.ClientTimeout(total=gemini_timeout),
-        ) as r:
-            if r.status != 200:
-                body = await r.text()
-                if r.status == 429:
-                    log.warning(f"⚠️ Gemini rate-limit hit for {symbol} presentation (429) - backing off")
-                    await asyncio.sleep(int(os.getenv('GEMINI_429_BACKOFF_SECONDS', '30')))
-                else:
-                    log.warning(f"⚠️ Gemini presentation extraction failed for {symbol} ({r.status}): {body[:200]}")
-                return error_result
-            data = await r.json()
+            gemini_timeout,
+        )
+        if status != 200:
+            if status == 429:
+                log.warning(f"⚠️ Gemini rate-limit hit for {symbol} presentation (429) - backing off")
+                await asyncio.sleep(int(os.getenv('GEMINI_429_BACKOFF_SECONDS', '45')))
+            else:
+                log.warning(f"⚠️ Gemini presentation extraction failed for {symbol} ({status}): {body[:200]}")
+            return error_result
     except asyncio.TimeoutError:
         log.warning(f"⚠️ Gemini call timed out for {symbol} presentation ({gemini_timeout}s limit, "
                      f"PDF was {len(pdf_bytes)} bytes) - consider raising GEMINI_PPT_TIMEOUT_SECONDS")
@@ -577,27 +578,25 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
     # than a results table.
     gemini_timeout = int(os.getenv('GEMINI_TRANSCRIPT_TIMEOUT_SECONDS', '180'))
     try:
-        async with session.post(
+        status, data, body = await _gemini_generate(
+            session,
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
-            headers={"Content-Type": "application/json"},
-            json={
+            {
                 "contents": [{"parts": [
                     {"inline_data": {"mime_type": "application/pdf", "data": pdf_b64}},
                     {"text": prompt},
                 ]}],
                 "generationConfig": {"responseMimeType": "application/json", "responseSchema": schema},
             },
-            timeout=aiohttp.ClientTimeout(total=gemini_timeout),
-        ) as r:
-            if r.status != 200:
-                body = await r.text()
-                if r.status == 429:
-                    log.warning(f"⚠️ Gemini rate-limit hit for {symbol} transcript (429) - backing off")
-                    await asyncio.sleep(int(os.getenv('GEMINI_429_BACKOFF_SECONDS', '30')))
-                else:
-                    log.warning(f"⚠️ Gemini transcript extraction failed for {symbol} ({r.status}): {body[:200]}")
-                return error_result
-            data = await r.json()
+            gemini_timeout,
+        )
+        if status != 200:
+            if status == 429:
+                log.warning(f"⚠️ Gemini rate-limit hit for {symbol} transcript (429) - backing off")
+                await asyncio.sleep(int(os.getenv('GEMINI_429_BACKOFF_SECONDS', '45')))
+            else:
+                log.warning(f"⚠️ Gemini transcript extraction failed for {symbol} ({status}): {body[:200]}")
+            return error_result
     except asyncio.TimeoutError:
         log.warning(f"⚠️ Gemini call timed out for {symbol} transcript ({gemini_timeout}s limit, "
                      f"PDF was {len(pdf_bytes)} bytes) - consider raising GEMINI_TRANSCRIPT_TIMEOUT_SECONDS")
@@ -798,31 +797,29 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
     # Oct 16 2026) - cheap, fast, and handles PDF input natively.
     model = os.getenv('GEMINI_CONCALL_MODEL', 'gemini-3.1-flash-lite')
     gemini_timeout = int(os.getenv('GEMINI_TIMEOUT_SECONDS', '120'))
-    # Stage 2: the Gemini call itself.
+    # Stage 2: the Gemini call itself (process-wide concurrency capped).
     try:
-        async with session.post(
+        status, data, body = await _gemini_generate(
+            session,
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
-            headers={"Content-Type": "application/json"},
-            json={
+            {
                 "contents": [{"parts": [
                     {"inline_data": {"mime_type": "application/pdf", "data": pdf_b64}},
                     {"text": prompt},
                 ]}],
                 "generationConfig": {"responseMimeType": "application/json", "responseSchema": schema},
             },
-            timeout=aiohttp.ClientTimeout(total=gemini_timeout),
-        ) as r:
-            if r.status != 200:
-                body = await r.text()
-                if r.status == 429:
-                    log.warning(f"⚠️ Gemini rate-limit hit for {symbol} (429) - free tier's per-minute "
-                                 f"quota exceeded. Pausing this loop briefly to back off; if this recurs "
-                                 f"often, lower RESULTS_PDF_BATCH_SIZE and/or raise RESULTS_PDF_PACING_SECONDS.")
-                    await asyncio.sleep(int(os.getenv('GEMINI_429_BACKOFF_SECONDS', '30')))
-                else:
-                    log.warning(f"⚠️ Gemini results extraction failed for {symbol} ({r.status}): {body[:200]}")
-                return error_result
-            data = await r.json()
+            gemini_timeout,
+        )
+        if status != 200:
+            if status == 429:
+                log.warning(f"⚠️ Gemini rate-limit hit for {symbol} (429) - free tier's per-minute "
+                             f"quota exceeded. Pausing this loop briefly to back off; if this recurs "
+                             f"often, lower RESULTS_PDF_BATCH_SIZE and/or raise RESULTS_PDF_PACING_SECONDS.")
+                await asyncio.sleep(int(os.getenv('GEMINI_429_BACKOFF_SECONDS', '45')))
+            else:
+                log.warning(f"⚠️ Gemini results extraction failed for {symbol} ({status}): {body[:200]}")
+            return error_result
     except asyncio.TimeoutError:
         log.warning(f"⚠️ Gemini call timed out for {symbol} ({gemini_timeout}s limit, "
                      f"PDF was {len(pdf_bytes)} bytes) - consider raising GEMINI_TIMEOUT_SECONDS "
@@ -983,7 +980,7 @@ async def backfill_exceptional_items(session: aiohttp.ClientSession, limit: int 
     done = 0
     for i, row in enumerate(rows):
         if i > 0:
-            await asyncio.sleep(float(os.getenv('RESULTS_PDF_PACING_SECONDS', '5')))
+            await asyncio.sleep(float(os.getenv('RESULTS_PDF_PACING_SECONDS', '8')))
         result = await extract_results_from_pdf(session, row['symbol'], row['attachment_url'])
         if result['error']:
             log.info(f"  🔁 {row['symbol']}: transient error re-fetching, skipping this pass")
@@ -1019,6 +1016,8 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
     headers = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
     _key_status_logged = False
     while True:
+        if await _idle_if_gemini_paused('results', 'Results extraction loop'):
+            continue
         if not os.getenv('GEMINI_API_KEY'):
             if not _key_status_logged:
                 log.warning("🎙️ Results extraction loop: GEMINI_API_KEY not set - loop is idle, "
@@ -1106,7 +1105,7 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
                 # margin for timing jitter - default 5s gives real
                 # headroom (12 RPM effective) while still keeping a
                 # 30-item batch's total pacing time reasonable.
-                await asyncio.sleep(float(os.getenv('RESULTS_PDF_PACING_SECONDS', '5')))
+                await asyncio.sleep(float(os.getenv('RESULTS_PDF_PACING_SECONDS', '8')))
             # Prefer the dedicated financial-results feed's PDF link
             # over the general announcement's attachment when available -
             # that feed only contains actual results filings (unlike the
@@ -1708,10 +1707,10 @@ async def ai_extract_fundamentals_metrics(session: aiohttp.ClientSession, sym: s
     }
     model = os.getenv('GEMINI_CONCALL_MODEL', 'gemini-3.1-flash-lite')
     try:
-        async with session.post(
+        status, data, body = await _gemini_generate(
+            session,
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
-            headers={"Content-Type": "application/json"},
-            json={
+            {
                 "contents": [{"parts": [{"text": prompt}]}],
                 "generationConfig": {
                     "responseMimeType": "application/json",
@@ -1719,17 +1718,15 @@ async def ai_extract_fundamentals_metrics(session: aiohttp.ClientSession, sym: s
                     "temperature": 0.1,
                 },
             },
-            timeout=aiohttp.ClientTimeout(total=90),
-        ) as r:
-            if r.status != 200:
-                body = await r.text()
-                if r.status == 429:
-                    log.warning(f"⚠️ Gemini rate-limit on fund AI fill for {sym} (429)")
-                    await asyncio.sleep(int(os.getenv('GEMINI_429_BACKOFF_SECONDS', '30')))
-                else:
-                    log.warning(f"⚠️ Gemini fund AI fill failed for {sym} ({r.status}): {body[:180]}")
-                return None
-            data = await r.json()
+            90,
+        )
+        if status != 200:
+            if status == 429:
+                log.warning(f"⚠️ Gemini rate-limit on fund AI fill for {sym} (429)")
+                await asyncio.sleep(int(os.getenv('GEMINI_429_BACKOFF_SECONDS', '45')))
+            else:
+                log.warning(f"⚠️ Gemini fund AI fill failed for {sym} ({status}): {body[:180]}")
+            return None
         parts = (data.get('candidates') or [{}])[0].get('content', {}).get('parts', [])
         raw = ''.join(p.get('text', '') for p in parts).strip()
         parsed = json.loads(raw)
@@ -1761,6 +1758,8 @@ async def _valuation_ai_catchup_loop(session: aiohttp.ClientSession):
     while True:
         if is_market_open():
             await asyncio.sleep(300)
+            continue
+        if await _idle_if_gemini_paused('valuation', 'Valuation AI catchup'):
             continue
         if not os.getenv('GEMINI_API_KEY'):
             if not _key_logged:
@@ -1815,7 +1814,7 @@ async def _valuation_ai_catchup_loop(session: aiohttp.ClientSession):
             for i, row in enumerate(todo):
                 sym = row['sym']
                 if i > 0:
-                    await asyncio.sleep(float(os.getenv('RESULTS_PDF_PACING_SECONDS', '5')))
+                    await asyncio.sleep(float(os.getenv('RESULTS_PDF_PACING_SECONDS', '8')))
                 # 1) Regex scrape (cheap when Screener cooperates)
                 scraped = await fetch_fundamentals_screener(session, sym)
                 merged = {k: row.get(k) for k in _AI_FUND_ALL}
@@ -1922,6 +1921,8 @@ async def _ppt_summary_loop(session: aiohttp.ClientSession):
     headers = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
     _key_status_logged = False
     while True:
+        if await _idle_if_gemini_paused('ppt', 'PPT summary loop'):
+            continue
         if not os.getenv('GEMINI_API_KEY'):
             if not _key_status_logged:
                 log.warning("🎙️ PPT summary loop: GEMINI_API_KEY not set - loop is idle")
@@ -1992,7 +1993,7 @@ async def _ppt_summary_loop(session: aiohttp.ClientSession):
                       f"thin={len(thin)}), nothing new")
         for i, row in enumerate(todo):
             if i > 0:
-                await asyncio.sleep(float(os.getenv('RESULTS_PDF_PACING_SECONDS', '5')))
+                await asyncio.sleep(float(os.getenv('RESULTS_PDF_PACING_SECONDS', '8')))
             result = await extract_ppt_summary(session, row['symbol'], row['attachment_url'])
             if result['error']:
                 log.info(f"  🎙️ {row['symbol']}: will retry presentation next cycle (transient error, not saved)")
@@ -2045,6 +2046,8 @@ async def _transcript_summary_loop(session: aiohttp.ClientSession):
     headers = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
     _key_status_logged = False
     while True:
+        if await _idle_if_gemini_paused('transcript', 'Transcript summary loop'):
+            continue
         if not os.getenv('GEMINI_API_KEY'):
             if not _key_status_logged:
                 log.warning("🎙️ Transcript summary loop: GEMINI_API_KEY not set - loop is idle")
@@ -2112,7 +2115,7 @@ async def _transcript_summary_loop(session: aiohttp.ClientSession):
                       f"({len(transcript_rows)} matched transcript filter, already={len(already)}), nothing new")
         for i, row in enumerate(todo):
             if i > 0:
-                await asyncio.sleep(float(os.getenv('RESULTS_PDF_PACING_SECONDS', '5')))
+                await asyncio.sleep(float(os.getenv('RESULTS_PDF_PACING_SECONDS', '8')))
             result = await extract_transcript_summary(session, row['symbol'], row['attachment_url'])
             if result['error']:
                 log.info(f"  🎙️ {row['symbol']}: will retry transcript next cycle (transient error, not saved)")
@@ -3428,39 +3431,25 @@ async def extract_about_company(session: aiohttp.ClientSession, symbol: str, ppt
         body["tools"] = [{"google_search": {}}]
 
     try:
-        async with session.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
-            headers={"Content-Type": "application/json"},
-            json=body,
-            timeout=aiohttp.ClientTimeout(total=120),
-        ) as r:
-            if r.status != 200:
-                body_txt = await r.text()
-                # Some models reject tools+request; retry once without search.
-                if use_search and r.status in (400, 404):
-                    log.warning(f"⚠️ Gemini about-company web-search rejected for {symbol} "
-                                f"({r.status}) — retrying without search")
-                    body.pop('tools', None)
-                    async with session.post(
-                        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
-                        headers={"Content-Type": "application/json"},
-                        json=body,
-                        timeout=aiohttp.ClientTimeout(total=90),
-                    ) as r2:
-                        if r2.status != 200:
-                            body2 = await r2.text()
-                            log.warning(f"⚠️ Gemini about-company failed for {symbol} ({r2.status}): {body2[:180]}")
-                            return error_result
-                        data = await r2.json()
-                elif r.status == 429:
-                    log.warning(f"⚠️ Gemini rate-limit on about-company for {symbol} (429)")
-                    await asyncio.sleep(int(os.getenv('GEMINI_429_BACKOFF_SECONDS', '30')))
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+        status, data, body_txt = await _gemini_generate(session, url, body, 120)
+        if status != 200:
+            # Some models reject tools+request; retry once without search.
+            if use_search and status in (400, 404):
+                log.warning(f"⚠️ Gemini about-company web-search rejected for {symbol} "
+                            f"({status}) — retrying without search")
+                body.pop('tools', None)
+                status, data, body2 = await _gemini_generate(session, url, body, 90)
+                if status != 200:
+                    log.warning(f"⚠️ Gemini about-company failed for {symbol} ({status}): {body2[:180]}")
                     return error_result
-                else:
-                    log.warning(f"⚠️ Gemini about-company failed for {symbol} ({r.status}): {body_txt[:180]}")
-                    return error_result
+            elif status == 429:
+                log.warning(f"⚠️ Gemini rate-limit on about-company for {symbol} (429)")
+                await asyncio.sleep(int(os.getenv('GEMINI_429_BACKOFF_SECONDS', '45')))
+                return error_result
             else:
-                data = await r.json()
+                log.warning(f"⚠️ Gemini about-company failed for {symbol} ({status}): {body_txt[:180]}")
+                return error_result
     except Exception as e:
         log.warning(f"⚠️ Gemini about-company call failed for {symbol}: {type(e).__name__}: {e}")
         return error_result
@@ -3575,35 +3564,22 @@ async def extract_stock_themes_ai(session: aiohttp.ClientSession, symbol: str,
     if use_search:
         body["tools"] = [{"google_search": {}}]
     try:
-        async with session.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
-            headers={"Content-Type": "application/json"},
-            json=body,
-            timeout=aiohttp.ClientTimeout(total=120),
-        ) as r:
-            if r.status != 200:
-                txt = await r.text()
-                if use_search and r.status in (400, 404):
-                    body.pop('tools', None)
-                    async with session.post(
-                        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
-                        headers={"Content-Type": "application/json"},
-                        json=body,
-                        timeout=aiohttp.ClientTimeout(total=90),
-                    ) as r2:
-                        if r2.status != 200:
-                            log.warning(f"⚠️ Themes AI failed for {symbol} ({r2.status}): {(await r2.text())[:160]}")
-                            return None
-                        data = await r2.json()
-                elif r.status == 429:
-                    log.warning(f"⚠️ Gemini rate-limit on stock themes for {symbol} (429)")
-                    await asyncio.sleep(int(os.getenv('GEMINI_429_BACKOFF_SECONDS', '30')))
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+        status, data, txt = await _gemini_generate(session, url, body, 120)
+        if status != 200:
+            if use_search and status in (400, 404):
+                body.pop('tools', None)
+                status, data, txt2 = await _gemini_generate(session, url, body, 90)
+                if status != 200:
+                    log.warning(f"⚠️ Themes AI failed for {symbol} ({status}): {txt2[:160]}")
                     return None
-                else:
-                    log.warning(f"⚠️ Themes AI failed for {symbol} ({r.status}): {txt[:160]}")
-                    return None
+            elif status == 429:
+                log.warning(f"⚠️ Gemini rate-limit on stock themes for {symbol} (429)")
+                await asyncio.sleep(int(os.getenv('GEMINI_429_BACKOFF_SECONDS', '45')))
+                return None
             else:
-                data = await r.json()
+                log.warning(f"⚠️ Themes AI failed for {symbol} ({status}): {txt[:160]}")
+                return None
         parts = (data.get('candidates') or [{}])[0].get('content', {}).get('parts', [])
         raw = ''.join(p.get('text', '') for p in parts).strip()
         parsed = _parse_json_object(raw)
@@ -3638,6 +3614,8 @@ async def _stock_themes_loop(session: aiohttp.ClientSession):
     STALE_DAYS = int(os.getenv('STOCK_THEMES_STALE_DAYS', '45'))
     _key_logged = False
     while True:
+        if await _idle_if_gemini_paused('themes', 'Stock-themes loop'):
+            continue
         if not os.getenv('GEMINI_API_KEY'):
             if not _key_logged:
                 log.warning("🌱 Stock-themes loop: GEMINI_API_KEY not set - loop idle")
@@ -4008,20 +3986,18 @@ async def extract_management_flags(session: aiohttp.ClientSession, symbol: str, 
         "generationConfig": {"temperature": 0.2},
     }
     try:
-        async with session.post(
+        status, data, txt = await _gemini_generate(
+            session,
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
-            headers={"Content-Type": "application/json"},
-            json=body,
-            timeout=aiohttp.ClientTimeout(total=90),
-        ) as r:
-            if r.status != 200:
-                txt = await r.text()
-                if r.status == 429:
-                    await asyncio.sleep(int(os.getenv('GEMINI_429_BACKOFF_SECONDS', '30')))
-                    return None
-                log.warning(f"⚠️ Mgmt-flags AI failed for {symbol} ({r.status}): {txt[:160]}")
+            body,
+            90,
+        )
+        if status != 200:
+            if status == 429:
+                await asyncio.sleep(int(os.getenv('GEMINI_429_BACKOFF_SECONDS', '45')))
                 return None
-            data = await r.json()
+            log.warning(f"⚠️ Mgmt-flags AI failed for {symbol} ({status}): {txt[:160]}")
+            return None
         parts = (data.get('candidates') or [{}])[0].get('content', {}).get('parts', [])
         raw = ''.join(p.get('text', '') for p in parts).strip()
         parsed = _parse_json_object(raw)
@@ -4104,34 +4080,21 @@ async def answer_stock_ai_ask(session: aiohttp.ClientSession, symbol: str, quest
     if use_web:
         body["tools"] = [{"google_search": {}}]
     try:
-        async with session.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
-            headers={"Content-Type": "application/json"},
-            json=body,
-            timeout=aiohttp.ClientTimeout(total=130 if use_web else 90),
-        ) as r:
-            if r.status != 200:
-                txt = await r.text()
-                if use_web and r.status in (400, 404):
-                    body.pop('tools', None)
-                    async with session.post(
-                        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
-                        headers={"Content-Type": "application/json"},
-                        json=body,
-                        timeout=aiohttp.ClientTimeout(total=100),
-                    ) as r2:
-                        if r2.status != 200:
-                            log.warning(f"⚠️ Ask-AI failed for {symbol} ({r2.status}): {(await r2.text())[:160]}")
-                            return None
-                        data = await r2.json()
-                elif r.status == 429:
-                    await asyncio.sleep(int(os.getenv('GEMINI_429_BACKOFF_SECONDS', '30')))
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+        status, data, txt = await _gemini_generate(session, url, body, 130 if use_web else 90)
+        if status != 200:
+            if use_web and status in (400, 404):
+                body.pop('tools', None)
+                status, data, txt2 = await _gemini_generate(session, url, body, 100)
+                if status != 200:
+                    log.warning(f"⚠️ Ask-AI failed for {symbol} ({status}): {txt2[:160]}")
                     return None
-                else:
-                    log.warning(f"⚠️ Ask-AI failed for {symbol} ({r.status}): {txt[:160]}")
-                    return None
+            elif status == 429:
+                await asyncio.sleep(int(os.getenv('GEMINI_429_BACKOFF_SECONDS', '45')))
+                return None
             else:
-                data = await r.json()
+                log.warning(f"⚠️ Ask-AI failed for {symbol} ({status}): {txt[:160]}")
+                return None
         parts = (data.get('candidates') or [{}])[0].get('content', {}).get('parts', [])
         raw = ''.join(p.get('text', '') for p in parts).strip()
         parsed = _parse_json_object(raw)
@@ -4157,10 +4120,12 @@ async def _mgmt_flags_loop(session: aiohttp.ClientSession):
     PPT/concall summaries on file — no web search."""
     headers = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
     CHECK_INTERVAL = int(os.getenv('MGMT_FLAGS_INTERVAL_SEC', '720'))
-    BATCH = int(os.getenv('MGMT_FLAGS_BATCH', '8'))
+    BATCH = int(os.getenv('MGMT_FLAGS_BATCH', '4'))
     STALE_DAYS = int(os.getenv('MGMT_FLAGS_STALE_DAYS', '30'))
     _key_logged = False
     while True:
+        if await _idle_if_gemini_paused('flags', 'Mgmt-flags loop'):
+            continue
         if not os.getenv('GEMINI_API_KEY'):
             if not _key_logged:
                 log.warning("🚩 Mgmt-flags loop: GEMINI_API_KEY not set - idle")
@@ -4438,10 +4403,10 @@ async def extract_fundamentals_highlights(session: aiohttp.ClientSession, row: d
     }
     model = os.getenv('GEMINI_CONCALL_MODEL', 'gemini-3.1-flash-lite')
     try:
-        async with session.post(
+        status, data, body = await _gemini_generate(
+            session,
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
-            headers={"Content-Type": "application/json"},
-            json={
+            {
                 "contents": [{"parts": [{"text": prompt}]}],
                 "generationConfig": {
                     "responseMimeType": "application/json",
@@ -4449,17 +4414,15 @@ async def extract_fundamentals_highlights(session: aiohttp.ClientSession, row: d
                     "temperature": 0.2,
                 },
             },
-            timeout=aiohttp.ClientTimeout(total=60),
-        ) as r:
-            if r.status != 200:
-                body = await r.text()
-                if r.status == 429:
-                    log.warning(f"⚠️ Gemini rate-limit on fund highlights for {sym} (429)")
-                    await asyncio.sleep(int(os.getenv('GEMINI_429_BACKOFF_SECONDS', '30')))
-                else:
-                    log.warning(f"⚠️ Gemini fund highlights failed for {sym} ({r.status}): {body[:180]}")
-                return None
-            data = await r.json()
+            60,
+        )
+        if status != 200:
+            if status == 429:
+                log.warning(f"⚠️ Gemini rate-limit on fund highlights for {sym} (429)")
+                await asyncio.sleep(int(os.getenv('GEMINI_429_BACKOFF_SECONDS', '45')))
+            else:
+                log.warning(f"⚠️ Gemini fund highlights failed for {sym} ({status}): {body[:180]}")
+            return None
         parts = (data.get('candidates') or [{}])[0].get('content', {}).get('parts', [])
         raw = ''.join(p.get('text', '') for p in parts).strip()
         parsed = _parse_json_object(raw) or json.loads(raw)
@@ -4493,10 +4456,12 @@ async def _fundamentals_ai_highlights_loop(session: aiohttp.ClientSession):
     Fundamentals tab. Runs after valuation fields exist; refresh periodically."""
     headers = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
     CHECK_INTERVAL = int(os.getenv('FUND_HIGHLIGHTS_INTERVAL_SEC', '600'))
-    BATCH = int(os.getenv('FUND_HIGHLIGHTS_BATCH', '12'))
+    BATCH = int(os.getenv('FUND_HIGHLIGHTS_BATCH', '4'))
     STALE_DAYS = int(os.getenv('FUND_HIGHLIGHTS_STALE_DAYS', '30'))
     _key_logged = False
     while True:
+        if await _idle_if_gemini_paused('highlights', 'Fund-highlights loop'):
+            continue
         if not os.getenv('GEMINI_API_KEY'):
             if not _key_logged:
                 log.warning("📌 Fund-highlights loop: GEMINI_API_KEY not set - loop idle")
@@ -4620,6 +4585,8 @@ async def _about_company_loop(session: aiohttp.ClientSession):
     headers = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
     _key_status_logged = False
     while True:
+        if await _idle_if_gemini_paused('about', 'About-company loop'):
+            continue
         if not os.getenv('GEMINI_API_KEY'):
             if not _key_status_logged:
                 log.warning("📘 About-company loop: GEMINI_API_KEY not set - loop is idle")
@@ -4627,11 +4594,12 @@ async def _about_company_loop(session: aiohttp.ClientSession):
             await asyncio.sleep(300)
             continue
         # Keep About batch modest — free-tier Gemini RPM is shared with PPT/transcript.
-        BATCH_SIZE = int(os.getenv('ABOUT_COMPANY_BATCH_SIZE', '4'))
+        BATCH_SIZE = int(os.getenv('ABOUT_COMPANY_BATCH_SIZE', '3'))
         if not _key_status_logged:
             log.info(f"📘 About-company loop: active with web search "
                       f"(batch={BATCH_SIZE}, ABOUT_COMPANY_WEB_SEARCH="
-                      f"{os.getenv('ABOUT_COMPANY_WEB_SEARCH', '1')})")
+                      f"{os.getenv('ABOUT_COMPANY_WEB_SEARCH', '1')}, "
+                      f"GEMINI_FOCUS={os.getenv('GEMINI_FOCUS', 'all')})")
             _key_status_logged = True
         try:
             async with session.get(
@@ -4748,7 +4716,7 @@ async def _about_company_loop(session: aiohttp.ClientSession):
         for i, (sym, ppt, tx, src_at) in enumerate(todo):
             if i > 0:
                 await asyncio.sleep(float(os.getenv('ABOUT_COMPANY_PACING_SECONDS',
-                                                    os.getenv('RESULTS_PDF_PACING_SECONDS', '8'))))
+                                                    os.getenv('RESULTS_PDF_PACING_SECONDS', '12'))))
             meta = meta_by_sym.get(sym) or {}
             result = await extract_about_company(
                 session, sym, ppt, tx,
@@ -4902,12 +4870,14 @@ async def fundamentals_worker_main():
             _bse_missing_backfill_loop(session),
             _bse_stale_results_loop(session),
             # Stagger Gemini-heavy loops so boot doesn't stampede free-tier RPM.
+            # GEMINI_FOCUS=about starts About immediately; other Gemini loops self-pause.
             _delayed(0, _concall_summary_loop(session)),
             _delayed(20, _transcript_summary_loop(session)),
             _delayed(40, _ppt_summary_loop(session)),
-            _delayed(60, _about_company_loop(session)),
+            _delayed(0 if (os.getenv('GEMINI_FOCUS') or '').strip().lower() == 'about' else 60,
+                     _about_company_loop(session)),
             _delayed(80, _fundamentals_ai_highlights_loop(session)),
-            _delayed(10, _stock_themes_loop(session)),  # sync-first is cheap
+            _delayed(10, _stock_themes_loop(session)),
             _delayed(100, _mgmt_flags_loop(session)),
             _delayed(30, _stock_ai_asks_loop(session)),
         )
@@ -4917,6 +4887,28 @@ async def _delayed(seconds: float, coro):
     if seconds > 0:
         await asyncio.sleep(seconds)
     await coro
+
+
+def _gemini_focus_allows(feature: str) -> bool:
+    """GEMINI_FOCUS=about (or comma list) limits free-tier RPM to those loops.
+    Empty / all / * = every Gemini feature runs. Interactive Ask-AI always allowed."""
+    if feature == 'asks':
+        return True
+    raw = (os.getenv('GEMINI_FOCUS') or 'all').strip().lower()
+    if not raw or raw in ('all', '*'):
+        return True
+    allowed = {x.strip() for x in raw.split(',') if x.strip()}
+    return feature in allowed
+
+
+async def _idle_if_gemini_paused(feature: str, label: str):
+    """Park a Gemini loop when GEMINI_FOCUS excludes it (e.g. About-first backfill)."""
+    if _gemini_focus_allows(feature):
+        return False
+    log.info(f"⏸️ {label}: paused (GEMINI_FOCUS={os.getenv('GEMINI_FOCUS')})")
+    while not _gemini_focus_allows(feature):
+        await asyncio.sleep(300)
+    return True
 
 def rate_announcements_free(rows: list) -> list:
     """Zero-cost rule-based fallback for when ANTHROPIC_API_KEY isn't
