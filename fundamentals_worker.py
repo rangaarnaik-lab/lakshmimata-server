@@ -1682,26 +1682,8 @@ def _html_to_compact_text(html: str, limit: int = 90000) -> str:
     return text[:limit]
 
 async def _fetch_screener_html(session: aiohttp.ClientSession, sym: str) -> str:
-    if _screener_disabled():
-        return ''
-    url = f"https://www.screener.in/company/{sym}/consolidated/"
-    headers = random.choice(_SCREENER_HEADER_SETS)
-    try:
-        async with session.get(url, headers=headers,
-                               timeout=aiohttp.ClientTimeout(total=15)) as r:
-            if r.status == 404:
-                url2 = f"https://www.screener.in/company/{sym}/"
-                async with session.get(url2, headers=headers,
-                                       timeout=aiohttp.ClientTimeout(total=15)) as r2:
-                    if r2.status != 200:
-                        return ''
-                    return await r2.text()
-            if r.status != 200:
-                return ''
-            return await r.text()
-    except Exception as e:
-        log.warning(f"⚠️ Screener HTML fetch failed for {sym}: {type(e).__name__}: {e}")
-        return ''
+    # Screener scrapes disabled — see _screener_disabled() / ENABLE_SCREENER.
+    return ''
 
 async def ai_extract_fundamentals_metrics(session: aiohttp.ClientSession, sym: str, html: str):
     """Gemini flash-lite structured extract of valuation / cash-flow / bank
