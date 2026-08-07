@@ -4972,10 +4972,11 @@ async def _about_company_loop(session: aiohttp.ClientSession):
         if hit_429:
             await asyncio.sleep(int(os.getenv('ABOUT_COMPANY_429_COOLDOWN_SECONDS', '180')))
         else:
-            # Faster cycles while backlog remains (batch=1 + free-tier pacing).
+            # Slow-and-steady on free tier (batch=1). Override with
+            # ABOUT_COMPANY_CYCLE_SECONDS if you want faster/slower.
             await asyncio.sleep(int(os.getenv(
                 'ABOUT_COMPANY_CYCLE_SECONDS',
-                '45' if todo else '300')))
+                '120' if todo else '300')))
 
 
 async def fundamentals_worker_main():
