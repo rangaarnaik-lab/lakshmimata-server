@@ -4735,15 +4735,22 @@ async def _about_company_loop(session: aiohttp.ClientSession):
             )
             prev = existing_map.get(sym)
             needs = False
+            web_on = os.getenv('ABOUT_COMPANY_WEB_SEARCH', '0').strip() not in (
+                '0', 'false', 'False')
+            # Only re-queue done rows for missing sources/logo when web search
+            # is ON. Filings-only never produces grounding URLs — old default
+            # stuck on BAJFINANCE forever (backlog never dropped).
+            backfill = os.getenv(
+                'ABOUT_COMPANY_WEB_BACKFILL',
+                '1' if web_on else '0',
+            ).strip() not in ('0', 'false', 'False')
             if not prev or prev.get('status') != 'done':
                 needs = True
             elif src_at and (prev.get('source_announced_at') or '') < src_at:
                 needs = True  # newer filing since last brief
-            elif prev.get('status') == 'done' and (
-                    not prev.get('sources') or not prev.get('image_url')) and os.getenv(
-                    'ABOUT_COMPANY_WEB_BACKFILL', '1').strip() not in ('0', 'false', 'False'):
-                # Upgrade filing-only / logo-missing briefs.
-                needs = True
+            elif (prev.get('status') == 'done' and web_on and backfill
+                  and (not prev.get('sources') or not prev.get('image_url'))):
+                needs = True  # upgrade filing-only / logo-missing via web
             if not needs:
                 continue
             mcap = ((fund_by_sym.get(sym) or {}).get('market_cap')
