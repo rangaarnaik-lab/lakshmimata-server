@@ -809,19 +809,16 @@ async def ensure_fundamentals_table(session: aiohttp.ClientSession,
     return False
 
 def _screener_disabled() -> bool:
-    """SKIP_SCREENER=1 (or PAUSE_SCREENER) skips all Screener.in scrapes.
-    Also auto-skips while GEMINI_FOCUS=about so About backfill isn't starved
-    by fundamentals scrape noise on Railway."""
-    v = (os.getenv('SKIP_SCREENER') or os.getenv('PAUSE_SCREENER') or '').strip().lower()
-    if v in ('1', 'true', 'yes', 'on'):
-        return True
-    focus = (os.getenv('GEMINI_FOCUS') or '').strip().lower()
-    return focus == 'about'
+    """Screener.in scrapes are disabled — Railway IP is rate-limited/blocked
+    and the noise starves useful work. Upstox (+ existing DB) is the source.
+    Set ENABLE_SCREENER=1 only if you intentionally want scrapes again."""
+    v = (os.getenv('ENABLE_SCREENER') or '').strip().lower()
+    return v not in ('1', 'true', 'yes', 'on')
 
 
 def _fundamentals_fetch_paused() -> bool:
-    """PAUSE_FUNDAMENTALS_FETCH=1 parks Upstox+Screener batch fetches.
-    Auto-pauses while GEMINI_FOCUS=about."""
+    """PAUSE_FUNDAMENTALS_FETCH=1 parks Upstox batch fetches.
+    Auto-pauses while GEMINI_FOCUS=about so About can use the box."""
     v = (os.getenv('PAUSE_FUNDAMENTALS_FETCH') or '').strip().lower()
     if v in ('1', 'true', 'yes', 'on'):
         return True
@@ -1432,7 +1429,7 @@ async def load_fundamentals_batch(session: aiohttp.ClientSession, symbols: list)
     if not to_fetch:
         return
 
-    log.info(f"  Fetching fundamentals for {len(to_fetch)} stocks (Upstox API primary, Screener.in fallback)…")
+    log.info(f"  Fetching fundamentals for {len(to_fetch)} stocks (Upstox API)…")
     if 'TARSONS' in to_fetch:
         log.info(f"  🔍 TARSONS is in this batch's to_fetch list (position {to_fetch.index('TARSONS')}/{len(to_fetch)})")
     elif 'TARSONS' in symbols:
@@ -1446,32 +1443,22 @@ async def load_fundamentals_batch(session: aiohttp.ClientSession, symbols: list)
     async def fetch_one_fundamentals(sym, debug):
         isin = isin_for(sym)
         upstox_data = await fetch_upstox_fundamentals(session, sym, isin, debug=debug) if isin else None
+        # Screener.in fallback removed — Railway IP is blocked/rate-limited
+        # and scrapes only produced noise. Missing fields stay None until
+        # Upstox/CSV/other sources fill them.
         if upstox_data is not None:
-            # Upstox's key-ratios endpoint NEVER returns Market Cap, EPS,
-            # or Debt-Equity (confirmed against real responses) — those
-            # three fields are always None here regardless of how
-            # successful the Upstox call was. A previous version of this
-            # function deliberately skipped the Screener.in fallback for
-            # just these 3 fields (to reduce scraping load), but since
-            # Upstox succeeds for most stocks, that meant Market Cap was
-            # blank for the MAJORITY of the scanner, not a rare edge case
-            # — confirmed via a live screenshot showing ~80% of rows with
-            # a populated P/E (from Upstox) but no Market Cap. Market Cap
-            # in particular is used throughout the app (filters, order-
-            # size tagging, Best Picks scoring), so it's worth the extra
-            # Screener.in call whenever it's the one still missing —
-            # same scraping load the app already ran before that
-            # optimization, just re-enabled for the fields Upstox can't
-            # provide at all.
-            if not upstox_data.get('industry') or upstox_data.get('market_cap') is None:
-                screener_data = await fetch_fundamentals_screener(session, sym, debug=debug)
-                if screener_data.get('industry') and not upstox_data.get('industry'):
-                    upstox_data['industry'] = screener_data['industry']
-                for f in ('market_cap', 'eps', 'debt_eq', 'shares_outstanding'):
-                    if upstox_data.get(f) is None and screener_data.get(f) is not None:
-                        upstox_data[f] = screener_data[f]
             return upstox_data
-        return await fetch_fundamentals_screener(session, sym, debug=debug)
+        return {
+            'market_cap': None, 'pe': None, 'roe': None, 'eps': None, 'debt_eq': None, 'promoter': None,
+            'eps_qoq': None, 'eps_yoy': None, 'sales_qoq': None, 'sales_yoy': None,
+            'opm_pct': None, 'opm_trend': None, 'eps_growth_streak': None,
+            'fii_pct': None, 'fii_trend': None, 'dii_pct': None, 'dii_trend': None,
+            'promoter_trend': None, 'peg_ratio': None, 'industry': None,
+            'shares_outstanding': None,
+            'pb': None, 'roce': None, 'industry_pe': None, 'div_yield': None,
+            'cfo': None, 'fcf': None, 'cfo_pat': None,
+            'nim': None, 'gnpa': None, 'nnpa': None, 'car': None, 'casa': None,
+        }
 
 
     global _fundamentals_debug_count
