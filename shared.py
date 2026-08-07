@@ -828,6 +828,9 @@ async def fetch_fundamentals_screener(session: aiohttp.ClientSession, sym: str, 
         'fii_pct': None, 'fii_trend': None, 'dii_pct': None, 'dii_trend': None,
         'promoter_trend': None, 'peg_ratio': None, 'industry': None,
         'shares_outstanding': None,
+        'pb': None, 'roce': None, 'industry_pe': None, 'div_yield': None,
+        'cfo': None, 'fcf': None, 'cfo_pat': None,
+        'nim': None, 'gnpa': None, 'nnpa': None, 'car': None, 'casa': None,
     }
     try:
         async with session.get(url, headers=headers,
@@ -884,6 +887,29 @@ async def fetch_fundamentals_screener(session: aiohttp.ClientSession, sym: str, 
         result['roe']        = parse_number(extract_ratio('ROE', html))
         result['eps']        = parse_number(extract_ratio('EPS', html))
         result['debt_eq']    = parse_number(extract_ratio('Debt to equity', html))
+        # Valuation extras — P/B and ROCE matter for banks & capital-heavy names;
+        # industry PE puts the stock's PE in context.
+        result['pb'] = (parse_number(extract_ratio('Price to book value', html))
+                        or parse_number(extract_ratio('Price to Book', html))
+                        or parse_number(extract_ratio('P/B', html)))
+        result['roce'] = parse_number(extract_ratio('ROCE', html))
+        result['industry_pe'] = (parse_number(extract_ratio('Industry PE', html))
+                                 or parse_number(extract_ratio('Industry P/E', html)))
+        result['div_yield'] = (parse_number(extract_ratio('Dividend Yield', html))
+                               or parse_number(extract_ratio('Dividend yield', html)))
+        # Bank / NBFC ratios — Screener only fills these for financials;
+        # leave null for everyone else.
+        result['nim'] = (parse_number(extract_ratio('Net Interest Margin', html))
+                         or parse_number(extract_ratio('NIM', html)))
+        result['gnpa'] = (parse_number(extract_ratio('Gross NPA', html))
+                          or parse_number(extract_ratio('Gross NPA %', html)))
+        result['nnpa'] = (parse_number(extract_ratio('Net NPA', html))
+                          or parse_number(extract_ratio('Net NPA %', html)))
+        result['car'] = (parse_number(extract_ratio('Capital Adequacy Ratio', html))
+                         or parse_number(extract_ratio('CRAR', html))
+                         or parse_number(extract_ratio('CAR', html)))
+        result['casa'] = (parse_number(extract_ratio('CASA', html))
+                          or parse_number(extract_ratio('CASA %', html)))
 
         # Shares outstanding = market cap ÷ Screener's own "Current Price"
         # snapshot at scrape time. This is the key to keeping market cap
@@ -1022,6 +1048,26 @@ async def fetch_fundamentals_screener(session: aiohttp.ClientSession, sym: str, 
         if result['pe'] and result['eps_yoy'] and result['eps_yoy'] > 0:
             result['peg_ratio'] = round(result['pe'] / result['eps_yoy'], 2)
 
+        # Cash-flow table (annual on Screener) — Operating CFO and Free Cash Flow.
+        # Prefer an explicit Free Cash Flow row; otherwise leave fcf null
+        # (don't invent FCF from investing cash which mixes M&A/capex).
+        cfo_series = (extract_row_series('Cash from Operating Activity', html)
+                      or extract_row_series('Cash from Operations', html))
+        fcf_series = extract_row_series('Free Cash Flow', html)
+        cfo_valid = [v for v in cfo_series if v is not None]
+        fcf_valid = [v for v in fcf_series if v is not None]
+        if cfo_valid:
+            result['cfo'] = cfo_valid[-1]
+        if fcf_valid:
+            result['fcf'] = fcf_valid[-1]
+        # CFO / PAT quality check when we have a recent PAT (₹ Cr) from
+        # quarterly Net Profit row — conversion ratio, not a %.
+        pat_series = (extract_row_series('Net Profit', html)
+                      or extract_row_series('Profit after tax', html))
+        pat_valid = [v for v in pat_series if v is not None]
+        if result['cfo'] is not None and pat_valid and pat_valid[-1] not in (0, None):
+            result['cfo_pat'] = round(result['cfo'] / abs(pat_valid[-1]), 2)
+
         # Shareholding Pattern table — promoter/FII/DII holding + trend
         promoter_series = extract_row_series('Promoters', html)
         fii_series      = extract_row_series('FIIs', html)
@@ -1089,6 +1135,9 @@ async def fetch_upstox_fundamentals(session: aiohttp.ClientSession, sym: str, is
         'fii_pct': None, 'fii_trend': None, 'dii_pct': None, 'dii_trend': None,
         'promoter_trend': None, 'peg_ratio': None, 'industry': None,
         'shares_outstanding': None,
+        'pb': None, 'roce': None, 'industry_pe': None, 'div_yield': None,
+        'cfo': None, 'fcf': None, 'cfo_pat': None,
+        'nim': None, 'gnpa': None, 'nnpa': None, 'car': None, 'casa': None,
     }
     got_any = False
 
@@ -1140,6 +1189,8 @@ async def fetch_upstox_fundamentals(session: aiohttp.ClientSession, sym: str, is
                 got_any = True
                 result['pe']  = ratio_map.get('P/E') or ratio_map.get('PE')
                 result['roe'] = ratio_map.get('ROE')
+                result['pb']  = ratio_map.get('P/B') or ratio_map.get('PB') or ratio_map.get('Price to Book')
+                result['roce'] = ratio_map.get('ROCE')
                 # Market Cap/EPS/Debt-Equity aren't in this endpoint's
                 # response (confirmed against real data) — left None
                 # here so the Screener.in fallback fills them in.
@@ -1317,7 +1368,9 @@ async def load_fundamentals_batch(session: aiohttp.ClientSession, symbols: list)
     DATA_FIELDS = ('market_cap', 'pe', 'roe', 'eps', 'debt_eq', 'promoter',
                    'eps_qoq', 'eps_yoy', 'sales_qoq', 'sales_yoy', 'opm_pct',
                    'opm_trend', 'eps_growth_streak', 'fii_pct', 'fii_trend',
-                   'dii_pct', 'dii_trend', 'promoter_trend', 'peg_ratio', 'industry')
+                   'dii_pct', 'dii_trend', 'promoter_trend', 'peg_ratio', 'industry',
+                   'pb', 'roce', 'industry_pe', 'div_yield', 'cfo', 'fcf', 'cfo_pat',
+                   'nim', 'gnpa', 'nnpa', 'car', 'casa')
     def is_blank_cache(sym):
         c = fundamentals_cache.get(sym)
         return c is not None and all(c.get(f) is None for f in DATA_FIELDS)
@@ -1330,11 +1383,19 @@ async def load_fundamentals_batch(session: aiohttp.ClientSession, symbols: list)
         c = fundamentals_cache.get(sym)
         return c is not None and c.get('market_cap') is None and not is_blank_cache(sym)
 
+    def missing_ext_cache(sym):
+        # Valuation / cash-flow / bank fields added later — re-scrape once.
+        c = fundamentals_cache.get(sym)
+        if c is None or is_blank_cache(sym):
+            return False
+        return all(c.get(k) is None for k in ('pb', 'roce', 'cfo', 'nim', 'div_yield'))
+
     to_fetch = [
         sym for sym in symbols
         if sym not in fundamentals_cache
         or is_blank_cache(sym)  # scrape failed last time — don't wait out the TTL
         or missing_mcap_cache(sym)
+        or missing_ext_cache(sym)
         or (now - fundamentals_cache[sym].get('fetched_at', 0)) > FUNDAMENTALS_TTL
     ]
     if not to_fetch:
@@ -1457,7 +1518,9 @@ async def load_fundamentals_from_supabase(session: aiohttp.ClientSession) -> lis
     DATA_FIELDS = ('market_cap', 'pe', 'roe', 'eps', 'debt_eq', 'promoter',
                    'eps_qoq', 'eps_yoy', 'sales_qoq', 'sales_yoy', 'opm_pct',
                    'opm_trend', 'eps_growth_streak', 'fii_pct', 'fii_trend',
-                   'dii_pct', 'dii_trend', 'promoter_trend', 'peg_ratio', 'industry')
+                   'dii_pct', 'dii_trend', 'promoter_trend', 'peg_ratio', 'industry',
+                   'pb', 'roce', 'industry_pe', 'div_yield', 'cfo', 'fcf', 'cfo_pat',
+                   'nim', 'gnpa', 'nnpa', 'car', 'casa')
 
     while True:
         try:
@@ -1466,7 +1529,8 @@ async def load_fundamentals_from_supabase(session: aiohttp.ClientSession) -> lis
                 f"{SUPABASE_URL}/rest/v1/stock_fundamentals"
                 f"?select=sym,market_cap,pe,roe,eps,debt_eq,promoter,"
                 f"eps_qoq,eps_yoy,sales_qoq,sales_yoy,opm_pct,opm_trend,eps_growth_streak,industry,"
-                f"fii_pct,fii_trend,dii_pct,dii_trend,promoter_trend,peg_ratio,shares_outstanding,fetched_at",
+                f"fii_pct,fii_trend,dii_pct,dii_trend,promoter_trend,peg_ratio,shares_outstanding,"
+                f"pb,roce,industry_pe,div_yield,cfo,fcf,cfo_pat,nim,gnpa,nnpa,car,casa,fetched_at",
                 headers=page_headers, timeout=aiohttp.ClientTimeout(total=30)
             ) as r:
                 if r.status not in (200, 206):
@@ -1501,6 +1565,11 @@ async def load_fundamentals_from_supabase(session: aiohttp.ClientSession) -> lis
                 'promoter_trend': row.get('promoter_trend'), 'peg_ratio': row.get('peg_ratio'),
                 'industry': row.get('industry'),
                 'shares_outstanding': row.get('shares_outstanding'),
+                'pb': row.get('pb'), 'roce': row.get('roce'),
+                'industry_pe': row.get('industry_pe'), 'div_yield': row.get('div_yield'),
+                'cfo': row.get('cfo'), 'fcf': row.get('fcf'), 'cfo_pat': row.get('cfo_pat'),
+                'nim': row.get('nim'), 'gnpa': row.get('gnpa'), 'nnpa': row.get('nnpa'),
+                'car': row.get('car'), 'casa': row.get('casa'),
                 'fetched_at': fetched_at_ts,
             }
             loaded += 1
@@ -1525,7 +1594,11 @@ async def load_fundamentals_from_supabase(session: aiohttp.ClientSession) -> lis
             # a one-time catch-up condition — once market_cap is filled,
             # the row no longer matches it.
             missing_mcap = (not is_blank) and row.get('market_cap') is None
-            if is_blank or missing_mcap or (now - fetched_at_ts) > FUNDAMENTALS_TTL:
+            # One-time catch-up after valuation/cash-flow/bank columns were added —
+            # old rows look "fresh" but never scraped P/B, CFO, NIM, etc.
+            missing_ext = (not is_blank) and all(
+                row.get(k) is None for k in ('pb', 'roce', 'cfo', 'nim', 'div_yield'))
+            if is_blank or missing_mcap or missing_ext or (now - fetched_at_ts) > FUNDAMENTALS_TTL:
                 stale_or_missing.append(sym)
 
         if len(page) < PAGE:
