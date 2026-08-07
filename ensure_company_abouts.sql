@@ -2,13 +2,14 @@
 -- Populated by fundamentals_worker from existing PPT/concall summary text via Gemini.
 -- Run once in Supabase SQL editor.
 
-CREATE TABLE IF NOT EXISTS public.company_abouts (
+  CREATE TABLE IF NOT EXISTS public.company_abouts (
   symbol text PRIMARY KEY,
   overall_brief text,
   what_they_do text,
   customers jsonb,
   segments jsonb,
   innovation jsonb,
+  sources jsonb,
   source_ppt_url text,
   source_tx_url text,
   source_announced_at timestamptz,
