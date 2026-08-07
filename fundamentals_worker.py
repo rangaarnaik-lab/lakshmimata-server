@@ -3200,6 +3200,249 @@ async def fetch_results_pdf_url_for_symbol(session: aiohttp.ClientSession, symbo
         await asyncio.sleep(0.3)
     return None
 
+def _fmt_filing_context(label: str, row) -> str:
+    """Flatten one PPT/transcript summary row into prompt text."""
+    if not row:
+        return ''
+    parts = [f"=== {label} ({(row.get('announced_at') or '')[:10]}) ==="]
+    if row.get('overall_summary'):
+        parts.append(f"OVERVIEW: {row['overall_summary']}")
+    field_map = [
+        ('business_segments', 'SEGMENTS'),
+        ('strategic_initiatives', 'STRATEGY / INNOVATION'),
+        ('industry_outlook', 'INDUSTRY / COMPETITIVE'),
+        ('competitive_positioning', 'COMPETITIVE POSITIONING'),
+        ('operational_kpis', 'OPERATIONAL KPIs'),
+        ('expansion_capex', 'EXPANSION / CAPEX'),
+        ('outlook_guidance', 'OUTLOOK'),
+        ('financial_highlights', 'FINANCIAL HIGHLIGHTS'),
+        ('theme_evidence', 'THEME EVIDENCE'),
+    ]
+    for key, title in field_map:
+        bullets = _clean_bullets(row.get(key))
+        if bullets:
+            parts.append(title + ':\n- ' + '\n- '.join(bullets))
+    themes = _clean_bullets(row.get('emerging_themes')) or row.get('emerging_themes')
+    if isinstance(themes, list) and themes:
+        parts.append('THEMES: ' + ', '.join(str(t) for t in themes))
+    return '\n'.join(parts)
+
+
+async def extract_about_company(session: aiohttp.ClientSession, symbol: str, ppt_row, tx_row):
+    """Synthesize a retail-friendly company brief from already-extracted
+    PPT/concall summary fields via Gemini. Deliberately does NOT re-download
+    PDFs — cheaper, and the filing summaries already hold segments/strategy.
+    Returns {'about': dict|None, 'error': bool}."""
+    error_result = {'about': None, 'error': True}
+    no_content_result = {'about': None, 'error': False}
+    api_key = os.getenv('GEMINI_API_KEY', '')
+    if not api_key:
+        return error_result
+    ctx = '\n\n'.join(x for x in [
+        _fmt_filing_context('INVESTOR PRESENTATION', ppt_row),
+        _fmt_filing_context('EARNINGS CALL / TRANSCRIPT', tx_row),
+    ] if x)
+    if len(ctx) < 80:
+        return no_content_result
+    prompt = (
+        f"You are writing a short company brief for Indian NSE stock {symbol} for a "
+        "retail investor. Use ONLY the filing excerpts below — never invent customers, "
+        "products, or markets that are not supported by the text. If something is unclear, "
+        "omit it rather than guess.\n\n"
+        "Write in plain English. No buy/sell advice. No price targets.\n\n"
+        "WHAT_THEY_DO: 1-3 sentences on what the company actually does (products/services).\n"
+        "CUSTOMERS: 2-5 short bullets on who buys / end markets / geographies if mentioned.\n"
+        "SEGMENTS: 2-5 short bullets on business lines / products / regions if mentioned.\n"
+        "INNOVATION: 2-5 short bullets on new products, capacity, tech, R&D, expansion, or "
+        "strategic initiatives if mentioned.\n"
+        "OVERALL_BRIEF: 80-140 word flowing prose overview combining the above — what the "
+        "business is, who it serves, and what it is building next. Neutral tone.\n\n"
+        f"FILING EXCERPTS:\n{ctx[:12000]}"
+    )
+    _bullet_field = {"type": "array", "items": {"type": "string"}, "nullable": True}
+    schema = {
+        "type": "object",
+        "properties": {
+            "what_they_do": {"type": "string", "nullable": True},
+            "customers": _bullet_field,
+            "segments": _bullet_field,
+            "innovation": _bullet_field,
+            "overall_brief": {"type": "string", "nullable": True},
+        },
+        "required": [],
+    }
+    model = os.getenv('GEMINI_CONCALL_MODEL', 'gemini-3.1-flash-lite')
+    try:
+        async with session.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
+            headers={"Content-Type": "application/json"},
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "responseMimeType": "application/json",
+                    "responseSchema": schema,
+                    "temperature": 0.2,
+                },
+            },
+            timeout=aiohttp.ClientTimeout(total=90),
+        ) as r:
+            if r.status != 200:
+                body = await r.text()
+                if r.status == 429:
+                    log.warning(f"⚠️ Gemini rate-limit on about-company for {symbol} (429)")
+                    await asyncio.sleep(int(os.getenv('GEMINI_429_BACKOFF_SECONDS', '30')))
+                else:
+                    log.warning(f"⚠️ Gemini about-company failed for {symbol} ({r.status}): {body[:180]}")
+                return error_result
+            data = await r.json()
+    except Exception as e:
+        log.warning(f"⚠️ Gemini about-company call failed for {symbol}: {type(e).__name__}: {e}")
+        return error_result
+    try:
+        candidates = data.get('candidates', [])
+        if not candidates:
+            return error_result
+        parts = candidates[0].get('content', {}).get('parts', [])
+        raw_text = ''.join(p.get('text', '') for p in parts).strip()
+        parsed = json.loads(raw_text)
+    except Exception as e:
+        log.warning(f"⚠️ Failed to parse about-company response for {symbol}: {type(e).__name__}: {e}")
+        return error_result
+    about = {
+        'what_they_do': (parsed.get('what_they_do') or '').strip()[:1200] or None,
+        'customers': _clean_bullets(parsed.get('customers')),
+        'segments': _clean_bullets(parsed.get('segments')),
+        'innovation': _clean_bullets(parsed.get('innovation')),
+        'overall_brief': (parsed.get('overall_brief') or '').strip()[:2000] or None,
+    }
+    if not any([about['what_they_do'], about['customers'], about['segments'],
+                about['innovation'], about['overall_brief']]):
+        return no_content_result
+    return {'about': about, 'error': False}
+
+
+async def _about_company_loop(session: aiohttp.ClientSession):
+    """Build AI About Company briefs from existing PPT/transcript summaries.
+    Runs after those loops have content — one Gemini text call per symbol,
+    no PDF re-download."""
+    headers = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
+    _key_status_logged = False
+    while True:
+        if not os.getenv('GEMINI_API_KEY'):
+            if not _key_status_logged:
+                log.warning("📘 About-company loop: GEMINI_API_KEY not set - loop is idle")
+                _key_status_logged = True
+            await asyncio.sleep(300)
+            continue
+        BATCH_SIZE = int(os.getenv('ABOUT_COMPANY_BATCH_SIZE', '10'))
+        if not _key_status_logged:
+            log.info(f"📘 About-company loop: active (batch={BATCH_SIZE})")
+            _key_status_logged = True
+        try:
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/ppt_summaries", headers=headers,
+                params={'select': 'symbol,announced_at,attachment_url,overall_summary,'
+                        'business_segments,strategic_initiatives,industry_outlook,'
+                        'operational_kpis,financial_highlights,emerging_themes,theme_evidence',
+                        'status': 'eq.done', 'order': 'announced_at.desc', 'limit': '400'},
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as r:
+                ppt_rows = await r.json() if r.status == 200 else []
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/transcript_summaries", headers=headers,
+                params={'select': 'symbol,announced_at,attachment_url,overall_summary,'
+                        'competitive_positioning,expansion_capex,outlook_guidance,'
+                        'operational_kpis,financial_highlights,emerging_themes,theme_evidence',
+                        'status': 'eq.done', 'order': 'announced_at.desc', 'limit': '400'},
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as r:
+                tx_rows = await r.json() if r.status == 200 else []
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/company_abouts", headers=headers,
+                params={'select': 'symbol,source_announced_at,status', 'limit': '5000'},
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as r:
+                existing = await r.json() if r.status == 200 else []
+                if not isinstance(existing, list):
+                    # Table may not exist yet — log once and idle
+                    if isinstance(existing, dict) and existing.get('code'):
+                        log.warning("📘 About-company loop: company_abouts table missing? "
+                                    "Run ensure_company_abouts.sql in Supabase.")
+                        await asyncio.sleep(600)
+                        continue
+                    existing = []
+        except Exception as e:
+            log.warning(f"⚠️ About-company loop fetch failed: {type(e).__name__}: {e}")
+            await asyncio.sleep(180)
+            continue
+
+        ppt_by_sym, tx_by_sym = {}, {}
+        for row in ppt_rows or []:
+            sym = row.get('symbol')
+            if sym and sym not in ppt_by_sym:
+                ppt_by_sym[sym] = row
+        for row in tx_rows or []:
+            sym = row.get('symbol')
+            if sym and sym not in tx_by_sym:
+                tx_by_sym[sym] = row
+        existing_map = {r['symbol']: r for r in (existing or []) if r.get('symbol')}
+
+        todo = []
+        for sym in sorted(set(ppt_by_sym) | set(tx_by_sym)):
+            ppt, tx = ppt_by_sym.get(sym), tx_by_sym.get(sym)
+            src_at = max(
+                (ppt or {}).get('announced_at') or '',
+                (tx or {}).get('announced_at') or '',
+            )
+            prev = existing_map.get(sym)
+            if prev and prev.get('status') == 'done' and (prev.get('source_announced_at') or '') >= src_at:
+                continue
+            todo.append((sym, ppt, tx, src_at))
+            if len(todo) >= BATCH_SIZE:
+                break
+
+        if todo:
+            log.info(f"📘 About-company loop: {len(todo)} symbol(s) to generate")
+        else:
+            log.info("📘 About-company loop: nothing new")
+
+        for i, (sym, ppt, tx, src_at) in enumerate(todo):
+            if i > 0:
+                await asyncio.sleep(float(os.getenv('RESULTS_PDF_PACING_SECONDS', '5')))
+            result = await extract_about_company(session, sym, ppt, tx)
+            if result['error']:
+                log.info(f"  📘 {sym}: will retry about-company next cycle")
+                continue
+            about = result['about']
+            payload = {
+                'symbol': sym,
+                'status': 'done' if about else 'skipped',
+                'source_ppt_url': (ppt or {}).get('attachment_url'),
+                'source_tx_url': (tx or {}).get('attachment_url'),
+                'source_announced_at': src_at or None,
+                'updated_at': datetime.now(timezone.utc).isoformat(),
+                **(about or {}),
+            }
+            try:
+                async with session.post(
+                    f"{SUPABASE_URL}/rest/v1/company_abouts",
+                    headers={**headers, 'Content-Type': 'application/json',
+                             'Prefer': 'resolution=merge-duplicates'},
+                    json=payload, timeout=aiohttp.ClientTimeout(total=15)
+                ) as r:
+                    if r.status not in (200, 201, 204):
+                        body = await r.text()
+                        log.warning(f"⚠️ About-company save {r.status} for {sym}: {body[:200]}")
+                        continue
+                if about:
+                    log.info(f"  📘 {sym}: about-company brief saved")
+                else:
+                    log.info(f"  📘 {sym}: no usable about content, marked skipped")
+            except Exception as e:
+                log.warning(f"⚠️ About-company save failed for {sym}: {type(e).__name__}: {e}")
+        await asyncio.sleep(120 if todo else 300)
+
+
 async def fundamentals_worker_main():
     """
     Standalone fundamentals + announcements worker — SERVICE_MODE=
@@ -3294,6 +3537,7 @@ async def fundamentals_worker_main():
             _concall_summary_loop(session),
             _transcript_summary_loop(session),
             _ppt_summary_loop(session),
+            _about_company_loop(session),
         )
 
 def rate_announcements_free(rows: list) -> list:
