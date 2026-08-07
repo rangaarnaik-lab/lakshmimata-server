@@ -49,6 +49,19 @@ _ABOUT_SAVE_FAILS: dict[str, int] = {}
 _ABOUT_OPTIONAL_COLS_MISSING = False  # set True after PGRST204 on image/sources
 # When Gemini starts failing: retry for ~10 min, then long-pause (6h).
 _ABOUT_GEMINI_UNHEALTHY_SINCE: float | None = None
+# Hard quota / billing 429 — skip short retry, go straight to long cooldown.
+_ABOUT_GEMINI_HARD_QUOTA = False
+
+
+def _gemini_quota_exhausted(body_txt: str | None) -> bool:
+    """True when 429 is plan/billing quota (not a short RPM blip)."""
+    t = (body_txt or '').lower()
+    return any(s in t for s in (
+        'exceeded your current quota',
+        'check your plan and billing',
+        'quota exceeded',
+        'resource_exhausted',
+    ))
 
 
 def _parse_iso_ts(value):
@@ -3526,16 +3539,21 @@ async def extract_about_company(session: aiohttp.ClientSession, symbol: str, ppt
             if status != 200:
                 # 429 / 5xx / high-demand → pause About loop (caller sleeps hours).
                 pause = status in (429, 500, 502, 503, 504) or status >= 500
+                hard_quota = status == 429 and _gemini_quota_exhausted(body_txt)
                 log.warning(f"⚠️ Gemini about-company failed for {symbol} ({status})"
+                            + (" — HARD QUOTA" if hard_quota else "")
                             + (" — will pause About loop" if pause else "")
                             + f": {(body_txt or '')[:180]}")
-                return {'about': None, 'error': True, 'rate_limited': pause}
+                return {
+                    'about': None, 'error': True,
+                    'rate_limited': pause, 'hard_quota': hard_quota,
+                }
     except Exception as e:
         # Timeouts / connection blips also pause — avoid burning cycles.
         pause = type(e).__name__ in ('TimeoutError', 'ClientConnectorError', 'ServerTimeoutError')
         log.warning(f"⚠️ Gemini about-company call failed for {symbol}: {type(e).__name__}: {e}"
                     + (" — will pause About loop" if pause else ""))
-        return {'about': None, 'error': True, 'rate_limited': pause}
+        return {'about': None, 'error': True, 'rate_limited': pause, 'hard_quota': False}
 
     try:
         candidates = data.get('candidates', [])
@@ -4882,12 +4900,13 @@ async def _about_company_loop(session: aiohttp.ClientSession):
             log.info("📘 About-company loop: nothing new")
 
         hit_gemini_pause = False
+        hit_hard_quota = False
         gemini_errors = 0
         gemini_ok = 0
         about_sem = asyncio.Semaphore(CONCURRENCY)
 
         async def _about_one(sym, ppt, tx, src_at):
-            nonlocal hit_gemini_pause, gemini_errors, gemini_ok
+            nonlocal hit_gemini_pause, hit_hard_quota, gemini_errors, gemini_ok
             if hit_gemini_pause:
                 return
             async with about_sem:
@@ -4903,6 +4922,8 @@ async def _about_company_loop(session: aiohttp.ClientSession):
                     # Stop this batch on 429/503/timeout or error streak.
                     if result.get('rate_limited') or gemini_errors >= max(1, CONCURRENCY):
                         hit_gemini_pause = True
+                        if result.get('hard_quota'):
+                            hit_hard_quota = True
                         log.warning("📘 About-company: Gemini errors — stopping batch")
                     return
                 gemini_ok += 1
@@ -5001,44 +5022,61 @@ async def _about_company_loop(session: aiohttp.ClientSession):
             await asyncio.gather(*[
                 _about_one(sym, ppt, tx, src_at) for sym, ppt, tx, src_at in todo
             ])
-        global _ABOUT_GEMINI_UNHEALTHY_SINCE
-        batch_failed = bool(
+        global _ABOUT_GEMINI_UNHEALTHY_SINCE, _ABOUT_GEMINI_HARD_QUOTA
+        # Any rate-limit/pause in the batch must cool down — even if a few
+        # symbols saved earlier in the same gather (old bug: gemini_ok>0
+        # cleared unhealthy and only slept ~15s, then kept burning quota).
+        need_cooldown = bool(todo and hit_gemini_pause)
+        all_failed = bool(
             todo and gemini_ok == 0
             and (hit_gemini_pause or gemini_errors >= len(todo))
         )
-        if gemini_ok > 0:
-            _ABOUT_GEMINI_UNHEALTHY_SINCE = None
-        if batch_failed:
-            # Retry Gemini for ~10 min, then long-pause (default 6h).
+        if hit_hard_quota:
+            _ABOUT_GEMINI_HARD_QUOTA = True
+        if need_cooldown or all_failed:
             retry_window = int(os.getenv('ABOUT_COMPANY_ERROR_RETRY_SECONDS', '600'))  # 10m
             retry_gap = int(os.getenv('ABOUT_COMPANY_ERROR_RETRY_GAP_SECONDS', '45'))
             cool = int(os.getenv(
                 'ABOUT_COMPANY_ERROR_COOLDOWN_SECONDS',
                 os.getenv('ABOUT_COMPANY_429_COOLDOWN_SECONDS', '21600')))  # 6h
-            now = time.monotonic()
-            if _ABOUT_GEMINI_UNHEALTHY_SINCE is None:
-                _ABOUT_GEMINI_UNHEALTHY_SINCE = now
+            # Billing/plan quota won't recover in 10 minutes — skip retry window.
+            if hit_hard_quota or _ABOUT_GEMINI_HARD_QUOTA:
                 log.warning(
-                    f"📘 About-company: Gemini unhealthy "
-                    f"(errors={gemini_errors}/{len(todo)}) "
-                    f"— will retry for {retry_window}s (~{retry_window // 60}m), "
-                    f"next try in {retry_gap}s")
-                await asyncio.sleep(max(15, retry_gap))
-            elif (now - _ABOUT_GEMINI_UNHEALTHY_SINCE) < retry_window:
-                left = int(retry_window - (now - _ABOUT_GEMINI_UNHEALTHY_SINCE))
-                log.warning(
-                    f"📘 About-company: Gemini still unhealthy "
-                    f"(errors={gemini_errors}/{len(todo)}) "
-                    f"— retry in {retry_gap}s ({left}s left in {retry_window}s window)")
-                await asyncio.sleep(max(15, retry_gap))
-            else:
-                log.warning(
-                    f"📘 About-company: Gemini unhealthy for {retry_window}s "
-                    f"— pausing About job for {cool}s (~{cool // 3600}h)")
+                    f"📘 About-company: Gemini HARD QUOTA "
+                    f"(ok={gemini_ok}, errors={gemini_errors}/{len(todo)}) "
+                    f"— pausing About job for {cool}s (~{cool // 3600}h). "
+                    f"Check Google AI Studio billing / raise limits, or set "
+                    f"GEMINI_API_KEY_ABOUT to a key with remaining quota.")
                 _ABOUT_GEMINI_UNHEALTHY_SINCE = None
+                _ABOUT_GEMINI_HARD_QUOTA = False
                 await asyncio.sleep(max(300, cool))
+            else:
+                now = time.monotonic()
+                if _ABOUT_GEMINI_UNHEALTHY_SINCE is None:
+                    _ABOUT_GEMINI_UNHEALTHY_SINCE = now
+                    log.warning(
+                        f"📘 About-company: Gemini unhealthy "
+                        f"(ok={gemini_ok}, errors={gemini_errors}/{len(todo)}) "
+                        f"— will retry for {retry_window}s (~{retry_window // 60}m), "
+                        f"next try in {retry_gap}s")
+                    await asyncio.sleep(max(15, retry_gap))
+                elif (now - _ABOUT_GEMINI_UNHEALTHY_SINCE) < retry_window:
+                    left = int(retry_window - (now - _ABOUT_GEMINI_UNHEALTHY_SINCE))
+                    log.warning(
+                        f"📘 About-company: Gemini still unhealthy "
+                        f"(ok={gemini_ok}, errors={gemini_errors}/{len(todo)}) "
+                        f"— retry in {retry_gap}s ({left}s left in {retry_window}s window)")
+                    await asyncio.sleep(max(15, retry_gap))
+                else:
+                    log.warning(
+                        f"📘 About-company: Gemini unhealthy for {retry_window}s "
+                        f"— pausing About job for {cool}s (~{cool // 3600}h)")
+                    _ABOUT_GEMINI_UNHEALTHY_SINCE = None
+                    await asyncio.sleep(max(300, cool))
         elif todo:
-            # Catchup still running — short pause between batches.
+            # Clean batch — clear unhealthy state and pace normally.
+            _ABOUT_GEMINI_UNHEALTHY_SINCE = None
+            _ABOUT_GEMINI_HARD_QUOTA = False
             await asyncio.sleep(int(os.getenv('ABOUT_COMPANY_CYCLE_SECONDS', '15')))
         elif not ranked:
             # All candidates done (or skipped). Rarely re-check for new
