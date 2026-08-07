@@ -3451,7 +3451,9 @@ async def extract_about_company(session: aiohttp.ClientSession, symbol: str, ppt
         prompt += f"FILING EXCERPTS ALREADY ON FILE (optional extra context):\n{filing_ctx[:8000]}\n"
 
     model = os.getenv('GEMINI_ABOUT_MODEL') or os.getenv('GEMINI_CONCALL_MODEL', 'gemini-3.1-flash-lite')
-    use_search = os.getenv('ABOUT_COMPANY_WEB_SEARCH', '1').strip() not in ('0', 'false', 'False')
+    # Default OFF — Google Search grounding burns free-tier quota in 1–2 calls.
+    # Set ABOUT_COMPANY_WEB_SEARCH=1 only on paid / higher quota keys.
+    use_search = os.getenv('ABOUT_COMPANY_WEB_SEARCH', '0').strip() not in ('0', 'false', 'False')
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.2},
@@ -4630,9 +4632,10 @@ async def _about_company_loop(session: aiohttp.ClientSession):
         # Keep About batch tiny on free tier — web-search grounding burns RPM fast.
         BATCH_SIZE = int(os.getenv('ABOUT_COMPANY_BATCH_SIZE', '1'))
         if not _key_status_logged:
-            log.info(f"📘 About-company loop: active with web search "
-                      f"(batch={BATCH_SIZE}, ABOUT_COMPANY_WEB_SEARCH="
-                      f"{os.getenv('ABOUT_COMPANY_WEB_SEARCH', '1')}, "
+            _web = os.getenv('ABOUT_COMPANY_WEB_SEARCH', '0')
+            log.info(f"📘 About-company loop: active "
+                      f"({'web search' if _web.strip() not in ('0', 'false', 'False') else 'filings-only'}) "
+                      f"(batch={BATCH_SIZE}, ABOUT_COMPANY_WEB_SEARCH={_web}, "
                       f"GEMINI_FOCUS={os.getenv('GEMINI_FOCUS', 'all')})")
             _key_status_logged = True
         try:
@@ -4742,8 +4745,11 @@ async def _about_company_loop(session: aiohttp.ClientSession):
         todo = [(sym, ppt, tx, src_at) for _, _, sym, ppt, tx, src_at in ranked[:BATCH_SIZE]]
 
         if todo:
+            _web = os.getenv('ABOUT_COMPANY_WEB_SEARCH', '0')
+            _mode = ('web search' if _web.strip() not in ('0', 'false', 'False')
+                     else 'filings-only')
             log.info(f"📘 About-company loop: {len(todo)} symbol(s) to generate "
-                      f"(web search; backlog≈{len(ranked)})")
+                      f"({_mode}; backlog≈{len(ranked)})")
         else:
             log.info("📘 About-company loop: nothing new")
 
