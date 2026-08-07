@@ -84,7 +84,7 @@ def _gemini_key_fingerprint(api_key: str) -> str:
 
 
 def _gemini_semaphore_for(api_key: str) -> asyncio.Semaphore:
-    n = max(1, int(os.getenv('GEMINI_MAX_CONCURRENT', '1')))
+    n = max(1, int(os.getenv('GEMINI_MAX_CONCURRENT', '4')))
     store = getattr(_gemini_semaphore_for, '_store', None)
     if store is None:
         store = {}
@@ -4674,13 +4674,15 @@ async def _about_company_loop(session: aiohttp.ClientSession):
                 _key_status_logged = True
             await asyncio.sleep(300)
             continue
-        # Keep About batch tiny on free tier — web-search grounding burns RPM fast.
-        BATCH_SIZE = int(os.getenv('ABOUT_COMPANY_BATCH_SIZE', '1'))
+        # Fast defaults when quota allows; override via env if needed.
+        BATCH_SIZE = int(os.getenv('ABOUT_COMPANY_BATCH_SIZE', '10'))
+        CONCURRENCY = max(1, int(os.getenv('ABOUT_COMPANY_CONCURRENCY', '4')))
         if not _key_status_logged:
             _web = os.getenv('ABOUT_COMPANY_WEB_SEARCH', '0')
             log.info(f"📘 About-company loop: active "
                       f"({'web search' if _web.strip() not in ('0', 'false', 'False') else 'filings-only'}) "
-                      f"(batch={BATCH_SIZE}, ABOUT_COMPANY_WEB_SEARCH={_web}, "
+                      f"(batch={BATCH_SIZE}, concurrency={CONCURRENCY}, "
+                      f"ABOUT_COMPANY_WEB_SEARCH={_web}, "
                       f"GEMINI_FOCUS={os.getenv('GEMINI_FOCUS', 'all')})")
             _key_status_logged = True
         try:
@@ -4876,107 +4878,109 @@ async def _about_company_loop(session: aiohttp.ClientSession):
             log.info("📘 About-company loop: nothing new")
 
         hit_429 = False
-        for i, (sym, ppt, tx, src_at) in enumerate(todo):
-            if i > 0:
-                await asyncio.sleep(float(os.getenv('ABOUT_COMPANY_PACING_SECONDS',
-                                                    os.getenv('RESULTS_PDF_PACING_SECONDS', '20'))))
-            meta = meta_by_sym.get(sym) or {}
-            result = await extract_about_company(
-                session, sym, ppt, tx,
-                industry=meta.get('industry'), sector=meta.get('sector'))
-            if result['error']:
-                log.info(f"  📘 {sym}: will retry about-company next cycle")
-                if result.get('rate_limited'):
-                    hit_429 = True
-                    cool = int(os.getenv('ABOUT_COMPANY_429_COOLDOWN_SECONDS', '180'))
-                    log.warning(f"📘 About-company: Gemini 429 — stopping batch, cooling {cool}s")
-                    break
-                continue
-            about = result['about']
-            # status/symbol last so about fields cannot overwrite them
-            payload = {
-                'source_ppt_url': (ppt or {}).get('attachment_url'),
-                'source_tx_url': (tx or {}).get('attachment_url'),
-                'source_announced_at': src_at or None,
-                'updated_at': datetime.now(timezone.utc).isoformat(),
-                **(about or {}),
-                'symbol': sym,
-                'status': 'done' if about else 'skipped',
-            }
-            # Prefer+on_conflict required for upsert — without on_conflict=symbol
-            # PostgREST rejects merge-duplicates and About stayed at 0 rows in prod.
-            about_url = f"{SUPABASE_URL}/rest/v1/company_abouts?on_conflict=symbol"
-            about_headers = {**headers, 'Content-Type': 'application/json',
-                             'Prefer': 'resolution=merge-duplicates,return=representation'}
-            try:
-                saved_ok = False
-                async with session.post(
-                    about_url, headers=about_headers,
-                    json=payload, timeout=aiohttp.ClientTimeout(total=15)
-                ) as r:
-                    body = await r.text()
-                    if r.status not in (200, 201, 204):
-                        # sources/image columns may be missing — retry without extras
-                        drop_keys = []
-                        if 'sources' in body:
-                            drop_keys.append('sources')
-                        if 'image_url' in body or 'website' in body:
-                            drop_keys.extend(['image_url', 'website'])
-                        if drop_keys and any(payload.get(k) is not None for k in drop_keys):
-                            for k in drop_keys:
-                                payload.pop(k, None)
-                            async with session.post(
-                                about_url, headers=about_headers,
-                                json=payload, timeout=aiohttp.ClientTimeout(total=15)
-                            ) as r2:
-                                body2 = await r2.text()
-                                if r2.status not in (200, 201, 204):
-                                    log.warning(f"⚠️ About-company save {r2.status} for {sym}: {body2[:200]}")
-                                    continue
-                                saved_ok = True
+        about_sem = asyncio.Semaphore(CONCURRENCY)
+
+        async def _about_one(sym, ppt, tx, src_at):
+            nonlocal hit_429
+            if hit_429:
+                return
+            async with about_sem:
+                if hit_429:
+                    return
+                meta = meta_by_sym.get(sym) or {}
+                result = await extract_about_company(
+                    session, sym, ppt, tx,
+                    industry=meta.get('industry'), sector=meta.get('sector'))
+                if result['error']:
+                    log.info(f"  📘 {sym}: will retry about-company next cycle")
+                    if result.get('rate_limited'):
+                        hit_429 = True
+                        cool = int(os.getenv('ABOUT_COMPANY_429_COOLDOWN_SECONDS', '60'))
+                        log.warning(f"📘 About-company: Gemini 429 — stopping batch, cooling {cool}s")
+                    return
+                about = result['about']
+                payload = {
+                    'source_ppt_url': (ppt or {}).get('attachment_url'),
+                    'source_tx_url': (tx or {}).get('attachment_url'),
+                    'source_announced_at': src_at or None,
+                    'updated_at': datetime.now(timezone.utc).isoformat(),
+                    **(about or {}),
+                    'symbol': sym,
+                    'status': 'done' if about else 'skipped',
+                }
+                about_url = f"{SUPABASE_URL}/rest/v1/company_abouts?on_conflict=symbol"
+                about_headers = {**headers, 'Content-Type': 'application/json',
+                                 'Prefer': 'resolution=merge-duplicates,return=representation'}
+                try:
+                    saved_ok = False
+                    async with session.post(
+                        about_url, headers=about_headers,
+                        json=payload, timeout=aiohttp.ClientTimeout(total=15)
+                    ) as r:
+                        body = await r.text()
+                        if r.status not in (200, 201, 204):
+                            drop_keys = []
+                            if 'sources' in body:
+                                drop_keys.append('sources')
+                            if 'image_url' in body or 'website' in body:
+                                drop_keys.extend(['image_url', 'website'])
+                            if drop_keys and any(payload.get(k) is not None for k in drop_keys):
+                                for k in drop_keys:
+                                    payload.pop(k, None)
+                                async with session.post(
+                                    about_url, headers=about_headers,
+                                    json=payload, timeout=aiohttp.ClientTimeout(total=15)
+                                ) as r2:
+                                    body2 = await r2.text()
+                                    if r2.status not in (200, 201, 204):
+                                        log.warning(f"⚠️ About-company save {r2.status} for {sym}: {body2[:200]}")
+                                        return
+                                    saved_ok = True
+                            else:
+                                log.warning(f"⚠️ About-company save {r.status} for {sym}: {body[:200]}")
+                                return
                         else:
-                            log.warning(f"⚠️ About-company save {r.status} for {sym}: {body[:200]}")
-                            continue
+                            saved_ok = True
+                            if 'row-level security' in (body or '').lower():
+                                log.error(f"📘 {sym}: upsert blocked by RLS — use SUPABASE service_role key")
+                                saved_ok = False
+                    if not saved_ok:
+                        return
+                    async with session.get(
+                        f"{SUPABASE_URL}/rest/v1/company_abouts", headers=headers,
+                        params={'select': 'symbol,status', 'symbol': f'eq.{sym}', 'limit': '1'},
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ) as vr:
+                        rows = await vr.json() if vr.status == 200 else []
+                        row_status = (rows[0].get('status') if isinstance(rows, list) and rows else None)
+                    if row_status not in ('done', 'skipped'):
+                        log.error(f"📘 {sym}: save returned OK but row not readable "
+                                  f"(status={row_status!r}). Check RLS / SUPABASE_KEY=service_role "
+                                  f"and ensure_company_abouts.sql")
                     else:
-                        saved_ok = True
-                        if 'row-level security' in (body or '').lower():
-                            log.error(f"📘 {sym}: upsert blocked by RLS — use SUPABASE service_role key")
-                            saved_ok = False
-                if not saved_ok:
-                    continue
-                # Confirm row readable; otherwise next cycle will re-pick forever.
-                async with session.get(
-                    f"{SUPABASE_URL}/rest/v1/company_abouts", headers=headers,
-                    params={'select': 'symbol,status', 'symbol': f'eq.{sym}', 'limit': '1'},
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as vr:
-                    rows = await vr.json() if vr.status == 200 else []
-                    row_status = (rows[0].get('status') if isinstance(rows, list) and rows else None)
-                if row_status not in ('done', 'skipped'):
-                    log.error(f"📘 {sym}: save returned OK but row not readable "
-                              f"(status={row_status!r}). Check RLS / SUPABASE_KEY=service_role "
-                              f"and ensure_company_abouts.sql")
-                else:
-                    _ABOUT_DONE_SYMS.add(sym)
-                if about:
-                    nsrc = len(about.get('sources') or [])
-                    log.info(f"  📘 {sym}: about-company brief saved"
-                              + (f" ({nsrc} web sources)" if nsrc else " (no grounding URLs)")
-                              + (f", logo={about.get('website')}" if about.get('image_url') else ", no logo")
-                              + f" db_status={row_status!r}")
-                else:
-                    log.info(f"  📘 {sym}: no usable about content, marked skipped "
-                              f"db_status={row_status!r}")
-            except Exception as e:
-                log.warning(f"⚠️ About-company save failed for {sym}: {type(e).__name__}: {e}")
+                        _ABOUT_DONE_SYMS.add(sym)
+                    if about:
+                        nsrc = len(about.get('sources') or [])
+                        log.info(f"  📘 {sym}: about-company brief saved"
+                                  + (f" ({nsrc} web sources)" if nsrc else " (no grounding URLs)")
+                                  + (f", logo={about.get('website')}" if about.get('image_url') else ", no logo")
+                                  + f" db_status={row_status!r}")
+                    else:
+                        log.info(f"  📘 {sym}: no usable about content, marked skipped "
+                                  f"db_status={row_status!r}")
+                except Exception as e:
+                    log.warning(f"⚠️ About-company save failed for {sym}: {type(e).__name__}: {e}")
+
+        if todo:
+            await asyncio.gather(*[
+                _about_one(sym, ppt, tx, src_at) for sym, ppt, tx, src_at in todo
+            ])
         if hit_429:
-            await asyncio.sleep(int(os.getenv('ABOUT_COMPANY_429_COOLDOWN_SECONDS', '180')))
+            await asyncio.sleep(int(os.getenv('ABOUT_COMPANY_429_COOLDOWN_SECONDS', '60')))
         else:
-            # Slow-and-steady on free tier (batch=1). Override with
-            # ABOUT_COMPANY_CYCLE_SECONDS if you want faster/slower.
             await asyncio.sleep(int(os.getenv(
                 'ABOUT_COMPANY_CYCLE_SECONDS',
-                '120' if todo else '300')))
+                '15' if todo else '180')))
 
 
 async def fundamentals_worker_main():
