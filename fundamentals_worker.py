@@ -42,6 +42,19 @@ def _is_concall_announcement(row: dict) -> bool:
     text = ((row.get('category') or '') + ' ' + (row.get('subject') or '')).lower()
     return any(x in text for x in _CONCALL_KEYWORDS)
 
+# Schema field names sometimes leak into bullet arrays when the model
+# glitches (seen in production: risks_flagged containing
+# "guidance_direction" / "reiterated"). Drop those so the UI doesn't
+# show garbage alongside real content.
+_BULLET_NOISE = {
+    'has_content', 'financial_highlights', 'cost_margin_commentary',
+    'expansion_capex', 'outlook_guidance', 'guidance_direction',
+    'management_changes', 'capital_allocation', 'competitive_positioning',
+    'operational_kpis', 'risks_flagged', 'regulatory_legal',
+    'key_concerns', 'overall_summary', 'raised', 'lowered', 'maintained',
+    'reiterated', 'not_discussed',
+}
+
 def _clean_bullets(v):
     """Validates/cleans a bullet-point array field from a Gemini
     response (used by both extract_ppt_summary and
@@ -50,11 +63,84 @@ def _clean_bullets(v):
     misbehaving response can't produce an unbounded field. Returns
     None (not an empty list) when there's nothing usable, consistent
     with how every other optional field in this pipeline represents
-    "not discussed"."""
+    "not discussed".
+    Also accepts a JSON-encoded array string — some model responses
+    (and older saved rows) store '["bullet one", "bullet two"]' as a
+    single string instead of a real array; parse those so we don't
+    drop usable content or save a string blob into jsonb."""
+    if isinstance(v, str):
+        raw = v.strip()
+        if raw.startswith('['):
+            try:
+                parsed = json.loads(raw)
+                v = parsed if isinstance(parsed, list) else None
+            except Exception:
+                v = [raw] if raw else None
+        elif raw:
+            v = [raw]
+        else:
+            v = None
     if not isinstance(v, list):
         return None
-    bullets = [str(b).strip()[:200] for b in v if b and str(b).strip()]
+    bullets = []
+    for b in v:
+        if not b:
+            continue
+        text = str(b).strip()[:200]
+        if not text:
+            continue
+        # Skip schema-noise tokens and tiny fragments that aren't facts
+        if text.lower().replace(' ', '_') in _BULLET_NOISE or text.lower() in _BULLET_NOISE:
+            continue
+        if len(text) < 8:
+            continue
+        bullets.append(text)
     return bullets[:6] or None
+
+def _infer_guidance_direction(gd, outlook_bullets):
+    """Prefer the model's explicit enum; if missing, derive a coarse
+    direction from outlook bullets already extracted from the same
+    transcript so the UI badge is usually populated."""
+    allowed = ('raised', 'lowered', 'maintained', 'reiterated', 'not_discussed')
+    if gd in allowed:
+        return gd
+    text = ' '.join(outlook_bullets or []).lower()
+    if not text:
+        return 'not_discussed'
+    if any(w in text for w in ('raise guidance', 'raised guidance', 'upgraded guidance',
+                               'increasing guidance', 'guidance raised', 'revised upward',
+                               'revised higher', 'now expect higher')):
+        return 'raised'
+    if any(w in text for w in ('lower guidance', 'lowered guidance', 'cut guidance',
+                               'guidance cut', 'revised downward', 'revised lower',
+                               'walked back', 'now expect lower')):
+        return 'lowered'
+    if any(w in text for w in ('maintain guidance', 'maintained guidance', 'guidance unchanged',
+                               'no change in guidance', 'reaffirm guidance')):
+        return 'maintained'
+    # Any forward-looking target without an explicit raise/cut is a
+    # reiteration of outlook, not "not discussed".
+    return 'reiterated'
+
+def _synthesize_overall_summary(summary: dict):
+    """Last-resort narrative when Gemini left overall_summary empty but
+    produced usable section bullets — keeps the Concall Report card from
+    rendering as a bare bullet list with no intro paragraph."""
+    chunks = []
+    fin = summary.get('financial_highlights') or []
+    if fin:
+        chunks.append('Management highlighted: ' + '; '.join(fin[:3]) + '.')
+    outlook = summary.get('outlook_guidance') or []
+    if outlook:
+        chunks.append('Outlook: ' + '; '.join(outlook[:3]) + '.')
+    concerns = summary.get('key_concerns') or []
+    if concerns:
+        chunks.append('On Q&A: ' + '; '.join(concerns[:2]) + '.')
+    risks = summary.get('risks_flagged') or []
+    if risks:
+        chunks.append('Risks noted: ' + '; '.join(risks[:2]) + '.')
+    text = ' '.join(chunks).strip()
+    return text[:1500] or None
 
 async def extract_ppt_summary(session: aiohttp.ClientSession, symbol: str, attachment_url: str):
     """Downloads an investor/analyst PRESENTATION PDF (a third distinct
@@ -262,79 +348,54 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
     pdf_b64 = base64.b64encode(pdf_bytes).decode('ascii')
     prompt = (
         "This is a transcript of an earnings/analyst/investor conference call for an Indian "
-        "listed company, filed with NSE/BSE. Read the full transcript, including the "
-        "prepared management remarks AND the Q&A session with analysts, and produce a "
-        "structured summary in your own words - never quote verbatim, always paraphrase. "
-        "Base every field ONLY on what's literally said in the transcript - never infer, "
-        "estimate, or add outside context.\n\n"
-        "IMPORTANT: some documents filed as 'transcript' announcements are actually just a "
-        "cover letter, board notice, call invite, or a slide deck/presentation - NOT an "
-        "actual transcript with real dialogue between management and analysts. If this "
-        "document does not contain actual spoken dialogue (a moderator, named speakers, "
-        "and back-and-forth Q&A), set has_content to false and leave every other field "
-        "null - do NOT invent or reconstruct what the call might plausibly have covered "
-        "based on the company's name, sector, or a cover letter mentioning the call took "
-        "place. If in doubt whether this is genuinely a transcript, treat it as false rather "
-        "than guess.\n\n"
-        "FINANCIAL_HIGHLIGHTS: What management said about this quarter's headline numbers "
-        "and what drove them (revenue/profit growth, margin trends, volume/pricing "
-        "drivers). Return 2-5 short bullet-point phrases (not full sentences, no trailing "
-        "period needed) - e.g. 'Revenue up 39% YoY to Rs 5,400 Cr', not a paragraph. Each "
-        "bullet should be a self-contained fact a reader could scan in under 2 seconds. "
-        "Null/empty array if not discussed.\n\n"
-        "COST_MARGIN_COMMENTARY: Specific commentary on input costs, pricing realizations, "
-        "or margin trajectory - especially any concrete numbers management gave for cost "
-        "trends or price outlook. Same short bullet-phrase format as above, 2-5 bullets. "
-        "Null/empty array if not discussed.\n\n"
-        "EXPANSION_CAPEX: Any expansion projects, capacity additions, or capex plans "
-        "discussed, including specific timelines, costs, or delays management mentioned. "
-        "Same short bullet-phrase format, 2-5 bullets. Null/empty array if not discussed.\n\n"
-        "OUTLOOK_GUIDANCE: Management's own forward-looking statements - guidance for "
-        "upcoming quarters, full-year targets, or stated expectations. Same short "
-        "bullet-phrase format, 2-4 bullets. Null/empty array if not discussed.\n\n"
-        "GUIDANCE_DIRECTION: Did management explicitly raise, lower, maintain, or simply "
-        "reiterate previous guidance during this call? Use 'raised' only if they said "
-        "numbers/targets are now higher than previously communicated, 'lowered' only if "
-        "explicitly walked back or cut, 'maintained' if they explicitly confirmed no "
-        "change, 'reiterated' if they repeated existing targets without a clear prior "
-        "comparison being discussed, or 'not_discussed' if guidance/targets weren't "
-        "addressed on this call at all. Base this only on what management explicitly "
-        "said, not your own inference from the numbers.\n\n"
-        "MANAGEMENT_CHANGES: Any new appointments, resignations, retirements, or "
-        "succession-planning discussed on the call (e.g. a new CFO, MD change, director "
-        "retiring). Same short bullet-phrase format, 1-3 bullets. Null/empty array if not "
-        "discussed.\n\n"
-        "CAPITAL_ALLOCATION: Any commentary on dividends, buybacks, debt "
-        "reduction/repayment plans, or other capital-return/balance-sheet decisions "
-        "discussed - separate from growth/expansion capex. Same short bullet-phrase "
-        "format, 1-3 bullets. Null/empty array if not discussed.\n\n"
-        "COMPETITIVE_POSITIONING: Anything management said about competitors, market "
-        "share gains or losses, or how the company sees its position within the "
-        "industry. Same short bullet-phrase format, 1-3 bullets. Null/empty array if not "
-        "discussed.\n\n"
-        "OPERATIONAL_KPIS: Sector-specific operational metrics management gave beyond "
-        "revenue/profit - e.g. order book size, capacity/utilization, unit volumes, "
-        "subscriber counts, same-store sales, project pipeline. Same short bullet-phrase "
-        "format, 2-5 bullets, each a concrete number where given (e.g. 'Order book at Rs "
-        "13,596 Cr'). Null/empty array if not discussed.\n\n"
-        "RISKS_FLAGGED: Risks or headwinds management THEMSELVES volunteered during "
-        "prepared remarks or Q&A (not analyst-raised concerns, which go in KEY_CONCERNS - "
-        "this is what management proactively flagged as a risk to their own outlook). "
-        "Same short bullet-phrase format, 1-4 bullets. Report only what was explicitly "
-        "stated as a risk/challenge/headwind - null/empty array if management didn't "
-        "volunteer any.\n\n"
-        "REGULATORY_LEGAL: Any litigation, regulatory approvals/rejections, compliance "
-        "matters, or government policy impacts discussed. Same short bullet-phrase "
-        "format, 1-3 bullets. Null/empty array if not discussed.\n\n"
-        "KEY_CONCERNS: The most substantive concerns, pushback, or skeptical questions "
-        "analysts raised during Q&A, and how management responded - this is often the "
-        "most informative part of a transcript. Same short bullet-phrase format, 2-5 "
-        "bullets, each capturing one concern+response pair concisely. Null/empty array if "
-        "the Q&A was routine with no notable pushback.\n\n"
-        "OVERALL_SUMMARY: A balanced 100-150 word summary of the call for a retail "
-        "investor, covering what a results PDF alone wouldn't tell them. This one stays as "
-        "flowing prose, not bullets - it's the narrative overview. Do not add your own "
-        "opinion or investment view - describe what was said, not what to do about it."
+        "listed company, filed with NSE/BSE. Read the FULL transcript — prepared management "
+        "remarks AND the analyst Q&A — then produce a structured summary in your own words. "
+        "Never quote verbatim; always paraphrase. Base every field ONLY on what is said in "
+        "the transcript — never invent outside facts.\n\n"
+        "DOCUMENT CHECK: some filings labeled 'transcript' are only a cover letter, invite, "
+        "or slide deck with no spoken dialogue. If there is no real dialogue (moderator / "
+        "named speakers / Q&A), set has_content to false and leave every other field null. "
+        "If in doubt, set has_content false.\n\n"
+        "When has_content is true, you MUST fill these three fields — they power the main "
+        "Concall Report UI and must not be left null for a real call:\n"
+        "1) overall_summary  2) guidance_direction  3) key_concerns (unless there is literally no Q&A)\n\n"
+        "OVERALL_SUMMARY (REQUIRED when has_content=true): Write 100-150 words of flowing "
+        "prose for a retail investor. Cover: (a) how management framed the quarter, "
+        "(b) what drove numbers / margins if discussed, (c) forward outlook or targets, "
+        "(d) the most important theme from Q&A. Do NOT use bullet points. Do NOT give buy/sell "
+        "advice. Do NOT leave this null or empty for a real transcript.\n\n"
+        "GUIDANCE_DIRECTION (REQUIRED when has_content=true): Exactly one of "
+        "raised | lowered | maintained | reiterated | not_discussed.\n"
+        "- raised: management said targets/guidance are higher than previously communicated\n"
+        "- lowered: management cut or walked back prior targets\n"
+        "- maintained: management explicitly confirmed guidance unchanged\n"
+        "- reiterated: management repeated targets/outlook without a clear raise/cut vs prior\n"
+        "- not_discussed: NO forward-looking targets, guidance, or outlook at all on this call\n"
+        "If they gave any forward targets (growth %, margins, order book, delivery goals) "
+        "without saying they raised or cut prior guidance, use reiterated — not not_discussed "
+        "and not null.\n\n"
+        "KEY_CONCERNS: From the Q&A section, capture 2-5 of the most important "
+        "analyst-question + management-answer pairs as short bullet phrases "
+        "(e.g. 'On margin pressure — management said mix and costs stabilize in H2'). "
+        "Include substantive topics even if the tone was polite — not only hostile pushback. "
+        "Only leave null/empty if the document has NO Q&A section at all. Never put schema "
+        "field names into this array.\n\n"
+        "FINANCIAL_HIGHLIGHTS: 2-5 short bullet phrases on headline numbers and drivers "
+        "(e.g. 'Revenue up 39% YoY to Rs 5,400 Cr'). Null if not discussed.\n\n"
+        "COST_MARGIN_COMMENTARY: 2-5 bullets on costs, pricing, margins. Null if not discussed.\n\n"
+        "EXPANSION_CAPEX: 2-5 bullets on capacity, projects, capex plans/timelines. Null if none.\n\n"
+        "OUTLOOK_GUIDANCE: 2-4 bullets of management's forward targets / expectations. "
+        "Null only if none were stated.\n\n"
+        "MANAGEMENT_CHANGES: 1-3 bullets on appointments/resignations/succession. Null if none.\n\n"
+        "CAPITAL_ALLOCATION: 1-3 bullets on dividends, buybacks, debt paydown. Null if none.\n\n"
+        "COMPETITIVE_POSITIONING: 1-3 bullets on competitors / market share. Null if none.\n\n"
+        "OPERATIONAL_KPIS: 2-5 bullets of operational metrics with numbers where given "
+        "(order book, volumes, utilization, etc.). Null if none.\n\n"
+        "RISKS_FLAGGED: 1-4 bullets of risks/headwinds management themselves mentioned "
+        "(not analyst concerns — those go in key_concerns). Null if none.\n\n"
+        "REGULATORY_LEGAL: 1-3 bullets on litigation, approvals, policy. Null if none.\n\n"
+        "Bullet format for every array field: short scannable phrases, not paragraphs; "
+        "no trailing period required; never insert enum tokens or JSON field names as bullets."
     )
     _bullet_field = {"type": "array", "items": {"type": "string"}, "nullable": True}
     schema = {
@@ -345,8 +406,9 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
             "cost_margin_commentary": _bullet_field,
             "expansion_capex": _bullet_field,
             "outlook_guidance": _bullet_field,
+            # Required (non-nullable) so the model always picks a direction for real calls.
             "guidance_direction": {"type": "string",
-                "enum": ["raised", "lowered", "maintained", "reiterated", "not_discussed"], "nullable": True},
+                "enum": ["raised", "lowered", "maintained", "reiterated", "not_discussed"]},
             "management_changes": _bullet_field,
             "capital_allocation": _bullet_field,
             "competitive_positioning": _bullet_field,
@@ -354,9 +416,9 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
             "risks_flagged": _bullet_field,
             "regulatory_legal": _bullet_field,
             "key_concerns": _bullet_field,
-            "overall_summary": {"type": "string", "nullable": True},
+            "overall_summary": {"type": "string"},
         },
-        "required": ["has_content"],
+        "required": ["has_content", "overall_summary", "guidance_direction"],
     }
     model = os.getenv('GEMINI_CONCALL_MODEL', 'gemini-3.1-flash-lite')
     # Separate, more generous default timeout than results PDFs
@@ -414,15 +476,18 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
                   'regulatory_legal', 'key_concerns')
     }
     summary['overall_summary'] = (parsed.get('overall_summary') or '').strip()[:1500] or None
-    # guidance_direction is a categorical field, not free text - validate
-    # against the allowed enum rather than applying the same string
-    # trimming, and treat an unexpected/missing value as None rather
-    # than saving something outside the expected set.
-    gd = parsed.get('guidance_direction')
-    summary['guidance_direction'] = gd if gd in (
-        'raised', 'lowered', 'maintained', 'reiterated', 'not_discussed') else None
+    if not summary['overall_summary']:
+        summary['overall_summary'] = _synthesize_overall_summary(summary)
+        if summary['overall_summary']:
+            log.info(f"ℹ️ {symbol}: overall_summary was empty — synthesized from section bullets")
+    summary['guidance_direction'] = _infer_guidance_direction(
+        parsed.get('guidance_direction'), summary.get('outlook_guidance'))
     if not any(v for k, v in summary.items() if k != 'guidance_direction'):
         return no_content_result
+    # Helpful for spotting thin reports in logs without dumping the whole payload
+    missing_core = [k for k in ('overall_summary', 'key_concerns') if not summary.get(k)]
+    if missing_core:
+        log.info(f"ℹ️ {symbol}: transcript summary still missing {', '.join(missing_core)} after cleanup")
     return {'summary': summary, 'error': False}
 
 async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, attachment_url: str):
@@ -1513,13 +1578,21 @@ async def _transcript_summary_loop(session: aiohttp.ClientSession):
         already = set()
         if transcript_rows:
             try:
+                # Rows with status done but empty overall_summary were produced by
+                # the older weaker prompt — treat them as not-yet-done so the
+                # improved extractor can overwrite via merge-duplicates.
                 async with session.get(
                     f"{SUPABASE_URL}/rest/v1/transcript_summaries", headers=headers,
-                    params={'select': 'symbol,attachment_url'},
+                    params={'select': 'symbol,attachment_url,status,overall_summary'},
                     timeout=aiohttp.ClientTimeout(total=30)
                 ) as r:
                     if r.status == 200:
-                        already = {(row['symbol'], row['attachment_url']) for row in await r.json()}
+                        for row in await r.json():
+                            if row.get('status') == 'skipped':
+                                already.add((row['symbol'], row['attachment_url']))
+                            elif row.get('status') == 'done' and (row.get('overall_summary') or '').strip():
+                                already.add((row['symbol'], row['attachment_url']))
+                            # else: thin/failed row — eligible for reprocess
                     else:
                         body = await r.text()
                         log.warning(f"⚠️ Transcript loop: already-processed query returned {r.status} "
@@ -1529,7 +1602,8 @@ async def _transcript_summary_loop(session: aiohttp.ClientSession):
 
         todo = [row for row in transcript_rows if (row['symbol'], row['attachment_url']) not in already][:BATCH_SIZE]
         if todo:
-            log.info(f"🎙️ Transcript summary loop: {len(todo)} new transcript(s) to process")
+            log.info(f"🎙️ Transcript summary loop: {len(todo)} transcript(s) to process "
+                      f"(new or thin reports missing overall_summary)")
         else:
             log.info(f"🎙️ Transcript summary loop: checked {len(candidates)} recent announcement(s) "
                       f"({len(transcript_rows)} matched transcript filter), nothing new to process")
