@@ -4674,9 +4674,9 @@ async def _about_company_loop(session: aiohttp.ClientSession):
                 _key_status_logged = True
             await asyncio.sleep(300)
             continue
-        # Fast defaults when quota allows; override via env if needed.
-        BATCH_SIZE = int(os.getenv('ABOUT_COMPANY_BATCH_SIZE', '10'))
-        CONCURRENCY = max(1, int(os.getenv('ABOUT_COMPANY_CONCURRENCY', '4')))
+        # 5 stocks at a time (parallel). Override via env if needed.
+        BATCH_SIZE = int(os.getenv('ABOUT_COMPANY_BATCH_SIZE', '5'))
+        CONCURRENCY = max(1, int(os.getenv('ABOUT_COMPANY_CONCURRENCY', '5')))
         if not _key_status_logged:
             _web = os.getenv('ABOUT_COMPANY_WEB_SEARCH', '0')
             log.info(f"📘 About-company loop: active "
