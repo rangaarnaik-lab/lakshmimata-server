@@ -119,7 +119,7 @@ _BULLET_NOISE = {
     'operational_kpis', 'risks_flagged', 'regulatory_legal',
     'key_concerns', 'overall_summary', 'raised', 'lowered', 'maintained',
     'reiterated', 'not_discussed', 'emerging_themes', 'theme_evidence',
-    'theme_intensity', 'management_tone', 'watch_next',
+    'theme_intensity', 'management_tone', 'watch_next', 'order_book',
     'confident', 'cautious', 'defensive', 'mixed', 'neutral',
 }
 
@@ -287,9 +287,15 @@ async def extract_ppt_summary(session: aiohttp.ClientSession, symbol: str, attac
         "positioning presented. Same short bullet-phrase format, 2-3 bullets. Null/empty "
         "array if not shown.\n\n"
         "OPERATIONAL_KPIS: Sector-specific operational metrics shown beyond revenue/profit "
-        "- e.g. order book size, capacity/utilization, unit volumes, subscriber counts, "
-        "same-store sales, project pipeline. Same short bullet-phrase format, 2-5 bullets, "
-        "each a concrete number where given. Null/empty array if not shown.\n\n"
+        "- e.g. capacity/utilization, unit volumes, subscriber counts, same-store sales, "
+        "project pipeline. Do NOT put order-book figures here — those go in ORDER_BOOK. "
+        "Same short bullet-phrase format, 2-5 bullets, each a concrete number where given. "
+        "Null/empty array if not shown.\n\n"
+        "ORDER_BOOK: Any order book / order backlog / book-to-bill / executable order book "
+        "figures shown in the deck (total OB, OB by segment/geography, YoY/QoQ change, "
+        "new order inflows, execution/sales from OB). 1-5 short bullets with numbers when "
+        "given (e.g. 'Order book Rs 12,400 Cr, +18% YoY'). Null/empty if the deck has no "
+        "order-book slide or figure — common for banks, IT services, FMCG.\n\n"
         "RISKS_FLAGGED: Risks or headwinds the deck itself presented (e.g. a dedicated "
         "'risk factors' slide) - not your own inference. Same short bullet-phrase format, "
         "1-4 bullets. Null/empty array if not shown.\n\n"
@@ -325,6 +331,7 @@ async def extract_ppt_summary(session: aiohttp.ClientSession, symbol: str, attac
             "capital_allocation": _bullet_field,
             "industry_outlook": _bullet_field,
             "operational_kpis": _bullet_field,
+            "order_book": _bullet_field,
             "risks_flagged": _bullet_field,
             "regulatory_legal": _bullet_field,
             "watch_next": _bullet_field,
@@ -390,9 +397,9 @@ async def extract_ppt_summary(session: aiohttp.ClientSession, symbol: str, attac
                   'capital_allocation', 'industry_outlook', 'operational_kpis',
                   'risks_flagged', 'regulatory_legal', 'theme_evidence')
     }
-    # Always persist an array (possibly empty) so watch_next IS NULL means
-    # "pre-migration row" and backfill can stop after one re-extract.
+    # Always persist arrays (possibly empty) so IS NULL means pre-migration row.
     summary['watch_next'] = _clean_bullets(parsed.get('watch_next')) or []
+    summary['order_book'] = _clean_bullets(parsed.get('order_book')) or []
     summary['overall_summary'] = (parsed.get('overall_summary') or '').strip()[:1500] or None
     gd = parsed.get('guidance_direction')
     summary['guidance_direction'] = gd if gd in (
@@ -493,7 +500,11 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
         "CAPITAL_ALLOCATION: 1-3 bullets on dividends, buybacks, debt paydown. Null if none.\n\n"
         "COMPETITIVE_POSITIONING: 1-3 bullets on competitors / market share. Null if none.\n\n"
         "OPERATIONAL_KPIS: 2-5 bullets of operational metrics with numbers where given "
-        "(order book, volumes, utilization, etc.). Null if none.\n\n"
+        "(volumes, utilization, etc.). Do NOT put order-book figures here — use ORDER_BOOK. "
+        "Null if none.\n\n"
+        "ORDER_BOOK: 1-5 bullets on order book / backlog / book-to-bill / new order inflows "
+        "if discussed on the call, with numbers when given. Null if not discussed "
+        "(many sectors never mention it).\n\n"
         "RISKS_FLAGGED: 1-4 bullets of risks/headwinds management themselves mentioned "
         "(not analyst concerns — those go in key_concerns). Null if none.\n\n"
         "REGULATORY_LEGAL: 1-3 bullets on litigation, approvals, policy. Null if none.\n\n"
@@ -526,6 +537,7 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
             "capital_allocation": _bullet_field,
             "competitive_positioning": _bullet_field,
             "operational_kpis": _bullet_field,
+            "order_book": _bullet_field,
             "risks_flagged": _bullet_field,
             "regulatory_legal": _bullet_field,
             "key_concerns": _bullet_field,
@@ -593,9 +605,9 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
                   'competitive_positioning', 'operational_kpis', 'risks_flagged',
                   'regulatory_legal', 'key_concerns', 'theme_evidence')
     }
-    # Always persist an array (possibly empty) so watch_next IS NULL means
-    # "pre-migration row" and backfill can stop after one re-extract.
+    # Always persist arrays (possibly empty) so IS NULL means pre-migration row.
     summary['watch_next'] = _clean_bullets(parsed.get('watch_next')) or []
+    summary['order_book'] = _clean_bullets(parsed.get('order_book')) or []
     summary['overall_summary'] = (parsed.get('overall_summary') or '').strip()[:1500] or None
     if not summary['overall_summary']:
         summary['overall_summary'] = _synthesize_overall_summary(summary)
@@ -609,7 +621,8 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
         parsed.get('theme_intensity'), summary['emerging_themes'])
     if not summary['emerging_themes']:
         summary['theme_evidence'] = None
-    if not any(v for k, v in summary.items() if k not in ('guidance_direction', 'theme_intensity', 'management_tone', 'watch_next')):
+    if not any(v for k, v in summary.items() if k not in (
+            'guidance_direction', 'theme_intensity', 'management_tone', 'watch_next', 'order_book')):
         return no_content_result
     # Helpful for spotting thin reports in logs without dumping the whole payload
     missing_core = [k for k in ('overall_summary', 'key_concerns') if not summary.get(k)]
@@ -1468,6 +1481,8 @@ async def _fetch_processed_attachment_keys(session: aiohttp.ClientSession, table
         cols.append('theme_intensity')
     if reprocess_missing_themes and 'watch_next' not in cols:
         cols.append('watch_next')
+    if reprocess_missing_themes and 'order_book' not in cols:
+        cols.append('order_book')
     select = ','.join(cols)
     page_size = 1000
     offset = 0
@@ -1500,8 +1515,11 @@ async def _fetch_processed_attachment_keys(session: aiohttp.ClientSession, table
             if status == 'done' and reprocess_missing_themes and row.get('theme_intensity') is None:
                 thin.add(key)
                 continue
-            # Pre-tone/watch_next rows: column null until re-extracted
+            # Pre-tone/watch_next/order_book rows: column null until re-extracted
             if status == 'done' and reprocess_missing_themes and row.get('watch_next') is None:
+                thin.add(key)
+                continue
+            if status == 'done' and reprocess_missing_themes and row.get('order_book') is None:
                 thin.add(key)
                 continue
             if status in ('done', 'skipped', 'failed', 'pending'):
@@ -1517,8 +1535,8 @@ async def _fetch_theme_backfill_rows(session: aiohttp.ClientSession, table: str,
     the emerging-themes columns existed (theme_intensity IS NULL), or
     before watch_next existed. Does not depend on corporate_announcements
     lookback, so old PPTs/transcripts still get re-read."""
-    # Prefer watch_next backfill first (newer gap), then theme_intensity.
-    for null_col in ('watch_next', 'theme_intensity'):
+    # Prefer newest schema gaps first, then older theme backfill.
+    for null_col in ('order_book', 'watch_next', 'theme_intensity'):
         try:
             async with session.get(
                 f"{SUPABASE_URL}/rest/v1/{table}", headers=headers,
@@ -1530,8 +1548,9 @@ async def _fetch_theme_backfill_rows(session: aiohttp.ClientSession, table: str,
                 if r.status != 200:
                     body = await r.text()
                     # Column may not exist yet until SQL migration is run
-                    if r.status == 400 and 'watch_next' in null_col:
-                        log.warning(f"⚠️ {table}: watch_next column missing — run add_tone_watch_next.sql")
+                    if r.status == 400 and null_col in ('watch_next', 'order_book'):
+                        log.warning(f"⚠️ {table}: {null_col} column missing — run add_tone_watch_next.sql "
+                                     f"/ add_order_book.sql")
                         continue
                     log.warning(f"⚠️ {table}: {null_col} backfill query returned {r.status}: {body[:200]}")
                     continue
