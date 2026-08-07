@@ -3520,22 +3520,20 @@ async def extract_about_company(session: aiohttp.ClientSession, symbol: str, ppt
                             f"({status}) — retrying without search")
                 body.pop('tools', None)
                 status, data, body2 = await _gemini_generate(session, url, body, 90, api_key=api_key)
-                if status != 200:
-                    log.warning(f"⚠️ Gemini about-company failed for {symbol} ({status}): {body2[:180]}")
-                    return error_result
-            elif status == 429:
-                # Body usually says which quota (RPM / RPD / search grounding).
-                log.warning(f"⚠️ Gemini rate-limit on about-company for {symbol} (429) "
-                            f"key={_gemini_key_fingerprint(api_key)}: "
-                            f"{(body_txt or '')[:220]}")
-                await asyncio.sleep(int(os.getenv('GEMINI_429_BACKOFF_SECONDS', '90')))
-                return {'about': None, 'error': True, 'rate_limited': True}
-            else:
-                log.warning(f"⚠️ Gemini about-company failed for {symbol} ({status}): {body_txt[:180]}")
-                return error_result
+                body_txt = body2
+            if status != 200:
+                # 429 / 5xx / high-demand → pause About loop (caller sleeps hours).
+                pause = status in (429, 500, 502, 503, 504) or status >= 500
+                log.warning(f"⚠️ Gemini about-company failed for {symbol} ({status})"
+                            + (" — will pause About loop" if pause else "")
+                            + f": {(body_txt or '')[:180]}")
+                return {'about': None, 'error': True, 'rate_limited': pause}
     except Exception as e:
-        log.warning(f"⚠️ Gemini about-company call failed for {symbol}: {type(e).__name__}: {e}")
-        return error_result
+        # Timeouts / connection blips also pause — avoid burning cycles.
+        pause = type(e).__name__ in ('TimeoutError', 'ClientConnectorError', 'ServerTimeoutError')
+        log.warning(f"⚠️ Gemini about-company call failed for {symbol}: {type(e).__name__}: {e}"
+                    + (" — will pause About loop" if pause else ""))
+        return {'about': None, 'error': True, 'rate_limited': pause}
 
     try:
         candidates = data.get('candidates', [])
@@ -4881,26 +4879,28 @@ async def _about_company_loop(session: aiohttp.ClientSession):
         else:
             log.info("📘 About-company loop: nothing new")
 
-        hit_429 = False
+        hit_gemini_pause = False
+        gemini_errors = 0
         about_sem = asyncio.Semaphore(CONCURRENCY)
 
         async def _about_one(sym, ppt, tx, src_at):
-            nonlocal hit_429
-            if hit_429:
+            nonlocal hit_gemini_pause, gemini_errors
+            if hit_gemini_pause:
                 return
             async with about_sem:
-                if hit_429:
+                if hit_gemini_pause:
                     return
                 meta = meta_by_sym.get(sym) or {}
                 result = await extract_about_company(
                     session, sym, ppt, tx,
                     industry=meta.get('industry'), sector=meta.get('sector'))
                 if result['error']:
+                    gemini_errors += 1
                     log.info(f"  📘 {sym}: will retry about-company next cycle")
-                    if result.get('rate_limited'):
-                        hit_429 = True
-                        cool = int(os.getenv('ABOUT_COMPANY_429_COOLDOWN_SECONDS', '60'))
-                        log.warning(f"📘 About-company: Gemini 429 — stopping batch, cooling {cool}s")
+                    # 429 / 503 / timeout, or a whole-batch error streak → pause hours.
+                    if result.get('rate_limited') or gemini_errors >= max(1, CONCURRENCY):
+                        hit_gemini_pause = True
+                        log.warning("📘 About-company: Gemini errors — stopping batch, long pause next")
                     return
                 about = result['about']
                 payload = {
@@ -4997,8 +4997,16 @@ async def _about_company_loop(session: aiohttp.ClientSession):
             await asyncio.gather(*[
                 _about_one(sym, ppt, tx, src_at) for sym, ppt, tx, src_at in todo
             ])
-        if hit_429:
-            await asyncio.sleep(int(os.getenv('ABOUT_COMPANY_429_COOLDOWN_SECONDS', '60')))
+        if hit_gemini_pause or (todo and gemini_errors >= len(todo)):
+            # Gemini 429 / 503 / timeouts / batch all failed → stop About for hours.
+            cool = int(os.getenv(
+                'ABOUT_COMPANY_ERROR_COOLDOWN_SECONDS',
+                os.getenv('ABOUT_COMPANY_429_COOLDOWN_SECONDS', '21600')))  # 6h
+            log.warning(
+                f"📘 About-company: Gemini unhealthy "
+                f"(errors={gemini_errors}/{len(todo) if todo else 0}) "
+                f"— pausing About job for {cool}s (~{cool // 3600}h)")
+            await asyncio.sleep(max(300, cool))
         elif todo:
             # Catchup still running — short pause between batches.
             await asyncio.sleep(int(os.getenv('ABOUT_COMPANY_CYCLE_SECONDS', '15')))
@@ -5011,7 +5019,7 @@ async def _about_company_loop(session: aiohttp.ClientSession):
                       f"— sleeping {idle}s until next refresh check")
             await asyncio.sleep(max(300, idle))
         else:
-            # Transient empty batch (e.g. all in-flight fails) — medium idle.
+            # Transient empty batch — medium idle.
             idle = int(os.getenv('ABOUT_COMPANY_IDLE_SECONDS', '3600'))  # 1h
             log.info(f"📘 About-company: nothing to generate "
                       f"(backlog≈{len(ranked)}) — sleeping {idle}s")
