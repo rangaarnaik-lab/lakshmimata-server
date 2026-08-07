@@ -875,24 +875,19 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
         # if there are more results-type announcements in the lookback
         # window than that cap, anything past the most recent N would
         # never even be fetched, no matter how many cycles run.
-        BATCH_SIZE = int(os.getenv('RESULTS_PDF_BATCH_SIZE', '10'))
-        candidates_limit = int(os.getenv('RESULTS_PDF_CANDIDATES_LIMIT', '500'))
+        BATCH_SIZE = int(os.getenv('RESULTS_PDF_BATCH_SIZE', '15'))
+        candidates_limit = int(os.getenv('RESULTS_PDF_CANDIDATES_LIMIT', '2000'))
         if not _key_status_logged:
             log.info(f"🎙️ Results extraction loop: GEMINI_API_KEY detected, active "
-                      f"(lookback={os.getenv('RESULTS_PDF_LOOKBACK_DAYS', '14')}d, batch={BATCH_SIZE}, "
+                      f"(lookback={os.getenv('RESULTS_PDF_LOOKBACK_DAYS', '90')}d, batch={BATCH_SIZE}, "
                       f"candidates_limit={candidates_limit})")
             _key_status_logged = True
         try:
             # Recent results announcements - configurable via
-            # RESULTS_PDF_LOOKBACK_DAYS (e.g. set to 1 for a quick,
-            # small test run rather than processing the full default
-            # backlog). Defaults to 14 days - older ones would already
-            # be covered by the BSE/XBRL pipeline running elsewhere,
-            # unless that pipeline has been disabled (GEMINI_ONLY_RESULTS/
-            # PAUSE_BSE_LOOPS), in which case both this and
-            # RESULTS_PDF_CANDIDATES_LIMIT need raising to actually reach
-            # older announcements.
-            lookback_days = int(os.getenv('RESULTS_PDF_LOOKBACK_DAYS', '14'))
+            # RESULTS_PDF_LOOKBACK_DAYS. Default raised to 90 days so
+            # earnings-season backlog isn't dropped after two weeks
+            # (confirmed gap: 14d lookback left most Jul filings unprocessed).
+            lookback_days = int(os.getenv('RESULTS_PDF_LOOKBACK_DAYS', '90'))
             since = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat()
             # DB-level pre-filter on subject/category keywords - confirmed
             # via production data (GRSE, 2026-08-06) that without this,
@@ -929,25 +924,16 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
         # values 76 seconds apart), which caused the PPT loop to
         # reprocess the same presentations every cycle indefinitely.
         # attachment_url stays stable for the same document regardless.
-        already = set()
-        if concall_rows:
-            try:
-                async with session.get(
-                    f"{SUPABASE_URL}/rest/v1/concall_summaries", headers=headers,
-                    params={'select': 'symbol,attachment_url'},
-                    timeout=aiohttp.ClientTimeout(total=30)
-                ) as r:
-                    if r.status == 200:
-                        already = {(row['symbol'], row['attachment_url']) for row in await r.json()}
-            except Exception as e:
-                log.warning(f"⚠️ Concall loop: existing-summaries fetch failed: {type(e).__name__}: {e}")
+        already, _thin = await _fetch_processed_attachment_keys(
+            session, 'concall_summaries', headers)
 
         todo = [row for row in concall_rows if (row['symbol'], row['attachment_url']) not in already][:BATCH_SIZE]
         if todo:
-            log.info(f"🎙️ Results extraction loop: {len(todo)} new results announcement(s) to process")
+            log.info(f"🎙️ Results extraction loop: {len(todo)} new results announcement(s) to process "
+                      f"(candidates={len(candidates)}, matched={len(concall_rows)}, already={len(already)})")
         else:
             log.info(f"🎙️ Results extraction loop: checked {len(candidates)} recent announcement(s) "
-                      f"({len(concall_rows)} matched results filters), nothing new to process")
+                      f"({len(concall_rows)} matched results filters, already={len(already)}), nothing new to process")
         for i, row in enumerate(todo):
             if i > 0:
                 # Pacing between calls, not just relying on natural
@@ -1122,17 +1108,27 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
                 'summary': summary, 'status': 'done' if summary else 'skipped',
             }
             try:
-                await session.post(
+                async with session.post(
                     f"{SUPABASE_URL}/rest/v1/concall_summaries", headers={**headers,
                         'Content-Type': 'application/json', 'Prefer': 'resolution=merge-duplicates'},
                     json=payload, timeout=aiohttp.ClientTimeout(total=15)
-                )
+                ) as r:
+                    if r.status not in (200, 201, 204):
+                        body = await r.text()
+                        log.warning(f"⚠️ Concall loop: save returned {r.status} for {row['symbol']} "
+                                     f"(is the concall_summaries table created with PK "
+                                     f"(symbol, attachment_url)?): {body[:300]}")
+                    elif summary:
+                        log.info(f"  🎙️ {row['symbol']}: results summary saved")
+                    else:
+                        log.info(f"  🎙️ {row['symbol']}: results PDF had no usable summary, marked skipped")
             except Exception as e:
                 log.warning(f"⚠️ Concall loop: save failed for {row['symbol']}: {type(e).__name__}: {e}")
             await asyncio.sleep(2)  # small gap between Gemini calls
         if todo:
             log.info(f"🎙️ Results extraction loop: batch complete")
-        await asyncio.sleep(300)  # 5 min, flat interval per user request
+        # Faster cadence while backlog exists (todo was non-empty this cycle)
+        await asyncio.sleep(120 if todo else 300)
 
 async def _announcements_loop(session: aiohttp.ClientSession):
     """Fetches NSE's corporate announcements feed (all equities in one
@@ -1321,6 +1317,53 @@ def _is_results_announcement(row: dict) -> bool:
         return False
     return any(x in text for x in _RESULTS_ANN_KEYWORDS)
 
+async def _fetch_processed_attachment_keys(session: aiohttp.ClientSession, table: str,
+                                          headers: dict, extra_select: str = ''):
+    """Pages through a summaries table collecting (symbol, attachment_url)
+    keys. PostgREST defaults to max 1000 rows per request — without
+    pagination, once a table grows past that the worker silently
+    re-fetches the same 'first 1000' forever and either reprocesses
+    duplicates or (worse) thinks everything past row 1000 is new while
+    also failing to see that older backlog items are unfinished.
+    Returns (already_done_or_skipped_set, thin_done_set) where thin_done
+    are status=done rows missing overall_summary (transcript reprocess)."""
+    already = set()
+    thin = set()
+    select = 'symbol,attachment_url,status' + (f',{extra_select}' if extra_select else '')
+    page_size = 1000
+    offset = 0
+    while True:
+        try:
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/{table}", headers=headers,
+                params={'select': select, 'order': 'announced_at.desc',
+                        'limit': str(page_size), 'offset': str(offset)},
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as r:
+                if r.status != 200:
+                    body = await r.text()
+                    log.warning(f"⚠️ {table}: already-processed page at offset {offset} "
+                                 f"returned {r.status}: {body[:200]}")
+                    break
+                rows = await r.json()
+        except Exception as e:
+            log.warning(f"⚠️ {table}: already-processed fetch failed at offset {offset}: "
+                         f"{type(e).__name__}: {e}")
+            break
+        if not rows:
+            break
+        for row in rows:
+            key = (row['symbol'], row['attachment_url'])
+            status = row.get('status')
+            if extra_select == 'overall_summary' and status == 'done' and not (row.get('overall_summary') or '').strip():
+                thin.add(key)
+            elif status in ('done', 'skipped', 'failed', 'pending'):
+                already.add(key)
+        if len(rows) < page_size:
+            break
+        offset += page_size
+    return already, thin
+
 async def _market_cap_catchup_loop(session: aiohttp.ClientSession):
     """Runs hourly, separate from the once-daily FULL fundamentals
     refresh (_fundamentals_loop below) — re-attempts ONLY stocks still
@@ -1441,15 +1484,15 @@ async def _ppt_summary_loop(session: aiohttp.ClientSession):
                 _key_status_logged = True
             await asyncio.sleep(300)
             continue
-        BATCH_SIZE = int(os.getenv('PPT_BATCH_SIZE', '10'))
-        candidates_limit = int(os.getenv('PPT_CANDIDATES_LIMIT', '500'))
+        BATCH_SIZE = int(os.getenv('PPT_BATCH_SIZE', '15'))
+        candidates_limit = int(os.getenv('PPT_CANDIDATES_LIMIT', '2000'))
         if not _key_status_logged:
             log.info(f"🎙️ PPT summary loop: GEMINI_API_KEY detected, active "
-                      f"(lookback={os.getenv('PPT_LOOKBACK_DAYS', '14')}d, batch={BATCH_SIZE}, "
+                      f"(lookback={os.getenv('PPT_LOOKBACK_DAYS', '90')}d, batch={BATCH_SIZE}, "
                       f"candidates_limit={candidates_limit})")
             _key_status_logged = True
         try:
-            lookback_days = int(os.getenv('PPT_LOOKBACK_DAYS', '14'))
+            lookback_days = int(os.getenv('PPT_LOOKBACK_DAYS', '90'))
             since = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat()
             or_filter = '(' + ','.join(
                 f'subject.ilike.*{kw}*' for kw in _PPT_ANN_KEYWORDS) + ')'
@@ -1466,29 +1509,15 @@ async def _ppt_summary_loop(session: aiohttp.ClientSession):
             candidates = []
         ppt_rows = [row for row in candidates if row.get('attachment_url') and _is_ppt_announcement(row)]
 
-        already = set()
-        if ppt_rows:
-            try:
-                async with session.get(
-                    f"{SUPABASE_URL}/rest/v1/ppt_summaries", headers=headers,
-                    params={'select': 'symbol,attachment_url'},
-                    timeout=aiohttp.ClientTimeout(total=30)
-                ) as r:
-                    if r.status == 200:
-                        already = {(row['symbol'], row['attachment_url']) for row in await r.json()}
-                    else:
-                        body = await r.text()
-                        log.warning(f"⚠️ PPT loop: already-processed query returned {r.status} "
-                                     f"(is the ppt_summaries table created?): {body[:200]}")
-            except Exception as e:
-                log.warning(f"⚠️ PPT loop: already-processed fetch failed: {type(e).__name__}: {e}")
+        already, _thin = await _fetch_processed_attachment_keys(session, 'ppt_summaries', headers)
 
         todo = [row for row in ppt_rows if (row['symbol'], row['attachment_url']) not in already][:BATCH_SIZE]
         if todo:
-            log.info(f"🎙️ PPT summary loop: {len(todo)} new presentation(s) to process")
+            log.info(f"🎙️ PPT summary loop: {len(todo)} new presentation(s) to process "
+                      f"(candidates={len(candidates)}, matched={len(ppt_rows)}, already={len(already)})")
         else:
             log.info(f"🎙️ PPT summary loop: checked {len(candidates)} recent announcement(s) "
-                      f"({len(ppt_rows)} matched presentation filter), nothing new to process")
+                      f"({len(ppt_rows)} matched presentation filter, already={len(already)}), nothing new")
         for i, row in enumerate(todo):
             if i > 0:
                 await asyncio.sleep(float(os.getenv('RESULTS_PDF_PACING_SECONDS', '5')))
@@ -1526,7 +1555,7 @@ async def _ppt_summary_loop(session: aiohttp.ClientSession):
                 log.warning(f"⚠️ PPT loop: save failed for {row['symbol']}: {type(e).__name__}: {e}")
         if todo:
             log.info("🎙️ PPT summary loop: batch complete")
-        await asyncio.sleep(300)
+        await asyncio.sleep(120 if todo else 300)
 
 async def _transcript_summary_loop(session: aiohttp.ClientSession):
     """Finds earnings-call TRANSCRIPT announcements (a different filing
@@ -1550,15 +1579,15 @@ async def _transcript_summary_loop(session: aiohttp.ClientSession):
                 _key_status_logged = True
             await asyncio.sleep(300)
             continue
-        BATCH_SIZE = int(os.getenv('TRANSCRIPT_BATCH_SIZE', '10'))
-        candidates_limit = int(os.getenv('TRANSCRIPT_CANDIDATES_LIMIT', '500'))
+        BATCH_SIZE = int(os.getenv('TRANSCRIPT_BATCH_SIZE', '15'))
+        candidates_limit = int(os.getenv('TRANSCRIPT_CANDIDATES_LIMIT', '2000'))
         if not _key_status_logged:
             log.info(f"🎙️ Transcript summary loop: GEMINI_API_KEY detected, active "
-                      f"(lookback={os.getenv('TRANSCRIPT_LOOKBACK_DAYS', '14')}d, batch={BATCH_SIZE}, "
+                      f"(lookback={os.getenv('TRANSCRIPT_LOOKBACK_DAYS', '90')}d, batch={BATCH_SIZE}, "
                       f"candidates_limit={candidates_limit})")
             _key_status_logged = True
         try:
-            lookback_days = int(os.getenv('TRANSCRIPT_LOOKBACK_DAYS', '14'))
+            lookback_days = int(os.getenv('TRANSCRIPT_LOOKBACK_DAYS', '90'))
             since = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat()
             or_filter = '(' + ','.join(
                 f'subject.ilike.*{kw}*' for kw in _TRANSCRIPT_ANN_KEYWORDS) + ')'
@@ -1575,38 +1604,21 @@ async def _transcript_summary_loop(session: aiohttp.ClientSession):
             candidates = []
         transcript_rows = [row for row in candidates if row.get('attachment_url') and _is_transcript_announcement(row)]
 
-        already = set()
-        if transcript_rows:
-            try:
-                # Rows with status done but empty overall_summary were produced by
-                # the older weaker prompt — treat them as not-yet-done so the
-                # improved extractor can overwrite via merge-duplicates.
-                async with session.get(
-                    f"{SUPABASE_URL}/rest/v1/transcript_summaries", headers=headers,
-                    params={'select': 'symbol,attachment_url,status,overall_summary'},
-                    timeout=aiohttp.ClientTimeout(total=30)
-                ) as r:
-                    if r.status == 200:
-                        for row in await r.json():
-                            if row.get('status') == 'skipped':
-                                already.add((row['symbol'], row['attachment_url']))
-                            elif row.get('status') == 'done' and (row.get('overall_summary') or '').strip():
-                                already.add((row['symbol'], row['attachment_url']))
-                            # else: thin/failed row — eligible for reprocess
-                    else:
-                        body = await r.text()
-                        log.warning(f"⚠️ Transcript loop: already-processed query returned {r.status} "
-                                     f"(is the transcript_summaries table created?): {body[:200]}")
-            except Exception as e:
-                log.warning(f"⚠️ Transcript loop: already-processed fetch failed: {type(e).__name__}: {e}")
-
-        todo = [row for row in transcript_rows if (row['symbol'], row['attachment_url']) not in already][:BATCH_SIZE]
+        # Rows with status done but empty overall_summary were produced by
+        # the older weaker prompt — leave them out of `already` so the
+        # improved extractor can overwrite via merge-duplicates.
+        already, thin = await _fetch_processed_attachment_keys(
+            session, 'transcript_summaries', headers, extra_select='overall_summary')
+        # thin keys are eligible for reprocess (not in already)
+        todo = [row for row in transcript_rows
+                if (row['symbol'], row['attachment_url']) not in already][:BATCH_SIZE]
         if todo:
             log.info(f"🎙️ Transcript summary loop: {len(todo)} transcript(s) to process "
-                      f"(new or thin reports missing overall_summary)")
+                      f"(new or thin; candidates={len(candidates)}, matched={len(transcript_rows)}, "
+                      f"already={len(already)}, thin={len(thin)})")
         else:
             log.info(f"🎙️ Transcript summary loop: checked {len(candidates)} recent announcement(s) "
-                      f"({len(transcript_rows)} matched transcript filter), nothing new to process")
+                      f"({len(transcript_rows)} matched transcript filter, already={len(already)}), nothing new")
         for i, row in enumerate(todo):
             if i > 0:
                 await asyncio.sleep(float(os.getenv('RESULTS_PDF_PACING_SECONDS', '5')))
@@ -1645,7 +1657,7 @@ async def _transcript_summary_loop(session: aiohttp.ClientSession):
                 log.warning(f"⚠️ Transcript loop: save failed for {row['symbol']}: {type(e).__name__}: {e}")
         if todo:
             log.info("🎙️ Transcript summary loop: batch complete")
-        await asyncio.sleep(300)  # 5 min, matching the results loop's cadence
+        await asyncio.sleep(120 if todo else 300)  # faster while backlog remains
 
 async def _results_loop(session: aiohttp.ClientSession):
     """Polls NSE's structured financial-results feed every 30 min — new
