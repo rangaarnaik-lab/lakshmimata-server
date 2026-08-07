@@ -19,6 +19,20 @@ from shared import *
 
 log = logging.getLogger('pocketrs')
 
+# Local fallbacks — shared.__all__ omitted these once and crash-looped Railway.
+# Prefer shared definitions when present; never NameError on boot.
+if '_fundamentals_fetch_paused' not in globals():
+    def _fundamentals_fetch_paused() -> bool:
+        v = (os.getenv('PAUSE_FUNDAMENTALS_FETCH') or '').strip().lower()
+        if v in ('1', 'true', 'yes', 'on'):
+            return True
+        return (os.getenv('GEMINI_FOCUS') or '').strip().lower() == 'about'
+
+if '_screener_disabled' not in globals():
+    def _screener_disabled() -> bool:
+        v = (os.getenv('ENABLE_SCREENER') or '').strip().lower()
+        return v not in ('1', 'true', 'yes', 'on')
+
 # Symbols confirmed to have no BSE scrip code at all (mostly ETFs/indices) -
 # tracked in-memory so the incremental BSE-missing backfill loop doesn't
 # keep wasting batch slots re-attempting the same permanently-doomed
