@@ -4706,19 +4706,56 @@ async def _about_company_loop(session: aiohttp.ClientSession):
                 stock_rows = await r.json() if r.status == 200 else []
                 if not isinstance(stock_rows, list):
                     stock_rows = []
+            # Minimal columns first — selecting sources/image_url 400s the whole
+            # read when those migrations weren't applied, which made existing=[]
+            # every cycle and stuck the loop on BAJFINANCE forever.
+            existing = []
             async with session.get(
                 f"{SUPABASE_URL}/rest/v1/company_abouts", headers=headers,
-                params={'select': 'symbol,source_announced_at,status,sources,image_url', 'limit': '5000'},
+                params={
+                    'select': 'symbol,source_announced_at,status',
+                    'order': 'symbol.asc',
+                    'limit': '5000',
+                },
                 timeout=aiohttp.ClientTimeout(total=30)
             ) as r:
-                existing = await r.json() if r.status == 200 else []
-                if not isinstance(existing, list):
-                    if isinstance(existing, dict) and existing.get('code'):
-                        log.warning("📘 About-company loop: company_abouts table missing? "
-                                    "Run ensure_company_abouts.sql in Supabase.")
+                raw = await r.text()
+                try:
+                    body = json.loads(raw) if raw else None
+                except Exception:
+                    body = None
+                if r.status != 200:
+                    log.warning(f"📘 About-company loop: company_abouts read failed "
+                                f"({r.status}): {raw[:220]}")
+                    if r.status in (404, 400):
+                        log.warning("📘 Run ensure_company_abouts.sql in Supabase.")
                         await asyncio.sleep(600)
                         continue
                     existing = []
+                elif isinstance(body, list):
+                    existing = body
+                elif isinstance(body, dict) and body.get('code'):
+                    log.warning("📘 About-company loop: company_abouts table missing? "
+                                "Run ensure_company_abouts.sql in Supabase.")
+                    await asyncio.sleep(600)
+                    continue
+            # Optional enrich for web-backfill decisions (ignore if cols missing).
+            if existing and os.getenv('ABOUT_COMPANY_WEB_SEARCH', '0').strip() not in (
+                    '0', 'false', 'False'):
+                async with session.get(
+                    f"{SUPABASE_URL}/rest/v1/company_abouts", headers=headers,
+                    params={'select': 'symbol,sources,image_url', 'limit': '5000'},
+                    timeout=aiohttp.ClientTimeout(total=30)
+                ) as r2:
+                    if r2.status == 200:
+                        extra = await r2.json()
+                        if isinstance(extra, list):
+                            by = {(x.get('symbol') or '').strip().upper(): x
+                                  for x in extra if x.get('symbol')}
+                            for row in existing:
+                                ex = by.get((row.get('symbol') or '').strip().upper()) or {}
+                                row['sources'] = ex.get('sources')
+                                row['image_url'] = ex.get('image_url')
         except Exception as e:
             log.warning(f"⚠️ About-company loop fetch failed: {type(e).__name__}: {e}")
             await asyncio.sleep(180)
@@ -4726,22 +4763,32 @@ async def _about_company_loop(session: aiohttp.ClientSession):
 
         ppt_by_sym, tx_by_sym, fund_by_sym, meta_by_sym = {}, {}, {}, {}
         for row in ppt_rows or []:
-            sym = row.get('symbol')
+            sym = (row.get('symbol') or '').strip().upper()
             if sym and sym not in ppt_by_sym:
                 ppt_by_sym[sym] = row
         for row in tx_rows or []:
-            sym = row.get('symbol')
+            sym = (row.get('symbol') or '').strip().upper()
             if sym and sym not in tx_by_sym:
                 tx_by_sym[sym] = row
         for row in fund_rows or []:
-            sym = row.get('sym')
+            sym = (row.get('sym') or '').strip().upper()
             if sym and sym not in fund_by_sym:
                 fund_by_sym[sym] = row
         for row in stock_rows or []:
-            sym = row.get('sym')
+            sym = (row.get('sym') or '').strip().upper()
             if sym and sym not in meta_by_sym:
                 meta_by_sym[sym] = row
-        existing_map = {r['symbol']: r for r in (existing or []) if r.get('symbol')}
+        existing_map = {}
+        for r in (existing or []):
+            sym = (r.get('symbol') or '').strip().upper()
+            if not sym:
+                continue
+            existing_map[sym] = r
+            if r.get('status') in ('done', 'skipped'):
+                _ABOUT_DONE_SYMS.add(sym)
+        _done_n = sum(1 for r in existing_map.values() if r.get('status') == 'done')
+        log.info(f"📘 About-company: loaded {len(existing_map)} row(s), "
+                 f"{_done_n} done, in-memory skip={len(_ABOUT_DONE_SYMS)}")
 
         # Prefer names with filings first, then large-cap names still missing a brief.
         # Include stocks-table universe so About backfills even without PPT/concall yet.
