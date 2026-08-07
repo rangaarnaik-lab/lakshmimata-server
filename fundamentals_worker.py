@@ -4999,10 +4999,23 @@ async def _about_company_loop(session: aiohttp.ClientSession):
             ])
         if hit_429:
             await asyncio.sleep(int(os.getenv('ABOUT_COMPANY_429_COOLDOWN_SECONDS', '60')))
+        elif todo:
+            # Catchup still running — short pause between batches.
+            await asyncio.sleep(int(os.getenv('ABOUT_COMPANY_CYCLE_SECONDS', '15')))
+        elif not ranked:
+            # All candidates done (or skipped). Rarely re-check for new
+            # filings / new listings — do NOT hammer Gemini / Supabase.
+            idle = int(os.getenv('ABOUT_COMPANY_CATCHUP_DONE_SECONDS', '21600'))  # 6h
+            log.info(f"📘 About-company: catchup complete "
+                      f"({_done_n} done, universe≈{len(set(ppt_by_sym)|set(tx_by_sym)|set(fund_by_sym)|set(meta_by_sym))}) "
+                      f"— sleeping {idle}s until next refresh check")
+            await asyncio.sleep(max(300, idle))
         else:
-            await asyncio.sleep(int(os.getenv(
-                'ABOUT_COMPANY_CYCLE_SECONDS',
-                '15' if todo else '180')))
+            # Transient empty batch (e.g. all in-flight fails) — medium idle.
+            idle = int(os.getenv('ABOUT_COMPANY_IDLE_SECONDS', '3600'))  # 1h
+            log.info(f"📘 About-company: nothing to generate "
+                      f"(backlog≈{len(ranked)}) — sleeping {idle}s")
+            await asyncio.sleep(max(120, idle))
 
 
 async def fundamentals_worker_main():
