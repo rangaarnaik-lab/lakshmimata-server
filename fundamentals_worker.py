@@ -1928,7 +1928,7 @@ async def _ppt_summary_loop(session: aiohttp.ClientSession):
                 _key_status_logged = True
             await asyncio.sleep(300)
             continue
-        BATCH_SIZE = int(os.getenv('PPT_BATCH_SIZE', '15'))
+        BATCH_SIZE = int(os.getenv('PPT_BATCH_SIZE', '5'))
         candidates_limit = int(os.getenv('PPT_CANDIDATES_LIMIT', '2000'))
         if not _key_status_logged:
             log.info(f"🎙️ PPT summary loop: GEMINI_API_KEY detected, active "
@@ -2051,7 +2051,7 @@ async def _transcript_summary_loop(session: aiohttp.ClientSession):
                 _key_status_logged = True
             await asyncio.sleep(300)
             continue
-        BATCH_SIZE = int(os.getenv('TRANSCRIPT_BATCH_SIZE', '15'))
+        BATCH_SIZE = int(os.getenv('TRANSCRIPT_BATCH_SIZE', '5'))
         candidates_limit = int(os.getenv('TRANSCRIPT_CANDIDATES_LIMIT', '2000'))
         if not _key_status_logged:
             log.info(f"🎙️ Transcript summary loop: GEMINI_API_KEY detected, active "
@@ -4626,9 +4626,8 @@ async def _about_company_loop(session: aiohttp.ClientSession):
                 _key_status_logged = True
             await asyncio.sleep(300)
             continue
-        # Default raised for backfill — ~1200 large-caps need briefs; 8/cycle
-        # at 8s pacing is too slow. Env can still lower if Gemini rate-limits.
-        BATCH_SIZE = int(os.getenv('ABOUT_COMPANY_BATCH_SIZE', '12'))
+        # Keep About batch modest — free-tier Gemini RPM is shared with PPT/transcript.
+        BATCH_SIZE = int(os.getenv('ABOUT_COMPANY_BATCH_SIZE', '4'))
         if not _key_status_logged:
             log.info(f"📘 About-company loop: active with web search "
                       f"(batch={BATCH_SIZE}, ABOUT_COMPANY_WEB_SEARCH="
