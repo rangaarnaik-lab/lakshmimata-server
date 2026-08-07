@@ -63,8 +63,17 @@ _GEMINI_JOBS_PAUSED_UNTIL: float | None = None
 
 
 def _gemini_jobs_hard_paused() -> bool:
+    """True while hard-stop window is active. Auto-clears and logs when 24h ends."""
+    global _GEMINI_JOBS_PAUSED_UNTIL
     until = _GEMINI_JOBS_PAUSED_UNTIL
-    return bool(until and time.time() < until)
+    if not until:
+        return False
+    if time.time() < until:
+        return True
+    _GEMINI_JOBS_PAUSED_UNTIL = None
+    log.info("▶️ Gemini jobs: 24h hard stop finished — starting again "
+             "(Results catchup resumes; About stays off unless PAUSE_ABOUT_COMPANY=0)")
+    return False
 
 
 def _gemini_jobs_hard_pause_seconds() -> int:
@@ -74,7 +83,8 @@ def _gemini_jobs_hard_pause_seconds() -> int:
 
 
 def _begin_gemini_jobs_hard_pause(reason: str, seconds: int | None = None):
-    """Stop every Gemini worker loop — Results failing means stop burning quota."""
+    """Stop every Gemini worker loop — Results failing means stop burning quota.
+    After the sleep window, loops auto-resume (no redeploy needed)."""
     global _GEMINI_JOBS_PAUSED_UNTIL, _ABOUT_YIELD_TO_RESULTS_UNTIL
     sec = _gemini_jobs_hard_pause_seconds() if seconds is None else max(3600, int(seconds))
     _GEMINI_JOBS_PAUSED_UNTIL = time.time() + sec
@@ -82,9 +92,18 @@ def _begin_gemini_jobs_hard_pause(reason: str, seconds: int | None = None):
     _ABOUT_YIELD_TO_RESULTS_UNTIL = None
     log.error(
         f"🛑 Gemini jobs HARD STOP for {sec}s (~{sec // 3600}h) — {reason}. "
-        f"Resume after "
+        f"Will auto-start again after "
         f"{datetime.fromtimestamp(_GEMINI_JOBS_PAUSED_UNTIL, tz=timezone.utc).isoformat()}. "
         f"Override with GEMINI_JOBS_HARD_PAUSE_SECONDS.")
+
+
+async def _sleep_while_gemini_hard_paused():
+    """Sleep until hard-stop ends, then return so the caller can start again."""
+    while _gemini_jobs_hard_paused():
+        left = max(1, int((_GEMINI_JOBS_PAUSED_UNTIL or time.time()) - time.time()))
+        # Chunk sleeps so process stays responsive; last chunk covers remainder.
+        await asyncio.sleep(min(3600, left))
+    # _gemini_jobs_hard_paused() already logged resume when the window expired.
 
 
 def _about_company_manually_paused() -> bool:
@@ -1238,10 +1257,10 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
     _key_status_logged = False
     while True:
         if _gemini_jobs_hard_paused():
-            left = max(0, int(_GEMINI_JOBS_PAUSED_UNTIL - time.time()))
+            left = max(0, int((_GEMINI_JOBS_PAUSED_UNTIL or 0) - time.time()))
             log.error(f"🛑 Results extraction: Gemini jobs hard-stopped "
-                      f"({left}s left) — not calling API")
-            await asyncio.sleep(min(3600, max(60, left)))
+                      f"({left}s / ~{left // 3600}h left) — sleeping, then auto-restart")
+            await _sleep_while_gemini_hard_paused()
             continue
         if await _idle_if_gemini_paused('results', 'Results extraction loop'):
             continue
@@ -1519,10 +1538,10 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
                 log.warning(f"⚠️ Concall loop: save failed for {row['symbol']}: {type(e).__name__}: {e}")
             await asyncio.sleep(2)  # small gap between Gemini calls
         if _gemini_jobs_hard_paused():
-            left = max(0, int(_GEMINI_JOBS_PAUSED_UNTIL - time.time()))
+            left = max(0, int((_GEMINI_JOBS_PAUSED_UNTIL or 0) - time.time()))
             log.error(f"🛑 Results extraction: batch aborted — Gemini hard stop "
-                      f"({left}s / ~{left // 3600}h remaining)")
-            await asyncio.sleep(min(3600, max(60, left)))
+                      f"({left}s / ~{left // 3600}h left) — sleeping, then auto-restart")
+            await _sleep_while_gemini_hard_paused()
             continue
         if todo:
             log.info(f"🎙️ Results extraction loop: batch complete"
@@ -5460,8 +5479,7 @@ async def _idle_if_gemini_paused(feature: str, label: str):
         log.info(f"⏸️ {label}: paused (GEMINI_FOCUS={why})")
     while not _gemini_focus_allows(feature):
         if _gemini_jobs_hard_paused():
-            left = max(0, int((_GEMINI_JOBS_PAUSED_UNTIL or 0) - time.time()))
-            await asyncio.sleep(min(3600, max(60, left or 60)))
+            await _sleep_while_gemini_hard_paused()
         else:
             await asyncio.sleep(
                 30 if (_ABOUT_YIELD_TO_RESULTS_UNTIL or _about_company_manually_paused()) else 300)
