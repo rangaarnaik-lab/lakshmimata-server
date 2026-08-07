@@ -5,7 +5,9 @@
 -- Also ensures theme + AI highlight + Flags columns exist.
 
 ALTER TABLE public.stock_fundamentals
-  ADD COLUMN IF NOT EXISTS industry text;
+  ADD COLUMN IF NOT EXISTS industry text,
+  ADD COLUMN IF NOT EXISTS fundamental_score numeric,
+  ADD COLUMN IF NOT EXISTS fundamental_label text;
 
 ALTER TABLE public.stock_fundamentals ENABLE ROW LEVEL SECURITY;
 
