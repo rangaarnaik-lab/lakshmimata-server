@@ -3941,17 +3941,20 @@ async def extract_management_flags(session: aiohttp.ClientSession, symbol: str, 
 
 
 async def answer_stock_ai_ask(session: aiohttp.ClientSession, symbol: str, question: str,
-                              context: str, industry=None, sector=None):
-    """Answer from filings already on file only — no web/backend search."""
+                              context: str, industry=None, sector=None, use_web: bool = False):
+    """Answer a diligence question.
+    use_web=False → filings/about on file only (no Google Search).
+    use_web=True  → Gemini Google Search + local context."""
     api_key = os.getenv('GEMINI_API_KEY', '')
     if not api_key:
         return None
-    if not context or len(context.strip()) < 200:
+    has_context = bool(context and len(context.strip()) >= 200)
+    if not use_web and not has_context:
         return {
             'answer': (
                 f"No PPT/concall summary is on file yet for {symbol}, so there isn’t enough "
-                "local filing information to answer. Flags appear after a presentation or "
-                "earnings call is summarized."
+                "local filing information to answer. Switch to Web research, or wait until a "
+                "presentation / earnings call is summarized."
             ),
             'verdict': 'unknown',
             'flags': None,
@@ -3959,40 +3962,72 @@ async def answer_stock_ai_ask(session: aiohttp.ClientSession, symbol: str, quest
             'insufficient': True,
         }
     sector_bit = ' / '.join(x for x in [industry, sector] if x) or 'NSE-listed company'
-    prompt = (
-        f"Answer this investor diligence question about Indian NSE stock {symbol} ({sector_bit}).\n"
-        f"QUESTION: {question.strip()}\n\n"
-        "Use ONLY the LOCAL CONTEXT below (PPT/concall/about already on file). "
-        "Do NOT browse the web or invent. If the context does not contain enough to answer, "
-        "say so clearly and return verdict=unknown with empty flags.\n"
-        "Compare management promises vs execution when the context supports it. "
-        "No buy/sell recommendation.\n\n"
-        "Return ONLY JSON:\n"
-        '- "answer": 80-200 words\n'
-        '- "verdict": trustworthy | mixed | caution | unknown | n/a\n'
-        '- "flags": 0-6 objects {tone: green|red|watch, title, detail} — only if context supports them\n\n'
-        f"LOCAL CONTEXT:\n{context[:14000]}\n"
-    )
+    if use_web:
+        prompt = (
+            f"Answer this investor diligence question about Indian NSE stock {symbol} ({sector_bit}).\n"
+            f"QUESTION: {question.strip()}\n\n"
+            "Use Google Search across annual reports, concalls, filings, company site, and "
+            "reputable news. Also use LOCAL CONTEXT below when present (PPT/concall/about on file).\n"
+            "Compare management promises vs execution when relevant. No buy/sell recommendation.\n"
+            "If evidence is weak, say so explicitly.\n\n"
+            "Return ONLY JSON:\n"
+            '- "answer": 120-220 words, clear and specific\n'
+            '- "verdict": trustworthy | mixed | caution | unknown | n/a\n'
+            '- "flags": 0-6 objects {tone: green|red|watch, title, detail}\n\n'
+        )
+        if has_context:
+            prompt += f"LOCAL CONTEXT:\n{context[:12000]}\n"
+    else:
+        prompt = (
+            f"Answer this investor diligence question about Indian NSE stock {symbol} ({sector_bit}).\n"
+            f"QUESTION: {question.strip()}\n\n"
+            "Use ONLY the LOCAL CONTEXT below (PPT/concall/about already on file). "
+            "Do NOT browse the web or invent. If the context does not contain enough to answer, "
+            "say so clearly and return verdict=unknown with empty flags.\n"
+            "Compare management promises vs execution when the context supports it. "
+            "No buy/sell recommendation.\n\n"
+            "Return ONLY JSON:\n"
+            '- "answer": 80-200 words\n'
+            '- "verdict": trustworthy | mixed | caution | unknown | n/a\n'
+            '- "flags": 0-6 objects {tone: green|red|watch, title, detail} — only if context supports them\n\n'
+            f"LOCAL CONTEXT:\n{context[:14000]}\n"
+        )
     model = os.getenv('GEMINI_ABOUT_MODEL') or os.getenv('GEMINI_CONCALL_MODEL', 'gemini-3.1-flash-lite')
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.2},
+        "generationConfig": {"temperature": 0.2 if not use_web else 0.25},
     }
+    if use_web:
+        body["tools"] = [{"google_search": {}}]
     try:
         async with session.post(
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
             headers={"Content-Type": "application/json"},
             json=body,
-            timeout=aiohttp.ClientTimeout(total=90),
+            timeout=aiohttp.ClientTimeout(total=130 if use_web else 90),
         ) as r:
             if r.status != 200:
                 txt = await r.text()
-                if r.status == 429:
+                if use_web and r.status in (400, 404):
+                    body.pop('tools', None)
+                    async with session.post(
+                        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
+                        headers={"Content-Type": "application/json"},
+                        json=body,
+                        timeout=aiohttp.ClientTimeout(total=100),
+                    ) as r2:
+                        if r2.status != 200:
+                            log.warning(f"⚠️ Ask-AI failed for {symbol} ({r2.status}): {(await r2.text())[:160]}")
+                            return None
+                        data = await r2.json()
+                elif r.status == 429:
                     await asyncio.sleep(int(os.getenv('GEMINI_429_BACKOFF_SECONDS', '30')))
                     return None
-                log.warning(f"⚠️ Ask-AI failed for {symbol} ({r.status}): {txt[:160]}")
-                return None
-            data = await r.json()
+                else:
+                    log.warning(f"⚠️ Ask-AI failed for {symbol} ({r.status}): {txt[:160]}")
+                    return None
+            else:
+                data = await r.json()
         parts = (data.get('candidates') or [{}])[0].get('content', {}).get('parts', [])
         raw = ''.join(p.get('text', '') for p in parts).strip()
         parsed = _parse_json_object(raw)
@@ -4001,11 +4036,12 @@ async def answer_stock_ai_ask(session: aiohttp.ClientSession, symbol: str, quest
         answer = str(parsed.get('answer') or '').strip()
         if len(answer) < 40:
             return None
+        sources = _grounding_source_urls(data, limit=6) if use_web else None
         return {
             'answer': answer[:2500],
             'verdict': str(parsed.get('verdict') or 'n/a')[:40],
             'flags': _clean_mgmt_flags(parsed.get('flags')),
-            'sources': None,
+            'sources': sources,
         }
     except Exception as e:
         log.warning(f"⚠️ Ask-AI error for {symbol}: {type(e).__name__}: {e}")
@@ -4170,7 +4206,7 @@ async def _stock_ai_asks_loop(session: aiohttp.ClientSession):
             async with session.get(
                 f"{SUPABASE_URL}/rest/v1/stock_ai_asks", headers=headers,
                 params={
-                    'select': 'id,symbol,question,created_at',
+                    'select': 'id,symbol,question,ask_mode,created_at',
                     'status': 'eq.pending',
                     'order': 'created_at.asc',
                     'limit': '3',
@@ -4183,10 +4219,21 @@ async def _stock_ai_asks_loop(session: aiohttp.ClientSession):
                         log.warning("💬 Ask-AI: run add_stock_ai_asks.sql")
                         await asyncio.sleep(600)
                         continue
-                    log.warning(f"💬 Ask-AI poll failed ({r.status}): {body[:160]}")
-                    await asyncio.sleep(30)
-                    continue
-                pending = await r.json()
+                    # Older DB without ask_mode — retry without it
+                    if r.status == 400 and 'ask_mode' in body:
+                        async with session.get(
+                            f"{SUPABASE_URL}/rest/v1/stock_ai_asks", headers=headers,
+                            params={'select': 'id,symbol,question,created_at', 'status': 'eq.pending',
+                                    'order': 'created_at.asc', 'limit': '3'},
+                            timeout=aiohttp.ClientTimeout(total=20),
+                        ) as r2:
+                            pending = await r2.json() if r2.status == 200 else []
+                    else:
+                        log.warning(f"💬 Ask-AI poll failed ({r.status}): {body[:160]}")
+                        await asyncio.sleep(30)
+                        continue
+                else:
+                    pending = await r.json()
             if not pending:
                 await asyncio.sleep(8)
                 continue
@@ -4194,27 +4241,29 @@ async def _stock_ai_asks_loop(session: aiohttp.ClientSession):
                 ask_id = row.get('id')
                 sym = (row.get('symbol') or '').strip().upper()
                 question = (row.get('question') or '').strip()
+                ask_mode = (row.get('ask_mode') or 'filings').strip().lower()
+                use_web = ask_mode in ('web', 'web_search', 'search')
                 if not ask_id or not sym or len(question) < 8:
                     continue
-                log.info(f"💬 Ask-AI answering {sym}: {question[:80]}")
+                log.info(f"💬 Ask-AI answering {sym} [{ask_mode}]: {question[:80]}")
                 context, fund, ppt, tx, _about = await _gather_stock_ask_context(session, headers, sym)
-                # Filings-only: drop fundamentals snapshot; require PPT or concall
                 filing_ctx = '\n\n'.join(
                     p for p in (context or '').split('\n\n')
                     if not p.startswith('FUNDAMENTALS SNAPSHOT:')
                 )
-                if not ppt and not tx:
+                if not use_web and not ppt and not tx:
                     filing_ctx = ''
                 result = await answer_stock_ai_ask(
                     session, sym, question, filing_ctx,
-                    industry=fund.get('industry'), sector=fund.get('sector'))
+                    industry=fund.get('industry'), sector=fund.get('sector'),
+                    use_web=use_web)
                 if result:
                     patch = {
                         'status': 'done',
                         'answer': result['answer'],
                         'verdict': result.get('verdict'),
                         'flags': result.get('flags'),
-                        'sources': None,  # no web search → no grounding URLs
+                        'sources': result.get('sources') if use_web else None,
                         'answered_at': datetime.now(timezone.utc).isoformat(),
                         'error': None,
                     }
