@@ -3452,14 +3452,29 @@ async def extract_about_company(session: aiohttp.ClientSession, symbol: str, ppt
     ] if x)
 
     sector_bit = ' / '.join(x for x in [industry, sector] if x) or 'NSE-listed company'
+    # Default OFF — Google Search grounding burns free-tier quota in 1–2 calls.
+    # Set ABOUT_COMPANY_WEB_SEARCH=1 only on paid / higher quota keys.
+    use_search = os.getenv('ABOUT_COMPANY_WEB_SEARCH', '0').strip() not in ('0', 'false', 'False')
+    if use_search:
+        research_bit = (
+            "Use Google Search to check multiple reliable public sources such as the company "
+            "website/about page, annual report / investor presentation pages, Screener.in, "
+            "Moneycontrol, NSE/BSE filings pages, Wikipedia, and recent news — then synthesize "
+            "a short retail-investor company brief.\n\n"
+            "Prefer facts that appear in more than one source. If something is unclear or "
+            "conflicting, omit it rather than invent."
+        )
+    else:
+        research_bit = (
+            "Synthesize a short retail-investor company brief from your knowledge of this "
+            "NSE-listed company PLUS any filing excerpts provided below. Do not invent "
+            "numbers, deals, or product lines that are not well-established or present in "
+            "the filing text. If unsure, omit."
+        )
     prompt = (
-        f"Research the Indian NSE-listed company with ticker {symbol} ({sector_bit}).\n"
-        "Use Google Search to check multiple reliable public sources such as the company "
-        "website/about page, annual report / investor presentation pages, Screener.in, "
-        "Moneycontrol, NSE/BSE filings pages, Wikipedia, and recent news — then synthesize "
-        "a short retail-investor company brief.\n\n"
-        "Prefer facts that appear in more than one source. If something is unclear or "
-        "conflicting, omit it rather than invent. No buy/sell advice. No price targets.\n\n"
+        f"Indian NSE-listed company ticker {symbol} ({sector_bit}).\n"
+        f"{research_bit}\n"
+        "No buy/sell advice. No price targets.\n\n"
         "Return ONLY a JSON object (no markdown fences) with these keys:\n"
         '- "what_they_do": 1-3 sentences on products/services\n'
         '- "customers": array of 2-5 short bullets on who buys / end markets / geographies\n'
@@ -3469,18 +3484,20 @@ async def extract_about_company(session: aiohttp.ClientSession, symbol: str, ppt
         '- "website": official company website domain only (e.g. "infosys.com"), no https://, '
         'null if unknown — never use screener/moneycontrol/nse/news sites\n'
         '- "logo_image_url": direct https URL to the company logo image (.png/.jpg/.svg/.webp) '
-        'if you found one on the official site; otherwise null\n'
+        'if known from the official site; otherwise null\n'
         "Use null or [] when unknown.\n\n"
     )
     if screener_txt:
         prompt += f"SCREENER.IN PAGE TEXT (local extract):\n{screener_txt[:10000]}\n\n"
     if filing_ctx:
-        prompt += f"FILING EXCERPTS ALREADY ON FILE (optional extra context):\n{filing_ctx[:8000]}\n"
+        prompt += f"FILING EXCERPTS ALREADY ON FILE:\n{filing_ctx[:8000]}\n"
+    elif not use_search:
+        prompt += (
+            "No PPT/concall excerpts on file — rely on well-known public facts only; "
+            "keep the brief shorter if needed.\n"
+        )
 
     model = os.getenv('GEMINI_ABOUT_MODEL') or os.getenv('GEMINI_CONCALL_MODEL', 'gemini-3.1-flash-lite')
-    # Default OFF — Google Search grounding burns free-tier quota in 1–2 calls.
-    # Set ABOUT_COMPANY_WEB_SEARCH=1 only on paid / higher quota keys.
-    use_search = os.getenv('ABOUT_COMPANY_WEB_SEARCH', '0').strip() not in ('0', 'false', 'False')
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.2},
@@ -4790,8 +4807,12 @@ async def _about_company_loop(session: aiohttp.ClientSession):
         log.info(f"📘 About-company: loaded {len(existing_map)} row(s), "
                  f"{_done_n} done, in-memory skip={len(_ABOUT_DONE_SYMS)}")
 
-        # Prefer names with filings first, then large-cap names still missing a brief.
-        # Include stocks-table universe so About backfills even without PPT/concall yet.
+        # Priority: ABOUT_PRIORITY_SYMBOLS → filings → large-cap → rest.
+        _prio = {
+            x.strip().upper()
+            for x in (os.getenv('ABOUT_PRIORITY_SYMBOLS') or 'COFORGE').split(',')
+            if x.strip()
+        }
         ranked = []
         for sym in set(ppt_by_sym) | set(tx_by_sym) | set(fund_by_sym) | set(meta_by_sym):
             ppt, tx = ppt_by_sym.get(sym), tx_by_sym.get(sym)
@@ -4836,9 +4857,11 @@ async def _about_company_loop(session: aiohttp.ClientSession):
             mcap = ((fund_by_sym.get(sym) or {}).get('market_cap')
                     or (meta_by_sym.get(sym) or {}).get('market_cap') or 0)
             has_filing = 1 if (ppt or tx) else 0
-            ranked.append((has_filing, mcap if isinstance(mcap, (int, float)) else 0, sym, ppt, tx, src_at))
-        ranked.sort(key=lambda x: (x[0], x[1]), reverse=True)
-        todo = [(sym, ppt, tx, src_at) for _, _, sym, ppt, tx, src_at in ranked[:BATCH_SIZE]]
+            pri = 1 if sym in _prio else 0
+            ranked.append((pri, has_filing, mcap if isinstance(mcap, (int, float)) else 0,
+                           sym, ppt, tx, src_at))
+        ranked.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+        todo = [(sym, ppt, tx, src_at) for _, _, _, sym, ppt, tx, src_at in ranked[:BATCH_SIZE]]
 
         if todo:
             _web = os.getenv('ABOUT_COMPANY_WEB_SEARCH', '0')
@@ -4949,7 +4972,10 @@ async def _about_company_loop(session: aiohttp.ClientSession):
         if hit_429:
             await asyncio.sleep(int(os.getenv('ABOUT_COMPANY_429_COOLDOWN_SECONDS', '180')))
         else:
-            await asyncio.sleep(120 if todo else 300)
+            # Faster cycles while backlog remains (batch=1 + free-tier pacing).
+            await asyncio.sleep(int(os.getenv(
+                'ABOUT_COMPANY_CYCLE_SECONDS',
+                '45' if todo else '300')))
 
 
 async def fundamentals_worker_main():
