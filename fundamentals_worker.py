@@ -3478,6 +3478,289 @@ _FUND_HIGHLIGHT_FIELDS = (
 )
 
 
+async def extract_stock_themes_ai(session: aiohttp.ClientSession, symbol: str,
+                                  industry: str = None, sector: str = None,
+                                  about: dict = None, ppt_row=None, tx_row=None):
+    """Tag allowlisted emerging themes for ANY stock via Gemini + Google Search,
+    optionally grounded with About/PPT/concall already on file. Returns
+    {emerging_themes, theme_evidence, theme_intensity} or None on failure."""
+    api_key = os.getenv('GEMINI_API_KEY', '')
+    if not api_key or not symbol:
+        return None
+    sector_bit = ' / '.join(x for x in [industry, sector] if x) or 'NSE-listed company'
+    filing_ctx = '\n\n'.join(x for x in [
+        _fmt_filing_context('INVESTOR PRESENTATION', ppt_row),
+        _fmt_filing_context('EARNINGS CALL / TRANSCRIPT', tx_row),
+    ] if x)
+    about_bits = []
+    if about:
+        for k in ('overall_brief', 'what_they_do'):
+            if about.get(k):
+                about_bits.append(str(about[k]))
+        for k, label in (('segments', 'SEGMENTS'), ('innovation', 'INNOVATION'),
+                         ('customers', 'CUSTOMERS')):
+            bullets = _clean_bullets(about.get(k))
+            if bullets:
+                about_bits.append(label + ':\n- ' + '\n- '.join(bullets))
+    theme_list = ', '.join(f'{tid} ({EMERGING_THEME_LABELS.get(tid, tid)})'
+                           for tid in EMERGING_THEME_IDS)
+    prompt = (
+        f"Research Indian NSE stock {symbol} ({sector_bit}) and tag emerging growth themes.\n"
+        "Use Google Search (company site, Screener, investor presentations, news, annual reports) "
+        "to find which of the CONTROLLED theme ids below are real growth/opportunity areas for "
+        "THIS company — not generic sector noise.\n\n"
+        f"CONTROLLED THEME IDS (return only these ids): {theme_list}\n\n"
+        "Rules:\n"
+        "- Return 0-5 theme ids. Empty array if none clearly apply.\n"
+        "- theme_evidence: 1-4 short bullets with concrete evidence (products, orders, capex, "
+        "capacity, partnerships). Paraphrase; do not invent numbers.\n"
+        "- theme_intensity: high | medium | low | none (none only when themes empty).\n"
+        "- Prefer themes with multi-source support. No buy/sell advice.\n\n"
+        "Return ONLY JSON with keys emerging_themes, theme_evidence, theme_intensity.\n"
+    )
+    if about_bits:
+        prompt += "COMPANY BRIEF ALREADY ON FILE:\n" + '\n'.join(about_bits)[:6000] + "\n\n"
+    if filing_ctx:
+        prompt += "FILING EXCERPTS:\n" + filing_ctx[:8000] + "\n"
+
+    model = os.getenv('GEMINI_ABOUT_MODEL') or os.getenv('GEMINI_CONCALL_MODEL', 'gemini-3.1-flash-lite')
+    use_search = os.getenv('STOCK_THEMES_WEB_SEARCH', '1').strip() not in ('0', 'false', 'False')
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.2},
+    }
+    if use_search:
+        body["tools"] = [{"google_search": {}}]
+    try:
+        async with session.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
+            headers={"Content-Type": "application/json"},
+            json=body,
+            timeout=aiohttp.ClientTimeout(total=120),
+        ) as r:
+            if r.status != 200:
+                txt = await r.text()
+                if use_search and r.status in (400, 404):
+                    body.pop('tools', None)
+                    async with session.post(
+                        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
+                        headers={"Content-Type": "application/json"},
+                        json=body,
+                        timeout=aiohttp.ClientTimeout(total=90),
+                    ) as r2:
+                        if r2.status != 200:
+                            log.warning(f"⚠️ Themes AI failed for {symbol} ({r2.status}): {(await r2.text())[:160]}")
+                            return None
+                        data = await r2.json()
+                elif r.status == 429:
+                    log.warning(f"⚠️ Gemini rate-limit on stock themes for {symbol} (429)")
+                    await asyncio.sleep(int(os.getenv('GEMINI_429_BACKOFF_SECONDS', '30')))
+                    return None
+                else:
+                    log.warning(f"⚠️ Themes AI failed for {symbol} ({r.status}): {txt[:160]}")
+                    return None
+            else:
+                data = await r.json()
+        parts = (data.get('candidates') or [{}])[0].get('content', {}).get('parts', [])
+        raw = ''.join(p.get('text', '') for p in parts).strip()
+        parsed = _parse_json_object(raw)
+        if not parsed:
+            return None
+    except Exception as e:
+        log.warning(f"⚠️ Themes AI error for {symbol}: {type(e).__name__}: {e}")
+        return None
+    themes = _clean_themes(parsed.get('emerging_themes'))
+    intensity = _clean_theme_intensity(parsed.get('theme_intensity'), themes)
+    evidence = _clean_bullets(parsed.get('theme_evidence')) if themes else None
+    if not themes:
+        return {
+            'emerging_themes': None,
+            'theme_evidence': None,
+            'theme_intensity': 'none',
+        }
+    return {
+        'emerging_themes': themes,
+        'theme_evidence': evidence,
+        'theme_intensity': intensity or 'medium',
+    }
+
+
+async def _stock_themes_loop(session: aiohttp.ClientSession):
+    """Fill Emerging Themes for ALL stocks on stock_fundamentals.
+    Prefer latest PPT/concall themes when present; otherwise Gemini+web research.
+    This powers the Market Cap → Emerging Themes card for every chart."""
+    headers = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
+    CHECK_INTERVAL = int(os.getenv('STOCK_THEMES_INTERVAL_SEC', '420'))
+    BATCH = int(os.getenv('STOCK_THEMES_BATCH', '10'))
+    STALE_DAYS = int(os.getenv('STOCK_THEMES_STALE_DAYS', '45'))
+    _key_logged = False
+    while True:
+        if not os.getenv('GEMINI_API_KEY'):
+            if not _key_logged:
+                log.warning("🌱 Stock-themes loop: GEMINI_API_KEY not set - loop idle")
+                _key_logged = True
+            await asyncio.sleep(300)
+            continue
+        if not _key_logged:
+            log.info(f"🌱 Stock-themes loop: active (batch={BATCH}, stale={STALE_DAYS}d)")
+            _key_logged = True
+        try:
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/stock_fundamentals", headers=headers,
+                params={
+                    'select': 'sym,industry,sector,market_cap,emerging_themes,theme_intensity,'
+                              'themes_source,themes_at,themes_announced_at',
+                    'order': 'market_cap.desc.nullslast',
+                    'limit': str(BATCH * 12),
+                },
+                timeout=aiohttp.ClientTimeout(total=45),
+            ) as r:
+                if r.status != 200:
+                    body = await r.text()
+                    if r.status == 400 and 'emerging_themes' in body:
+                        log.warning("🌱 Stock-themes loop: run add_stock_themes.sql in Supabase")
+                        await asyncio.sleep(600)
+                        continue
+                    log.warning(f"🌱 Stock-themes query failed ({r.status}): {body[:200]}")
+                    await asyncio.sleep(CHECK_INTERVAL)
+                    continue
+                fund_rows = await r.json()
+
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/ppt_summaries", headers=headers,
+                params={'select': 'symbol,announced_at,emerging_themes,theme_evidence,theme_intensity,'
+                        'attachment_url,overall_summary,business_segments,strategic_initiatives,'
+                        'financial_highlights',
+                        'status': 'eq.done', 'order': 'announced_at.desc', 'limit': '600'},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as r:
+                ppt_rows = await r.json() if r.status == 200 else []
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/transcript_summaries", headers=headers,
+                params={'select': 'symbol,announced_at,emerging_themes,theme_evidence,theme_intensity,'
+                        'attachment_url,overall_summary,competitive_positioning,expansion_capex,'
+                        'financial_highlights',
+                        'status': 'eq.done', 'order': 'announced_at.desc', 'limit': '600'},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as r:
+                tx_rows = await r.json() if r.status == 200 else []
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/company_abouts", headers=headers,
+                params={'select': 'symbol,overall_brief,what_they_do,customers,segments,innovation,status',
+                        'status': 'eq.done', 'limit': '3000'},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as r:
+                about_rows = await r.json() if r.status == 200 else []
+        except Exception as e:
+            log.warning(f"⚠️ Stock-themes fetch failed: {type(e).__name__}: {e}")
+            await asyncio.sleep(180)
+            continue
+
+        ppt_by, tx_by, about_by = {}, {}, {}
+        for row in ppt_rows or []:
+            sym = row.get('symbol')
+            if sym and sym not in ppt_by:
+                ppt_by[sym] = row
+        for row in tx_rows or []:
+            sym = row.get('symbol')
+            if sym and sym not in tx_by:
+                tx_by[sym] = row
+        for row in about_rows or []:
+            sym = row.get('symbol')
+            if sym:
+                about_by[sym] = row
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=STALE_DAYS)
+        todo = []
+        for row in fund_rows or []:
+            sym = row.get('sym')
+            if not sym:
+                continue
+            ppt, tx = ppt_by.get(sym), tx_by.get(sym)
+            ppt_themes = _clean_themes((ppt or {}).get('emerging_themes'))
+            tx_themes = _clean_themes((tx or {}).get('emerging_themes'))
+            filing_at = max(
+                (ppt or {}).get('announced_at') or '',
+                (tx or {}).get('announced_at') or '',
+            )
+            at = row.get('themes_at')
+            has = _clean_themes(row.get('emerging_themes')) or (
+                row.get('theme_intensity') == 'none' and row.get('themes_source'))
+            stale = True
+            if at:
+                try:
+                    ts = datetime.fromisoformat(str(at).replace('Z', '+00:00'))
+                    stale = ts < cutoff
+                except Exception:
+                    stale = True
+            # Refresh when a newer filing has themes we haven't synced
+            filing_newer = bool(
+                filing_at and (not row.get('themes_announced_at')
+                               or str(row.get('themes_announced_at')) < filing_at)
+                and (ppt_themes or tx_themes)
+            )
+            if has and not stale and not filing_newer:
+                continue
+            # Prefer sync-from-filing when available (cheap)
+            mode = 'ai'
+            if ppt_themes or tx_themes:
+                mode = 'sync'
+            todo.append((sym, row, ppt, tx, mode, filing_at))
+            if len(todo) >= BATCH:
+                break
+
+        if not todo:
+            log.info("🌱 Stock-themes loop: nothing to generate")
+            await asyncio.sleep(CHECK_INTERVAL)
+            continue
+        log.info(f"🌱 Stock-themes loop: {len(todo)} symbol(s) "
+                 f"({sum(1 for t in todo if t[4]=='sync')} sync / "
+                 f"{sum(1 for t in todo if t[4]=='ai')} AI)")
+
+        saved = 0
+        for i, (sym, row, ppt, tx, mode, filing_at) in enumerate(todo):
+            if i > 0 and mode == 'ai':
+                await asyncio.sleep(float(os.getenv(
+                    'STOCK_THEMES_PACING_SECONDS',
+                    os.getenv('ABOUT_COMPANY_PACING_SECONDS', '8'))))
+            payload = {
+                'sym': sym,
+                'themes_at': datetime.now(timezone.utc).isoformat(),
+                'themes_announced_at': filing_at or None,
+            }
+            if mode == 'sync':
+                src_row = ppt if _clean_themes((ppt or {}).get('emerging_themes')) else tx
+                themes = _clean_themes(src_row.get('emerging_themes'))
+                payload.update({
+                    'emerging_themes': themes,
+                    'theme_evidence': _clean_bullets(src_row.get('theme_evidence')) if themes else None,
+                    'theme_intensity': _clean_theme_intensity(
+                        src_row.get('theme_intensity'), themes),
+                    'themes_source': 'ppt' if src_row is ppt else 'concall',
+                })
+            else:
+                result = await extract_stock_themes_ai(
+                    session, sym,
+                    industry=row.get('industry'), sector=row.get('sector'),
+                    about=about_by.get(sym), ppt_row=ppt, tx_row=tx)
+                if result is None:
+                    continue
+                payload.update({
+                    **result,
+                    'themes_source': 'ai_web',
+                })
+            try:
+                await save_fundamentals_batch_to_db(session, [payload])
+                saved += 1
+                n = len(payload.get('emerging_themes') or [])
+                log.info(f"  🌱 {sym}: {payload.get('themes_source')} "
+                         f"{n} theme(s) intensity={payload.get('theme_intensity')}")
+            except Exception as e:
+                log.warning(f"⚠️ Themes save failed for {sym}: {type(e).__name__}: {e}")
+        log.info(f"🌱 Stock-themes loop: saved {saved}/{len(todo)}")
+        await asyncio.sleep(CHECK_INTERVAL)
+
+
 async def extract_fundamentals_highlights(session: aiohttp.ClientSession, row: dict):
     """Ask Gemini which metrics matter most for this stock and write short
     takeaways for the Fundamentals tab. Numbers come from our DB row — the
@@ -3939,6 +4222,7 @@ async def fundamentals_worker_main():
             _ppt_summary_loop(session),
             _about_company_loop(session),
             _fundamentals_ai_highlights_loop(session),
+            _stock_themes_loop(session),
         )
 
 def rate_announcements_free(rows: list) -> list:
