@@ -3373,9 +3373,9 @@ async def extract_about_company(session: aiohttp.ClientSession, symbol: str, ppt
     """Build a retail-friendly company brief using Gemini + Google Search
     across the public web, optionally grounded with Screener.in page text
     and existing PPT/concall summary fields. Also resolves website + logo.
-    Returns {'about': dict|None, 'error': bool}."""
-    error_result = {'about': None, 'error': True}
-    no_content_result = {'about': None, 'error': False}
+    Returns {'about': dict|None, 'error': bool, 'rate_limited': bool}."""
+    error_result = {'about': None, 'error': True, 'rate_limited': False}
+    no_content_result = {'about': None, 'error': False, 'rate_limited': False}
     api_key = os.getenv('GEMINI_API_KEY', '')
     if not api_key:
         return error_result
@@ -3445,8 +3445,8 @@ async def extract_about_company(session: aiohttp.ClientSession, symbol: str, ppt
                     return error_result
             elif status == 429:
                 log.warning(f"⚠️ Gemini rate-limit on about-company for {symbol} (429)")
-                await asyncio.sleep(int(os.getenv('GEMINI_429_BACKOFF_SECONDS', '45')))
-                return error_result
+                await asyncio.sleep(int(os.getenv('GEMINI_429_BACKOFF_SECONDS', '90')))
+                return {'about': None, 'error': True, 'rate_limited': True}
             else:
                 log.warning(f"⚠️ Gemini about-company failed for {symbol} ({status}): {body_txt[:180]}")
                 return error_result
@@ -3491,7 +3491,7 @@ async def extract_about_company(session: aiohttp.ClientSession, symbol: str, ppt
     if not any([about['what_they_do'], about['customers'], about['segments'],
                 about['innovation'], about['overall_brief']]):
         return no_content_result
-    return {'about': about, 'error': False}
+    return {'about': about, 'error': False, 'rate_limited': False}
 
 
 # Core ratio fields used for AI Fundamentals takeaways. Optional columns
@@ -4593,8 +4593,8 @@ async def _about_company_loop(session: aiohttp.ClientSession):
                 _key_status_logged = True
             await asyncio.sleep(300)
             continue
-        # Keep About batch modest — free-tier Gemini RPM is shared with PPT/transcript.
-        BATCH_SIZE = int(os.getenv('ABOUT_COMPANY_BATCH_SIZE', '3'))
+        # Keep About batch tiny on free tier — web-search grounding burns RPM fast.
+        BATCH_SIZE = int(os.getenv('ABOUT_COMPANY_BATCH_SIZE', '1'))
         if not _key_status_logged:
             log.info(f"📘 About-company loop: active with web search "
                       f"(batch={BATCH_SIZE}, ABOUT_COMPANY_WEB_SEARCH="
@@ -4713,16 +4713,22 @@ async def _about_company_loop(session: aiohttp.ClientSession):
         else:
             log.info("📘 About-company loop: nothing new")
 
+        hit_429 = False
         for i, (sym, ppt, tx, src_at) in enumerate(todo):
             if i > 0:
                 await asyncio.sleep(float(os.getenv('ABOUT_COMPANY_PACING_SECONDS',
-                                                    os.getenv('RESULTS_PDF_PACING_SECONDS', '12'))))
+                                                    os.getenv('RESULTS_PDF_PACING_SECONDS', '20'))))
             meta = meta_by_sym.get(sym) or {}
             result = await extract_about_company(
                 session, sym, ppt, tx,
                 industry=meta.get('industry'), sector=meta.get('sector'))
             if result['error']:
                 log.info(f"  📘 {sym}: will retry about-company next cycle")
+                if result.get('rate_limited'):
+                    hit_429 = True
+                    cool = int(os.getenv('ABOUT_COMPANY_429_COOLDOWN_SECONDS', '180'))
+                    log.warning(f"📘 About-company: Gemini 429 — stopping batch, cooling {cool}s")
+                    break
                 continue
             about = result['about']
             payload = {
@@ -4775,7 +4781,10 @@ async def _about_company_loop(session: aiohttp.ClientSession):
                     log.info(f"  📘 {sym}: no usable about content, marked skipped")
             except Exception as e:
                 log.warning(f"⚠️ About-company save failed for {sym}: {type(e).__name__}: {e}")
-        await asyncio.sleep(120 if todo else 300)
+        if hit_429:
+            await asyncio.sleep(int(os.getenv('ABOUT_COMPANY_429_COOLDOWN_SECONDS', '180')))
+        else:
+            await asyncio.sleep(120 if todo else 300)
 
 
 async def fundamentals_worker_main():
