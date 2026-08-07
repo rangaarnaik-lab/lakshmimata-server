@@ -43,6 +43,10 @@ _BSE_NO_SCRIP_CODE = set()
 # About briefs successfully saved this process — never re-Gemini the same
 # symbol in-process even if Supabase read-back lags / timestamp compare glitches.
 _ABOUT_DONE_SYMS: set[str] = set()
+# Symbols that failed save repeatedly (e.g. missing DB columns) — skip so
+# backlog can advance; cleared on process restart.
+_ABOUT_SAVE_FAILS: dict[str, int] = {}
+_ABOUT_OPTIONAL_COLS_MISSING = False  # set True after PGRST204 on image/sources
 
 
 def _parse_iso_ts(value):
@@ -84,7 +88,7 @@ def _gemini_key_fingerprint(api_key: str) -> str:
 
 
 def _gemini_semaphore_for(api_key: str) -> asyncio.Semaphore:
-    n = max(1, int(os.getenv('GEMINI_MAX_CONCURRENT', '5')))
+    n = max(1, int(os.getenv('GEMINI_MAX_CONCURRENT', '1')))
     store = getattr(_gemini_semaphore_for, '_store', None)
     if store is None:
         store = {}
@@ -4908,43 +4912,56 @@ async def _about_company_loop(session: aiohttp.ClientSession):
                     'symbol': sym,
                     'status': 'done' if about else 'skipped',
                 }
+                # Drop nulls — PostgREST still rejects unknown cols when value is null.
+                payload = {k: v for k, v in payload.items() if v is not None}
+                global _ABOUT_OPTIONAL_COLS_MISSING
+                if _ABOUT_OPTIONAL_COLS_MISSING:
+                    for k in ('sources', 'image_url', 'website'):
+                        payload.pop(k, None)
                 about_url = f"{SUPABASE_URL}/rest/v1/company_abouts?on_conflict=symbol"
                 about_headers = {**headers, 'Content-Type': 'application/json',
                                  'Prefer': 'resolution=merge-duplicates,return=representation'}
-                try:
-                    saved_ok = False
+
+                async def _post_about(data):
                     async with session.post(
                         about_url, headers=about_headers,
-                        json=payload, timeout=aiohttp.ClientTimeout(total=15)
-                    ) as r:
-                        body = await r.text()
-                        if r.status not in (200, 201, 204):
-                            drop_keys = []
-                            if 'sources' in body:
-                                drop_keys.append('sources')
-                            if 'image_url' in body or 'website' in body:
-                                drop_keys.extend(['image_url', 'website'])
-                            if drop_keys and any(payload.get(k) is not None for k in drop_keys):
-                                for k in drop_keys:
-                                    payload.pop(k, None)
-                                async with session.post(
-                                    about_url, headers=about_headers,
-                                    json=payload, timeout=aiohttp.ClientTimeout(total=15)
-                                ) as r2:
-                                    body2 = await r2.text()
-                                    if r2.status not in (200, 201, 204):
-                                        log.warning(f"⚠️ About-company save {r2.status} for {sym}: {body2[:200]}")
-                                        return
-                                    saved_ok = True
-                            else:
-                                log.warning(f"⚠️ About-company save {r.status} for {sym}: {body[:200]}")
-                                return
-                        else:
-                            saved_ok = True
-                            if 'row-level security' in (body or '').lower():
-                                log.error(f"📘 {sym}: upsert blocked by RLS — use SUPABASE service_role key")
-                                saved_ok = False
-                    if not saved_ok:
+                        json=data, timeout=aiohttp.ClientTimeout(total=15)
+                    ) as resp:
+                        return resp.status, await resp.text()
+
+                try:
+                    status, body = await _post_about(payload)
+                    if status not in (200, 201, 204):
+                        log.warning(f"⚠️ About-company save {status} for {sym}: {body[:200]}")
+                        # Always strip optional cols on schema-cache misses and retry.
+                        drop = [k for k in ('sources', 'image_url', 'website')
+                                if k in body or k in payload]
+                        if drop or 'PGRST204' in body:
+                            _ABOUT_OPTIONAL_COLS_MISSING = True
+                            for k in ('sources', 'image_url', 'website'):
+                                payload.pop(k, None)
+                            status, body = await _post_about(payload)
+                            if status not in (200, 201, 204):
+                                # Core-only last resort
+                                core = {k: payload[k] for k in (
+                                    'symbol', 'status', 'overall_brief', 'what_they_do',
+                                    'customers', 'segments', 'innovation',
+                                    'source_ppt_url', 'source_tx_url',
+                                    'source_announced_at', 'updated_at',
+                                ) if k in payload}
+                                status, body = await _post_about(core)
+                                if status not in (200, 201, 204):
+                                    log.warning(f"⚠️ About-company save {status} for {sym} "
+                                                f"(core retry): {body[:200]}")
+                                    _ABOUT_SAVE_FAILS[sym] = _ABOUT_SAVE_FAILS.get(sym, 0) + 1
+                                    if _ABOUT_SAVE_FAILS[sym] >= 3:
+                                        _ABOUT_DONE_SYMS.add(sym)
+                                        log.error(f"📘 {sym}: skipping after {_ABOUT_SAVE_FAILS[sym]} "
+                                                  f"save failures — run add_company_about_image.sql "
+                                                  f"+ ensure_company_abouts.sql")
+                                    return
+                    if 'row-level security' in (body or '').lower():
+                        log.error(f"📘 {sym}: upsert blocked by RLS — use SUPABASE service_role key")
                         return
                     async with session.get(
                         f"{SUPABASE_URL}/rest/v1/company_abouts", headers=headers,
@@ -4956,9 +4973,13 @@ async def _about_company_loop(session: aiohttp.ClientSession):
                     if row_status not in ('done', 'skipped'):
                         log.error(f"📘 {sym}: save returned OK but row not readable "
                                   f"(status={row_status!r}). Check RLS / SUPABASE_KEY=service_role "
-                                  f"and ensure_company_abouts.sql")
-                    else:
-                        _ABOUT_DONE_SYMS.add(sym)
+                                  f"and ensure_company_abouts.sql / add_company_about_image.sql")
+                        _ABOUT_SAVE_FAILS[sym] = _ABOUT_SAVE_FAILS.get(sym, 0) + 1
+                        if _ABOUT_SAVE_FAILS[sym] >= 3:
+                            _ABOUT_DONE_SYMS.add(sym)
+                        return
+                    _ABOUT_DONE_SYMS.add(sym)
+                    _ABOUT_SAVE_FAILS.pop(sym, None)
                     if about:
                         nsrc = len(about.get('sources') or [])
                         log.info(f"  📘 {sym}: about-company brief saved"
@@ -4970,6 +4991,7 @@ async def _about_company_loop(session: aiohttp.ClientSession):
                                   f"db_status={row_status!r}")
                 except Exception as e:
                     log.warning(f"⚠️ About-company save failed for {sym}: {type(e).__name__}: {e}")
+                    _ABOUT_SAVE_FAILS[sym] = _ABOUT_SAVE_FAILS.get(sym, 0) + 1
 
         if todo:
             await asyncio.gather(*[
