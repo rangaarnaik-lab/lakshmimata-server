@@ -119,8 +119,19 @@ _BULLET_NOISE = {
     'operational_kpis', 'risks_flagged', 'regulatory_legal',
     'key_concerns', 'overall_summary', 'raised', 'lowered', 'maintained',
     'reiterated', 'not_discussed', 'emerging_themes', 'theme_evidence',
-    'theme_intensity',
+    'theme_intensity', 'management_tone', 'watch_next',
+    'confident', 'cautious', 'defensive', 'mixed', 'neutral',
 }
+
+_MANAGEMENT_TONES = ('confident', 'cautious', 'defensive', 'mixed', 'neutral')
+
+def _clean_management_tone(v):
+    """Normalize Gemini management_tone to the allowlisted enum, or None."""
+    if not v or not isinstance(v, str):
+        return None
+    t = v.strip().lower()
+    return t if t in _MANAGEMENT_TONES else None
+
 
 def _clean_bullets(v):
     """Validates/cleans a bullet-point array field from a Gemini
@@ -289,6 +300,13 @@ async def extract_ppt_summary(session: aiohttp.ClientSession, symbol: str, attac
         "or simply reiterated guidance/targets versus what was previously communicated? "
         "Use 'raised'/'lowered'/'maintained'/'reiterated' only when the deck is explicit "
         "about the comparison, or 'not_discussed' if guidance/targets aren't addressed.\n\n"
+        "MANAGEMENT_TONE: Overall tone of the deck's narrative — exactly one of "
+        "confident | cautious | defensive | mixed | neutral. Use confident when growth/"
+        "strength is emphasized; cautious when hedging language dominates; defensive when "
+        "explaining misses; mixed when both; neutral when mostly factual tables.\n\n"
+        "WATCH_NEXT: 2-4 short bullets of concrete near-term things a reader should track "
+        "from the deck (upcoming capacity, margin target, order book milestones, launches). "
+        "Only from what the slides imply or state — never invent. Null if nothing actionable.\n\n"
         + _THEME_PROMPT_BLOCK +
         "OVERALL_SUMMARY: A balanced 100-150 word summary of the presentation for a retail "
         "investor. This one stays as flowing prose, not bullets - it's the narrative "
@@ -309,8 +327,11 @@ async def extract_ppt_summary(session: aiohttp.ClientSession, symbol: str, attac
             "operational_kpis": _bullet_field,
             "risks_flagged": _bullet_field,
             "regulatory_legal": _bullet_field,
+            "watch_next": _bullet_field,
             "guidance_direction": {"type": "string",
                 "enum": ["raised", "lowered", "maintained", "reiterated", "not_discussed"], "nullable": True},
+            "management_tone": {"type": "string",
+                "enum": list(_MANAGEMENT_TONES), "nullable": True},
             "emerging_themes": _theme_field,
             "theme_evidence": _bullet_field,
             "theme_intensity": {"type": "string",
@@ -369,10 +390,14 @@ async def extract_ppt_summary(session: aiohttp.ClientSession, symbol: str, attac
                   'capital_allocation', 'industry_outlook', 'operational_kpis',
                   'risks_flagged', 'regulatory_legal', 'theme_evidence')
     }
+    # Always persist an array (possibly empty) so watch_next IS NULL means
+    # "pre-migration row" and backfill can stop after one re-extract.
+    summary['watch_next'] = _clean_bullets(parsed.get('watch_next')) or []
     summary['overall_summary'] = (parsed.get('overall_summary') or '').strip()[:1500] or None
     gd = parsed.get('guidance_direction')
     summary['guidance_direction'] = gd if gd in (
         'raised', 'lowered', 'maintained', 'reiterated', 'not_discussed') else None
+    summary['management_tone'] = _clean_management_tone(parsed.get('management_tone'))
     summary['emerging_themes'] = _clean_themes(parsed.get('emerging_themes'))
     summary['theme_intensity'] = _clean_theme_intensity(
         parsed.get('theme_intensity'), summary['emerging_themes'])
@@ -472,6 +497,12 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
         "RISKS_FLAGGED: 1-4 bullets of risks/headwinds management themselves mentioned "
         "(not analyst concerns — those go in key_concerns). Null if none.\n\n"
         "REGULATORY_LEGAL: 1-3 bullets on litigation, approvals, policy. Null if none.\n\n"
+        "MANAGEMENT_TONE: Overall speaking tone on the call — exactly one of "
+        "confident | cautious | defensive | mixed | neutral. Judge from language "
+        "(certainty vs hedging, willingness to give numbers, how they handle tough Q&A).\n\n"
+        "WATCH_NEXT: 2-4 short bullets of concrete near-term signals to track after this "
+        "call (e.g. 'Q2 disbursement acceleration', 'NIM expansion vs 1.65% target'). "
+        "Derive only from guidance, risks, or Q&A — never invent. Null if nothing concrete.\n\n"
         + _THEME_PROMPT_BLOCK +
         "Bullet format for every array field: short scannable phrases, not paragraphs; "
         "no trailing period required; never insert enum tokens or JSON field names as bullets."
@@ -489,6 +520,8 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
             # Required (non-nullable) so the model always picks a direction for real calls.
             "guidance_direction": {"type": "string",
                 "enum": ["raised", "lowered", "maintained", "reiterated", "not_discussed"]},
+            "management_tone": {"type": "string",
+                "enum": list(_MANAGEMENT_TONES), "nullable": True},
             "management_changes": _bullet_field,
             "capital_allocation": _bullet_field,
             "competitive_positioning": _bullet_field,
@@ -496,6 +529,7 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
             "risks_flagged": _bullet_field,
             "regulatory_legal": _bullet_field,
             "key_concerns": _bullet_field,
+            "watch_next": _bullet_field,
             "emerging_themes": _theme_field,
             "theme_evidence": _bullet_field,
             "theme_intensity": {"type": "string",
@@ -559,6 +593,9 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
                   'competitive_positioning', 'operational_kpis', 'risks_flagged',
                   'regulatory_legal', 'key_concerns', 'theme_evidence')
     }
+    # Always persist an array (possibly empty) so watch_next IS NULL means
+    # "pre-migration row" and backfill can stop after one re-extract.
+    summary['watch_next'] = _clean_bullets(parsed.get('watch_next')) or []
     summary['overall_summary'] = (parsed.get('overall_summary') or '').strip()[:1500] or None
     if not summary['overall_summary']:
         summary['overall_summary'] = _synthesize_overall_summary(summary)
@@ -566,12 +603,13 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
             log.info(f"ℹ️ {symbol}: overall_summary was empty — synthesized from section bullets")
     summary['guidance_direction'] = _infer_guidance_direction(
         parsed.get('guidance_direction'), summary.get('outlook_guidance'))
+    summary['management_tone'] = _clean_management_tone(parsed.get('management_tone'))
     summary['emerging_themes'] = _clean_themes(parsed.get('emerging_themes'))
     summary['theme_intensity'] = _clean_theme_intensity(
         parsed.get('theme_intensity'), summary['emerging_themes'])
     if not summary['emerging_themes']:
         summary['theme_evidence'] = None
-    if not any(v for k, v in summary.items() if k not in ('guidance_direction', 'theme_intensity')):
+    if not any(v for k, v in summary.items() if k not in ('guidance_direction', 'theme_intensity', 'management_tone', 'watch_next')):
         return no_content_result
     # Helpful for spotting thin reports in logs without dumping the whole payload
     missing_core = [k for k in ('overall_summary', 'key_concerns') if not summary.get(k)]
@@ -1428,6 +1466,8 @@ async def _fetch_processed_attachment_keys(session: aiohttp.ClientSession, table
         cols.append(extra_select)
     if reprocess_missing_themes and 'theme_intensity' not in cols:
         cols.append('theme_intensity')
+    if reprocess_missing_themes and 'watch_next' not in cols:
+        cols.append('watch_next')
     select = ','.join(cols)
     page_size = 1000
     offset = 0
@@ -1460,6 +1500,10 @@ async def _fetch_processed_attachment_keys(session: aiohttp.ClientSession, table
             if status == 'done' and reprocess_missing_themes and row.get('theme_intensity') is None:
                 thin.add(key)
                 continue
+            # Pre-tone/watch_next rows: column null until re-extracted
+            if status == 'done' and reprocess_missing_themes and row.get('watch_next') is None:
+                thin.add(key)
+                continue
             if status in ('done', 'skipped', 'failed', 'pending'):
                 already.add(key)
         if len(rows) < page_size:
@@ -1470,25 +1514,33 @@ async def _fetch_processed_attachment_keys(session: aiohttp.ClientSession, table
 async def _fetch_theme_backfill_rows(session: aiohttp.ClientSession, table: str,
                                     headers: dict, limit: int):
     """Direct backlog from the summaries table: done rows written before
-    the emerging-themes columns existed (theme_intensity IS NULL).
-    Does not depend on corporate_announcements lookback, so old PPTs/
-    transcripts still get re-read for theme tags."""
-    try:
-        async with session.get(
-            f"{SUPABASE_URL}/rest/v1/{table}", headers=headers,
-            params={'select': 'symbol,announced_at,attachment_url',
-                    'status': 'eq.done', 'theme_intensity': 'is.null',
-                    'order': 'announced_at.desc', 'limit': str(limit)},
-            timeout=aiohttp.ClientTimeout(total=30)
-        ) as r:
-            if r.status != 200:
-                body = await r.text()
-                log.warning(f"⚠️ {table}: theme backfill query returned {r.status}: {body[:200]}")
-                return []
-            return await r.json()
-    except Exception as e:
-        log.warning(f"⚠️ {table}: theme backfill fetch failed: {type(e).__name__}: {e}")
-        return []
+    the emerging-themes columns existed (theme_intensity IS NULL), or
+    before watch_next existed. Does not depend on corporate_announcements
+    lookback, so old PPTs/transcripts still get re-read."""
+    # Prefer watch_next backfill first (newer gap), then theme_intensity.
+    for null_col in ('watch_next', 'theme_intensity'):
+        try:
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/{table}", headers=headers,
+                params={'select': 'symbol,announced_at,attachment_url',
+                        'status': 'eq.done', null_col: 'is.null',
+                        'order': 'announced_at.desc', 'limit': str(limit)},
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as r:
+                if r.status != 200:
+                    body = await r.text()
+                    # Column may not exist yet until SQL migration is run
+                    if r.status == 400 and 'watch_next' in null_col:
+                        log.warning(f"⚠️ {table}: watch_next column missing — run add_tone_watch_next.sql")
+                        continue
+                    log.warning(f"⚠️ {table}: {null_col} backfill query returned {r.status}: {body[:200]}")
+                    continue
+                rows = await r.json()
+                if rows:
+                    return rows
+        except Exception as e:
+            log.warning(f"⚠️ {table}: {null_col} backfill fetch failed: {type(e).__name__}: {e}")
+    return []
 
 async def _market_cap_catchup_loop(session: aiohttp.ClientSession):
     """Runs hourly, separate from the once-daily FULL fundamentals
