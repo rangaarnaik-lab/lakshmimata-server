@@ -1035,7 +1035,7 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
         # if there are more results-type announcements in the lookback
         # window than that cap, anything past the most recent N would
         # never even be fetched, no matter how many cycles run.
-        BATCH_SIZE = int(os.getenv('RESULTS_PDF_BATCH_SIZE', '15'))
+        BATCH_SIZE = int(os.getenv('RESULTS_PDF_BATCH_SIZE', '5'))
         candidates_limit = int(os.getenv('RESULTS_PDF_CANDIDATES_LIMIT', '2000'))
         if not _key_status_logged:
             log.info(f"🎙️ Results extraction loop: GEMINI_API_KEY detected, active "
@@ -3719,6 +3719,20 @@ async def _stock_themes_loop(session: aiohttp.ClientSession):
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as r:
                 about_rows = await r.json() if r.status == 200 else []
+            # Symbols that already have themes on fund — without this the sync
+            # pass rewrote the same PPT symbols every cycle (fund_by only holds
+            # the current missing-slice, so already-synced names looked "empty").
+            already_themed = set()
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/stock_fundamentals", headers=headers,
+                params={'select': 'sym', 'or': '(emerging_themes.not.is.null,themes_source.not.is.null)',
+                        'limit': '5000'},
+                timeout=aiohttp.ClientTimeout(total=45),
+            ) as r:
+                if r.status == 200:
+                    already_themed = {
+                        row.get('sym') for row in (await r.json() or []) if row.get('sym')
+                    }
         except Exception as e:
             log.warning(f"⚠️ Stock-themes fetch failed: {type(e).__name__}: {e}")
             await asyncio.sleep(180)
@@ -3750,10 +3764,11 @@ async def _stock_themes_loop(session: aiohttp.ClientSession):
             *[(s, r, 'concall') for s, r in tx_by.items()],
         ):
             themes = _clean_themes((src or {}).get('emerging_themes'))
-            if not themes or sym in seen_todo:
+            if not themes or sym in seen_todo or sym in already_themed:
                 continue
             existing = fund_by.get(sym) or {}
             if _clean_themes(existing.get('emerging_themes')):
+                already_themed.add(sym)
                 continue
             todo.append((sym, existing, ppt_by.get(sym), tx_by.get(sym), 'sync',
                          (src or {}).get('announced_at') or ''))
@@ -3838,6 +3853,7 @@ async def _stock_themes_loop(session: aiohttp.ClientSession):
             try:
                 await save_fundamentals_batch_to_db(session, [payload])
                 saved += 1
+                already_themed.add(sym)
                 n = len(payload.get('emerging_themes') or [])
                 log.info(f"  🌱 {sym}: {payload.get('themes_source')} "
                          f"{n} theme(s) intensity={payload.get('theme_intensity')}")
