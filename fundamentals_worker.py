@@ -1515,12 +1515,12 @@ async def _fetch_processed_attachment_keys(session: aiohttp.ClientSession, table
 
 async def _fetch_theme_backfill_rows(session: aiohttp.ClientSession, table: str,
                                     headers: dict, limit: int):
-    """Direct backlog from the summaries table: done rows written before
-    the emerging-themes columns existed (theme_intensity IS NULL), or
-    before watch_next existed. Does not depend on corporate_announcements
-    lookback, so old PPTs/transcripts still get re-read."""
-    # Prefer newest schema gaps first, then older theme backfill.
-    for null_col in ('watch_next', 'theme_intensity'):
+    """Direct backlog from the summaries table: done rows missing core
+    sections (overall_summary), watch_next, or theme_intensity.
+    Does not depend on corporate_announcements lookback, so old
+    PPTs/transcripts still get re-read and section-filled."""
+    # Prefer narrative gaps first (empty sections in the UI), then schema gaps.
+    for null_col in ('overall_summary', 'watch_next', 'theme_intensity'):
         try:
             async with session.get(
                 f"{SUPABASE_URL}/rest/v1/{table}", headers=headers,
@@ -1532,8 +1532,9 @@ async def _fetch_theme_backfill_rows(session: aiohttp.ClientSession, table: str,
                 if r.status != 200:
                     body = await r.text()
                     # Column may not exist yet until SQL migration is run
-                    if r.status == 400 and null_col == 'watch_next':
-                        log.warning(f"⚠️ {table}: watch_next column missing — run add_tone_watch_next.sql")
+                    if r.status == 400 and null_col in ('watch_next', 'overall_summary'):
+                        if null_col == 'watch_next':
+                            log.warning(f"⚠️ {table}: watch_next column missing — run add_tone_watch_next.sql")
                         continue
                     log.warning(f"⚠️ {table}: {null_col} backfill query returned {r.status}: {body[:200]}")
                     continue
@@ -1921,11 +1922,14 @@ async def _ppt_summary_loop(session: aiohttp.ClientSession):
             candidates = []
         ppt_rows = [row for row in candidates if row.get('attachment_url') and _is_ppt_announcement(row)]
 
-        already, _thin = await _fetch_processed_attachment_keys(
-            session, 'ppt_summaries', headers, reprocess_missing_themes=True)
+        # Reprocess thin done-rows (missing overall_summary / themes /
+        # watch_next) so PPT section cards fill in after prompt upgrades.
+        already, thin = await _fetch_processed_attachment_keys(
+            session, 'ppt_summaries', headers,
+            extra_select='overall_summary', reprocess_missing_themes=True)
 
-        # Prefer theme backfill of old done rows (theme_intensity IS NULL)
-        # so pre-theme PPTs get re-read even if outside announcement lookback.
+        # Prefer section/theme backfill of old done rows so pre-upgrade
+        # PPTs get re-read even if outside announcement lookback.
         backfill = await _fetch_theme_backfill_rows(
             session, 'ppt_summaries', headers, BATCH_SIZE)
         todo = []
@@ -1949,11 +1953,12 @@ async def _ppt_summary_loop(session: aiohttp.ClientSession):
             bf = sum(1 for r in todo if (r['symbol'], r['attachment_url']) in
                      {(b['symbol'], b['attachment_url']) for b in backfill})
             log.info(f"🎙️ PPT summary loop: {len(todo)} presentation(s) to process "
-                      f"({bf} theme-backfill, candidates={len(candidates)}, "
-                      f"matched={len(ppt_rows)}, already={len(already)})")
+                      f"({bf} section-backfill, candidates={len(candidates)}, "
+                      f"matched={len(ppt_rows)}, already={len(already)}, thin={len(thin)})")
         else:
             log.info(f"🎙️ PPT summary loop: checked {len(candidates)} recent announcement(s) "
-                      f"({len(ppt_rows)} matched presentation filter, already={len(already)}), nothing new")
+                      f"({len(ppt_rows)} matched presentation filter, already={len(already)}, "
+                      f"thin={len(thin)}), nothing new")
         for i, row in enumerate(todo):
             if i > 0:
                 await asyncio.sleep(float(os.getenv('RESULTS_PDF_PACING_SECONDS', '5')))
@@ -3608,7 +3613,8 @@ async def _stock_themes_loop(session: aiohttp.ClientSession):
             async with session.get(
                 f"{SUPABASE_URL}/rest/v1/stock_fundamentals", headers=headers,
                 params={
-                    'select': 'sym,industry,sector,market_cap,emerging_themes,theme_intensity,'
+                    # Prefer industry when present (added by ensure_stock_fundamentals_public_read.sql).
+                    'select': 'sym,industry,market_cap,emerging_themes,theme_intensity,'
                               'themes_source,themes_at,themes_announced_at',
                     'order': 'market_cap.desc.nullslast',
                     'limit': str(BATCH * 12),
@@ -3621,11 +3627,32 @@ async def _stock_themes_loop(session: aiohttp.ClientSession):
                         log.warning("🌱 Stock-themes loop: run add_stock_themes.sql in Supabase")
                         await asyncio.sleep(600)
                         continue
-                    log.warning(f"🌱 Stock-themes query failed ({r.status}): {body[:200]}")
-                    await asyncio.sleep(CHECK_INTERVAL)
-                    continue
-                fund_rows = await r.json()
-
+                    # Older schemas without industry — retry without it
+                    if r.status == 400 and 'industry' in body:
+                        async with session.get(
+                            f"{SUPABASE_URL}/rest/v1/stock_fundamentals", headers=headers,
+                            params={
+                                'select': 'sym,market_cap,emerging_themes,theme_intensity,'
+                                          'themes_source,themes_at,themes_announced_at',
+                                'order': 'market_cap.desc.nullslast',
+                                'limit': str(BATCH * 12),
+                            },
+                            timeout=aiohttp.ClientTimeout(total=45),
+                        ) as r2:
+                            if r2.status != 200:
+                                body2 = await r2.text()
+                                log.warning(f"🌱 Stock-themes query failed ({r2.status}): {body2[:200]}")
+                                await asyncio.sleep(CHECK_INTERVAL)
+                                continue
+                            fund_rows = await r2.json()
+                    else:
+                        log.warning(f"🌱 Stock-themes query failed ({r.status}): {body[:200]}")
+                        await asyncio.sleep(CHECK_INTERVAL)
+                        continue
+                else:
+                    fund_rows = await r.json()
+                if not isinstance(fund_rows, list):
+                    fund_rows = []
             async with session.get(
                 f"{SUPABASE_URL}/rest/v1/ppt_summaries", headers=headers,
                 params={'select': 'symbol,announced_at,emerging_themes,theme_evidence,theme_intensity,'
@@ -4097,7 +4124,8 @@ async def _mgmt_flags_loop(session: aiohttp.ClientSession):
             async with session.get(
                 f"{SUPABASE_URL}/rest/v1/stock_fundamentals", headers=headers,
                 params={
-                    'select': 'sym,industry,sector,market_cap,mgmt_flags,mgmt_flags_at,mgmt_verdict',
+                    # No sector column on stock_fundamentals in prod.
+                    'select': 'sym,industry,market_cap,mgmt_flags,mgmt_flags_at,mgmt_verdict',
                     'sym': f'in.({",".join(filing_syms[:200])})',
                     'order': 'market_cap.desc.nullslast',
                     'limit': str(min(200, len(filing_syms))),
@@ -4119,7 +4147,7 @@ async def _mgmt_flags_loop(session: aiohttp.ClientSession):
                 async with session.get(
                     f"{SUPABASE_URL}/rest/v1/stock_fundamentals", headers=headers,
                     params={
-                        'select': 'sym,industry,sector,market_cap,mgmt_flags,mgmt_flags_at',
+                        'select': 'sym,industry,market_cap,mgmt_flags,mgmt_flags_at',
                         'order': 'market_cap.desc.nullslast',
                         'limit': '300',
                     },
@@ -4493,7 +4521,9 @@ async def _about_company_loop(session: aiohttp.ClientSession):
                 _key_status_logged = True
             await asyncio.sleep(300)
             continue
-        BATCH_SIZE = int(os.getenv('ABOUT_COMPANY_BATCH_SIZE', '8'))
+        # Default raised for backfill — ~1200 large-caps need briefs; 8/cycle
+        # at 8s pacing is too slow. Env can still lower if Gemini rate-limits.
+        BATCH_SIZE = int(os.getenv('ABOUT_COMPANY_BATCH_SIZE', '12'))
         if not _key_status_logged:
             log.info(f"📘 About-company loop: active with web search "
                       f"(batch={BATCH_SIZE}, ABOUT_COMPANY_WEB_SEARCH="
@@ -4518,13 +4548,27 @@ async def _about_company_loop(session: aiohttp.ClientSession):
                 timeout=aiohttp.ClientTimeout(total=30)
             ) as r:
                 tx_rows = await r.json() if r.status == 200 else []
+            # PK is `sym` (not symbol). industry/sector live on stocks;
+            # stock_fundamentals may lack those columns in prod.
             async with session.get(
                 f"{SUPABASE_URL}/rest/v1/stock_fundamentals", headers=headers,
-                params={'select': 'symbol,industry,sector,market_cap',
+                params={'select': 'sym,market_cap',
                         'order': 'market_cap.desc.nullslast', 'limit': '800'},
                 timeout=aiohttp.ClientTimeout(total=30)
             ) as r:
                 fund_rows = await r.json() if r.status == 200 else []
+                if not isinstance(fund_rows, list):
+                    fund_rows = []
+            # Sector/industry for prompts — from live stocks table (always present).
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/stocks", headers=headers,
+                params={'select': 'sym,sector,industry,market_cap',
+                        'order': 'market_cap.desc.nullslast', 'limit': '1200'},
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as r:
+                stock_rows = await r.json() if r.status == 200 else []
+                if not isinstance(stock_rows, list):
+                    stock_rows = []
             async with session.get(
                 f"{SUPABASE_URL}/rest/v1/company_abouts", headers=headers,
                 params={'select': 'symbol,source_announced_at,status,sources,image_url', 'limit': '5000'},
@@ -4543,7 +4587,7 @@ async def _about_company_loop(session: aiohttp.ClientSession):
             await asyncio.sleep(180)
             continue
 
-        ppt_by_sym, tx_by_sym, fund_by_sym = {}, {}, {}
+        ppt_by_sym, tx_by_sym, fund_by_sym, meta_by_sym = {}, {}, {}, {}
         for row in ppt_rows or []:
             sym = row.get('symbol')
             if sym and sym not in ppt_by_sym:
@@ -4553,14 +4597,19 @@ async def _about_company_loop(session: aiohttp.ClientSession):
             if sym and sym not in tx_by_sym:
                 tx_by_sym[sym] = row
         for row in fund_rows or []:
-            sym = row.get('symbol')
+            sym = row.get('sym')
             if sym and sym not in fund_by_sym:
                 fund_by_sym[sym] = row
+        for row in stock_rows or []:
+            sym = row.get('sym')
+            if sym and sym not in meta_by_sym:
+                meta_by_sym[sym] = row
         existing_map = {r['symbol']: r for r in (existing or []) if r.get('symbol')}
 
         # Prefer names with filings first, then large-cap names still missing a brief.
+        # Include stocks-table universe so About backfills even without PPT/concall yet.
         ranked = []
-        for sym in set(ppt_by_sym) | set(tx_by_sym) | set(fund_by_sym):
+        for sym in set(ppt_by_sym) | set(tx_by_sym) | set(fund_by_sym) | set(meta_by_sym):
             ppt, tx = ppt_by_sym.get(sym), tx_by_sym.get(sym)
             src_at = max(
                 (ppt or {}).get('announced_at') or '',
@@ -4579,14 +4628,16 @@ async def _about_company_loop(session: aiohttp.ClientSession):
                 needs = True
             if not needs:
                 continue
-            mcap = (fund_by_sym.get(sym) or {}).get('market_cap') or 0
+            mcap = ((fund_by_sym.get(sym) or {}).get('market_cap')
+                    or (meta_by_sym.get(sym) or {}).get('market_cap') or 0)
             has_filing = 1 if (ppt or tx) else 0
             ranked.append((has_filing, mcap if isinstance(mcap, (int, float)) else 0, sym, ppt, tx, src_at))
         ranked.sort(key=lambda x: (x[0], x[1]), reverse=True)
         todo = [(sym, ppt, tx, src_at) for _, _, sym, ppt, tx, src_at in ranked[:BATCH_SIZE]]
 
         if todo:
-            log.info(f"📘 About-company loop: {len(todo)} symbol(s) to generate (web search)")
+            log.info(f"📘 About-company loop: {len(todo)} symbol(s) to generate "
+                      f"(web search; backlog≈{len(ranked)})")
         else:
             log.info("📘 About-company loop: nothing new")
 
@@ -4594,10 +4645,10 @@ async def _about_company_loop(session: aiohttp.ClientSession):
             if i > 0:
                 await asyncio.sleep(float(os.getenv('ABOUT_COMPANY_PACING_SECONDS',
                                                     os.getenv('RESULTS_PDF_PACING_SECONDS', '8'))))
-            fund = fund_by_sym.get(sym) or {}
+            meta = meta_by_sym.get(sym) or {}
             result = await extract_about_company(
                 session, sym, ppt, tx,
-                industry=fund.get('industry'), sector=fund.get('sector'))
+                industry=meta.get('industry'), sector=meta.get('sector'))
             if result['error']:
                 log.info(f"  📘 {sym}: will retry about-company next cycle")
                 continue
