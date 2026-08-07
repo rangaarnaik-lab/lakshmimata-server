@@ -57,6 +57,34 @@ _ABOUT_GEMINI_HARD_QUOTA = False
 # While set (unix ts), About is parked and Results PDF extraction may run
 # even if GEMINI_FOCUS=about — so quota downtime still makes progress.
 _ABOUT_YIELD_TO_RESULTS_UNTIL: float | None = None
+# When Results (or any Gemini catchup) hits hard quota, park ALL Gemini
+# worker loops until this unix ts — do not keep burning the key.
+_GEMINI_JOBS_PAUSED_UNTIL: float | None = None
+
+
+def _gemini_jobs_hard_paused() -> bool:
+    until = _GEMINI_JOBS_PAUSED_UNTIL
+    return bool(until and time.time() < until)
+
+
+def _gemini_jobs_hard_pause_seconds() -> int:
+    return max(3600, int(os.getenv(
+        'GEMINI_JOBS_HARD_PAUSE_SECONDS',
+        os.getenv('RESULTS_HARD_QUOTA_COOLDOWN_SECONDS', '86400'))))  # 24h
+
+
+def _begin_gemini_jobs_hard_pause(reason: str, seconds: int | None = None):
+    """Stop every Gemini worker loop — Results failing means stop burning quota."""
+    global _GEMINI_JOBS_PAUSED_UNTIL, _ABOUT_YIELD_TO_RESULTS_UNTIL
+    sec = _gemini_jobs_hard_pause_seconds() if seconds is None else max(3600, int(seconds))
+    _GEMINI_JOBS_PAUSED_UNTIL = time.time() + sec
+    # Don't yield About→Results while the whole Gemini job is dead.
+    _ABOUT_YIELD_TO_RESULTS_UNTIL = None
+    log.error(
+        f"🛑 Gemini jobs HARD STOP for {sec}s (~{sec // 3600}h) — {reason}. "
+        f"Resume after "
+        f"{datetime.fromtimestamp(_GEMINI_JOBS_PAUSED_UNTIL, tz=timezone.utc).isoformat()}. "
+        f"Override with GEMINI_JOBS_HARD_PAUSE_SECONDS.")
 
 
 def _about_company_manually_paused() -> bool:
@@ -784,8 +812,14 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
     hit a Gemini timeout got stuck marked 'skipped' forever and were
     never retried, since the old code treated every failure the same as
     genuine no-content."""
-    error_result = {'financial_data': None, 'comparison_data': None, 'yoy_data': None, 'summary': None, 'error': True}
-    no_content_result = {'financial_data': None, 'comparison_data': None, 'yoy_data': None, 'summary': None, 'error': False}
+    error_result = {
+        'financial_data': None, 'comparison_data': None, 'yoy_data': None,
+        'summary': None, 'error': True, 'rate_limited': False, 'hard_quota': False,
+    }
+    no_content_result = {
+        'financial_data': None, 'comparison_data': None, 'yoy_data': None,
+        'summary': None, 'error': False, 'rate_limited': False, 'hard_quota': False,
+    }
     api_key = _gemini_api_key('RESULTS')
     if not api_key or not attachment_url:
         return error_result  # not a real "no content" case - just not configured/no URL, don't mark as processed
@@ -922,18 +956,24 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
             api_key=api_key,
         )
         if status != 200:
+            pause = status in (429, 500, 502, 503, 504) or status >= 500
+            hard_quota = status == 429 and _gemini_quota_exhausted(body)
             if status == 429:
-                log.warning(f"⚠️ Gemini rate-limit hit for {symbol} (429) - free tier's per-minute "
-                             f"quota exceeded. Pausing this loop briefly to back off; if this recurs "
-                             f"often, lower RESULTS_PDF_BATCH_SIZE and/or raise RESULTS_PDF_PACING_SECONDS.")
-                await asyncio.sleep(int(os.getenv('GEMINI_429_BACKOFF_SECONDS', '45')))
+                log.warning(f"⚠️ Gemini results 429 for {symbol}"
+                            + (" — HARD QUOTA" if hard_quota else " — rate limit")
+                            + f": {(body or '')[:180]}")
             else:
-                log.warning(f"⚠️ Gemini results extraction failed for {symbol} ({status}): {body[:200]}")
-            return error_result
+                log.warning(f"⚠️ Gemini results extraction failed for {symbol} ({status}): {(body or '')[:200]}")
+            return {
+                **error_result,
+                'rate_limited': pause,
+                'hard_quota': hard_quota,
+            }
     except asyncio.TimeoutError:
         log.warning(f"⚠️ Gemini call timed out for {symbol} ({gemini_timeout}s limit, "
                      f"PDF was {len(pdf_bytes)} bytes) - consider raising GEMINI_TIMEOUT_SECONDS "
                      f"if this recurs consistently, since it's a separate stage from the PDF download")
+        # Timeout is not quota — retry later; do not hard-stop all Gemini jobs.
         return error_result
     except Exception as e:
         log.warning(f"⚠️ Gemini call failed for {symbol}: {type(e).__name__}: {e}")
@@ -1197,6 +1237,12 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
     headers = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
     _key_status_logged = False
     while True:
+        if _gemini_jobs_hard_paused():
+            left = max(0, int(_GEMINI_JOBS_PAUSED_UNTIL - time.time()))
+            log.error(f"🛑 Results extraction: Gemini jobs hard-stopped "
+                      f"({left}s left) — not calling API")
+            await asyncio.sleep(min(3600, max(60, left)))
+            continue
         if await _idle_if_gemini_paused('results', 'Results extraction loop'):
             continue
         if not _gemini_api_key('RESULTS'):
@@ -1315,14 +1361,16 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
                                  f"{type(e).__name__}: {e}")
             result = await extract_results_from_pdf(session, row['symbol'], pdf_url)
             if result['error']:
-                # Transient failure (timeout, network, API error) - don't
-                # save any row at all, so this symbol still shows as
-                # "not yet processed" and gets retried next cycle.
-                # Confirmed in production (2026-08-04): saving a
-                # 'skipped' row here for a timeout permanently stuck 4/4
-                # failed symbols as "already done", so they were never
-                # retried even though we never actually got an answer
-                # from Gemini for them.
+                # Quota / 429 / 5xx → stop ALL Gemini jobs (do not keep burning).
+                if result.get('hard_quota') or result.get('rate_limited'):
+                    why = ('HARD QUOTA' if result.get('hard_quota')
+                           else f"Gemini pause signal on {row['symbol']}")
+                    _begin_gemini_jobs_hard_pause(
+                        f"Results PDF failed ({why})")
+                    break
+                # Other transient failure - don't save; retry later.
+                # Confirmed in production (2026-08-04): saving 'skipped'
+                # on timeout permanently stuck symbols as already done.
                 log.info(f"  🎙️ {row['symbol']}: will retry next cycle (transient error, not saved)")
                 continue
             summary = result['summary']
@@ -1470,6 +1518,12 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
             except Exception as e:
                 log.warning(f"⚠️ Concall loop: save failed for {row['symbol']}: {type(e).__name__}: {e}")
             await asyncio.sleep(2)  # small gap between Gemini calls
+        if _gemini_jobs_hard_paused():
+            left = max(0, int(_GEMINI_JOBS_PAUSED_UNTIL - time.time()))
+            log.error(f"🛑 Results extraction: batch aborted — Gemini hard stop "
+                      f"({left}s / ~{left // 3600}h remaining)")
+            await asyncio.sleep(min(3600, max(60, left)))
+            continue
         if todo:
             log.info(f"🎙️ Results extraction loop: batch complete"
                       f"{' (catchup)' if catchup else ''}")
@@ -5365,7 +5419,10 @@ def _gemini_focus_allows(feature: str) -> bool:
     """GEMINI_FOCUS=about (or comma list) limits free-tier RPM to those loops.
     Empty / all / * = every Gemini feature runs. Interactive Ask-AI always allowed.
     When About is stopped (PAUSE_ABOUT_COMPANY / hard-quota yield), Results PDF
-    extraction is allowed even if GEMINI_FOCUS=about."""
+    extraction is allowed even if GEMINI_FOCUS=about.
+    When Results hits hard quota, ALL Gemini worker features are blocked."""
+    if _gemini_jobs_hard_paused():
+        return False
     if feature == 'asks':
         return True
     # About stopped → force Results catchup (ignore GEMINI_FOCUS=about).
@@ -5392,15 +5449,22 @@ async def _idle_if_gemini_paused(feature: str, label: str):
     if _gemini_focus_allows(feature):
         return False
     why = os.getenv('GEMINI_FOCUS')
-    if feature == 'about' and _about_company_manually_paused():
+    if _gemini_jobs_hard_paused():
+        left = max(0, int((_GEMINI_JOBS_PAUSED_UNTIL or 0) - time.time()))
+        log.error(f"🛑 {label}: Gemini HARD STOP ({left}s left)")
+    elif feature == 'about' and _about_company_manually_paused():
         log.info(f"⏸️ {label}: paused (PAUSE_ABOUT_COMPANY — Results catchup active)")
     elif feature == 'results' and (_ABOUT_YIELD_TO_RESULTS_UNTIL or _about_company_manually_paused()):
         log.info(f"⏸️ {label}: waiting for About→Results handoff")
     else:
         log.info(f"⏸️ {label}: paused (GEMINI_FOCUS={why})")
     while not _gemini_focus_allows(feature):
-        await asyncio.sleep(
-            30 if (_ABOUT_YIELD_TO_RESULTS_UNTIL or _about_company_manually_paused()) else 300)
+        if _gemini_jobs_hard_paused():
+            left = max(0, int((_GEMINI_JOBS_PAUSED_UNTIL or 0) - time.time()))
+            await asyncio.sleep(min(3600, max(60, left or 60)))
+        else:
+            await asyncio.sleep(
+                30 if (_ABOUT_YIELD_TO_RESULTS_UNTIL or _about_company_manually_paused()) else 300)
     if feature == 'results':
         log.info(f"▶️ {label}: active (Results catchup / focus allows results)")
     return True
