@@ -8,6 +8,7 @@ import sys
 import time
 import json
 import base64
+import random
 import asyncio
 import aiohttp
 import logging
@@ -1598,6 +1599,238 @@ async def _market_cap_catchup_loop(session: aiohttp.ClientSession):
             log.error(f"Market cap catchup loop failed: {type(e).__name__}: {e}")
         await asyncio.sleep(CHECK_INTERVAL)
 
+# Fields we want populated for EVERY stock (banks get NIM/NPA/etc. too;
+# non-banks leave those null — that's fine). A row still needs fill if
+# the core valuation/cash-flow set is entirely empty.
+_AI_FUND_CORE = ('pb', 'roce', 'cfo', 'div_yield', 'pe', 'roe')
+_AI_FUND_ALL = (
+    'market_cap', 'pe', 'roe', 'eps', 'debt_eq', 'promoter',
+    'pb', 'roce', 'industry_pe', 'div_yield', 'cfo', 'fcf', 'cfo_pat',
+    'nim', 'gnpa', 'nnpa', 'car', 'casa', 'peg_ratio',
+)
+
+def _html_to_compact_text(html: str, limit: int = 90000) -> str:
+    """Strip tags/scripts so Gemini sees ratios/tables, not markup noise."""
+    import re
+    text = re.sub(r'(?is)<script[^>]*>.*?</script>', ' ', html or '')
+    text = re.sub(r'(?is)<style[^>]*>.*?</style>', ' ', text)
+    text = re.sub(r'(?is)<!--.*?-->', ' ', text)
+    text = re.sub(r'<[^>]+>', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text[:limit]
+
+async def _fetch_screener_html(session: aiohttp.ClientSession, sym: str) -> str:
+    url = f"https://www.screener.in/company/{sym}/consolidated/"
+    headers = random.choice(_SCREENER_HEADER_SETS)
+    try:
+        async with session.get(url, headers=headers,
+                               timeout=aiohttp.ClientTimeout(total=15)) as r:
+            if r.status == 404:
+                url2 = f"https://www.screener.in/company/{sym}/"
+                async with session.get(url2, headers=headers,
+                                       timeout=aiohttp.ClientTimeout(total=15)) as r2:
+                    if r2.status != 200:
+                        return ''
+                    return await r2.text()
+            if r.status != 200:
+                return ''
+            return await r.text()
+    except Exception as e:
+        log.warning(f"⚠️ Screener HTML fetch failed for {sym}: {type(e).__name__}: {e}")
+        return ''
+
+async def ai_extract_fundamentals_metrics(session: aiohttp.ClientSession, sym: str, html: str):
+    """Gemini flash-lite structured extract of valuation / cash-flow / bank
+    ratios from a Screener.in company page. Used to fill ALL stocks still
+    missing these fields after regex scrape. Returns dict of numeric
+    fields (None when not disclosed) or None on failure."""
+    api_key = os.getenv('GEMINI_API_KEY', '')
+    if not api_key or not html:
+        return None
+    text = _html_to_compact_text(html)
+    if len(text) < 400:
+        return None
+    prompt = (
+        f"You are extracting fundamental ratios for Indian NSE stock {sym} from its "
+        "Screener.in company page text. Return ONLY values that appear in the text — "
+        "never invent. Use null when a metric is not shown.\n\n"
+        "Units:\n"
+        "- market_cap, cfo, fcf: ₹ Crore numbers\n"
+        "- pe, pb, industry_pe, peg_ratio, debt_eq, cfo_pat: ratios (unitless)\n"
+        "- roe, roce, div_yield, nim, gnpa, nnpa, car, casa, promoter: percentages "
+        "(number only, no % sign)\n"
+        "- eps: ₹ per share\n\n"
+        "Bank/NBFC pages often show NIM, Gross NPA, Net NPA, CAR/CRAR, CASA — fill those "
+        "when present; leave null for non-financial companies.\n"
+        "Industrial pages usually show Cash from Operating Activity / Free Cash Flow — "
+        "map those to cfo / fcf.\n"
+        "cfo_pat = CFO / latest Net Profit when both are visible.\n"
+        "peg_ratio = P/E ÷ EPS YoY growth % when both visible and growth > 0.\n\n"
+        f"PAGE TEXT:\n{text}"
+    )
+    num = {"type": "number", "nullable": True}
+    schema = {
+        "type": "object",
+        "properties": {k: num for k in _AI_FUND_ALL},
+        "required": [],
+    }
+    model = os.getenv('GEMINI_CONCALL_MODEL', 'gemini-3.1-flash-lite')
+    try:
+        async with session.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
+            headers={"Content-Type": "application/json"},
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "responseMimeType": "application/json",
+                    "responseSchema": schema,
+                    "temperature": 0.1,
+                },
+            },
+            timeout=aiohttp.ClientTimeout(total=90),
+        ) as r:
+            if r.status != 200:
+                body = await r.text()
+                if r.status == 429:
+                    log.warning(f"⚠️ Gemini rate-limit on fund AI fill for {sym} (429)")
+                    await asyncio.sleep(int(os.getenv('GEMINI_429_BACKOFF_SECONDS', '30')))
+                else:
+                    log.warning(f"⚠️ Gemini fund AI fill failed for {sym} ({r.status}): {body[:180]}")
+                return None
+            data = await r.json()
+        parts = (data.get('candidates') or [{}])[0].get('content', {}).get('parts', [])
+        raw = ''.join(p.get('text', '') for p in parts).strip()
+        parsed = json.loads(raw)
+    except Exception as e:
+        log.warning(f"⚠️ Gemini fund AI fill error for {sym}: {type(e).__name__}: {e}")
+        return None
+    out = {}
+    for k in _AI_FUND_ALL:
+        v = parsed.get(k)
+        if v is None:
+            continue
+        try:
+            out[k] = round(float(v), 4)
+        except (TypeError, ValueError):
+            continue
+    # Recompute PEG if model skipped it but we have inputs
+    if out.get('peg_ratio') is None and out.get('pe') and out.get('pe') > 0:
+        # eps_yoy not in AI schema response as growth — leave peg if unset
+        pass
+    return out or None
+
+async def _valuation_ai_catchup_loop(session: aiohttp.ClientSession):
+    """Backfill P/B, ROCE, cash-flow, bank ratios for EVERY stock still
+    missing them — regex scrape first, Gemini fill for remaining gaps.
+    Runs while market is closed so it doesn't fight live-scan I/O."""
+    CHECK_INTERVAL = int(os.getenv('VALUATION_AI_INTERVAL_SEC', '900'))  # 15 min
+    MAX_PER_CYCLE = int(os.getenv('VALUATION_AI_BATCH', '25'))
+    _key_logged = False
+    while True:
+        if is_market_open():
+            await asyncio.sleep(300)
+            continue
+        if not os.getenv('GEMINI_API_KEY'):
+            if not _key_logged:
+                log.warning("📊 Valuation AI catchup: GEMINI_API_KEY not set — loop idle")
+                _key_logged = True
+            await asyncio.sleep(600)
+            continue
+        if not _key_logged:
+            log.info(f"📊 Valuation AI catchup: active (batch={MAX_PER_CYCLE}, "
+                     f"interval={CHECK_INTERVAL}s) — fills pb/roce/cfo/… for all missing stocks")
+            _key_logged = True
+        try:
+            headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+            # Prefer rows where core valuation fields are still null
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/stock_fundamentals",
+                headers=headers,
+                params={
+                    'select': 'sym,pe,pb,roce,cfo,div_yield,nim,market_cap,roe,eps,debt_eq,'
+                              'promoter,industry_pe,fcf,cfo_pat,gnpa,nnpa,car,casa,peg_ratio',
+                    'or': '(pb.is.null,cfo.is.null,roce.is.null)',
+                    'order': 'sym.asc',
+                    'limit': str(MAX_PER_CYCLE * 3),
+                },
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as r:
+                if r.status != 200:
+                    body = await r.text()
+                    if r.status == 400 and ('pb' in body or 'cfo' in body):
+                        log.warning("📊 Valuation AI catchup: columns missing — run "
+                                    "add_valuation_cashflow_bank.sql")
+                        await asyncio.sleep(CHECK_INTERVAL)
+                        continue
+                    log.warning(f"📊 Valuation AI catchup query failed ({r.status}): {body[:200]}")
+                    rows = []
+                else:
+                    rows = await r.json()
+            todo = []
+            for row in rows:
+                if all(row.get(k) is None for k in ('pb', 'roce', 'cfo', 'div_yield', 'nim')):
+                    todo.append(row)
+                elif row.get('pb') is None or (row.get('cfo') is None and row.get('nim') is None):
+                    todo.append(row)
+                if len(todo) >= MAX_PER_CYCLE:
+                    break
+            if not todo:
+                log.info("📊 Valuation AI catchup: no missing rows this cycle")
+                await asyncio.sleep(CHECK_INTERVAL)
+                continue
+            log.info(f"📊 Valuation AI catchup: filling {len(todo)} stock(s)…")
+            saved = 0
+            for i, row in enumerate(todo):
+                sym = row['sym']
+                if i > 0:
+                    await asyncio.sleep(float(os.getenv('RESULTS_PDF_PACING_SECONDS', '5')))
+                # 1) Regex scrape (cheap when Screener cooperates)
+                scraped = await fetch_fundamentals_screener(session, sym)
+                merged = {k: row.get(k) for k in _AI_FUND_ALL}
+                for k, v in (scraped or {}).items():
+                    if k in merged and v is not None:
+                        merged[k] = v
+                # 2) AI fill remaining gaps from the same page
+                still = [k for k in _AI_FUND_CORE if merged.get(k) is None]
+                if still:
+                    html = await _fetch_screener_html(session, sym)
+                    ai = await ai_extract_fundamentals_metrics(session, sym, html)
+                    if ai:
+                        for k, v in ai.items():
+                            if merged.get(k) is None and v is not None:
+                                merged[k] = v
+                # PEG from pe + existing eps_yoy in cache if possible
+                cache = fundamentals_cache.get(sym) or {}
+                eps_yoy = cache.get('eps_yoy')
+                if merged.get('peg_ratio') is None and merged.get('pe') and eps_yoy and eps_yoy > 0:
+                    merged['peg_ratio'] = round(merged['pe'] / eps_yoy, 2)
+                payload = {'sym': sym, **{k: merged.get(k) for k in _AI_FUND_ALL}}
+                payload['fetched_at'] = datetime.now(timezone.utc).isoformat()
+                # Keep shareholding / growth fields already on file
+                for k in ('eps_qoq', 'eps_yoy', 'sales_qoq', 'sales_yoy', 'opm_pct', 'opm_trend',
+                          'eps_growth_streak', 'fii_pct', 'fii_trend', 'dii_pct', 'dii_trend',
+                          'promoter_trend', 'industry', 'shares_outstanding'):
+                    if cache.get(k) is not None:
+                        payload[k] = cache.get(k)
+                    elif scraped and scraped.get(k) is not None:
+                        payload[k] = scraped.get(k)
+                try:
+                    await save_fundamentals_batch_to_db(session, [payload])
+                    fundamentals_cache[sym] = {
+                        **(fundamentals_cache.get(sym) or {}),
+                        **{k: payload.get(k) for k in _AI_FUND_ALL},
+                        'fetched_at': time.time(),
+                    }
+                    filled = [k for k in _AI_FUND_CORE if payload.get(k) is not None]
+                    log.info(f"  📊 {sym}: filled {', '.join(filled) or 'nothing new'}")
+                    saved += 1
+                except Exception as e:
+                    log.warning(f"⚠️ Valuation save failed for {sym}: {type(e).__name__}: {e}")
+            log.info(f"📊 Valuation AI catchup: saved {saved}/{len(todo)} this cycle")
+        except Exception as e:
+            log.error(f"Valuation AI catchup loop failed: {type(e).__name__}: {e}")
+        await asyncio.sleep(CHECK_INTERVAL)
+
 def _norm_date(s):
     """NSE's two endpoints format the same date differently — the
     results LIST feed gives 'toDate' as e.g. '31-Dec-2024' (title-case
@@ -3051,6 +3284,7 @@ async def fundamentals_worker_main():
         await asyncio.gather(
             _fundamentals_loop(session),
             _market_cap_catchup_loop(session),
+            _valuation_ai_catchup_loop(session),
             _announcements_loop(session),
             _results_loop(session),
             _bse_calendar_refresh_loop(session),
