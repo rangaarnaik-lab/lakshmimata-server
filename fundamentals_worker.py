@@ -26,6 +26,9 @@ if '_fundamentals_fetch_paused' not in globals():
         v = (os.getenv('PAUSE_FUNDAMENTALS_FETCH') or '').strip().lower()
         if v in ('1', 'true', 'yes', 'on'):
             return True
+        about_paused = (os.getenv('PAUSE_ABOUT_COMPANY') or '1').strip().lower()
+        if about_paused not in ('0', 'false', 'no', 'off'):
+            return False
         return (os.getenv('GEMINI_FOCUS') or '').strip().lower() == 'about'
 
 if '_screener_disabled' not in globals():
@@ -54,6 +57,13 @@ _ABOUT_GEMINI_HARD_QUOTA = False
 # While set (unix ts), About is parked and Results PDF extraction may run
 # even if GEMINI_FOCUS=about — so quota downtime still makes progress.
 _ABOUT_YIELD_TO_RESULTS_UNTIL: float | None = None
+
+
+def _about_company_manually_paused() -> bool:
+    """Stop About Gemini entirely (quota exhausted). Default ON so deploy
+    shifts work to Results PDF catchup. Set PAUSE_ABOUT_COMPANY=0 to resume."""
+    v = (os.getenv('PAUSE_ABOUT_COMPANY') or '1').strip().lower()
+    return v not in ('0', 'false', 'no', 'off')
 
 
 def _gemini_quota_exhausted(body_txt: str | None) -> bool:
@@ -1165,8 +1175,10 @@ async def _fetch_results_announcement_candidates(
 
 
 def _results_catchup_boosted() -> bool:
-    """High-throughput Results PDF mode: About hard-pause handoff, or
-    RESULTS_PDF_CATCHUP=1 for a dedicated catchup deploy."""
+    """High-throughput Results PDF mode while About is stopped / yielded,
+    or RESULTS_PDF_CATCHUP=1 for a dedicated catchup deploy."""
+    if _about_company_manually_paused():
+        return True
     v = (os.getenv('RESULTS_PDF_CATCHUP') or '').strip().lower()
     if v in ('1', 'true', 'yes', 'on'):
         return True
@@ -4786,7 +4798,18 @@ async def _about_company_loop(session: aiohttp.ClientSession):
     PPT / concall context when available). Works even when filings are missing."""
     headers = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
     _key_status_logged = False
+    _pause_logged = False
     while True:
+        # Quota exhausted — park About; Results catchup takes the Gemini slot.
+        if _about_company_manually_paused():
+            if not _pause_logged:
+                log.warning(
+                    "📘 About-company: STOPPED (PAUSE_ABOUT_COMPANY default on / quota). "
+                    "Running Results PDF catchup instead. Set PAUSE_ABOUT_COMPANY=0 to resume About.")
+                _pause_logged = True
+            await asyncio.sleep(3600)
+            continue
+        _pause_logged = False
         if await _idle_if_gemini_paused('about', 'About-company loop'):
             continue
         if not _gemini_api_key('ABOUT'):
@@ -5240,6 +5263,12 @@ async def fundamentals_worker_main():
                  else ('GEMINI_API_KEY' if about_k else 'none'))
     log.info(f"  📘 About will call Gemini with {about_src} "
              f"{_gemini_key_fingerprint(about_k)}")
+    if _about_company_manually_paused():
+        log.warning("  📘 About-company: STOPPED (PAUSE_ABOUT_COMPANY) — "
+                    "Results PDF catchup will use the Gemini slot. "
+                    "Set PAUSE_ABOUT_COMPANY=0 when quota recovers.")
+    else:
+        log.info("  📘 About-company: enabled (PAUSE_ABOUT_COMPANY=0)")
 
     connector = aiohttp.TCPConnector(limit=20, ssl=False)
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -5335,10 +5364,16 @@ async def _delayed(seconds: float, coro):
 def _gemini_focus_allows(feature: str) -> bool:
     """GEMINI_FOCUS=about (or comma list) limits free-tier RPM to those loops.
     Empty / all / * = every Gemini feature runs. Interactive Ask-AI always allowed.
-    While About is in a hard quota pause, Results PDF extraction is temporarily
-    allowed so catchup can continue on a different Gemini use-case."""
+    When About is stopped (PAUSE_ABOUT_COMPANY / hard-quota yield), Results PDF
+    extraction is allowed even if GEMINI_FOCUS=about."""
     if feature == 'asks':
         return True
+    # About stopped → force Results catchup (ignore GEMINI_FOCUS=about).
+    if _about_company_manually_paused():
+        if feature == 'about':
+            return False
+        if feature == 'results':
+            return True
     until = _ABOUT_YIELD_TO_RESULTS_UNTIL
     if until and time.time() < until:
         if feature == 'about':
@@ -5357,16 +5392,17 @@ async def _idle_if_gemini_paused(feature: str, label: str):
     if _gemini_focus_allows(feature):
         return False
     why = os.getenv('GEMINI_FOCUS')
-    if feature == 'results' and _ABOUT_YIELD_TO_RESULTS_UNTIL:
-        left = max(0, int(_ABOUT_YIELD_TO_RESULTS_UNTIL - time.time()))
-        log.info(f"⏸️ {label}: waiting for About yield window ({left}s left)")
+    if feature == 'about' and _about_company_manually_paused():
+        log.info(f"⏸️ {label}: paused (PAUSE_ABOUT_COMPANY — Results catchup active)")
+    elif feature == 'results' and (_ABOUT_YIELD_TO_RESULTS_UNTIL or _about_company_manually_paused()):
+        log.info(f"⏸️ {label}: waiting for About→Results handoff")
     else:
         log.info(f"⏸️ {label}: paused (GEMINI_FOCUS={why})")
     while not _gemini_focus_allows(feature):
-        # Wake sooner when About may hand off to Results.
-        await asyncio.sleep(30 if _ABOUT_YIELD_TO_RESULTS_UNTIL else 300)
+        await asyncio.sleep(
+            30 if (_ABOUT_YIELD_TO_RESULTS_UNTIL or _about_company_manually_paused()) else 300)
     if feature == 'results':
-        log.info(f"▶️ {label}: active (About yielded Gemini slot / focus allows results)")
+        log.info(f"▶️ {label}: active (Results catchup / focus allows results)")
     return True
 
 def rate_announcements_free(rows: list) -> list:
