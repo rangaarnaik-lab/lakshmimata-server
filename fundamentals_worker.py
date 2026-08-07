@@ -3474,12 +3474,14 @@ async def extract_about_company(session: aiohttp.ClientSession, symbol: str, ppt
     return {'about': about, 'error': False}
 
 
+# Do NOT include `sector` — stock_fundamentals has no sector column in prod
+# (lives on stocks). Selecting it 400s the whole highlights loop forever.
 _FUND_HIGHLIGHT_FIELDS = (
     'pe', 'pb', 'roe', 'roce', 'peg_ratio', 'debt_eq', 'eps', 'eps_yoy', 'eps_qoq',
     'sales_yoy', 'sales_qoq', 'opm_pct', 'opm_trend', 'cfo', 'fcf', 'cfo_pat',
     'div_yield', 'promoter', 'promoter_trend', 'fii_pct', 'fii_trend', 'dii_pct',
     'dii_trend', 'industry_pe', 'market_cap', 'nim', 'gnpa', 'nnpa', 'car', 'casa',
-    'fundamental_score', 'fundamental_label', 'industry', 'sector',
+    'fundamental_score', 'fundamental_label', 'industry',
 )
 
 
@@ -3610,49 +3612,52 @@ async def _stock_themes_loop(session: aiohttp.ClientSession):
             log.info(f"🌱 Stock-themes loop: active (batch={BATCH}, stale={STALE_DAYS}d)")
             _key_logged = True
         try:
-            async with session.get(
-                f"{SUPABASE_URL}/rest/v1/stock_fundamentals", headers=headers,
-                params={
-                    # Prefer industry when present (added by ensure_stock_fundamentals_public_read.sql).
-                    'select': 'sym,industry,market_cap,emerging_themes,theme_intensity,'
-                              'themes_source,themes_at,themes_announced_at',
-                    'order': 'market_cap.desc.nullslast',
-                    'limit': str(BATCH * 12),
-                },
-                timeout=aiohttp.ClientTimeout(total=45),
-            ) as r:
-                if r.status != 200:
-                    body = await r.text()
-                    if r.status == 400 and 'emerging_themes' in body:
-                        log.warning("🌱 Stock-themes loop: run add_stock_themes.sql in Supabase")
-                        await asyncio.sleep(600)
-                        continue
-                    # Older schemas without industry — retry without it
-                    if r.status == 400 and 'industry' in body:
-                        async with session.get(
-                            f"{SUPABASE_URL}/rest/v1/stock_fundamentals", headers=headers,
-                            params={
-                                'select': 'sym,market_cap,emerging_themes,theme_intensity,'
-                                          'themes_source,themes_at,themes_announced_at',
-                                'order': 'market_cap.desc.nullslast',
-                                'limit': str(BATCH * 12),
-                            },
-                            timeout=aiohttp.ClientTimeout(total=45),
-                        ) as r2:
-                            if r2.status != 200:
-                                body2 = await r2.text()
-                                log.warning(f"🌱 Stock-themes query failed ({r2.status}): {body2[:200]}")
-                                await asyncio.sleep(CHECK_INTERVAL)
-                                continue
-                            fund_rows = await r2.json()
-                    else:
+            # Prefer rows that still need themes — top-N-by-mcap alone left
+            # ~2400 stocks untouched while only 3 had themes in prod.
+            fund_select = ('sym,industry,market_cap,emerging_themes,theme_intensity,'
+                           'themes_source,themes_at,themes_announced_at')
+            fund_rows = []
+            for params in (
+                {'select': fund_select, 'themes_at': 'is.null',
+                 'order': 'market_cap.desc.nullslast', 'limit': str(BATCH * 40)},
+                {'select': fund_select, 'emerging_themes': 'is.null',
+                 'order': 'market_cap.desc.nullslast', 'limit': str(BATCH * 40)},
+                {'select': fund_select, 'order': 'market_cap.desc.nullslast',
+                 'limit': str(BATCH * 20)},
+            ):
+                async with session.get(
+                    f"{SUPABASE_URL}/rest/v1/stock_fundamentals", headers=headers,
+                    params=params, timeout=aiohttp.ClientTimeout(total=45),
+                ) as r:
+                    if r.status != 200:
+                        body = await r.text()
+                        if r.status == 400 and 'emerging_themes' in body:
+                            log.warning("🌱 Stock-themes loop: run add_stock_themes.sql in Supabase")
+                            await asyncio.sleep(600)
+                            fund_rows = None
+                            break
+                        if r.status == 400 and 'industry' in body:
+                            params = {**params, 'select': fund_select.replace('industry,', '')}
+                            async with session.get(
+                                f"{SUPABASE_URL}/rest/v1/stock_fundamentals", headers=headers,
+                                params=params, timeout=aiohttp.ClientTimeout(total=45),
+                            ) as r2:
+                                if r2.status == 200:
+                                    chunk = await r2.json()
+                                    if isinstance(chunk, list) and chunk:
+                                        fund_rows = chunk
+                                        break
+                            continue
                         log.warning(f"🌱 Stock-themes query failed ({r.status}): {body[:200]}")
-                        await asyncio.sleep(CHECK_INTERVAL)
                         continue
-                else:
-                    fund_rows = await r.json()
-                if not isinstance(fund_rows, list):
-                    fund_rows = []
+                    chunk = await r.json()
+                    if isinstance(chunk, list) and chunk:
+                        fund_rows = chunk
+                        break
+            if fund_rows is None:
+                continue
+            if not isinstance(fund_rows, list):
+                fund_rows = []
             async with session.get(
                 f"{SUPABASE_URL}/rest/v1/ppt_summaries", headers=headers,
                 params={'select': 'symbol,announced_at,emerging_themes,theme_evidence,theme_intensity,'
@@ -3698,10 +3703,33 @@ async def _stock_themes_loop(session: aiohttp.ClientSession):
                 about_by[sym] = row
 
         cutoff = datetime.now(timezone.utc) - timedelta(days=STALE_DAYS)
+        fund_by = {r.get('sym'): r for r in (fund_rows or []) if r.get('sym')}
         todo = []
+        seen_todo = set()
+
+        # Cheap pass first: copy themes from PPT/concall onto fund rows
+        # for EVERY filing we have — not only the mcap-top slice.
+        for sym, src, src_name in (
+            *[(s, r, 'ppt') for s, r in ppt_by.items()],
+            *[(s, r, 'concall') for s, r in tx_by.items()],
+        ):
+            themes = _clean_themes((src or {}).get('emerging_themes'))
+            if not themes or sym in seen_todo:
+                continue
+            existing = fund_by.get(sym) or {}
+            if _clean_themes(existing.get('emerging_themes')):
+                continue
+            todo.append((sym, existing, ppt_by.get(sym), tx_by.get(sym), 'sync',
+                         (src or {}).get('announced_at') or ''))
+            seen_todo.add(sym)
+            if len(todo) >= BATCH:
+                break
+
         for row in fund_rows or []:
+            if len(todo) >= BATCH:
+                break
             sym = row.get('sym')
-            if not sym:
+            if not sym or sym in seen_todo:
                 continue
             ppt, tx = ppt_by.get(sym), tx_by.get(sym)
             ppt_themes = _clean_themes((ppt or {}).get('emerging_themes'))
@@ -3720,7 +3748,6 @@ async def _stock_themes_loop(session: aiohttp.ClientSession):
                     stale = ts < cutoff
                 except Exception:
                     stale = True
-            # Refresh when a newer filing has themes we haven't synced
             filing_newer = bool(
                 filing_at and (not row.get('themes_announced_at')
                                or str(row.get('themes_announced_at')) < filing_at)
@@ -3728,13 +3755,9 @@ async def _stock_themes_loop(session: aiohttp.ClientSession):
             )
             if has and not stale and not filing_newer:
                 continue
-            # Prefer sync-from-filing when available (cheap)
-            mode = 'ai'
-            if ppt_themes or tx_themes:
-                mode = 'sync'
+            mode = 'sync' if (ppt_themes or tx_themes) else 'ai'
             todo.append((sym, row, ppt, tx, mode, filing_at))
-            if len(todo) >= BATCH:
-                break
+            seen_todo.add(sym)
 
         if not todo:
             log.info("🌱 Stock-themes loop: nothing to generate")
@@ -3785,7 +3808,8 @@ async def _stock_themes_loop(session: aiohttp.ClientSession):
             except Exception as e:
                 log.warning(f"⚠️ Themes save failed for {sym}: {type(e).__name__}: {e}")
         log.info(f"🌱 Stock-themes loop: saved {saved}/{len(todo)}")
-        await asyncio.sleep(CHECK_INTERVAL)
+        # Faster while backlog remains (especially cheap sync batches)
+        await asyncio.sleep(60 if saved else CHECK_INTERVAL)
 
 
 def _clean_mgmt_flags(v):
@@ -4431,26 +4455,39 @@ async def _fundamentals_ai_highlights_loop(session: aiohttp.ClientSession):
             _key_logged = True
         try:
             select_cols = 'sym,' + ','.join(_FUND_HIGHLIGHT_FIELDS) + ',ai_highlights,ai_highlights_at,fetched_at'
-            async with session.get(
-                f"{SUPABASE_URL}/rest/v1/stock_fundamentals",
-                headers=headers,
-                params={
-                    'select': select_cols,
-                    'order': 'market_cap.desc.nullslast',
-                    'limit': str(BATCH * 8),
-                },
-                timeout=aiohttp.ClientTimeout(total=45),
-            ) as r:
-                if r.status != 200:
-                    body = await r.text()
-                    if r.status == 400 and 'ai_highlights' in body:
-                        log.warning("📌 Fund-highlights loop: run add_fundamentals_ai_highlights.sql")
-                        await asyncio.sleep(600)
+            # Prefer missing highlights — otherwise top-by-mcap rows with sparse
+            # ratios starve the queue and ai_highlights stayed at 0 in prod.
+            rows = []
+            for extra in (
+                {'ai_highlights': 'is.null'},
+                {},
+            ):
+                async with session.get(
+                    f"{SUPABASE_URL}/rest/v1/stock_fundamentals",
+                    headers=headers,
+                    params={
+                        'select': select_cols,
+                        'order': 'market_cap.desc.nullslast',
+                        'limit': str(BATCH * 30),
+                        **extra,
+                    },
+                    timeout=aiohttp.ClientTimeout(total=45),
+                ) as r:
+                    if r.status != 200:
+                        body = await r.text()
+                        if r.status == 400 and 'ai_highlights' in body:
+                            log.warning("📌 Fund-highlights loop: run add_fundamentals_ai_highlights.sql")
+                            await asyncio.sleep(600)
+                            rows = None
+                            break
+                        log.warning(f"📌 Fund-highlights query failed ({r.status}): {body[:200]}")
                         continue
-                    log.warning(f"📌 Fund-highlights query failed ({r.status}): {body[:200]}")
-                    await asyncio.sleep(CHECK_INTERVAL)
-                    continue
-                rows = await r.json()
+                    chunk = await r.json()
+                    if isinstance(chunk, list) and chunk:
+                        rows = chunk
+                        break
+            if rows is None:
+                continue
             cutoff = datetime.now(timezone.utc) - timedelta(days=STALE_DAYS)
             todo = []
             for row in rows or []:
@@ -4662,11 +4699,14 @@ async def _about_company_loop(session: aiohttp.ClientSession):
                 'updated_at': datetime.now(timezone.utc).isoformat(),
                 **(about or {}),
             }
+            # Prefer+on_conflict required for upsert — without on_conflict=symbol
+            # PostgREST rejects merge-duplicates and About stayed at 0 rows in prod.
+            about_url = f"{SUPABASE_URL}/rest/v1/company_abouts?on_conflict=symbol"
+            about_headers = {**headers, 'Content-Type': 'application/json',
+                             'Prefer': 'resolution=merge-duplicates,return=minimal'}
             try:
                 async with session.post(
-                    f"{SUPABASE_URL}/rest/v1/company_abouts",
-                    headers={**headers, 'Content-Type': 'application/json',
-                             'Prefer': 'resolution=merge-duplicates'},
+                    about_url, headers=about_headers,
                     json=payload, timeout=aiohttp.ClientTimeout(total=15)
                 ) as r:
                     if r.status not in (200, 201, 204):
@@ -4681,9 +4721,7 @@ async def _about_company_loop(session: aiohttp.ClientSession):
                             for k in drop_keys:
                                 payload.pop(k, None)
                             async with session.post(
-                                f"{SUPABASE_URL}/rest/v1/company_abouts",
-                                headers={**headers, 'Content-Type': 'application/json',
-                                         'Prefer': 'resolution=merge-duplicates'},
+                                about_url, headers=about_headers,
                                 json=payload, timeout=aiohttp.ClientTimeout(total=15)
                             ) as r2:
                                 if r2.status not in (200, 201, 204):
