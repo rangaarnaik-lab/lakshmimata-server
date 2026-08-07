@@ -40,6 +40,25 @@ if '_screener_disabled' not in globals():
 # worst case is one wasted retry per restart, not an ongoing drag.
 _BSE_NO_SCRIP_CODE = set()
 
+# About briefs successfully saved this process — never re-Gemini the same
+# symbol in-process even if Supabase read-back lags / timestamp compare glitches.
+_ABOUT_DONE_SYMS: set[str] = set()
+
+
+def _parse_iso_ts(value):
+    """Parse PostgREST / filing timestamps for comparison; None if unusable."""
+    if not value:
+        return None
+    s = str(value).strip().replace('Z', '+00:00')
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
 # Cap concurrent Gemini calls. Free tier is typically ~15 RPM per API key.
 # When multiple GEMINI_API_KEY_* are set, each key gets its own semaphore so
 # About/PPT/etc. can burn separate free-tier quotas in parallel.
@@ -4735,6 +4754,7 @@ async def _about_company_loop(session: aiohttp.ClientSession):
             )
             prev = existing_map.get(sym)
             needs = False
+            reason = ''
             web_on = os.getenv('ABOUT_COMPANY_WEB_SEARCH', '0').strip() not in (
                 '0', 'false', 'False')
             # Only re-queue done rows for missing sources/logo when web search
@@ -4744,15 +4764,28 @@ async def _about_company_loop(session: aiohttp.ClientSession):
                 'ABOUT_COMPANY_WEB_BACKFILL',
                 '1' if web_on else '0',
             ).strip() not in ('0', 'false', 'False')
-            if not prev or prev.get('status') != 'done':
+            if sym in _ABOUT_DONE_SYMS:
+                needs = False
+            elif not prev or prev.get('status') != 'done':
                 needs = True
-            elif src_at and (prev.get('source_announced_at') or '') < src_at:
-                needs = True  # newer filing since last brief
-            elif (prev.get('status') == 'done' and web_on and backfill
-                  and (not prev.get('sources') or not prev.get('image_url'))):
-                needs = True  # upgrade filing-only / logo-missing via web
+                reason = 'missing_or_not_done'
+            elif src_at:
+                # Only refresh when we can parse BOTH timestamps and filing is newer.
+                # Old `'' < src_at` re-queued every done row with null source_announced_at.
+                cur_ts = _parse_iso_ts(src_at)
+                old_ts = _parse_iso_ts(prev.get('source_announced_at'))
+                if cur_ts and old_ts and cur_ts > old_ts + timedelta(seconds=1):
+                    needs = True
+                    reason = 'newer_filing'
+            if (not needs and sym not in _ABOUT_DONE_SYMS and prev
+                    and prev.get('status') == 'done' and web_on and backfill
+                    and (not prev.get('sources') or not prev.get('image_url'))):
+                needs = True
+                reason = 'web_backfill'
             if not needs:
                 continue
+            # Stash reason on tuple via side channel only for the chosen todo log
+            meta_by_sym.setdefault(sym, {})['_about_reason'] = reason or 'unknown'
             mcap = ((fund_by_sym.get(sym) or {}).get('market_cap')
                     or (meta_by_sym.get(sym) or {}).get('market_cap') or 0)
             has_filing = 1 if (ppt or tx) else 0
@@ -4764,8 +4797,10 @@ async def _about_company_loop(session: aiohttp.ClientSession):
             _web = os.getenv('ABOUT_COMPANY_WEB_SEARCH', '0')
             _mode = ('web search' if _web.strip() not in ('0', 'false', 'False')
                      else 'filings-only')
+            _next = todo[0][0] if todo else '?'
+            _why = (meta_by_sym.get(_next) or {}).get('_about_reason', '?')
             log.info(f"📘 About-company loop: {len(todo)} symbol(s) to generate "
-                      f"({_mode}; backlog≈{len(ranked)}; "
+                      f"({_mode}; next={_next} reason={_why}; backlog≈{len(ranked)}; "
                       f"key={_gemini_key_fingerprint(_gemini_api_key('ABOUT'))})")
         else:
             log.info("📘 About-company loop: nothing new")
@@ -4788,27 +4823,29 @@ async def _about_company_loop(session: aiohttp.ClientSession):
                     break
                 continue
             about = result['about']
+            # status/symbol last so about fields cannot overwrite them
             payload = {
-                'symbol': sym,
-                'status': 'done' if about else 'skipped',
                 'source_ppt_url': (ppt or {}).get('attachment_url'),
                 'source_tx_url': (tx or {}).get('attachment_url'),
                 'source_announced_at': src_at or None,
                 'updated_at': datetime.now(timezone.utc).isoformat(),
                 **(about or {}),
+                'symbol': sym,
+                'status': 'done' if about else 'skipped',
             }
             # Prefer+on_conflict required for upsert — without on_conflict=symbol
             # PostgREST rejects merge-duplicates and About stayed at 0 rows in prod.
             about_url = f"{SUPABASE_URL}/rest/v1/company_abouts?on_conflict=symbol"
             about_headers = {**headers, 'Content-Type': 'application/json',
-                             'Prefer': 'resolution=merge-duplicates,return=minimal'}
+                             'Prefer': 'resolution=merge-duplicates,return=representation'}
             try:
+                saved_ok = False
                 async with session.post(
                     about_url, headers=about_headers,
                     json=payload, timeout=aiohttp.ClientTimeout(total=15)
                 ) as r:
+                    body = await r.text()
                     if r.status not in (200, 201, 204):
-                        body = await r.text()
                         # sources/image columns may be missing — retry without extras
                         drop_keys = []
                         if 'sources' in body:
@@ -4822,20 +4859,44 @@ async def _about_company_loop(session: aiohttp.ClientSession):
                                 about_url, headers=about_headers,
                                 json=payload, timeout=aiohttp.ClientTimeout(total=15)
                             ) as r2:
+                                body2 = await r2.text()
                                 if r2.status not in (200, 201, 204):
-                                    body2 = await r2.text()
                                     log.warning(f"⚠️ About-company save {r2.status} for {sym}: {body2[:200]}")
                                     continue
+                                saved_ok = True
                         else:
                             log.warning(f"⚠️ About-company save {r.status} for {sym}: {body[:200]}")
                             continue
+                    else:
+                        saved_ok = True
+                        if 'row-level security' in (body or '').lower():
+                            log.error(f"📘 {sym}: upsert blocked by RLS — use SUPABASE service_role key")
+                            saved_ok = False
+                if not saved_ok:
+                    continue
+                # Confirm row readable; otherwise next cycle will re-pick forever.
+                async with session.get(
+                    f"{SUPABASE_URL}/rest/v1/company_abouts", headers=headers,
+                    params={'select': 'symbol,status', 'symbol': f'eq.{sym}', 'limit': '1'},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as vr:
+                    rows = await vr.json() if vr.status == 200 else []
+                    row_status = (rows[0].get('status') if isinstance(rows, list) and rows else None)
+                if row_status not in ('done', 'skipped'):
+                    log.error(f"📘 {sym}: save returned OK but row not readable "
+                              f"(status={row_status!r}). Check RLS / SUPABASE_KEY=service_role "
+                              f"and ensure_company_abouts.sql")
+                else:
+                    _ABOUT_DONE_SYMS.add(sym)
                 if about:
                     nsrc = len(about.get('sources') or [])
                     log.info(f"  📘 {sym}: about-company brief saved"
                               + (f" ({nsrc} web sources)" if nsrc else " (no grounding URLs)")
-                              + (f", logo={about.get('website')}" if about.get('image_url') else ", no logo"))
+                              + (f", logo={about.get('website')}" if about.get('image_url') else ", no logo")
+                              + f" db_status={row_status!r}")
                 else:
-                    log.info(f"  📘 {sym}: no usable about content, marked skipped")
+                    log.info(f"  📘 {sym}: no usable about content, marked skipped "
+                              f"db_status={row_status!r}")
             except Exception as e:
                 log.warning(f"⚠️ About-company save failed for {sym}: {type(e).__name__}: {e}")
         if hit_429:
