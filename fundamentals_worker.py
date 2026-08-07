@@ -47,6 +47,8 @@ _ABOUT_DONE_SYMS: set[str] = set()
 # backlog can advance; cleared on process restart.
 _ABOUT_SAVE_FAILS: dict[str, int] = {}
 _ABOUT_OPTIONAL_COLS_MISSING = False  # set True after PGRST204 on image/sources
+# When Gemini starts failing: retry for ~10 min, then long-pause (6h).
+_ABOUT_GEMINI_UNHEALTHY_SINCE: float | None = None
 
 
 def _parse_iso_ts(value):
@@ -4881,10 +4883,11 @@ async def _about_company_loop(session: aiohttp.ClientSession):
 
         hit_gemini_pause = False
         gemini_errors = 0
+        gemini_ok = 0
         about_sem = asyncio.Semaphore(CONCURRENCY)
 
         async def _about_one(sym, ppt, tx, src_at):
-            nonlocal hit_gemini_pause, gemini_errors
+            nonlocal hit_gemini_pause, gemini_errors, gemini_ok
             if hit_gemini_pause:
                 return
             async with about_sem:
@@ -4897,11 +4900,12 @@ async def _about_company_loop(session: aiohttp.ClientSession):
                 if result['error']:
                     gemini_errors += 1
                     log.info(f"  📘 {sym}: will retry about-company next cycle")
-                    # 429 / 503 / timeout, or a whole-batch error streak → pause hours.
+                    # Stop this batch on 429/503/timeout or error streak.
                     if result.get('rate_limited') or gemini_errors >= max(1, CONCURRENCY):
                         hit_gemini_pause = True
-                        log.warning("📘 About-company: Gemini errors — stopping batch, long pause next")
+                        log.warning("📘 About-company: Gemini errors — stopping batch")
                     return
+                gemini_ok += 1
                 about = result['about']
                 payload = {
                     'source_ppt_url': (ppt or {}).get('attachment_url'),
@@ -4997,16 +5001,42 @@ async def _about_company_loop(session: aiohttp.ClientSession):
             await asyncio.gather(*[
                 _about_one(sym, ppt, tx, src_at) for sym, ppt, tx, src_at in todo
             ])
-        if hit_gemini_pause or (todo and gemini_errors >= len(todo)):
-            # Gemini 429 / 503 / timeouts / batch all failed → stop About for hours.
+        global _ABOUT_GEMINI_UNHEALTHY_SINCE
+        batch_failed = bool(
+            todo and gemini_ok == 0
+            and (hit_gemini_pause or gemini_errors >= len(todo))
+        )
+        if gemini_ok > 0:
+            _ABOUT_GEMINI_UNHEALTHY_SINCE = None
+        if batch_failed:
+            # Retry Gemini for ~10 min, then long-pause (default 6h).
+            retry_window = int(os.getenv('ABOUT_COMPANY_ERROR_RETRY_SECONDS', '600'))  # 10m
+            retry_gap = int(os.getenv('ABOUT_COMPANY_ERROR_RETRY_GAP_SECONDS', '45'))
             cool = int(os.getenv(
                 'ABOUT_COMPANY_ERROR_COOLDOWN_SECONDS',
                 os.getenv('ABOUT_COMPANY_429_COOLDOWN_SECONDS', '21600')))  # 6h
-            log.warning(
-                f"📘 About-company: Gemini unhealthy "
-                f"(errors={gemini_errors}/{len(todo) if todo else 0}) "
-                f"— pausing About job for {cool}s (~{cool // 3600}h)")
-            await asyncio.sleep(max(300, cool))
+            now = time.monotonic()
+            if _ABOUT_GEMINI_UNHEALTHY_SINCE is None:
+                _ABOUT_GEMINI_UNHEALTHY_SINCE = now
+                log.warning(
+                    f"📘 About-company: Gemini unhealthy "
+                    f"(errors={gemini_errors}/{len(todo)}) "
+                    f"— will retry for {retry_window}s (~{retry_window // 60}m), "
+                    f"next try in {retry_gap}s")
+                await asyncio.sleep(max(15, retry_gap))
+            elif (now - _ABOUT_GEMINI_UNHEALTHY_SINCE) < retry_window:
+                left = int(retry_window - (now - _ABOUT_GEMINI_UNHEALTHY_SINCE))
+                log.warning(
+                    f"📘 About-company: Gemini still unhealthy "
+                    f"(errors={gemini_errors}/{len(todo)}) "
+                    f"— retry in {retry_gap}s ({left}s left in {retry_window}s window)")
+                await asyncio.sleep(max(15, retry_gap))
+            else:
+                log.warning(
+                    f"📘 About-company: Gemini unhealthy for {retry_window}s "
+                    f"— pausing About job for {cool}s (~{cool // 3600}h)")
+                _ABOUT_GEMINI_UNHEALTHY_SINCE = None
+                await asyncio.sleep(max(300, cool))
         elif todo:
             # Catchup still running — short pause between batches.
             await asyncio.sleep(int(os.getenv('ABOUT_COMPANY_CYCLE_SECONDS', '15')))
