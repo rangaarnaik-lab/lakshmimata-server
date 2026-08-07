@@ -3469,6 +3469,207 @@ async def extract_about_company(session: aiohttp.ClientSession, symbol: str, ppt
     return {'about': about, 'error': False}
 
 
+_FUND_HIGHLIGHT_FIELDS = (
+    'pe', 'pb', 'roe', 'roce', 'peg_ratio', 'debt_eq', 'eps', 'eps_yoy', 'eps_qoq',
+    'sales_yoy', 'sales_qoq', 'opm_pct', 'opm_trend', 'cfo', 'fcf', 'cfo_pat',
+    'div_yield', 'promoter', 'promoter_trend', 'fii_pct', 'fii_trend', 'dii_pct',
+    'dii_trend', 'industry_pe', 'market_cap', 'nim', 'gnpa', 'nnpa', 'car', 'casa',
+    'fundamental_score', 'fundamental_label', 'industry', 'sector',
+)
+
+
+async def extract_fundamentals_highlights(session: aiohttp.ClientSession, row: dict):
+    """Ask Gemini which metrics matter most for this stock and write short
+    takeaways for the Fundamentals tab. Numbers come from our DB row — the
+    model only ranks/explains, it does not invent ratios."""
+    api_key = os.getenv('GEMINI_API_KEY', '')
+    sym = (row.get('sym') or '').strip()
+    if not api_key or not sym:
+        return None
+    metrics = {k: row.get(k) for k in _FUND_HIGHLIGHT_FIELDS if row.get(k) is not None}
+    if len(metrics) < 4:
+        return None
+    prompt = (
+        f"You are a fundamentals analyst for Indian NSE stock {sym}. "
+        "Using ONLY the metrics JSON below (already scraped; do not invent numbers), "
+        "pick the most important ratios for THIS business and write concise takeaways.\n\n"
+        "Rules:\n"
+        "- highlights: 3–5 short bullets (max ~18 words each). Mention actual numbers from JSON.\n"
+        "- key_metrics: 5–8 metric keys from the JSON that an investor should look at first "
+        "(use exact keys like pe, roe, roce, cfo_pat, nim — not labels).\n"
+        "- For banks/NBFCs emphasize NIM/NPA/CAR/CASA when present; for industrials "
+        "emphasize ROCE/CFO/FCF/margins/growth.\n"
+        "- Neutral tone. Not investment advice. No buy/sell wording.\n\n"
+        f"METRICS JSON:\n{json.dumps(metrics, default=str)}"
+    )
+    schema = {
+        "type": "object",
+        "properties": {
+            "highlights": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 2,
+                "maxItems": 6,
+            },
+            "key_metrics": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 3,
+                "maxItems": 10,
+            },
+        },
+        "required": ["highlights", "key_metrics"],
+    }
+    model = os.getenv('GEMINI_CONCALL_MODEL', 'gemini-3.1-flash-lite')
+    try:
+        async with session.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
+            headers={"Content-Type": "application/json"},
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "responseMimeType": "application/json",
+                    "responseSchema": schema,
+                    "temperature": 0.2,
+                },
+            },
+            timeout=aiohttp.ClientTimeout(total=60),
+        ) as r:
+            if r.status != 200:
+                body = await r.text()
+                if r.status == 429:
+                    log.warning(f"⚠️ Gemini rate-limit on fund highlights for {sym} (429)")
+                    await asyncio.sleep(int(os.getenv('GEMINI_429_BACKOFF_SECONDS', '30')))
+                else:
+                    log.warning(f"⚠️ Gemini fund highlights failed for {sym} ({r.status}): {body[:180]}")
+                return None
+            data = await r.json()
+        parts = (data.get('candidates') or [{}])[0].get('content', {}).get('parts', [])
+        raw = ''.join(p.get('text', '') for p in parts).strip()
+        parsed = _parse_json_object(raw) or json.loads(raw)
+    except Exception as e:
+        log.warning(f"⚠️ Gemini fund highlights error for {sym}: {type(e).__name__}: {e}")
+        return None
+    highlights = [str(h).strip() for h in (parsed.get('highlights') or []) if str(h).strip()]
+    allowed = set(_FUND_HIGHLIGHT_FIELDS)
+    key_metrics = []
+    for k in (parsed.get('key_metrics') or []):
+        key = str(k).strip().lower().replace(' ', '_').replace('/', '_').replace('%', '')
+        # normalize a few common aliases
+        aliases = {
+            'p_e': 'pe', 'price_to_earnings': 'pe', 'p_b': 'pb', 'debt_equity': 'debt_eq',
+            'd_e': 'debt_eq', 'dividend_yield': 'div_yield', 'operating_margin': 'opm_pct',
+            'gross_npa': 'gnpa', 'net_npa': 'nnpa', 'crar': 'car',
+        }
+        key = aliases.get(key, key)
+        if key in allowed and key in metrics and key not in key_metrics:
+            key_metrics.append(key)
+    if len(highlights) < 2 or len(key_metrics) < 3:
+        return None
+    return {
+        'ai_highlights': highlights[:6],
+        'ai_key_metrics': key_metrics[:8],
+    }
+
+
+async def _fundamentals_ai_highlights_loop(session: aiohttp.ClientSession):
+    """Populate ai_highlights / ai_key_metrics on stock_fundamentals for the
+    Fundamentals tab. Runs after valuation fields exist; refresh periodically."""
+    headers = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
+    CHECK_INTERVAL = int(os.getenv('FUND_HIGHLIGHTS_INTERVAL_SEC', '600'))
+    BATCH = int(os.getenv('FUND_HIGHLIGHTS_BATCH', '12'))
+    STALE_DAYS = int(os.getenv('FUND_HIGHLIGHTS_STALE_DAYS', '30'))
+    _key_logged = False
+    while True:
+        if not os.getenv('GEMINI_API_KEY'):
+            if not _key_logged:
+                log.warning("📌 Fund-highlights loop: GEMINI_API_KEY not set - loop idle")
+                _key_logged = True
+            await asyncio.sleep(300)
+            continue
+        if not _key_logged:
+            log.info(f"📌 Fund-highlights loop: active (batch={BATCH}, stale={STALE_DAYS}d)")
+            _key_logged = True
+        try:
+            select_cols = 'sym,' + ','.join(_FUND_HIGHLIGHT_FIELDS) + ',ai_highlights,ai_highlights_at,fetched_at'
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/stock_fundamentals",
+                headers=headers,
+                params={
+                    'select': select_cols,
+                    'order': 'market_cap.desc.nullslast',
+                    'limit': str(BATCH * 8),
+                },
+                timeout=aiohttp.ClientTimeout(total=45),
+            ) as r:
+                if r.status != 200:
+                    body = await r.text()
+                    if r.status == 400 and 'ai_highlights' in body:
+                        log.warning("📌 Fund-highlights loop: run add_fundamentals_ai_highlights.sql")
+                        await asyncio.sleep(600)
+                        continue
+                    log.warning(f"📌 Fund-highlights query failed ({r.status}): {body[:200]}")
+                    await asyncio.sleep(CHECK_INTERVAL)
+                    continue
+                rows = await r.json()
+            cutoff = datetime.now(timezone.utc) - timedelta(days=STALE_DAYS)
+            todo = []
+            for row in rows or []:
+                if not row.get('sym'):
+                    continue
+                # Need enough numeric meat to summarize
+                filled = sum(1 for k in ('pe', 'roe', 'pb', 'roce', 'cfo', 'nim', 'eps_yoy')
+                             if row.get(k) is not None)
+                if filled < 3:
+                    continue
+                at = row.get('ai_highlights_at')
+                has = row.get('ai_highlights')
+                stale = True
+                if has and at:
+                    try:
+                        ts = datetime.fromisoformat(str(at).replace('Z', '+00:00'))
+                        stale = ts < cutoff
+                    except Exception:
+                        stale = True
+                if has and not stale:
+                    continue
+                todo.append(row)
+                if len(todo) >= BATCH:
+                    break
+            if not todo:
+                log.info("📌 Fund-highlights loop: nothing to generate")
+                await asyncio.sleep(CHECK_INTERVAL)
+                continue
+            log.info(f"📌 Fund-highlights loop: generating for {len(todo)} stock(s)")
+            saved = 0
+            for i, row in enumerate(todo):
+                sym = row['sym']
+                if i > 0:
+                    await asyncio.sleep(float(os.getenv(
+                        'FUND_HIGHLIGHTS_PACING_SECONDS',
+                        os.getenv('RESULTS_PDF_PACING_SECONDS', '6'))))
+                result = await extract_fundamentals_highlights(session, row)
+                if not result:
+                    continue
+                payload = {
+                    'sym': sym,
+                    'ai_highlights': result['ai_highlights'],
+                    'ai_key_metrics': result['ai_key_metrics'],
+                    'ai_highlights_at': datetime.now(timezone.utc).isoformat(),
+                }
+                try:
+                    await save_fundamentals_batch_to_db(session, [payload])
+                    saved += 1
+                    log.info(f"  📌 {sym}: {len(result['ai_highlights'])} highlights, "
+                             f"keys={','.join(result['ai_key_metrics'])}")
+                except Exception as e:
+                    log.warning(f"⚠️ Fund-highlights save failed for {sym}: {type(e).__name__}: {e}")
+            log.info(f"📌 Fund-highlights loop: saved {saved}/{len(todo)}")
+        except Exception as e:
+            log.error(f"Fund-highlights loop failed: {type(e).__name__}: {e}")
+        await asyncio.sleep(CHECK_INTERVAL)
+
+
 async def _about_company_loop(session: aiohttp.ClientSession):
     """Build AI About Company briefs via Gemini Google Search (+ Screener /
     PPT / concall context when available). Works even when filings are missing."""
@@ -3737,6 +3938,7 @@ async def fundamentals_worker_main():
             _transcript_summary_loop(session),
             _ppt_summary_loop(session),
             _about_company_loop(session),
+            _fundamentals_ai_highlights_loop(session),
         )
 
 def rate_announcements_free(rows: list) -> list:
