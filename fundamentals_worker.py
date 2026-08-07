@@ -3464,7 +3464,9 @@ async def extract_about_company(session: aiohttp.ClientSession, symbol: str, ppt
                     log.warning(f"⚠️ Gemini about-company failed for {symbol} ({status}): {body2[:180]}")
                     return error_result
             elif status == 429:
-                log.warning(f"⚠️ Gemini rate-limit on about-company for {symbol} (429)")
+                # Body usually says which quota (RPM / RPD / search grounding).
+                log.warning(f"⚠️ Gemini rate-limit on about-company for {symbol} (429): "
+                            f"{(body_txt or '')[:220]}")
                 await asyncio.sleep(int(os.getenv('GEMINI_429_BACKOFF_SECONDS', '90')))
                 return {'about': None, 'error': True, 'rate_limited': True}
             else:
