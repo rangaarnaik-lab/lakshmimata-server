@@ -26,8 +26,8 @@ if '_fundamentals_fetch_paused' not in globals():
         v = (os.getenv('PAUSE_FUNDAMENTALS_FETCH') or '').strip().lower()
         if v in ('1', 'true', 'yes', 'on'):
             return True
-        about_paused = (os.getenv('PAUSE_ABOUT_COMPANY') or '1').strip().lower()
-        if about_paused not in ('0', 'false', 'no', 'off'):
+        about_paused = (os.getenv('PAUSE_ABOUT_COMPANY') or '0').strip().lower()
+        if about_paused in ('1', 'true', 'yes', 'on'):
             return False
         return (os.getenv('GEMINI_FOCUS') or '').strip().lower() == 'about'
 
@@ -60,6 +60,9 @@ _ABOUT_YIELD_TO_RESULTS_UNTIL: float | None = None
 # When Results (or any Gemini catchup) hits hard quota, park ALL Gemini
 # worker loops until this unix ts — do not keep burning the key.
 _GEMINI_JOBS_PAUSED_UNTIL: float | None = None
+# PAUSE_ABOUT_COMPANY=1 → timed pause (24h) then About auto-resumes.
+_ABOUT_ENV_PAUSE_UNTIL: float | None = None
+_ABOUT_ENV_PAUSE_RESUME_LOGGED = False
 
 
 def _gemini_jobs_hard_paused() -> bool:
@@ -72,7 +75,7 @@ def _gemini_jobs_hard_paused() -> bool:
         return True
     _GEMINI_JOBS_PAUSED_UNTIL = None
     log.info("▶️ Gemini jobs: 24h hard stop finished — starting again "
-             "(Results catchup resumes; About stays off unless PAUSE_ABOUT_COMPANY=0)")
+             "(Results + About Company both resume)")
     return False
 
 
@@ -84,7 +87,7 @@ def _gemini_jobs_hard_pause_seconds() -> int:
 
 def _begin_gemini_jobs_hard_pause(reason: str, seconds: int | None = None):
     """Stop every Gemini worker loop — Results failing means stop burning quota.
-    After the sleep window, loops auto-resume (no redeploy needed)."""
+    After the sleep window, About + Results auto-resume (no redeploy needed)."""
     global _GEMINI_JOBS_PAUSED_UNTIL, _ABOUT_YIELD_TO_RESULTS_UNTIL
     sec = _gemini_jobs_hard_pause_seconds() if seconds is None else max(3600, int(seconds))
     _GEMINI_JOBS_PAUSED_UNTIL = time.time() + sec
@@ -92,7 +95,7 @@ def _begin_gemini_jobs_hard_pause(reason: str, seconds: int | None = None):
     _ABOUT_YIELD_TO_RESULTS_UNTIL = None
     log.error(
         f"🛑 Gemini jobs HARD STOP for {sec}s (~{sec // 3600}h) — {reason}. "
-        f"Will auto-start again after "
+        f"About + Results will auto-start again after "
         f"{datetime.fromtimestamp(_GEMINI_JOBS_PAUSED_UNTIL, tz=timezone.utc).isoformat()}. "
         f"Override with GEMINI_JOBS_HARD_PAUSE_SECONDS.")
 
@@ -107,10 +110,29 @@ async def _sleep_while_gemini_hard_paused():
 
 
 def _about_company_manually_paused() -> bool:
-    """Stop About Gemini entirely (quota exhausted). Default ON so deploy
-    shifts work to Results PDF catchup. Set PAUSE_ABOUT_COMPANY=0 to resume."""
-    v = (os.getenv('PAUSE_ABOUT_COMPANY') or '1').strip().lower()
-    return v not in ('0', 'false', 'no', 'off')
+    """PAUSE_ABOUT_COMPANY=1 parks About for 24h, then auto-resumes (same
+    window as Gemini hard stop). Default off. After the window, About runs
+    again even if the env var is still set (until process restart)."""
+    global _ABOUT_ENV_PAUSE_UNTIL, _ABOUT_ENV_PAUSE_RESUME_LOGGED
+    v = (os.getenv('PAUSE_ABOUT_COMPANY') or '0').strip().lower()
+    if v not in ('1', 'true', 'yes', 'on'):
+        _ABOUT_ENV_PAUSE_UNTIL = None
+        _ABOUT_ENV_PAUSE_RESUME_LOGGED = False
+        return False
+    if _ABOUT_ENV_PAUSE_UNTIL is None:
+        sec = _about_hard_pause_seconds()
+        _ABOUT_ENV_PAUSE_UNTIL = time.time() + sec
+        _ABOUT_ENV_PAUSE_RESUME_LOGGED = False
+        log.warning(
+            f"📘 About-company: PAUSE_ABOUT_COMPANY on — paused {sec}s (~{sec // 3600}h). "
+            f"Will auto-start again after "
+            f"{datetime.fromtimestamp(_ABOUT_ENV_PAUSE_UNTIL, tz=timezone.utc).isoformat()}")
+    if time.time() < _ABOUT_ENV_PAUSE_UNTIL:
+        return True
+    if not _ABOUT_ENV_PAUSE_RESUME_LOGGED:
+        _ABOUT_ENV_PAUSE_RESUME_LOGGED = True
+        log.info("▶️ About-company: 24h pause finished — starting again")
+    return False
 
 
 def _gemini_quota_exhausted(body_txt: str | None) -> bool:
@@ -4873,14 +4895,23 @@ async def _about_company_loop(session: aiohttp.ClientSession):
     _key_status_logged = False
     _pause_logged = False
     while True:
-        # Quota exhausted — park About; Results catchup takes the Gemini slot.
+        # Shared Gemini hard stop (e.g. Results 429) — sleep 24h, then About resumes too.
+        if _gemini_jobs_hard_paused():
+            left = max(0, int((_GEMINI_JOBS_PAUSED_UNTIL or 0) - time.time()))
+            log.error(f"🛑 About-company: Gemini hard stop ({left}s / ~{left // 3600}h left) "
+                      f"— sleeping, then auto-restart with Results")
+            await _sleep_while_gemini_hard_paused()
+            continue
+        # PAUSE_ABOUT_COMPANY=1 — timed 24h park; Results catchup runs; then About resumes.
         if _about_company_manually_paused():
             if not _pause_logged:
+                left = max(0, int((_ABOUT_ENV_PAUSE_UNTIL or 0) - time.time()))
                 log.warning(
-                    "📘 About-company: STOPPED (PAUSE_ABOUT_COMPANY default on / quota). "
-                    "Running Results PDF catchup instead. Set PAUSE_ABOUT_COMPANY=0 to resume About.")
+                    f"📘 About-company: paused ({left}s left) — Results catchup active. "
+                    f"About auto-starts after this window.")
                 _pause_logged = True
-            await asyncio.sleep(3600)
+            left = max(60, int((_ABOUT_ENV_PAUSE_UNTIL or time.time()) - time.time()))
+            await asyncio.sleep(min(3600, left))
             continue
         _pause_logged = False
         if await _idle_if_gemini_paused('about', 'About-company loop'):
@@ -5337,11 +5368,11 @@ async def fundamentals_worker_main():
     log.info(f"  📘 About will call Gemini with {about_src} "
              f"{_gemini_key_fingerprint(about_k)}")
     if _about_company_manually_paused():
-        log.warning("  📘 About-company: STOPPED (PAUSE_ABOUT_COMPANY) — "
-                    "Results PDF catchup will use the Gemini slot. "
-                    "Set PAUSE_ABOUT_COMPANY=0 when quota recovers.")
+        left = max(0, int((_ABOUT_ENV_PAUSE_UNTIL or 0) - time.time()))
+        log.warning(f"  📘 About-company: paused ~{left // 3600}h "
+                    f"(PAUSE_ABOUT_COMPANY) — Results catchup first; About auto-resumes after")
     else:
-        log.info("  📘 About-company: enabled (PAUSE_ABOUT_COMPANY=0)")
+        log.info("  📘 About-company: enabled (will also resume after any 24h Gemini hard stop)")
 
     connector = aiohttp.TCPConnector(limit=20, ssl=False)
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -5460,6 +5491,9 @@ def _gemini_focus_allows(feature: str) -> bool:
     if not raw or raw in ('all', '*'):
         return True
     allowed = {x.strip() for x in raw.split(',') if x.strip()}
+    # About-first deploys: after 24h pauses both About and Results should run.
+    if allowed == {'about'}:
+        allowed = {'about', 'results'}
     return feature in allowed
 
 

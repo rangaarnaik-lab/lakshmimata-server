@@ -819,13 +819,13 @@ def _screener_disabled() -> bool:
 def _fundamentals_fetch_paused() -> bool:
     """PAUSE_FUNDAMENTALS_FETCH=1 parks Upstox batch fetches.
     Auto-pauses while GEMINI_FOCUS=about so About can use the box —
-    unless About itself is stopped (PAUSE_ABOUT_COMPANY), in which case
+    unless About is temporarily paused (PAUSE_ABOUT_COMPANY), in which case
     the box should run Results / other backfill instead."""
     v = (os.getenv('PAUSE_FUNDAMENTALS_FETCH') or '').strip().lower()
     if v in ('1', 'true', 'yes', 'on'):
         return True
-    about_paused = (os.getenv('PAUSE_ABOUT_COMPANY') or '1').strip().lower()
-    if about_paused not in ('0', 'false', 'no', 'off'):
+    about_paused = (os.getenv('PAUSE_ABOUT_COMPANY') or '0').strip().lower()
+    if about_paused in ('1', 'true', 'yes', 'on'):
         return False
     focus = (os.getenv('GEMINI_FOCUS') or '').strip().lower()
     return focus == 'about'
