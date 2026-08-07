@@ -36,3 +36,22 @@ END $$;
 
 GRANT SELECT ON public.company_abouts TO anon, authenticated;
 GRANT ALL ON public.company_abouts TO service_role;
+
+-- Worker upserts via SUPABASE_KEY. If that key is the anon/publishable key
+-- (not service_role), INSERT/UPDATE needs an explicit policy or saves
+-- appear to succeed while rows never stick and About loops the same symbol.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies
+    WHERE tablename = 'company_abouts' AND policyname = 'company_abouts_write'
+  ) THEN
+    CREATE POLICY company_abouts_write
+      ON public.company_abouts FOR ALL
+      TO anon, authenticated, service_role
+      USING (true)
+      WITH CHECK (true);
+  END IF;
+END $$;
+
+GRANT INSERT, UPDATE, DELETE ON public.company_abouts TO anon, authenticated;
