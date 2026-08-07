@@ -194,6 +194,32 @@ def _gemini_api_key(feature: str = '') -> str:
     return (os.getenv('GEMINI_API_KEY') or '').strip()
 
 
+def _gemini_api_key_any(*features: str) -> str:
+    """First usable free-tier key from preferred features, then any GEMINI_API_KEY*."""
+    seen: set[str] = set()
+    for feat in features:
+        k = _gemini_api_key(feat)
+        if k and k not in seen:
+            return k
+        if k:
+            seen.add(k)
+    for name, val in os.environ.items():
+        if not name.startswith('GEMINI_API_KEY'):
+            continue
+        k = (val or '').strip()
+        if k and k not in seen:
+            return k
+    return ''
+
+
+def _gemini_ask_model() -> str:
+    """Prefer free/lite models for interactive Ask AI."""
+    return (os.getenv('GEMINI_ASK_MODEL')
+            or os.getenv('GEMINI_ABOUT_MODEL')
+            or os.getenv('GEMINI_CONCALL_MODEL')
+            or 'gemini-2.0-flash-lite')
+
+
 def _gemini_key_fingerprint(api_key: str) -> str:
     """Safe log token — last 4 chars only (never log full key)."""
     k = (api_key or '').strip()
@@ -4330,25 +4356,23 @@ async def extract_management_flags(session: aiohttp.ClientSession, symbol: str, 
 
 async def answer_stock_ai_ask(session: aiohttp.ClientSession, symbol: str, question: str,
                               context: str, industry=None, sector=None, use_web: bool = False):
-    """Answer a diligence question.
-    use_web=False → filings/about on file only (no Google Search).
-    use_web=True  → Gemini Google Search + local context."""
-    api_key = _gemini_api_key('ASKS')
-    if not api_key:
+    """Answer a diligence question via free Gemini (flash-lite).
+    use_web=False → local context (filings/about/fundamentals); if thin, still
+    answers with free Gemini + clear uncertainty (does not refuse).
+    use_web=True  → Gemini Google Search + local context.
+    Always exempt from batch hard-stops — interactive Q&A must keep working."""
+    # Prefer ASKS key, else any free-tier Gemini key on the box.
+    keys = []
+    for feat in ('ASKS', '', 'ABOUT', 'RESULTS', 'PPT', 'TRANSCRIPT'):
+        k = _gemini_api_key(feat) if feat else _gemini_api_key('')
+        if k and k not in keys:
+            keys.append(k)
+    extra = _gemini_api_key_any()
+    if extra and extra not in keys:
+        keys.append(extra)
+    if not keys:
         return None
-    has_context = bool(context and len(context.strip()) >= 200)
-    if not use_web and not has_context:
-        return {
-            'answer': (
-                f"No PPT/concall summary is on file yet for {symbol}, so there isn’t enough "
-                "local filing information to answer. Switch to Web research, or wait until a "
-                "presentation / earnings call is summarized."
-            ),
-            'verdict': 'unknown',
-            'flags': None,
-            'sources': None,
-            'insufficient': True,
-        }
+    has_context = bool(context and len(context.strip()) >= 80)
     sector_bit = ' / '.join(x for x in [industry, sector] if x) or 'NSE-listed company'
     if use_web:
         prompt = (
@@ -4365,62 +4389,87 @@ async def answer_stock_ai_ask(session: aiohttp.ClientSession, symbol: str, quest
         )
         if has_context:
             prompt += f"LOCAL CONTEXT:\n{context[:12000]}\n"
-    else:
+    elif has_context:
         prompt = (
             f"Answer this investor diligence question about Indian NSE stock {symbol} ({sector_bit}).\n"
             f"QUESTION: {question.strip()}\n\n"
-            "Use ONLY the LOCAL CONTEXT below (PPT/concall/about already on file). "
-            "Do NOT browse the web or invent. If the context does not contain enough to answer, "
-            "say so clearly and return verdict=unknown with empty flags.\n"
-            "Compare management promises vs execution when the context supports it. "
-            "No buy/sell recommendation.\n\n"
+            "Prefer the LOCAL CONTEXT below (PPT/concall/about/fundamentals on file). "
+            "If context is thin, say what is known vs unknown — still give a useful answer. "
+            "Do not invent precise figures not in context. No buy/sell recommendation.\n\n"
             "Return ONLY JSON:\n"
             '- "answer": 80-200 words\n'
             '- "verdict": trustworthy | mixed | caution | unknown | n/a\n'
-            '- "flags": 0-6 objects {tone: green|red|watch, title, detail} — only if context supports them\n\n'
+            '- "flags": 0-6 objects {tone: green|red|watch, title, detail}\n\n'
             f"LOCAL CONTEXT:\n{context[:14000]}\n"
         )
-    model = os.getenv('GEMINI_ABOUT_MODEL') or os.getenv('GEMINI_CONCALL_MODEL', 'gemini-3.1-flash-lite')
+    else:
+        # No filings yet — still answer with free Gemini (general public knowledge).
+        prompt = (
+            f"Answer this investor diligence question about Indian NSE stock {symbol} ({sector_bit}).\n"
+            f"QUESTION: {question.strip()}\n\n"
+            "No PPT/concall excerpts are on file. Use well-known public facts about this company "
+            "only; clearly label uncertainty; do not invent precise quarterly figures. "
+            "No buy/sell recommendation.\n\n"
+            "Return ONLY JSON:\n"
+            '- "answer": 80-180 words\n'
+            '- "verdict": unknown | n/a | mixed\n'
+            '- "flags": []\n'
+        )
+    model = _gemini_ask_model()
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.2 if not use_web else 0.25},
     }
     if use_web:
         body["tools"] = [{"google_search": {}}]
-    try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-        status, data, txt = await _gemini_generate(session, url, body, 130 if use_web else 90, api_key=api_key)
-        if status != 200:
-            if use_web and status in (400, 404):
+
+    last_err = None
+    for api_key in keys:
+        try:
+            url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+                   f"{model}:generateContent?key={api_key}")
+            status, data, txt = await _gemini_generate(
+                session, url, body, 130 if use_web else 90, api_key=api_key)
+            if status != 200 and use_web and status in (400, 404):
                 body.pop('tools', None)
-                status, data, txt2 = await _gemini_generate(session, url, body, 100, api_key=api_key)
-                if status != 200:
-                    log.warning(f"⚠️ Ask-AI failed for {symbol} ({status}): {txt2[:160]}")
-                    return None
-            elif status == 429:
-                await asyncio.sleep(int(os.getenv('GEMINI_429_BACKOFF_SECONDS', '45')))
-                return None
-            else:
-                log.warning(f"⚠️ Ask-AI failed for {symbol} ({status}): {txt[:160]}")
-                return None
-        parts = (data.get('candidates') or [{}])[0].get('content', {}).get('parts', [])
-        raw = ''.join(p.get('text', '') for p in parts).strip()
-        parsed = _parse_json_object(raw)
-        if not parsed:
-            return None
-        answer = str(parsed.get('answer') or '').strip()
-        if len(answer) < 40:
-            return None
-        sources = _grounding_source_urls(data, limit=6) if use_web else None
-        return {
-            'answer': answer[:2500],
-            'verdict': str(parsed.get('verdict') or 'n/a')[:40],
-            'flags': _clean_mgmt_flags(parsed.get('flags')),
-            'sources': sources,
-        }
-    except Exception as e:
-        log.warning(f"⚠️ Ask-AI error for {symbol}: {type(e).__name__}: {e}")
-        return None
+                status, data, txt = await _gemini_generate(
+                    session, url, body, 100, api_key=api_key)
+            if status == 429:
+                last_err = f"429 on {_gemini_key_fingerprint(api_key)}"
+                log.warning(f"⚠️ Ask-AI 429 for {symbol} key={_gemini_key_fingerprint(api_key)} "
+                            f"— trying next free key if any")
+                await asyncio.sleep(2)
+                continue
+            if status != 200:
+                last_err = f"{status}: {(txt or '')[:120]}"
+                log.warning(f"⚠️ Ask-AI failed for {symbol} ({status}): {(txt or '')[:160]}")
+                continue
+            parts = (data.get('candidates') or [{}])[0].get('content', {}).get('parts', [])
+            raw = ''.join(p.get('text', '') for p in parts).strip()
+            parsed = _parse_json_object(raw)
+            if not parsed:
+                last_err = 'no JSON'
+                continue
+            answer = str(parsed.get('answer') or '').strip()
+            if len(answer) < 40:
+                last_err = 'short answer'
+                continue
+            sources = _grounding_source_urls(data, limit=6) if use_web else None
+            log.info(f"💬 Ask-AI answered {symbol} via free Gemini "
+                     f"model={model} key={_gemini_key_fingerprint(api_key)}")
+            return {
+                'answer': answer[:2500],
+                'verdict': str(parsed.get('verdict') or 'n/a')[:40],
+                'flags': _clean_mgmt_flags(parsed.get('flags')),
+                'sources': sources,
+            }
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+            log.warning(f"⚠️ Ask-AI error for {symbol}: {last_err}")
+            continue
+    if last_err:
+        log.warning(f"⚠️ Ask-AI exhausted keys for {symbol}: {last_err}")
+    return None
 
 
 async def _mgmt_flags_loop(session: aiohttp.ClientSession):
@@ -4563,7 +4612,9 @@ async def _mgmt_flags_loop(session: aiohttp.ClientSession):
 
 
 async def _stock_ai_asks_loop(session: aiohttp.ClientSession):
-    """Answer pending free-form Ask AI questions from the UI."""
+    """Answer pending free-form Ask AI questions from the UI.
+    Always on — uses free Gemini (any configured key). Not paused by
+    GEMINI_FOCUS or Results/About hard-stops."""
     headers = {
         'apikey': SUPABASE_KEY,
         'Authorization': f'Bearer {SUPABASE_KEY}',
@@ -4571,14 +4622,18 @@ async def _stock_ai_asks_loop(session: aiohttp.ClientSession):
     }
     _key_logged = False
     while True:
-        if not _gemini_api_key('ASKS'):
+        ask_key = _gemini_api_key_any('ASKS', '', 'ABOUT', 'RESULTS', 'PPT', 'TRANSCRIPT')
+        if not ask_key:
             if not _key_logged:
-                log.warning("💬 Ask-AI loop: GEMINI_API_KEY not set - idle")
+                log.warning("💬 Ask-AI loop: no GEMINI_API_KEY* set - idle")
                 _key_logged = True
             await asyncio.sleep(60)
             continue
         if not _key_logged:
-            log.info("💬 Ask-AI loop: filings-only (no web search)")
+            log.info(f"💬 Ask-AI loop: free Gemini active "
+                     f"(model={_gemini_ask_model()}, "
+                     f"key={_gemini_key_fingerprint(ask_key)}; "
+                     f"exempt from batch hard-stops)")
             _key_logged = True
         try:
             async with session.get(
@@ -4625,14 +4680,10 @@ async def _stock_ai_asks_loop(session: aiohttp.ClientSession):
                     continue
                 log.info(f"💬 Ask-AI answering {sym} [{ask_mode}]: {question[:80]}")
                 context, fund, ppt, tx, _about = await _gather_stock_ask_context(session, headers, sym)
-                filing_ctx = '\n\n'.join(
-                    p for p in (context or '').split('\n\n')
-                    if not p.startswith('FUNDAMENTALS SNAPSHOT:')
-                )
-                if not use_web and not ppt and not tx:
-                    filing_ctx = ''
+                # Keep about + fundamentals + filings — free Gemini can answer
+                # even when PPT/concall are not on file yet.
                 result = await answer_stock_ai_ask(
-                    session, sym, question, filing_ctx,
+                    session, sym, question, context or '',
                     industry=fund.get('industry'), sector=fund.get('sector'),
                     use_web=use_web)
                 if result:
@@ -5467,14 +5518,16 @@ async def _delayed(seconds: float, coro):
 
 def _gemini_focus_allows(feature: str) -> bool:
     """GEMINI_FOCUS=about (or comma list) limits free-tier RPM to those loops.
-    Empty / all / * = every Gemini feature runs. Interactive Ask-AI always allowed.
+    Empty / all / * = every Gemini feature runs. Interactive Ask-AI always allowed
+    (including during Results/About hard-stops — uses free Gemini).
     When About is stopped (PAUSE_ABOUT_COMPANY / hard-quota yield), Results PDF
     extraction is allowed even if GEMINI_FOCUS=about.
-    When Results hits hard quota, ALL Gemini worker features are blocked."""
-    if _gemini_jobs_hard_paused():
-        return False
+    When Results hits hard quota, batch Gemini features are blocked (not Ask)."""
+    # Ask AI is interactive and must keep answering on free Gemini.
     if feature == 'asks':
         return True
+    if _gemini_jobs_hard_paused():
+        return False
     # About stopped → force Results catchup (ignore GEMINI_FOCUS=about).
     if _about_company_manually_paused():
         if feature == 'about':
