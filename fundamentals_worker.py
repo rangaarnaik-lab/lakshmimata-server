@@ -3275,24 +3275,78 @@ def _grounding_source_urls(gemini_data: dict, limit: int = 8):
     return urls or None
 
 
+def _normalize_website_domain(raw):
+    """Turn a website string into a bare domain (example.com)."""
+    import re
+    if not raw or not isinstance(raw, str):
+        return None
+    s = raw.strip().lower()
+    s = re.sub(r'^https?://', '', s)
+    s = s.split('/')[0].split('?')[0].strip('.')
+    s = re.sub(r'^www\.', '', s)
+    if not s or '.' not in s or ' ' in s:
+        return None
+    # Skip aggregator domains — we want the company's own site
+    blocked = (
+        'screener.in', 'moneycontrol.com', 'nseindia.com', 'bseindia.com',
+        'wikipedia.org', 'linkedin.com', 'twitter.com', 'x.com', 'facebook.com',
+        'youtube.com', 'bloomberg.com', 'reuters.com', 'economictimes.',
+        'business-standard.com', 'livemint.com', 'tradingview.com',
+        'yahoo.com', 'google.com', 'chatgpt.com',
+    )
+    if any(b in s for b in blocked):
+        return None
+    return s[:200]
+
+
+def _logo_url_for_domain(domain: str):
+    """Build a logo image URL for a company domain.
+    Prefers Logo.dev when LOGO_DEV_PUBLISHABLE_KEY is set; otherwise Google Favicon."""
+    if not domain:
+        return None
+    token = (os.getenv('LOGO_DEV_PUBLISHABLE_KEY') or os.getenv('LOGO_DEV_TOKEN') or '').strip()
+    if token:
+        return f"https://img.logo.dev/{domain}?token={token}&format=png&size=128&theme=dark&retina=true"
+    return f"https://www.google.com/s2/favicons?domain={domain}&sz=128"
+
+
+def _extract_website_from_screener_html(html: str):
+    """Best-effort company website from Screener.in page markup."""
+    import re
+    if not html:
+        return None
+    # Common Screener pattern: external company website link
+    for pat in (
+        r'href="(https?://(?!www\.screener\.in)[^"]+)"[^>]*>\s*Website',
+        r'href="(https?://(?!www\.screener\.in)[^"]+)"[^>]*title="[^"]*Website',
+        r'rel="noopener"[^>]*href="(https?://(?!www\.screener\.in)[^"]+)"',
+    ):
+        m = re.search(pat, html, flags=re.I)
+        if m:
+            d = _normalize_website_domain(m.group(1))
+            if d:
+                return d
+    return None
+
+
 async def extract_about_company(session: aiohttp.ClientSession, symbol: str, ppt_row, tx_row,
                                 industry: str = None, sector: str = None):
     """Build a retail-friendly company brief using Gemini + Google Search
     across the public web, optionally grounded with Screener.in page text
-    and existing PPT/concall summary fields. Returns
-    {'about': dict|None, 'error': bool}."""
-    import re
+    and existing PPT/concall summary fields. Also resolves website + logo.
+    Returns {'about': dict|None, 'error': bool}."""
     error_result = {'about': None, 'error': True}
     no_content_result = {'about': None, 'error': False}
     api_key = os.getenv('GEMINI_API_KEY', '')
     if not api_key:
         return error_result
 
+    screener_html = ''
     screener_txt = ''
     try:
-        html = await _fetch_screener_html(session, symbol)
-        if html:
-            screener_txt = _html_to_compact_text(html, limit=12000)
+        screener_html = await _fetch_screener_html(session, symbol)
+        if screener_html:
+            screener_txt = _html_to_compact_text(screener_html, limit=12000)
     except Exception as e:
         log.info(f"📘 {symbol}: Screener fetch skipped ({type(e).__name__})")
 
@@ -3316,6 +3370,10 @@ async def extract_about_company(session: aiohttp.ClientSession, symbol: str, ppt
         '- "segments": array of 2-5 short bullets on business lines / products / regions\n'
         '- "innovation": array of 2-5 short bullets on new products, capacity, tech, R&D, expansion\n'
         '- "overall_brief": 80-160 word flowing prose overview\n'
+        '- "website": official company website domain only (e.g. "infosys.com"), no https://, '
+        'null if unknown — never use screener/moneycontrol/nse/news sites\n'
+        '- "logo_image_url": direct https URL to the company logo image (.png/.jpg/.svg/.webp) '
+        'if you found one on the official site; otherwise null\n'
         "Use null or [] when unknown.\n\n"
     )
     if screener_txt:
@@ -3384,6 +3442,17 @@ async def extract_about_company(session: aiohttp.ClientSession, symbol: str, ppt
         log.warning(f"⚠️ Failed to parse about-company response for {symbol}: {type(e).__name__}: {e}")
         return error_result
 
+    website = _normalize_website_domain(parsed.get('website'))
+    if not website:
+        website = _extract_website_from_screener_html(screener_html)
+    logo_direct = (parsed.get('logo_image_url') or '').strip()
+    if logo_direct and not logo_direct.lower().startswith('https://'):
+        logo_direct = ''
+    if logo_direct and any(x in logo_direct.lower() for x in (
+            'screener.in', 'moneycontrol', 'google.com/search', 'wikipedia.org')):
+        logo_direct = ''
+    image_url = (logo_direct[:500] if logo_direct else None) or _logo_url_for_domain(website)
+
     about = {
         'what_they_do': (parsed.get('what_they_do') or '').strip()[:1200] or None,
         'customers': _clean_bullets(parsed.get('customers')),
@@ -3391,6 +3460,8 @@ async def extract_about_company(session: aiohttp.ClientSession, symbol: str, ppt
         'innovation': _clean_bullets(parsed.get('innovation')),
         'overall_brief': (parsed.get('overall_brief') or '').strip()[:2000] or None,
         'sources': _grounding_source_urls(data),
+        'website': website,
+        'image_url': image_url,
     }
     if not any([about['what_they_do'], about['customers'], about['segments'],
                 about['innovation'], about['overall_brief']]):
@@ -3444,7 +3515,7 @@ async def _about_company_loop(session: aiohttp.ClientSession):
                 fund_rows = await r.json() if r.status == 200 else []
             async with session.get(
                 f"{SUPABASE_URL}/rest/v1/company_abouts", headers=headers,
-                params={'select': 'symbol,source_announced_at,status,sources', 'limit': '5000'},
+                params={'select': 'symbol,source_announced_at,status,sources,image_url', 'limit': '5000'},
                 timeout=aiohttp.ClientTimeout(total=30)
             ) as r:
                 existing = await r.json() if r.status == 200 else []
@@ -3489,9 +3560,10 @@ async def _about_company_loop(session: aiohttp.ClientSession):
                 needs = True
             elif src_at and (prev.get('source_announced_at') or '') < src_at:
                 needs = True  # newer filing since last brief
-            elif prev.get('status') == 'done' and not prev.get('sources') and os.getenv(
+            elif prev.get('status') == 'done' and (
+                    not prev.get('sources') or not prev.get('image_url')) and os.getenv(
                     'ABOUT_COMPANY_WEB_BACKFILL', '1').strip() not in ('0', 'false', 'False'):
-                # One-time upgrade of filing-only briefs to web-grounded briefs.
+                # Upgrade filing-only / logo-missing briefs.
                 needs = True
             if not needs:
                 continue
@@ -3536,9 +3608,15 @@ async def _about_company_loop(session: aiohttp.ClientSession):
                 ) as r:
                     if r.status not in (200, 201, 204):
                         body = await r.text()
-                        # sources column may be missing — retry without it
-                        if 'sources' in body and payload.get('sources') is not None:
-                            payload.pop('sources', None)
+                        # sources/image columns may be missing — retry without extras
+                        drop_keys = []
+                        if 'sources' in body:
+                            drop_keys.append('sources')
+                        if 'image_url' in body or 'website' in body:
+                            drop_keys.extend(['image_url', 'website'])
+                        if drop_keys and any(payload.get(k) is not None for k in drop_keys):
+                            for k in drop_keys:
+                                payload.pop(k, None)
                             async with session.post(
                                 f"{SUPABASE_URL}/rest/v1/company_abouts",
                                 headers={**headers, 'Content-Type': 'application/json',
@@ -3555,7 +3633,8 @@ async def _about_company_loop(session: aiohttp.ClientSession):
                 if about:
                     nsrc = len(about.get('sources') or [])
                     log.info(f"  📘 {sym}: about-company brief saved"
-                              + (f" ({nsrc} web sources)" if nsrc else " (no grounding URLs)"))
+                              + (f" ({nsrc} web sources)" if nsrc else " (no grounding URLs)")
+                              + (f", logo={about.get('website')}" if about.get('image_url') else ", no logo"))
                 else:
                     log.info(f"  📘 {sym}: no usable about content, marked skipped")
             except Exception as e:

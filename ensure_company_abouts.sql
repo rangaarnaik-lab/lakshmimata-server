@@ -10,6 +10,8 @@
   segments jsonb,
   innovation jsonb,
   sources jsonb,
+  website text,
+  image_url text,
   source_ppt_url text,
   source_tx_url text,
   source_announced_at timestamptz,
