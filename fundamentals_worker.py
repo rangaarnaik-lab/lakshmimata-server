@@ -3228,92 +3228,169 @@ def _fmt_filing_context(label: str, row) -> str:
     return '\n'.join(parts)
 
 
-async def extract_about_company(session: aiohttp.ClientSession, symbol: str, ppt_row, tx_row):
-    """Synthesize a retail-friendly company brief from already-extracted
-    PPT/concall summary fields via Gemini. Deliberately does NOT re-download
-    PDFs — cheaper, and the filing summaries already hold segments/strategy.
-    Returns {'about': dict|None, 'error': bool}."""
+def _parse_json_object(raw_text: str):
+    """Pull a JSON object out of a Gemini text response (may be fenced)."""
+    import re
+    if not raw_text:
+        return None
+    text = raw_text.strip()
+    if text.startswith('```'):
+        text = re.sub(r'^```(?:json)?\s*', '', text)
+        text = re.sub(r'\s*```$', '', text)
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        start, end = text.find('{'), text.rfind('}')
+        if start >= 0 and end > start:
+            try:
+                parsed = json.loads(text[start:end + 1])
+                return parsed if isinstance(parsed, dict) else None
+            except Exception:
+                return None
+    return None
+
+
+def _grounding_source_urls(gemini_data: dict, limit: int = 8):
+    """Extract cited web URLs from Gemini google_search grounding metadata."""
+    urls = []
+    seen = set()
+    try:
+        cands = gemini_data.get('candidates') or []
+        meta = (cands[0].get('groundingMetadata') if cands else None) or {}
+        for ch in meta.get('groundingChunks') or []:
+            web = ch.get('web') or {}
+            u = (web.get('uri') or web.get('url') or '').strip()
+            title = (web.get('title') or '').strip()
+            if u and u not in seen:
+                seen.add(u)
+                urls.append({'url': u[:500], 'title': (title or u)[:200]})
+            if len(urls) >= limit:
+                break
+        for q in meta.get('webSearchQueries') or []:
+            if isinstance(q, str) and q.strip() and len(urls) < limit:
+                urls.append({'query': q.strip()[:200]})
+    except Exception:
+        pass
+    return urls or None
+
+
+async def extract_about_company(session: aiohttp.ClientSession, symbol: str, ppt_row, tx_row,
+                                industry: str = None, sector: str = None):
+    """Build a retail-friendly company brief using Gemini + Google Search
+    across the public web, optionally grounded with Screener.in page text
+    and existing PPT/concall summary fields. Returns
+    {'about': dict|None, 'error': bool}."""
+    import re
     error_result = {'about': None, 'error': True}
     no_content_result = {'about': None, 'error': False}
     api_key = os.getenv('GEMINI_API_KEY', '')
     if not api_key:
         return error_result
-    ctx = '\n\n'.join(x for x in [
+
+    screener_txt = ''
+    try:
+        html = await _fetch_screener_html(session, symbol)
+        if html:
+            screener_txt = _html_to_compact_text(html, limit=12000)
+    except Exception as e:
+        log.info(f"📘 {symbol}: Screener fetch skipped ({type(e).__name__})")
+
+    filing_ctx = '\n\n'.join(x for x in [
         _fmt_filing_context('INVESTOR PRESENTATION', ppt_row),
         _fmt_filing_context('EARNINGS CALL / TRANSCRIPT', tx_row),
     ] if x)
-    if len(ctx) < 80:
-        return no_content_result
+
+    sector_bit = ' / '.join(x for x in [industry, sector] if x) or 'NSE-listed company'
     prompt = (
-        f"You are writing a short company brief for Indian NSE stock {symbol} for a "
-        "retail investor. Use ONLY the filing excerpts below — never invent customers, "
-        "products, or markets that are not supported by the text. If something is unclear, "
-        "omit it rather than guess.\n\n"
-        "Write in plain English. No buy/sell advice. No price targets.\n\n"
-        "WHAT_THEY_DO: 1-3 sentences on what the company actually does (products/services).\n"
-        "CUSTOMERS: 2-5 short bullets on who buys / end markets / geographies if mentioned.\n"
-        "SEGMENTS: 2-5 short bullets on business lines / products / regions if mentioned.\n"
-        "INNOVATION: 2-5 short bullets on new products, capacity, tech, R&D, expansion, or "
-        "strategic initiatives if mentioned.\n"
-        "OVERALL_BRIEF: 80-140 word flowing prose overview combining the above — what the "
-        "business is, who it serves, and what it is building next. Neutral tone.\n\n"
-        f"FILING EXCERPTS:\n{ctx[:12000]}"
+        f"Research the Indian NSE-listed company with ticker {symbol} ({sector_bit}).\n"
+        "Use Google Search to check multiple reliable public sources such as the company "
+        "website/about page, annual report / investor presentation pages, Screener.in, "
+        "Moneycontrol, NSE/BSE filings pages, Wikipedia, and recent news — then synthesize "
+        "a short retail-investor company brief.\n\n"
+        "Prefer facts that appear in more than one source. If something is unclear or "
+        "conflicting, omit it rather than invent. No buy/sell advice. No price targets.\n\n"
+        "Return ONLY a JSON object (no markdown fences) with these keys:\n"
+        '- "what_they_do": 1-3 sentences on products/services\n'
+        '- "customers": array of 2-5 short bullets on who buys / end markets / geographies\n'
+        '- "segments": array of 2-5 short bullets on business lines / products / regions\n'
+        '- "innovation": array of 2-5 short bullets on new products, capacity, tech, R&D, expansion\n'
+        '- "overall_brief": 80-160 word flowing prose overview\n'
+        "Use null or [] when unknown.\n\n"
     )
-    _bullet_field = {"type": "array", "items": {"type": "string"}, "nullable": True}
-    schema = {
-        "type": "object",
-        "properties": {
-            "what_they_do": {"type": "string", "nullable": True},
-            "customers": _bullet_field,
-            "segments": _bullet_field,
-            "innovation": _bullet_field,
-            "overall_brief": {"type": "string", "nullable": True},
-        },
-        "required": [],
+    if screener_txt:
+        prompt += f"SCREENER.IN PAGE TEXT (local extract):\n{screener_txt[:10000]}\n\n"
+    if filing_ctx:
+        prompt += f"FILING EXCERPTS ALREADY ON FILE (optional extra context):\n{filing_ctx[:8000]}\n"
+
+    model = os.getenv('GEMINI_ABOUT_MODEL') or os.getenv('GEMINI_CONCALL_MODEL', 'gemini-3.1-flash-lite')
+    use_search = os.getenv('ABOUT_COMPANY_WEB_SEARCH', '1').strip() not in ('0', 'false', 'False')
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.2},
     }
-    model = os.getenv('GEMINI_CONCALL_MODEL', 'gemini-3.1-flash-lite')
+    if use_search:
+        # Grounding with Google Search — model searches the live web.
+        body["tools"] = [{"google_search": {}}]
+
     try:
         async with session.post(
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
             headers={"Content-Type": "application/json"},
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "responseMimeType": "application/json",
-                    "responseSchema": schema,
-                    "temperature": 0.2,
-                },
-            },
-            timeout=aiohttp.ClientTimeout(total=90),
+            json=body,
+            timeout=aiohttp.ClientTimeout(total=120),
         ) as r:
             if r.status != 200:
-                body = await r.text()
-                if r.status == 429:
+                body_txt = await r.text()
+                # Some models reject tools+request; retry once without search.
+                if use_search and r.status in (400, 404):
+                    log.warning(f"⚠️ Gemini about-company web-search rejected for {symbol} "
+                                f"({r.status}) — retrying without search")
+                    body.pop('tools', None)
+                    async with session.post(
+                        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
+                        headers={"Content-Type": "application/json"},
+                        json=body,
+                        timeout=aiohttp.ClientTimeout(total=90),
+                    ) as r2:
+                        if r2.status != 200:
+                            body2 = await r2.text()
+                            log.warning(f"⚠️ Gemini about-company failed for {symbol} ({r2.status}): {body2[:180]}")
+                            return error_result
+                        data = await r2.json()
+                elif r.status == 429:
                     log.warning(f"⚠️ Gemini rate-limit on about-company for {symbol} (429)")
                     await asyncio.sleep(int(os.getenv('GEMINI_429_BACKOFF_SECONDS', '30')))
+                    return error_result
                 else:
-                    log.warning(f"⚠️ Gemini about-company failed for {symbol} ({r.status}): {body[:180]}")
-                return error_result
-            data = await r.json()
+                    log.warning(f"⚠️ Gemini about-company failed for {symbol} ({r.status}): {body_txt[:180]}")
+                    return error_result
+            else:
+                data = await r.json()
     except Exception as e:
         log.warning(f"⚠️ Gemini about-company call failed for {symbol}: {type(e).__name__}: {e}")
         return error_result
+
     try:
         candidates = data.get('candidates', [])
         if not candidates:
             return error_result
         parts = candidates[0].get('content', {}).get('parts', [])
         raw_text = ''.join(p.get('text', '') for p in parts).strip()
-        parsed = json.loads(raw_text)
+        parsed = _parse_json_object(raw_text)
+        if not parsed:
+            raise ValueError('no JSON object in response')
     except Exception as e:
         log.warning(f"⚠️ Failed to parse about-company response for {symbol}: {type(e).__name__}: {e}")
         return error_result
+
     about = {
         'what_they_do': (parsed.get('what_they_do') or '').strip()[:1200] or None,
         'customers': _clean_bullets(parsed.get('customers')),
         'segments': _clean_bullets(parsed.get('segments')),
         'innovation': _clean_bullets(parsed.get('innovation')),
         'overall_brief': (parsed.get('overall_brief') or '').strip()[:2000] or None,
+        'sources': _grounding_source_urls(data),
     }
     if not any([about['what_they_do'], about['customers'], about['segments'],
                 about['innovation'], about['overall_brief']]):
@@ -3322,9 +3399,8 @@ async def extract_about_company(session: aiohttp.ClientSession, symbol: str, ppt
 
 
 async def _about_company_loop(session: aiohttp.ClientSession):
-    """Build AI About Company briefs from existing PPT/transcript summaries.
-    Runs after those loops have content — one Gemini text call per symbol,
-    no PDF re-download."""
+    """Build AI About Company briefs via Gemini Google Search (+ Screener /
+    PPT / concall context when available). Works even when filings are missing."""
     headers = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
     _key_status_logged = False
     while True:
@@ -3334,9 +3410,11 @@ async def _about_company_loop(session: aiohttp.ClientSession):
                 _key_status_logged = True
             await asyncio.sleep(300)
             continue
-        BATCH_SIZE = int(os.getenv('ABOUT_COMPANY_BATCH_SIZE', '10'))
+        BATCH_SIZE = int(os.getenv('ABOUT_COMPANY_BATCH_SIZE', '8'))
         if not _key_status_logged:
-            log.info(f"📘 About-company loop: active (batch={BATCH_SIZE})")
+            log.info(f"📘 About-company loop: active with web search "
+                      f"(batch={BATCH_SIZE}, ABOUT_COMPANY_WEB_SEARCH="
+                      f"{os.getenv('ABOUT_COMPANY_WEB_SEARCH', '1')})")
             _key_status_logged = True
         try:
             async with session.get(
@@ -3358,13 +3436,19 @@ async def _about_company_loop(session: aiohttp.ClientSession):
             ) as r:
                 tx_rows = await r.json() if r.status == 200 else []
             async with session.get(
+                f"{SUPABASE_URL}/rest/v1/stock_fundamentals", headers=headers,
+                params={'select': 'symbol,industry,sector,market_cap',
+                        'order': 'market_cap.desc.nullslast', 'limit': '800'},
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as r:
+                fund_rows = await r.json() if r.status == 200 else []
+            async with session.get(
                 f"{SUPABASE_URL}/rest/v1/company_abouts", headers=headers,
-                params={'select': 'symbol,source_announced_at,status', 'limit': '5000'},
+                params={'select': 'symbol,source_announced_at,status,sources', 'limit': '5000'},
                 timeout=aiohttp.ClientTimeout(total=30)
             ) as r:
                 existing = await r.json() if r.status == 200 else []
                 if not isinstance(existing, list):
-                    # Table may not exist yet — log once and idle
                     if isinstance(existing, dict) and existing.get('code'):
                         log.warning("📘 About-company loop: company_abouts table missing? "
                                     "Run ensure_company_abouts.sql in Supabase.")
@@ -3376,7 +3460,7 @@ async def _about_company_loop(session: aiohttp.ClientSession):
             await asyncio.sleep(180)
             continue
 
-        ppt_by_sym, tx_by_sym = {}, {}
+        ppt_by_sym, tx_by_sym, fund_by_sym = {}, {}, {}
         for row in ppt_rows or []:
             sym = row.get('symbol')
             if sym and sym not in ppt_by_sym:
@@ -3385,31 +3469,51 @@ async def _about_company_loop(session: aiohttp.ClientSession):
             sym = row.get('symbol')
             if sym and sym not in tx_by_sym:
                 tx_by_sym[sym] = row
+        for row in fund_rows or []:
+            sym = row.get('symbol')
+            if sym and sym not in fund_by_sym:
+                fund_by_sym[sym] = row
         existing_map = {r['symbol']: r for r in (existing or []) if r.get('symbol')}
 
-        todo = []
-        for sym in sorted(set(ppt_by_sym) | set(tx_by_sym)):
+        # Prefer names with filings first, then large-cap names still missing a brief.
+        ranked = []
+        for sym in set(ppt_by_sym) | set(tx_by_sym) | set(fund_by_sym):
             ppt, tx = ppt_by_sym.get(sym), tx_by_sym.get(sym)
             src_at = max(
                 (ppt or {}).get('announced_at') or '',
                 (tx or {}).get('announced_at') or '',
             )
             prev = existing_map.get(sym)
-            if prev and prev.get('status') == 'done' and (prev.get('source_announced_at') or '') >= src_at:
+            needs = False
+            if not prev or prev.get('status') != 'done':
+                needs = True
+            elif src_at and (prev.get('source_announced_at') or '') < src_at:
+                needs = True  # newer filing since last brief
+            elif prev.get('status') == 'done' and not prev.get('sources') and os.getenv(
+                    'ABOUT_COMPANY_WEB_BACKFILL', '1').strip() not in ('0', 'false', 'False'):
+                # One-time upgrade of filing-only briefs to web-grounded briefs.
+                needs = True
+            if not needs:
                 continue
-            todo.append((sym, ppt, tx, src_at))
-            if len(todo) >= BATCH_SIZE:
-                break
+            mcap = (fund_by_sym.get(sym) or {}).get('market_cap') or 0
+            has_filing = 1 if (ppt or tx) else 0
+            ranked.append((has_filing, mcap if isinstance(mcap, (int, float)) else 0, sym, ppt, tx, src_at))
+        ranked.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        todo = [(sym, ppt, tx, src_at) for _, _, sym, ppt, tx, src_at in ranked[:BATCH_SIZE]]
 
         if todo:
-            log.info(f"📘 About-company loop: {len(todo)} symbol(s) to generate")
+            log.info(f"📘 About-company loop: {len(todo)} symbol(s) to generate (web search)")
         else:
             log.info("📘 About-company loop: nothing new")
 
         for i, (sym, ppt, tx, src_at) in enumerate(todo):
             if i > 0:
-                await asyncio.sleep(float(os.getenv('RESULTS_PDF_PACING_SECONDS', '5')))
-            result = await extract_about_company(session, sym, ppt, tx)
+                await asyncio.sleep(float(os.getenv('ABOUT_COMPANY_PACING_SECONDS',
+                                                    os.getenv('RESULTS_PDF_PACING_SECONDS', '8'))))
+            fund = fund_by_sym.get(sym) or {}
+            result = await extract_about_company(
+                session, sym, ppt, tx,
+                industry=fund.get('industry'), sector=fund.get('sector'))
             if result['error']:
                 log.info(f"  📘 {sym}: will retry about-company next cycle")
                 continue
@@ -3432,10 +3536,26 @@ async def _about_company_loop(session: aiohttp.ClientSession):
                 ) as r:
                     if r.status not in (200, 201, 204):
                         body = await r.text()
-                        log.warning(f"⚠️ About-company save {r.status} for {sym}: {body[:200]}")
-                        continue
+                        # sources column may be missing — retry without it
+                        if 'sources' in body and payload.get('sources') is not None:
+                            payload.pop('sources', None)
+                            async with session.post(
+                                f"{SUPABASE_URL}/rest/v1/company_abouts",
+                                headers={**headers, 'Content-Type': 'application/json',
+                                         'Prefer': 'resolution=merge-duplicates'},
+                                json=payload, timeout=aiohttp.ClientTimeout(total=15)
+                            ) as r2:
+                                if r2.status not in (200, 201, 204):
+                                    body2 = await r2.text()
+                                    log.warning(f"⚠️ About-company save {r2.status} for {sym}: {body2[:200]}")
+                                    continue
+                        else:
+                            log.warning(f"⚠️ About-company save {r.status} for {sym}: {body[:200]}")
+                            continue
                 if about:
-                    log.info(f"  📘 {sym}: about-company brief saved")
+                    nsrc = len(about.get('sources') or [])
+                    log.info(f"  📘 {sym}: about-company brief saved"
+                              + (f" ({nsrc} web sources)" if nsrc else " (no grounding URLs)"))
                 else:
                     log.info(f"  📘 {sym}: no usable about content, marked skipped")
             except Exception as e:
