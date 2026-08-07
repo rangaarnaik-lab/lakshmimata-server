@@ -26,22 +26,38 @@ log = logging.getLogger('pocketrs')
 # worst case is one wasted retry per restart, not an ongoing drag.
 _BSE_NO_SCRIP_CODE = set()
 
-# Cap concurrent Gemini calls across About/PPT/Transcript/Highlights/Themes/
-# Results/Valuation. Free tier is typically ~15 RPM — default to 1 in-flight
-# call so parallel loops can't stampede the quota.
-def _gemini_semaphore() -> asyncio.Semaphore:
+# Cap concurrent Gemini calls. Free tier is typically ~15 RPM per API key.
+# When multiple GEMINI_API_KEY_* are set, each key gets its own semaphore so
+# About/PPT/etc. can burn separate free-tier quotas in parallel.
+def _gemini_api_key(feature: str = '') -> str:
+    """Resolve API key for a use-case.
+    Order: GEMINI_API_KEY_<FEATURE> → GEMINI_API_KEY.
+    Features: ABOUT, PPT, TRANSCRIPT, RESULTS, VALUATION, THEMES,
+    FLAGS, HIGHLIGHTS, ASKS."""
+    feat = (feature or '').strip().upper()
+    if feat:
+        specific = (os.getenv(f'GEMINI_API_KEY_{feat}') or '').strip()
+        if specific:
+            return specific
+    return (os.getenv('GEMINI_API_KEY') or '').strip()
+
+
+def _gemini_semaphore_for(api_key: str) -> asyncio.Semaphore:
     n = max(1, int(os.getenv('GEMINI_MAX_CONCURRENT', '1')))
-    sem = getattr(_gemini_semaphore, '_sem', None)
-    if sem is None or getattr(_gemini_semaphore, '_n', None) != n:
-        _gemini_semaphore._sem = asyncio.Semaphore(n)
-        _gemini_semaphore._n = n
-    return _gemini_semaphore._sem
+    store = getattr(_gemini_semaphore_for, '_store', None)
+    if store is None:
+        store = {}
+        _gemini_semaphore_for._store = store
+    entry = store.get(api_key or '_')
+    if entry is None or entry[0] != n:
+        store[api_key or '_'] = (n, asyncio.Semaphore(n))
+    return store[api_key or '_'][1]
 
 
 async def _gemini_generate(session: aiohttp.ClientSession, url: str, body: dict,
-                           timeout_s: float = 120):
-    """POST to Gemini with a process-wide concurrency cap (+ small gap after)."""
-    async with _gemini_semaphore():
+                           timeout_s: float = 120, api_key: str = ''):
+    """POST to Gemini with a per-API-key concurrency cap (+ small gap after)."""
+    async with _gemini_semaphore_for(api_key or url):
         async with session.post(
             url,
             headers={"Content-Type": "application/json"},
@@ -271,7 +287,7 @@ async def extract_ppt_summary(session: aiohttp.ClientSession, symbol: str, attac
     usable was found (safe to mark done)."""
     error_result = {'summary': None, 'error': True}
     no_content_result = {'summary': None, 'error': False}
-    api_key = os.getenv('GEMINI_API_KEY', '')
+    api_key = _gemini_api_key('PPT')
     if not api_key or not attachment_url:
         return error_result
     try:
@@ -389,6 +405,7 @@ async def extract_ppt_summary(session: aiohttp.ClientSession, symbol: str, attac
                 "generationConfig": {"responseMimeType": "application/json", "responseSchema": schema},
             },
             gemini_timeout,
+            api_key=api_key,
         )
         if status != 200:
             if status == 429:
@@ -457,7 +474,7 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
     results pipeline can't be affected by changes here."""
     error_result = {'summary': None, 'error': True}
     no_content_result = {'summary': None, 'error': False}
-    api_key = os.getenv('GEMINI_API_KEY', '')
+    api_key = _gemini_api_key('TRANSCRIPT')
     if not api_key or not attachment_url:
         return error_result
     try:
@@ -589,6 +606,7 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
                 "generationConfig": {"responseMimeType": "application/json", "responseSchema": schema},
             },
             gemini_timeout,
+            api_key=api_key,
         )
         if status != 200:
             if status == 429:
@@ -677,7 +695,7 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
     genuine no-content."""
     error_result = {'financial_data': None, 'comparison_data': None, 'yoy_data': None, 'summary': None, 'error': True}
     no_content_result = {'financial_data': None, 'comparison_data': None, 'yoy_data': None, 'summary': None, 'error': False}
-    api_key = os.getenv('GEMINI_API_KEY', '')
+    api_key = _gemini_api_key('RESULTS')
     if not api_key or not attachment_url:
         return error_result  # not a real "no content" case - just not configured/no URL, don't mark as processed
     # Stage 1: download the PDF. Separate try/except so a timeout here
@@ -810,6 +828,7 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
                 "generationConfig": {"responseMimeType": "application/json", "responseSchema": schema},
             },
             gemini_timeout,
+            api_key=api_key,
         )
         if status != 200:
             if status == 429:
@@ -1018,7 +1037,7 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
     while True:
         if await _idle_if_gemini_paused('results', 'Results extraction loop'):
             continue
-        if not os.getenv('GEMINI_API_KEY'):
+        if not _gemini_api_key('RESULTS'):
             if not _key_status_logged:
                 log.warning("🎙️ Results extraction loop: GEMINI_API_KEY not set - loop is idle, "
                             "checking every 5 min in case it gets added")
@@ -1675,7 +1694,7 @@ async def ai_extract_fundamentals_metrics(session: aiohttp.ClientSession, sym: s
     ratios from a Screener.in company page. Used to fill ALL stocks still
     missing these fields after regex scrape. Returns dict of numeric
     fields (None when not disclosed) or None on failure."""
-    api_key = os.getenv('GEMINI_API_KEY', '')
+    api_key = _gemini_api_key('VALUATION')
     if not api_key or not html:
         return None
     text = _html_to_compact_text(html)
@@ -1719,6 +1738,7 @@ async def ai_extract_fundamentals_metrics(session: aiohttp.ClientSession, sym: s
                 },
             },
             90,
+            api_key=api_key,
         )
         if status != 200:
             if status == 429:
@@ -1761,7 +1781,7 @@ async def _valuation_ai_catchup_loop(session: aiohttp.ClientSession):
             continue
         if await _idle_if_gemini_paused('valuation', 'Valuation AI catchup'):
             continue
-        if not os.getenv('GEMINI_API_KEY'):
+        if not _gemini_api_key('VALUATION'):
             if not _key_logged:
                 log.warning("📊 Valuation AI catchup: GEMINI_API_KEY not set — loop idle")
                 _key_logged = True
@@ -1923,7 +1943,7 @@ async def _ppt_summary_loop(session: aiohttp.ClientSession):
     while True:
         if await _idle_if_gemini_paused('ppt', 'PPT summary loop'):
             continue
-        if not os.getenv('GEMINI_API_KEY'):
+        if not _gemini_api_key('PPT'):
             if not _key_status_logged:
                 log.warning("🎙️ PPT summary loop: GEMINI_API_KEY not set - loop is idle")
                 _key_status_logged = True
@@ -2048,7 +2068,7 @@ async def _transcript_summary_loop(session: aiohttp.ClientSession):
     while True:
         if await _idle_if_gemini_paused('transcript', 'Transcript summary loop'):
             continue
-        if not os.getenv('GEMINI_API_KEY'):
+        if not _gemini_api_key('TRANSCRIPT'):
             if not _key_status_logged:
                 log.warning("🎙️ Transcript summary loop: GEMINI_API_KEY not set - loop is idle")
                 _key_status_logged = True
@@ -3376,7 +3396,7 @@ async def extract_about_company(session: aiohttp.ClientSession, symbol: str, ppt
     Returns {'about': dict|None, 'error': bool, 'rate_limited': bool}."""
     error_result = {'about': None, 'error': True, 'rate_limited': False}
     no_content_result = {'about': None, 'error': False, 'rate_limited': False}
-    api_key = os.getenv('GEMINI_API_KEY', '')
+    api_key = _gemini_api_key('ABOUT')
     if not api_key:
         return error_result
 
@@ -3432,14 +3452,14 @@ async def extract_about_company(session: aiohttp.ClientSession, symbol: str, ppt
 
     try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-        status, data, body_txt = await _gemini_generate(session, url, body, 120)
+        status, data, body_txt = await _gemini_generate(session, url, body, 120, api_key=api_key)
         if status != 200:
             # Some models reject tools+request; retry once without search.
             if use_search and status in (400, 404):
                 log.warning(f"⚠️ Gemini about-company web-search rejected for {symbol} "
                             f"({status}) — retrying without search")
                 body.pop('tools', None)
-                status, data, body2 = await _gemini_generate(session, url, body, 90)
+                status, data, body2 = await _gemini_generate(session, url, body, 90, api_key=api_key)
                 if status != 200:
                     log.warning(f"⚠️ Gemini about-company failed for {symbol} ({status}): {body2[:180]}")
                     return error_result
@@ -3516,7 +3536,7 @@ async def extract_stock_themes_ai(session: aiohttp.ClientSession, symbol: str,
     """Tag allowlisted emerging themes for ANY stock via Gemini + Google Search,
     optionally grounded with About/PPT/concall already on file. Returns
     {emerging_themes, theme_evidence, theme_intensity} or None on failure."""
-    api_key = os.getenv('GEMINI_API_KEY', '')
+    api_key = _gemini_api_key('THEMES')
     if not api_key or not symbol:
         return None
     sector_bit = ' / '.join(x for x in [industry, sector] if x) or 'NSE-listed company'
@@ -3565,11 +3585,11 @@ async def extract_stock_themes_ai(session: aiohttp.ClientSession, symbol: str,
         body["tools"] = [{"google_search": {}}]
     try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-        status, data, txt = await _gemini_generate(session, url, body, 120)
+        status, data, txt = await _gemini_generate(session, url, body, 120, api_key=api_key)
         if status != 200:
             if use_search and status in (400, 404):
                 body.pop('tools', None)
-                status, data, txt2 = await _gemini_generate(session, url, body, 90)
+                status, data, txt2 = await _gemini_generate(session, url, body, 90, api_key=api_key)
                 if status != 200:
                     log.warning(f"⚠️ Themes AI failed for {symbol} ({status}): {txt2[:160]}")
                     return None
@@ -3616,7 +3636,7 @@ async def _stock_themes_loop(session: aiohttp.ClientSession):
     while True:
         if await _idle_if_gemini_paused('themes', 'Stock-themes loop'):
             continue
-        if not os.getenv('GEMINI_API_KEY'):
+        if not _gemini_api_key('THEMES'):
             if not _key_logged:
                 log.warning("🌱 Stock-themes loop: GEMINI_API_KEY not set - loop idle")
                 _key_logged = True
@@ -3960,7 +3980,7 @@ async def extract_management_flags(session: aiohttp.ClientSession, symbol: str, 
                                    industry=None, sector=None):
     """Precompute green/red/watch flags from filings already on file only.
     No web search — skip when there is no PPT/concall/about context."""
-    api_key = os.getenv('GEMINI_API_KEY', '')
+    api_key = _gemini_api_key('FLAGS')
     if not api_key:
         return None
     if not context or len(context.strip()) < 200:
@@ -3991,6 +4011,7 @@ async def extract_management_flags(session: aiohttp.ClientSession, symbol: str, 
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
             body,
             90,
+            api_key=api_key,
         )
         if status != 200:
             if status == 429:
@@ -4025,7 +4046,7 @@ async def answer_stock_ai_ask(session: aiohttp.ClientSession, symbol: str, quest
     """Answer a diligence question.
     use_web=False → filings/about on file only (no Google Search).
     use_web=True  → Gemini Google Search + local context."""
-    api_key = os.getenv('GEMINI_API_KEY', '')
+    api_key = _gemini_api_key('ASKS')
     if not api_key:
         return None
     has_context = bool(context and len(context.strip()) >= 200)
@@ -4081,11 +4102,11 @@ async def answer_stock_ai_ask(session: aiohttp.ClientSession, symbol: str, quest
         body["tools"] = [{"google_search": {}}]
     try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-        status, data, txt = await _gemini_generate(session, url, body, 130 if use_web else 90)
+        status, data, txt = await _gemini_generate(session, url, body, 130 if use_web else 90, api_key=api_key)
         if status != 200:
             if use_web and status in (400, 404):
                 body.pop('tools', None)
-                status, data, txt2 = await _gemini_generate(session, url, body, 100)
+                status, data, txt2 = await _gemini_generate(session, url, body, 100, api_key=api_key)
                 if status != 200:
                     log.warning(f"⚠️ Ask-AI failed for {symbol} ({status}): {txt2[:160]}")
                     return None
@@ -4126,7 +4147,7 @@ async def _mgmt_flags_loop(session: aiohttp.ClientSession):
     while True:
         if await _idle_if_gemini_paused('flags', 'Mgmt-flags loop'):
             continue
-        if not os.getenv('GEMINI_API_KEY'):
+        if not _gemini_api_key('FLAGS'):
             if not _key_logged:
                 log.warning("🚩 Mgmt-flags loop: GEMINI_API_KEY not set - idle")
                 _key_logged = True
@@ -4263,7 +4284,7 @@ async def _stock_ai_asks_loop(session: aiohttp.ClientSession):
     }
     _key_logged = False
     while True:
-        if not os.getenv('GEMINI_API_KEY'):
+        if not _gemini_api_key('ASKS'):
             if not _key_logged:
                 log.warning("💬 Ask-AI loop: GEMINI_API_KEY not set - idle")
                 _key_logged = True
@@ -4363,7 +4384,7 @@ async def extract_fundamentals_highlights(session: aiohttp.ClientSession, row: d
     """Ask Gemini which metrics matter most for this stock and write short
     takeaways for the Fundamentals tab. Numbers come from our DB row — the
     model only ranks/explains, it does not invent ratios."""
-    api_key = os.getenv('GEMINI_API_KEY', '')
+    api_key = _gemini_api_key('HIGHLIGHTS')
     sym = (row.get('sym') or '').strip()
     if not api_key or not sym:
         return None
@@ -4415,6 +4436,7 @@ async def extract_fundamentals_highlights(session: aiohttp.ClientSession, row: d
                 },
             },
             60,
+            api_key=api_key,
         )
         if status != 200:
             if status == 429:
@@ -4462,7 +4484,7 @@ async def _fundamentals_ai_highlights_loop(session: aiohttp.ClientSession):
     while True:
         if await _idle_if_gemini_paused('highlights', 'Fund-highlights loop'):
             continue
-        if not os.getenv('GEMINI_API_KEY'):
+        if not _gemini_api_key('HIGHLIGHTS'):
             if not _key_logged:
                 log.warning("📌 Fund-highlights loop: GEMINI_API_KEY not set - loop idle")
                 _key_logged = True
@@ -4587,7 +4609,7 @@ async def _about_company_loop(session: aiohttp.ClientSession):
     while True:
         if await _idle_if_gemini_paused('about', 'About-company loop'):
             continue
-        if not os.getenv('GEMINI_API_KEY'):
+        if not _gemini_api_key('ABOUT'):
             if not _key_status_logged:
                 log.warning("📘 About-company loop: GEMINI_API_KEY not set - loop is idle")
                 _key_status_logged = True
@@ -4806,6 +4828,18 @@ async def fundamentals_worker_main():
     log.info("  Fundamentals + Announcements Worker — standalone process")
     log.info("  (SERVICE_MODE=fundamentals — live scan runs in a separate service)")
     log.info("=" * 60)
+    _feat_keys = []
+    for feat in ('ABOUT', 'PPT', 'TRANSCRIPT', 'RESULTS', 'VALUATION',
+                 'THEMES', 'FLAGS', 'HIGHLIGHTS', 'ASKS'):
+        k = _gemini_api_key(feat)
+        src = f'GEMINI_API_KEY_{feat}' if (os.getenv(f'GEMINI_API_KEY_{feat}') or '').strip() else (
+            'GEMINI_API_KEY' if k else 'none')
+        if k:
+            _feat_keys.append(f'{feat.lower()}={src}')
+    if _feat_keys:
+        log.info(f"  Gemini keys: {', '.join(_feat_keys)}")
+    else:
+        log.warning("  Gemini keys: none configured")
 
     connector = aiohttp.TCPConnector(limit=20, ssl=False)
     async with aiohttp.ClientSession(connector=connector) as session:
