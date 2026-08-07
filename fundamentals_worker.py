@@ -42,17 +42,84 @@ def _is_concall_announcement(row: dict) -> bool:
     text = ((row.get('category') or '') + ' ' + (row.get('subject') or '')).lower()
     return any(x in text for x in _CONCALL_KEYWORDS)
 
-# Schema field names sometimes leak into bullet arrays when the model
-# glitches (seen in production: risks_flagged containing
-# "guidance_direction" / "reiterated"). Drop those so the UI doesn't
-# show garbage alongside real content.
+# Controlled vocabulary for emerging-theme tagging from PPT/transcript
+# PDFs. Gemini must map only to these ids (or return empty) so the UI
+# Themes radar stays clean instead of free-text soup.
+EMERGING_THEME_IDS = (
+    'data_center', 'AI', 'semiconductor', 'EMS', 'defence', 'aerospace',
+    'nuclear', 'renewable', 'green_hydrogen', 'EV', 'battery', 'railways',
+    'CDMO', 'specialty_chem', 'fintech_infra',
+)
+EMERGING_THEME_LABELS = {
+    'data_center': 'Data Center',
+    'AI': 'AI',
+    'semiconductor': 'Semiconductor',
+    'EMS': 'EMS',
+    'defence': 'Defence',
+    'aerospace': 'Aerospace',
+    'nuclear': 'Nuclear',
+    'renewable': 'Renewable',
+    'green_hydrogen': 'Green Hydrogen',
+    'EV': 'EV',
+    'battery': 'Battery',
+    'railways': 'Railways',
+    'CDMO': 'CDMO',
+    'specialty_chem': 'Specialty Chem',
+    'fintech_infra': 'Fintech Infra',
+}
+_THEME_PROMPT_BLOCK = (
+    "EMERGING_THEMES: From the controlled list only — "
+    + ', '.join(EMERGING_THEME_IDS)
+    + " — return 0-5 theme ids that management/the deck clearly discussed as a "
+    "growth/opportunity area (not just a passing industry mention). Empty array if none. "
+    "Do NOT invent themes outside this list.\n\n"
+    "THEME_EVIDENCE: 1-4 short bullet phrases quoting the evidence in paraphrase "
+    "(e.g. 'Data-center infra order book at Rs 45 Cr', 'Capex earmarked for AI server "
+    "cooling capacity'). Each bullet should name the theme naturally. Null if no themes.\n\n"
+    "THEME_INTENSITY: high if a theme is a core growth narrative with numbers/capex/"
+    "order-book; medium if discussed with some substance; low if brief mention only; "
+    "none if emerging_themes is empty.\n\n"
+)
+
+def _clean_themes(v):
+    """Keep only allowlisted theme ids, preserve order, cap at 5."""
+    if isinstance(v, str):
+        raw = v.strip()
+        if raw.startswith('['):
+            try:
+                v = json.loads(raw)
+            except Exception:
+                v = [raw]
+        elif raw:
+            v = [raw]
+        else:
+            v = None
+    if not isinstance(v, list):
+        return None
+    allowed = set(EMERGING_THEME_IDS)
+    out = []
+    for item in v:
+        tid = str(item).strip()
+        if tid in allowed and tid not in out:
+            out.append(tid)
+    return out[:5] or None
+
+def _clean_theme_intensity(v, themes):
+    allowed = ('high', 'medium', 'low', 'none')
+    if v in allowed:
+        if not themes and v != 'none':
+            return 'none'
+        return v
+    return 'high' if themes and len(themes) >= 2 else ('medium' if themes else 'none')
+
 _BULLET_NOISE = {
     'has_content', 'financial_highlights', 'cost_margin_commentary',
     'expansion_capex', 'outlook_guidance', 'guidance_direction',
     'management_changes', 'capital_allocation', 'competitive_positioning',
     'operational_kpis', 'risks_flagged', 'regulatory_legal',
     'key_concerns', 'overall_summary', 'raised', 'lowered', 'maintained',
-    'reiterated', 'not_discussed',
+    'reiterated', 'not_discussed', 'emerging_themes', 'theme_evidence',
+    'theme_intensity',
 }
 
 def _clean_bullets(v):
@@ -222,12 +289,14 @@ async def extract_ppt_summary(session: aiohttp.ClientSession, symbol: str, attac
         "or simply reiterated guidance/targets versus what was previously communicated? "
         "Use 'raised'/'lowered'/'maintained'/'reiterated' only when the deck is explicit "
         "about the comparison, or 'not_discussed' if guidance/targets aren't addressed.\n\n"
+        + _THEME_PROMPT_BLOCK +
         "OVERALL_SUMMARY: A balanced 100-150 word summary of the presentation for a retail "
         "investor. This one stays as flowing prose, not bullets - it's the narrative "
         "overview. Do not add your own opinion or investment view - describe what was "
         "shown, not what to do about it."
     )
     _bullet_field = {"type": "array", "items": {"type": "string"}, "nullable": True}
+    _theme_field = {"type": "array", "items": {"type": "string", "enum": list(EMERGING_THEME_IDS)}, "nullable": True}
     schema = {
         "type": "object",
         "properties": {
@@ -242,6 +311,10 @@ async def extract_ppt_summary(session: aiohttp.ClientSession, symbol: str, attac
             "regulatory_legal": _bullet_field,
             "guidance_direction": {"type": "string",
                 "enum": ["raised", "lowered", "maintained", "reiterated", "not_discussed"], "nullable": True},
+            "emerging_themes": _theme_field,
+            "theme_evidence": _bullet_field,
+            "theme_intensity": {"type": "string",
+                "enum": ["high", "medium", "low", "none"], "nullable": True},
             "overall_summary": {"type": "string", "nullable": True},
         },
         "required": ["has_content"],
@@ -294,13 +367,18 @@ async def extract_ppt_summary(session: aiohttp.ClientSession, symbol: str, attac
         k: _clean_bullets(parsed.get(k))
         for k in ('financial_highlights', 'business_segments', 'strategic_initiatives',
                   'capital_allocation', 'industry_outlook', 'operational_kpis',
-                  'risks_flagged', 'regulatory_legal')
+                  'risks_flagged', 'regulatory_legal', 'theme_evidence')
     }
     summary['overall_summary'] = (parsed.get('overall_summary') or '').strip()[:1500] or None
     gd = parsed.get('guidance_direction')
     summary['guidance_direction'] = gd if gd in (
         'raised', 'lowered', 'maintained', 'reiterated', 'not_discussed') else None
-    if not any(v for k, v in summary.items() if k != 'guidance_direction'):
+    summary['emerging_themes'] = _clean_themes(parsed.get('emerging_themes'))
+    summary['theme_intensity'] = _clean_theme_intensity(
+        parsed.get('theme_intensity'), summary['emerging_themes'])
+    if not summary['emerging_themes']:
+        summary['theme_evidence'] = None
+    if not any(v for k, v in summary.items() if k not in ('guidance_direction', 'theme_intensity')):
         return no_content_result
     return {'summary': summary, 'error': False}
 
@@ -394,10 +472,12 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
         "RISKS_FLAGGED: 1-4 bullets of risks/headwinds management themselves mentioned "
         "(not analyst concerns — those go in key_concerns). Null if none.\n\n"
         "REGULATORY_LEGAL: 1-3 bullets on litigation, approvals, policy. Null if none.\n\n"
+        + _THEME_PROMPT_BLOCK +
         "Bullet format for every array field: short scannable phrases, not paragraphs; "
         "no trailing period required; never insert enum tokens or JSON field names as bullets."
     )
     _bullet_field = {"type": "array", "items": {"type": "string"}, "nullable": True}
+    _theme_field = {"type": "array", "items": {"type": "string", "enum": list(EMERGING_THEME_IDS)}, "nullable": True}
     schema = {
         "type": "object",
         "properties": {
@@ -416,6 +496,10 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
             "risks_flagged": _bullet_field,
             "regulatory_legal": _bullet_field,
             "key_concerns": _bullet_field,
+            "emerging_themes": _theme_field,
+            "theme_evidence": _bullet_field,
+            "theme_intensity": {"type": "string",
+                "enum": ["high", "medium", "low", "none"], "nullable": True},
             "overall_summary": {"type": "string"},
         },
         "required": ["has_content", "overall_summary", "guidance_direction"],
@@ -473,7 +557,7 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
         for k in ('financial_highlights', 'cost_margin_commentary', 'expansion_capex',
                   'outlook_guidance', 'management_changes', 'capital_allocation',
                   'competitive_positioning', 'operational_kpis', 'risks_flagged',
-                  'regulatory_legal', 'key_concerns')
+                  'regulatory_legal', 'key_concerns', 'theme_evidence')
     }
     summary['overall_summary'] = (parsed.get('overall_summary') or '').strip()[:1500] or None
     if not summary['overall_summary']:
@@ -482,7 +566,12 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
             log.info(f"ℹ️ {symbol}: overall_summary was empty — synthesized from section bullets")
     summary['guidance_direction'] = _infer_guidance_direction(
         parsed.get('guidance_direction'), summary.get('outlook_guidance'))
-    if not any(v for k, v in summary.items() if k != 'guidance_direction'):
+    summary['emerging_themes'] = _clean_themes(parsed.get('emerging_themes'))
+    summary['theme_intensity'] = _clean_theme_intensity(
+        parsed.get('theme_intensity'), summary['emerging_themes'])
+    if not summary['emerging_themes']:
+        summary['theme_evidence'] = None
+    if not any(v for k, v in summary.items() if k not in ('guidance_direction', 'theme_intensity')):
         return no_content_result
     # Helpful for spotting thin reports in logs without dumping the whole payload
     missing_core = [k for k in ('overall_summary', 'key_concerns') if not summary.get(k)]
