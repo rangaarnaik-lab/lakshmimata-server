@@ -3739,15 +3739,22 @@ _SCREENER_CSV_FUNDAMENTALS_MAP = {
     'market_cap': 'Market Capitalization',
     'pe': 'Price to Earning',
     'industry_pe': 'Industry PE',
+    'pb': 'Price to book',
     'roce': 'Return on capital employed',
     'roe': 'Return on equity',
     'debt_eq': 'Debt to equity',
+    'div_yield': 'Dividend yield',
     'current_ratio': 'Current ratio',
     'interest_coverage': 'Interest Coverage Ratio',
     'promoter': 'Promoter holding',
     'fii_pct': 'FII holding',
     'dii_pct': 'DII holding',
     'receivables_to_sales': 'Receivables to Sales Ratio',
+    'nim': 'Net Interest Margin',
+    'gnpa': 'Gross NPA',
+    'nnpa': 'Net NPA',
+    'car': 'Capital Adequacy Ratio',
+    'casa': 'CASA',
 }
 
 async def _save_screener_fundamentals(session: aiohttp.ClientSession, rows: list):
