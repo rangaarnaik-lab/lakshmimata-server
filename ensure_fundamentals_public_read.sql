@@ -4,6 +4,9 @@
 -- worker had written data.
 -- Also ensures theme + AI highlight + Flags columns exist.
 
+ALTER TABLE public.stock_fundamentals
+  ADD COLUMN IF NOT EXISTS industry text;
+
 ALTER TABLE public.stock_fundamentals ENABLE ROW LEVEL SECURITY;
 
 DO $$
