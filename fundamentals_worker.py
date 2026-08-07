@@ -47,10 +47,13 @@ _ABOUT_DONE_SYMS: set[str] = set()
 # backlog can advance; cleared on process restart.
 _ABOUT_SAVE_FAILS: dict[str, int] = {}
 _ABOUT_OPTIONAL_COLS_MISSING = False  # set True after PGRST204 on image/sources
-# When Gemini starts failing: retry for ~10 min, then long-pause (6h).
+# When Gemini starts failing: retry for ~10 min, then long-pause.
 _ABOUT_GEMINI_UNHEALTHY_SINCE: float | None = None
 # Hard quota / billing 429 — skip short retry, go straight to long cooldown.
 _ABOUT_GEMINI_HARD_QUOTA = False
+# While set (unix ts), About is parked and Results PDF extraction may run
+# even if GEMINI_FOCUS=about — so quota downtime still makes progress.
+_ABOUT_YIELD_TO_RESULTS_UNTIL: float | None = None
 
 
 def _gemini_quota_exhausted(body_txt: str | None) -> bool:
@@ -62,6 +65,24 @@ def _gemini_quota_exhausted(body_txt: str | None) -> bool:
         'quota exceeded',
         'resource_exhausted',
     ))
+
+
+def _about_hard_pause_seconds() -> int:
+    """About hard-stop duration (default 24h). Independent of short RPM gaps
+    like ABOUT_COMPANY_ERROR_COOLDOWN_SECONDS=300."""
+    return max(3600, int(os.getenv(
+        'ABOUT_COMPANY_HARD_QUOTA_COOLDOWN_SECONDS', '86400')))  # 24h
+
+
+def _begin_about_yield_to_results(seconds: int, reason: str):
+    """Park About and temporarily allow Results Gemini backfill."""
+    global _ABOUT_YIELD_TO_RESULTS_UNTIL
+    sec = max(3600, int(seconds))
+    _ABOUT_YIELD_TO_RESULTS_UNTIL = time.time() + sec
+    log.warning(
+        f"📘 About-company: pausing {sec}s (~{sec // 3600}h) — {reason}. "
+        f"Yielding Gemini slot to Results PDF extraction until "
+        f"{datetime.fromtimestamp(_ABOUT_YIELD_TO_RESULTS_UNTIL, tz=timezone.utc).isoformat()}")
 
 
 def _parse_iso_ts(value):
@@ -5023,6 +5044,7 @@ async def _about_company_loop(session: aiohttp.ClientSession):
                 _about_one(sym, ppt, tx, src_at) for sym, ppt, tx, src_at in todo
             ])
         global _ABOUT_GEMINI_UNHEALTHY_SINCE, _ABOUT_GEMINI_HARD_QUOTA
+        global _ABOUT_YIELD_TO_RESULTS_UNTIL
         # Any rate-limit/pause in the batch must cool down — even if a few
         # symbols saved earlier in the same gather (old bug: gemini_ok>0
         # cleared unhealthy and only slept ~15s, then kept burning quota).
@@ -5036,20 +5058,21 @@ async def _about_company_loop(session: aiohttp.ClientSession):
         if need_cooldown or all_failed:
             retry_window = int(os.getenv('ABOUT_COMPANY_ERROR_RETRY_SECONDS', '600'))  # 10m
             retry_gap = int(os.getenv('ABOUT_COMPANY_ERROR_RETRY_GAP_SECONDS', '45'))
-            cool = int(os.getenv(
-                'ABOUT_COMPANY_ERROR_COOLDOWN_SECONDS',
-                os.getenv('ABOUT_COMPANY_429_COOLDOWN_SECONDS', '21600')))  # 6h
-            # Billing/plan quota won't recover in 10 minutes — skip retry window.
+            # Soft gap between RPM retries only — NOT the hard stop.
+            # ABOUT_COMPANY_ERROR_COOLDOWN_SECONDS=300 must not shorten the 24h pause.
+            hard_cool = _about_hard_pause_seconds()
+            # Billing/plan quota won't recover soon — skip retry window, pause 24h,
+            # and hand the Gemini slot to Results PDF backfill.
             if hit_hard_quota or _ABOUT_GEMINI_HARD_QUOTA:
-                log.warning(
-                    f"📘 About-company: Gemini HARD QUOTA "
-                    f"(ok={gemini_ok}, errors={gemini_errors}/{len(todo)}) "
-                    f"— pausing About job for {cool}s (~{cool // 3600}h). "
-                    f"Check Google AI Studio billing / raise limits, or set "
-                    f"GEMINI_API_KEY_ABOUT to a key with remaining quota.")
                 _ABOUT_GEMINI_UNHEALTHY_SINCE = None
                 _ABOUT_GEMINI_HARD_QUOTA = False
-                await asyncio.sleep(max(300, cool))
+                _begin_about_yield_to_results(
+                    hard_cool,
+                    f"HARD QUOTA (ok={gemini_ok}, errors={gemini_errors}/{len(todo)}); "
+                    f"check AI Studio billing or GEMINI_API_KEY_ABOUT")
+                await asyncio.sleep(hard_cool)
+                _ABOUT_YIELD_TO_RESULTS_UNTIL = None
+                log.info("📘 About-company: hard pause done — resuming About; Results focus ends")
             else:
                 now = time.monotonic()
                 if _ABOUT_GEMINI_UNHEALTHY_SINCE is None:
@@ -5068,15 +5091,20 @@ async def _about_company_loop(session: aiohttp.ClientSession):
                         f"— retry in {retry_gap}s ({left}s left in {retry_window}s window)")
                     await asyncio.sleep(max(15, retry_gap))
                 else:
-                    log.warning(
-                        f"📘 About-company: Gemini unhealthy for {retry_window}s "
-                        f"— pausing About job for {cool}s (~{cool // 3600}h)")
+                    # Still failing after retry window → same 24h pause + Results.
                     _ABOUT_GEMINI_UNHEALTHY_SINCE = None
-                    await asyncio.sleep(max(300, cool))
+                    _begin_about_yield_to_results(
+                        hard_cool,
+                        f"unhealthy for {retry_window}s "
+                        f"(ok={gemini_ok}, errors={gemini_errors}/{len(todo)})")
+                    await asyncio.sleep(hard_cool)
+                    _ABOUT_YIELD_TO_RESULTS_UNTIL = None
+                    log.info("📘 About-company: hard pause done — resuming About; Results focus ends")
         elif todo:
             # Clean batch — clear unhealthy state and pace normally.
             _ABOUT_GEMINI_UNHEALTHY_SINCE = None
             _ABOUT_GEMINI_HARD_QUOTA = False
+            _ABOUT_YIELD_TO_RESULTS_UNTIL = None
             await asyncio.sleep(int(os.getenv('ABOUT_COMPANY_CYCLE_SECONDS', '15')))
         elif not ranked:
             # All candidates done (or skipped). Rarely re-check for new
@@ -5228,9 +5256,17 @@ async def _delayed(seconds: float, coro):
 
 def _gemini_focus_allows(feature: str) -> bool:
     """GEMINI_FOCUS=about (or comma list) limits free-tier RPM to those loops.
-    Empty / all / * = every Gemini feature runs. Interactive Ask-AI always allowed."""
+    Empty / all / * = every Gemini feature runs. Interactive Ask-AI always allowed.
+    While About is in a hard quota pause, Results PDF extraction is temporarily
+    allowed so catchup can continue on a different Gemini use-case."""
     if feature == 'asks':
         return True
+    until = _ABOUT_YIELD_TO_RESULTS_UNTIL
+    if until and time.time() < until:
+        if feature == 'about':
+            return False
+        if feature == 'results':
+            return True
     raw = (os.getenv('GEMINI_FOCUS') or 'all').strip().lower()
     if not raw or raw in ('all', '*'):
         return True
@@ -5242,9 +5278,17 @@ async def _idle_if_gemini_paused(feature: str, label: str):
     """Park a Gemini loop when GEMINI_FOCUS excludes it (e.g. About-first backfill)."""
     if _gemini_focus_allows(feature):
         return False
-    log.info(f"⏸️ {label}: paused (GEMINI_FOCUS={os.getenv('GEMINI_FOCUS')})")
+    why = os.getenv('GEMINI_FOCUS')
+    if feature == 'results' and _ABOUT_YIELD_TO_RESULTS_UNTIL:
+        left = max(0, int(_ABOUT_YIELD_TO_RESULTS_UNTIL - time.time()))
+        log.info(f"⏸️ {label}: waiting for About yield window ({left}s left)")
+    else:
+        log.info(f"⏸️ {label}: paused (GEMINI_FOCUS={why})")
     while not _gemini_focus_allows(feature):
-        await asyncio.sleep(300)
+        # Wake sooner when About may hand off to Results.
+        await asyncio.sleep(30 if _ABOUT_YIELD_TO_RESULTS_UNTIL else 300)
+    if feature == 'results':
+        log.info(f"▶️ {label}: active (About yielded Gemini slot / focus allows results)")
     return True
 
 def rate_announcements_free(rows: list) -> list:
