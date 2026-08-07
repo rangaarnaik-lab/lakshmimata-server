@@ -240,21 +240,39 @@ def _gemini_semaphore_for(api_key: str) -> asyncio.Semaphore:
     return store[api_key or '_'][1]
 
 
+def _gemini_ask_semaphore() -> asyncio.Semaphore:
+    """Separate from batch PDF jobs so Ask AI is not stuck behind Results."""
+    n = max(1, int(os.getenv('GEMINI_ASK_MAX_CONCURRENT', '2')))
+    entry = getattr(_gemini_ask_semaphore, '_entry', None)
+    if entry is None or entry[0] != n:
+        _gemini_ask_semaphore._entry = (n, asyncio.Semaphore(n))
+    return _gemini_ask_semaphore._entry[1]
+
+
 async def _gemini_generate(session: aiohttp.ClientSession, url: str, body: dict,
-                           timeout_s: float = 120, api_key: str = ''):
-    """POST to Gemini with a per-API-key concurrency cap (+ small gap after)."""
-    async with _gemini_semaphore_for(api_key or url):
-        async with session.post(
-            url,
-            headers={"Content-Type": "application/json"},
-            json=body,
-            timeout=aiohttp.ClientTimeout(total=timeout_s),
-        ) as r:
-            text = await r.text()
-            status = r.status
-        # Leave a beat between calls so RPM stays under free-tier caps even
-        # when many loops wake at once.
-        await asyncio.sleep(float(os.getenv('GEMINI_MIN_GAP_SECONDS', '4')))
+                           timeout_s: float = 120, api_key: str = '',
+                           priority: bool = False):
+    """POST to Gemini with a per-API-key concurrency cap (+ small gap after).
+    priority=True (Ask AI) uses a separate semaphore so interactive answers
+    are not queued behind long Results/PPT PDF extractions."""
+    sem = _gemini_ask_semaphore() if priority else _gemini_semaphore_for(api_key or url)
+    try:
+        async with sem:
+            async with session.post(
+                url,
+                headers={"Content-Type": "application/json"},
+                json=body,
+                timeout=aiohttp.ClientTimeout(total=timeout_s),
+            ) as r:
+                text = await r.text()
+                status = r.status
+            # Batch jobs pace for free-tier RPM; Ask AI uses a short gap.
+            gap = float(os.getenv(
+                'GEMINI_ASK_MIN_GAP_SECONDS' if priority else 'GEMINI_MIN_GAP_SECONDS',
+                '1' if priority else '4'))
+            await asyncio.sleep(max(0.0, gap))
+    except (asyncio.TimeoutError, TimeoutError, aiohttp.ServerTimeoutError):
+        return 408, {}, 'timeout'
     try:
         data = json.loads(text) if text else {}
     except Exception:
@@ -4416,53 +4434,83 @@ async def answer_stock_ai_ask(session: aiohttp.ClientSession, symbol: str, quest
             '- "flags": []\n'
         )
     model = _gemini_ask_model()
-    body = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.2 if not use_web else 0.25},
-    }
-    if use_web:
-        body["tools"] = [{"google_search": {}}]
+    # Web search is slow on free tier — short timeout, then fast no-tools fallback.
+    web_timeout = int(os.getenv('GEMINI_ASK_WEB_TIMEOUT_SECONDS', '40'))
+    fast_timeout = int(os.getenv('GEMINI_ASK_TIMEOUT_SECONDS', '35'))
+
+    async def _parse_answer(data, with_sources: bool):
+        parts = (data.get('candidates') or [{}])[0].get('content', {}).get('parts', [])
+        raw = ''.join(p.get('text', '') for p in parts).strip()
+        parsed = _parse_json_object(raw)
+        if not parsed:
+            return None
+        answer = str(parsed.get('answer') or '').strip()
+        if len(answer) < 40:
+            return None
+        return {
+            'answer': answer[:2500],
+            'verdict': str(parsed.get('verdict') or 'n/a')[:40],
+            'flags': _clean_mgmt_flags(parsed.get('flags')),
+            'sources': (_grounding_source_urls(data, limit=6) if with_sources else None),
+        }
 
     last_err = None
     for api_key in keys:
+        url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+               f"{model}:generateContent?key={api_key}")
         try:
-            url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
-                   f"{model}:generateContent?key={api_key}")
-            status, data, txt = await _gemini_generate(
-                session, url, body, 130 if use_web else 90, api_key=api_key)
-            if status != 200 and use_web and status in (400, 404):
-                body.pop('tools', None)
+            if use_web:
+                body_web = {
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"temperature": 0.25},
+                    "tools": [{"google_search": {}}],
+                }
                 status, data, txt = await _gemini_generate(
-                    session, url, body, 100, api_key=api_key)
+                    session, url, body_web, web_timeout, api_key=api_key, priority=True)
+                if status == 408:
+                    log.warning(f"⚠️ Ask-AI web timed out for {symbol} ({web_timeout}s) "
+                                f"— fast fallback without search")
+                if status == 200:
+                    out = await _parse_answer(data, True)
+                    if out:
+                        log.info(f"💬 Ask-AI answered {symbol} via web+Gemini "
+                                 f"model={model} key={_gemini_key_fingerprint(api_key)}")
+                        return out
+                # Fast path: same prompt, no Google Search tool.
+                body_fast = {
+                    "contents": [{"parts": [{"text": prompt +
+                        "\n(Answer quickly from LOCAL CONTEXT and well-known public facts; "
+                        "no live browsing.)\n"}]}],
+                    "generationConfig": {"temperature": 0.2},
+                }
+                status, data, txt = await _gemini_generate(
+                    session, url, body_fast, fast_timeout, api_key=api_key, priority=True)
+            else:
+                body = {
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"temperature": 0.2},
+                }
+                status, data, txt = await _gemini_generate(
+                    session, url, body, fast_timeout, api_key=api_key, priority=True)
+
             if status == 429:
                 last_err = f"429 on {_gemini_key_fingerprint(api_key)}"
                 log.warning(f"⚠️ Ask-AI 429 for {symbol} key={_gemini_key_fingerprint(api_key)} "
                             f"— trying next free key if any")
-                await asyncio.sleep(2)
+                await asyncio.sleep(1)
                 continue
             if status != 200:
                 last_err = f"{status}: {(txt or '')[:120]}"
                 log.warning(f"⚠️ Ask-AI failed for {symbol} ({status}): {(txt or '')[:160]}")
                 continue
-            parts = (data.get('candidates') or [{}])[0].get('content', {}).get('parts', [])
-            raw = ''.join(p.get('text', '') for p in parts).strip()
-            parsed = _parse_json_object(raw)
-            if not parsed:
-                last_err = 'no JSON'
+            out = await _parse_answer(data, False)
+            if not out:
+                last_err = 'bad/short answer'
                 continue
-            answer = str(parsed.get('answer') or '').strip()
-            if len(answer) < 40:
-                last_err = 'short answer'
-                continue
-            sources = _grounding_source_urls(data, limit=6) if use_web else None
             log.info(f"💬 Ask-AI answered {symbol} via free Gemini "
-                     f"model={model} key={_gemini_key_fingerprint(api_key)}")
-            return {
-                'answer': answer[:2500],
-                'verdict': str(parsed.get('verdict') or 'n/a')[:40],
-                'flags': _clean_mgmt_flags(parsed.get('flags')),
-                'sources': sources,
-            }
+                     f"model={model} key={_gemini_key_fingerprint(api_key)}"
+                     f"{' (web fallback)' if use_web else ''}")
+            return out
         except Exception as e:
             last_err = f"{type(e).__name__}: {e}"
             log.warning(f"⚠️ Ask-AI error for {symbol}: {last_err}")
@@ -4668,7 +4716,7 @@ async def _stock_ai_asks_loop(session: aiohttp.ClientSession):
                 else:
                     pending = await r.json()
             if not pending:
-                await asyncio.sleep(8)
+                await asyncio.sleep(float(os.getenv('STOCK_ASK_IDLE_SECONDS', '1.5')))
                 continue
             for row in pending:
                 ask_id = row.get('id')
@@ -4678,6 +4726,7 @@ async def _stock_ai_asks_loop(session: aiohttp.ClientSession):
                 use_web = ask_mode in ('web', 'web_search', 'search')
                 if not ask_id or not sym or len(question) < 8:
                     continue
+                t0 = time.monotonic()
                 log.info(f"💬 Ask-AI answering {sym} [{ask_mode}]: {question[:80]}")
                 context, fund, ppt, tx, _about = await _gather_stock_ask_context(session, headers, sym)
                 # Keep about + fundamentals + filings — free Gemini can answer
@@ -4686,6 +4735,7 @@ async def _stock_ai_asks_loop(session: aiohttp.ClientSession):
                     session, sym, question, context or '',
                     industry=fund.get('industry'), sector=fund.get('sector'),
                     use_web=use_web)
+                elapsed = time.monotonic() - t0
                 if result:
                     patch = {
                         'status': 'done',
@@ -4711,11 +4761,12 @@ async def _stock_ai_asks_loop(session: aiohttp.ClientSession):
                     if pr.status not in (200, 204):
                         log.warning(f"⚠️ Ask-AI patch {pr.status} for {ask_id}: {(await pr.text())[:160]}")
                     else:
-                        log.info(f"  💬 {sym}: ask {ask_id[:8]}… → {patch['status']}")
-                await asyncio.sleep(float(os.getenv('STOCK_ASK_PACING_SECONDS', '6')))
+                        log.info(f"  💬 {sym}: ask {ask_id[:8]}… → {patch['status']} "
+                                 f"in {elapsed:.1f}s")
+                await asyncio.sleep(float(os.getenv('STOCK_ASK_PACING_SECONDS', '1')))
         except Exception as e:
             log.error(f"Ask-AI loop failed: {type(e).__name__}: {e}")
-            await asyncio.sleep(20)
+            await asyncio.sleep(5)
 
 
 async def extract_fundamentals_highlights(session: aiohttp.ClientSession, row: dict):
@@ -5506,7 +5557,8 @@ async def fundamentals_worker_main():
             _delayed(80, _fundamentals_ai_highlights_loop(session)),
             _delayed(10, _stock_themes_loop(session)),
             _delayed(100, _mgmt_flags_loop(session)),
-            _delayed(30, _stock_ai_asks_loop(session)),
+            # Ask AI starts immediately — interactive, not staggered with batch jobs.
+            _delayed(0, _stock_ai_asks_loop(session)),
         )
 
 
