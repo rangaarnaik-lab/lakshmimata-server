@@ -84,7 +84,7 @@ def _gemini_key_fingerprint(api_key: str) -> str:
 
 
 def _gemini_semaphore_for(api_key: str) -> asyncio.Semaphore:
-    n = max(1, int(os.getenv('GEMINI_MAX_CONCURRENT', '4')))
+    n = max(1, int(os.getenv('GEMINI_MAX_CONCURRENT', '5')))
     store = getattr(_gemini_semaphore_for, '_store', None)
     if store is None:
         store = {}
@@ -4674,9 +4674,9 @@ async def _about_company_loop(session: aiohttp.ClientSession):
                 _key_status_logged = True
             await asyncio.sleep(300)
             continue
-        # 5 stocks at a time (parallel). Override via env if needed.
-        BATCH_SIZE = int(os.getenv('ABOUT_COMPANY_BATCH_SIZE', '5'))
-        CONCURRENCY = max(1, int(os.getenv('ABOUT_COMPANY_CONCURRENCY', '5')))
+        # One stock at a time (safest for quota). Override via env if needed.
+        BATCH_SIZE = int(os.getenv('ABOUT_COMPANY_BATCH_SIZE', '1'))
+        CONCURRENCY = max(1, int(os.getenv('ABOUT_COMPANY_CONCURRENCY', '1')))
         if not _key_status_logged:
             _web = os.getenv('ABOUT_COMPANY_WEB_SEARCH', '0')
             log.info(f"📘 About-company loop: active "
