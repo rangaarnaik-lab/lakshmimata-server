@@ -56,6 +56,14 @@ def _gemini_api_key(feature: str = '') -> str:
     return (os.getenv('GEMINI_API_KEY') or '').strip()
 
 
+def _gemini_key_fingerprint(api_key: str) -> str:
+    """Safe log token — last 4 chars only (never log full key)."""
+    k = (api_key or '').strip()
+    if not k:
+        return 'none'
+    return f'…{k[-4:]} (len={len(k)})'
+
+
 def _gemini_semaphore_for(api_key: str) -> asyncio.Semaphore:
     n = max(1, int(os.getenv('GEMINI_MAX_CONCURRENT', '1')))
     store = getattr(_gemini_semaphore_for, '_store', None)
@@ -3477,7 +3485,8 @@ async def extract_about_company(session: aiohttp.ClientSession, symbol: str, ppt
                     return error_result
             elif status == 429:
                 # Body usually says which quota (RPM / RPD / search grounding).
-                log.warning(f"⚠️ Gemini rate-limit on about-company for {symbol} (429): "
+                log.warning(f"⚠️ Gemini rate-limit on about-company for {symbol} (429) "
+                            f"key={_gemini_key_fingerprint(api_key)}: "
                             f"{(body_txt or '')[:220]}")
                 await asyncio.sleep(int(os.getenv('GEMINI_429_BACKOFF_SECONDS', '90')))
                 return {'about': None, 'error': True, 'rate_limited': True}
@@ -4749,7 +4758,8 @@ async def _about_company_loop(session: aiohttp.ClientSession):
             _mode = ('web search' if _web.strip() not in ('0', 'false', 'False')
                      else 'filings-only')
             log.info(f"📘 About-company loop: {len(todo)} symbol(s) to generate "
-                      f"({_mode}; backlog≈{len(ranked)})")
+                      f"({_mode}; backlog≈{len(ranked)}; "
+                      f"key={_gemini_key_fingerprint(_gemini_api_key('ABOUT'))})")
         else:
             log.info("📘 About-company loop: nothing new")
 
@@ -4847,17 +4857,26 @@ async def fundamentals_worker_main():
     log.info("  (SERVICE_MODE=fundamentals — live scan runs in a separate service)")
     log.info("=" * 60)
     _feat_keys = []
+    _default_k = (os.getenv('GEMINI_API_KEY') or '').strip()
     for feat in ('ABOUT', 'PPT', 'TRANSCRIPT', 'RESULTS', 'VALUATION',
                  'THEMES', 'FLAGS', 'HIGHLIGHTS', 'ASKS'):
         k = _gemini_api_key(feat)
-        src = f'GEMINI_API_KEY_{feat}' if (os.getenv(f'GEMINI_API_KEY_{feat}') or '').strip() else (
+        specific = (os.getenv(f'GEMINI_API_KEY_{feat}') or '').strip()
+        src = f'GEMINI_API_KEY_{feat}' if specific else (
             'GEMINI_API_KEY' if k else 'none')
         if k:
-            _feat_keys.append(f'{feat.lower()}={src}')
+            same = ' SAME_AS_DEFAULT' if (specific and _default_k and specific == _default_k) else ''
+            _feat_keys.append(f'{feat.lower()}={src}:{_gemini_key_fingerprint(k)}{same}')
     if _feat_keys:
         log.info(f"  Gemini keys: {', '.join(_feat_keys)}")
     else:
         log.warning("  Gemini keys: none configured")
+    about_k = _gemini_api_key('ABOUT')
+    about_src = ('GEMINI_API_KEY_ABOUT'
+                 if (os.getenv('GEMINI_API_KEY_ABOUT') or '').strip()
+                 else ('GEMINI_API_KEY' if about_k else 'none'))
+    log.info(f"  📘 About will call Gemini with {about_src} "
+             f"{_gemini_key_fingerprint(about_k)}")
 
     connector = aiohttp.TCPConnector(limit=20, ssl=False)
     async with aiohttp.ClientSession(connector=connector) as session:
