@@ -1407,7 +1407,8 @@ def _is_results_announcement(row: dict) -> bool:
     return any(x in text for x in _RESULTS_ANN_KEYWORDS)
 
 async def _fetch_processed_attachment_keys(session: aiohttp.ClientSession, table: str,
-                                          headers: dict, extra_select: str = ''):
+                                          headers: dict, extra_select: str = '',
+                                          reprocess_missing_themes: bool = False):
     """Pages through a summaries table collecting (symbol, attachment_url)
     keys. PostgREST defaults to max 1000 rows per request — without
     pagination, once a table grows past that the worker silently
@@ -1415,10 +1416,19 @@ async def _fetch_processed_attachment_keys(session: aiohttp.ClientSession, table
     duplicates or (worse) thinks everything past row 1000 is new while
     also failing to see that older backlog items are unfinished.
     Returns (already_done_or_skipped_set, thin_done_set) where thin_done
-    are status=done rows missing overall_summary (transcript reprocess)."""
+    are status=done rows missing overall_summary and/or theme fields
+    (eligible for reprocess / theme backfill).
+    theme_intensity IS NULL is the signal for pre-theme-pipeline rows:
+    the new extractor always writes high|medium|low|none, even when no
+    themes were found."""
     already = set()
     thin = set()
-    select = 'symbol,attachment_url,status' + (f',{extra_select}' if extra_select else '')
+    cols = ['symbol', 'attachment_url', 'status']
+    if extra_select:
+        cols.append(extra_select)
+    if reprocess_missing_themes and 'theme_intensity' not in cols:
+        cols.append('theme_intensity')
+    select = ','.join(cols)
     page_size = 1000
     offset = 0
     while True:
@@ -1444,14 +1454,41 @@ async def _fetch_processed_attachment_keys(session: aiohttp.ClientSession, table
         for row in rows:
             key = (row['symbol'], row['attachment_url'])
             status = row.get('status')
-            if extra_select == 'overall_summary' and status == 'done' and not (row.get('overall_summary') or '').strip():
+            if status == 'done' and extra_select == 'overall_summary' and not (row.get('overall_summary') or '').strip():
                 thin.add(key)
-            elif status in ('done', 'skipped', 'failed', 'pending'):
+                continue
+            if status == 'done' and reprocess_missing_themes and row.get('theme_intensity') is None:
+                thin.add(key)
+                continue
+            if status in ('done', 'skipped', 'failed', 'pending'):
                 already.add(key)
         if len(rows) < page_size:
             break
         offset += page_size
     return already, thin
+
+async def _fetch_theme_backfill_rows(session: aiohttp.ClientSession, table: str,
+                                    headers: dict, limit: int):
+    """Direct backlog from the summaries table: done rows written before
+    the emerging-themes columns existed (theme_intensity IS NULL).
+    Does not depend on corporate_announcements lookback, so old PPTs/
+    transcripts still get re-read for theme tags."""
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/{table}", headers=headers,
+            params={'select': 'symbol,announced_at,attachment_url',
+                    'status': 'eq.done', 'theme_intensity': 'is.null',
+                    'order': 'announced_at.desc', 'limit': str(limit)},
+            timeout=aiohttp.ClientTimeout(total=30)
+        ) as r:
+            if r.status != 200:
+                body = await r.text()
+                log.warning(f"⚠️ {table}: theme backfill query returned {r.status}: {body[:200]}")
+                return []
+            return await r.json()
+    except Exception as e:
+        log.warning(f"⚠️ {table}: theme backfill fetch failed: {type(e).__name__}: {e}")
+        return []
 
 async def _market_cap_catchup_loop(session: aiohttp.ClientSession):
     """Runs hourly, separate from the once-daily FULL fundamentals
@@ -1598,12 +1635,36 @@ async def _ppt_summary_loop(session: aiohttp.ClientSession):
             candidates = []
         ppt_rows = [row for row in candidates if row.get('attachment_url') and _is_ppt_announcement(row)]
 
-        already, _thin = await _fetch_processed_attachment_keys(session, 'ppt_summaries', headers)
+        already, _thin = await _fetch_processed_attachment_keys(
+            session, 'ppt_summaries', headers, reprocess_missing_themes=True)
 
-        todo = [row for row in ppt_rows if (row['symbol'], row['attachment_url']) not in already][:BATCH_SIZE]
+        # Prefer theme backfill of old done rows (theme_intensity IS NULL)
+        # so pre-theme PPTs get re-read even if outside announcement lookback.
+        backfill = await _fetch_theme_backfill_rows(
+            session, 'ppt_summaries', headers, BATCH_SIZE)
+        todo = []
+        seen = set()
+        for row in backfill:
+            key = (row['symbol'], row['attachment_url'])
+            if key in seen or not row.get('attachment_url'):
+                continue
+            seen.add(key)
+            todo.append(row)
+        for row in ppt_rows:
+            key = (row['symbol'], row['attachment_url'])
+            if key in already or key in seen:
+                continue
+            seen.add(key)
+            todo.append(row)
+            if len(todo) >= BATCH_SIZE:
+                break
+        todo = todo[:BATCH_SIZE]
         if todo:
-            log.info(f"🎙️ PPT summary loop: {len(todo)} new presentation(s) to process "
-                      f"(candidates={len(candidates)}, matched={len(ppt_rows)}, already={len(already)})")
+            bf = sum(1 for r in todo if (r['symbol'], r['attachment_url']) in
+                     {(b['symbol'], b['attachment_url']) for b in backfill})
+            log.info(f"🎙️ PPT summary loop: {len(todo)} presentation(s) to process "
+                      f"({bf} theme-backfill, candidates={len(candidates)}, "
+                      f"matched={len(ppt_rows)}, already={len(already)})")
         else:
             log.info(f"🎙️ PPT summary loop: checked {len(candidates)} recent announcement(s) "
                       f"({len(ppt_rows)} matched presentation filter, already={len(already)}), nothing new")
@@ -1693,18 +1754,37 @@ async def _transcript_summary_loop(session: aiohttp.ClientSession):
             candidates = []
         transcript_rows = [row for row in candidates if row.get('attachment_url') and _is_transcript_announcement(row)]
 
-        # Rows with status done but empty overall_summary were produced by
-        # the older weaker prompt — leave them out of `already` so the
-        # improved extractor can overwrite via merge-duplicates.
+        # Rows with status done but empty overall_summary / missing themes
+        # were produced by older prompts — leave them out of `already` so
+        # the improved extractor can overwrite via merge-duplicates.
         already, thin = await _fetch_processed_attachment_keys(
-            session, 'transcript_summaries', headers, extra_select='overall_summary')
-        # thin keys are eligible for reprocess (not in already)
-        todo = [row for row in transcript_rows
-                if (row['symbol'], row['attachment_url']) not in already][:BATCH_SIZE]
+            session, 'transcript_summaries', headers,
+            extra_select='overall_summary', reprocess_missing_themes=True)
+        backfill = await _fetch_theme_backfill_rows(
+            session, 'transcript_summaries', headers, BATCH_SIZE)
+        todo = []
+        seen = set()
+        for row in backfill:
+            key = (row['symbol'], row['attachment_url'])
+            if key in seen or not row.get('attachment_url'):
+                continue
+            seen.add(key)
+            todo.append(row)
+        for row in transcript_rows:
+            key = (row['symbol'], row['attachment_url'])
+            if key in already or key in seen:
+                continue
+            seen.add(key)
+            todo.append(row)
+            if len(todo) >= BATCH_SIZE:
+                break
+        todo = todo[:BATCH_SIZE]
         if todo:
+            bf = sum(1 for r in todo if (r['symbol'], r['attachment_url']) in
+                     {(b['symbol'], b['attachment_url']) for b in backfill})
             log.info(f"🎙️ Transcript summary loop: {len(todo)} transcript(s) to process "
-                      f"(new or thin; candidates={len(candidates)}, matched={len(transcript_rows)}, "
-                      f"already={len(already)}, thin={len(thin)})")
+                      f"({bf} theme-backfill; candidates={len(candidates)}, "
+                      f"matched={len(transcript_rows)}, already={len(already)}, thin={len(thin)})")
         else:
             log.info(f"🎙️ Transcript summary loop: checked {len(candidates)} recent announcement(s) "
                       f"({len(transcript_rows)} matched transcript filter, already={len(already)}), nothing new")
