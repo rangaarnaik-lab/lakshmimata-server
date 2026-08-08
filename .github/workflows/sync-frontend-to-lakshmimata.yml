@@ -1,0 +1,53 @@
+name: Sync frontend fix to Lakshmimata
+
+# Pushes the patched frontend to rangaarnaik-lab/Lakshmimata main.
+# Vercel is git-connected — a push to main auto-deploys lakshmimata.vercel.app.
+# Requires ONE secret: LAKSHMIMATA_PAT (GitHub PAT with repo scope on Lakshmimata).
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'deploy/frontend-pead-canslim.patch'
+      - '.github/workflows/sync-frontend-to-lakshmimata.yml'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout server repo (patch)
+        uses: actions/checkout@v4
+        with:
+          path: server
+
+      - name: Checkout Lakshmimata main
+        uses: actions/checkout@v4
+        with:
+          repository: rangaarnaik-lab/Lakshmimata
+          path: frontend
+          ref: main
+          token: ${{ secrets.LAKSHMIMATA_PAT }}
+
+      - name: Apply patch
+        run: git -C frontend apply ../server/deploy/frontend-pead-canslim.patch
+
+      - name: Push to Lakshmimata main (triggers Vercel)
+        env:
+          PAT: ${{ secrets.LAKSHMIMATA_PAT }}
+        run: |
+          if [ -z "$PAT" ]; then
+            echo "::error::Add LAKSHMIMATA_PAT to lakshmimata-server secrets — a GitHub PAT with repo write access to rangaarnaik-lab/Lakshmimata. Vercel will auto-deploy on push; no VERCEL_TOKEN needed."
+            exit 1
+          fi
+          cd frontend
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet; then
+            echo "Patch already applied on Lakshmimata main — nothing to push."
+            exit 0
+          fi
+          git add -A
+          git commit -m "Apply PEAD/CANSLIM + APOLLO result-rating fix (from lakshmimata-server patch)"
+          git push "https://x-access-token:${PAT}@github.com/rangaarnaik-lab/Lakshmimata.git" HEAD:main
