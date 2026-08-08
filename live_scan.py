@@ -867,6 +867,11 @@ def build_synthetic_index(symbols: list, cache: dict, min_stocks: int = 20) -> d
     Build synthetic index from constituent stocks.
     Uses the LONGEST common window (most stocks have 285 days).
     Stocks with shorter history are excluded rather than truncating all.
+
+    LAST-RESORT only for MID/SML RS when the official Midcap 150 /
+    Smallcap 250 series is unavailable. Do NOT stitch this onto real
+    index history — absolute price levels differ by an order of magnitude
+    and corrupt the 63/126/189/252d return lookbacks used by calc_raw_rs_series.
     """
     # Get all series, find the most common length (mode)
     all_series = []
@@ -893,6 +898,109 @@ def build_synthetic_index(symbols: list, cache: dict, min_stocks: int = 20) -> d
         for i in range(target_len)
     ]
     return {'prices': prices}
+
+def _index_series_has_corrupt_jumps(prices: list) -> bool:
+    """True if a broad index series has impossible single-day gaps.
+    Official Midcap 150 / Smallcap 250 do not move 45%+ in one session;
+    that signature appears when real index levels (~10k–40k) were stitched
+    onto equal-weight synthetic averages of stock prices (~hundreds–low thousands).
+    """
+    if not prices or len(prices) < 5:
+        return False
+    for i in range(1, len(prices)):
+        a, b = prices[i - 1], prices[i]
+        if not a or not b or a <= 0:
+            continue
+        if abs(b - a) / a > 0.45:
+            return True
+    return False
+
+def _index_levels_compatible(older: list, newer: list, tol: float = 0.25) -> bool:
+    """Reject merge when DB prefix and Upstox/Yahoo tail are different scales."""
+    if not older or not newer or len(older) < 5 or len(newer) < 5:
+        return False
+    a = sum(older[-5:]) / 5
+    b = sum(newer[:5]) / 5
+    if a <= 0 or b <= 0:
+        return False
+    return abs(a - b) / max(a, b) <= tol
+
+async def refresh_mid_smallcap_benchmarks(session: aiohttp.ClientSession) -> None:
+    """
+    Populate midcap_cache / smallcap_cache from the OFFICIAL Nifty Midcap 150
+    and Nifty Smallcap 250 index series (Upstox + clean DB/Yahoo history).
+
+    Previously these caches were rebuilt from equal-weight averages of
+    constituent stock prices and naively spliced onto Yahoo index history
+    stored under the same DB keys — different absolute levels, one stitch
+    jump, and MID/SML RS went wrong for most stocks.
+    """
+    global midcap_cache, smallcap_cache
+
+    yahoo_cache: dict = {}  # lazy one-shot Yahoo refill if DB was corrupted
+
+    async def _resolve(name: str, synth_symbols: list, min_stocks: int) -> list:
+        fresh = list(index_history_cache.get(name, {}).get('prices') or [])
+        db = await load_index_history_from_db(session, name)
+        db_was_corrupt = False
+        if db and _index_series_has_corrupt_jumps(db):
+            log.warning(f"  ⚠️ Discarding corrupted {name} DB history "
+                        f"({len(db)}d — synthetic/index scale stitch detected)")
+            db = []
+            db_was_corrupt = True
+        if fresh and _index_series_has_corrupt_jumps(fresh):
+            log.warning(f"  ⚠️ Discarding corrupt Upstox {name} series")
+            fresh = []
+
+        # If we threw away a corrupt DB series and Upstox is short/missing,
+        # re-pull official Yahoo history once (same source as load_full_history_once).
+        if db_was_corrupt and len(fresh) < 252:
+            if not yahoo_cache:
+                try:
+                    yahoo_cache.update(await fetch_full_nifty_history(session) or {})
+                except Exception as e:
+                    log.warning(f"  Yahoo Mid/Small refill failed: {e}")
+            y = yahoo_cache.get(name) or []
+            if y and not _index_series_has_corrupt_jumps(y):
+                if not fresh or len(y) > len(fresh):
+                    fresh = list(y)
+                    log.info(f"  ✅ {name}: rebuilt from Yahoo after discarding corrupt DB ({len(fresh)}d)")
+
+        merged: list = []
+        used_synth = False
+        if db and fresh and len(db) > len(fresh):
+            overlap_old = db[-len(fresh):]
+            if _index_levels_compatible(overlap_old, fresh) and not _index_series_has_corrupt_jumps(db[:-len(fresh)] + fresh):
+                merged = db[:-len(fresh)] + fresh
+                log.info(f"  ✅ {name}: {len(merged)}d (DB seed {len(db)-len(fresh)}d + fresh {len(fresh)}d)")
+            else:
+                merged = fresh
+                log.warning(f"  ⚠️ {name}: DB scale incompatible with fresh — using Upstox/Yahoo only ({len(fresh)}d)")
+        elif fresh:
+            merged = fresh
+            log.info(f"  ✅ {name}: {len(merged)}d from Upstox/Yahoo")
+        elif db:
+            merged = db
+            log.info(f"  ✅ {name}: {len(merged)}d from DB only")
+        else:
+            synth = build_synthetic_index(list(synth_symbols), historical_cache, min_stocks=min_stocks)
+            merged = synth.get('prices') or []
+            used_synth = bool(merged)
+            if merged:
+                log.warning(f"  ⚠️ {name}: official index unavailable — "
+                            f"temporary equal-weight synthetic fallback ({len(merged)}d)")
+
+        # Persist clean official series so the next restart doesn't re-use
+        # the corrupted stitch. Never write synthetic under the official name.
+        if merged and not used_synth and not _index_series_has_corrupt_jumps(merged):
+            await save_index_history_to_db(session, name, merged)
+        return merged
+
+    mid_prices = await _resolve("Midcap 150", MIDCAP, 50)
+    sml_prices = await _resolve("Smallcap 250", SMALLCAP, 80)
+    midcap_cache = {'prices': mid_prices}
+    smallcap_cache = {'prices': sml_prices}
+    log.info(f"✅ Midcap benchmark: {len(mid_prices)}d | Smallcap benchmark: {len(sml_prices)}d")
 
 def calc_live_raw_rs_today(prices: list, bench_prices: list,
                             live_price: float, live_bench_price: float) -> Optional[float]:
@@ -3441,7 +3549,8 @@ async def load_index_cache(session: aiohttp.ClientSession):
                 log.warning(f"Index {name} error: {e}")
             await asyncio.sleep(0.2)
         if not success:
-            log.warning(f"⚠️ Index {name}: all key formats failed — MID/SML RS will use Nifty as fallback")
+            log.warning(f"⚠️ Index {name}: all key formats failed"
+                        + (" — MID/SML RS will fall back to Yahoo/DB or synthetic" if name in ("Midcap 150", "Smallcap 250", "Microcap 250") else ""))
     log.info(f"✅ Index cache loaded: {loaded}/{len(INDEX_TRACKER)} indices")
 
 async def load_index_history_from_db(session: aiohttp.ClientSession, name: str) -> list:
@@ -3780,23 +3889,12 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
     except Exception as e:
         log.warning(f"Live Nifty fetch failed: {e}")
 
-    # Live synthetic Midcap 150 / Smallcap 250 values — same simple-average
-    # method as build_synthetic_index (the historical version), just using
-    # this scan's live prices instead of historical closes. Lets RS-TV's
-    # Midcap/Smallcap-benchmarked variants also react intraday, not just
-    # the Nifty-benchmarked one.
-    def _live_synthetic_price(symbols, min_stocks=20):
-        vals = [live_data[s]['last_price'] for s in symbols
-                if s in live_data and live_data[s].get('last_price')]
-        return (sum(vals) / len(vals)) if len(vals) >= min_stocks else None
-
-    live_midcap_price   = _live_synthetic_price(MIDCAP)
-    live_smallcap_price = _live_synthetic_price(SMALLCAP)
-
     # Live prices for ALL tracked indices (Index Dashboard page) — same
     # normalized-key matching as the Nifty fetch above. Also splits the
     # request into two batches: index quote requests can partially fail
     # as a group, and a smaller batch reduces blast radius.
+    # Midcap 150 / Smallcap 250 live quotes from this block also drive
+    # intraday MID/SML RS (must match the official historical series).
     global _live_index_debug_count
     live_index_data: dict = {}
     try:
@@ -3829,6 +3927,17 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
                      + (f" — missing: {missing}" if missing else ""))
     except Exception as e:
         log.warning(f"Live index prices fetch failed: {e}")
+
+    # Prefer official live Midcap/Smallcap index quotes for MID/SML RS.
+    # Equal-weight synthetic average of constituents is a last-resort only
+    # (different level/weighting vs the official series used historically).
+    def _live_synthetic_price(symbols, min_stocks=20):
+        vals = [live_data[s]['last_price'] for s in symbols
+                if s in live_data and live_data[s].get('last_price')]
+        return (sum(vals) / len(vals)) if len(vals) >= min_stocks else None
+
+    live_midcap_price   = live_index_data.get('Midcap 150')   or _live_synthetic_price(MIDCAP)
+    live_smallcap_price = live_index_data.get('Smallcap 250') or _live_synthetic_price(SMALLCAP)
 
     if live_data:
         sample = list(live_data.keys())[:3]
@@ -3863,20 +3972,9 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             await load_nifty_cache(session)
             await load_index_cache(session)
             last_eod_refresh_date = today_ist_check
-            # Rebuild synthetic indices with fresh EOD data
-            global midcap_cache, smallcap_cache
-            fresh_mid = build_synthetic_index(list(MIDCAP),   historical_cache, min_stocks=50)
-            fresh_sml = build_synthetic_index(list(SMALLCAP), historical_cache, min_stocks=80)
-            db_mid = await load_index_history_from_db(session, "Midcap 150")
-            db_sml = await load_index_history_from_db(session, "Smallcap 250")
-            def merge_p(db, fresh):
-                fp = fresh.get('prices', [])
-                return db[:-len(fp)] + fp if db and len(db) > len(fp) else fp
-            midcap_cache   = {'prices': merge_p(db_mid, fresh_mid)}
-            smallcap_cache = {'prices': merge_p(db_sml, fresh_sml)}
-            if midcap_cache['prices']:   await save_index_history_to_db(session, "Midcap 150",   midcap_cache['prices'])
-            if smallcap_cache['prices']: await save_index_history_to_db(session, "Smallcap 250", smallcap_cache['prices'])
-            log.info(f"  Indices rebuilt: Mid={len(midcap_cache['prices'])}d Sml={len(smallcap_cache['prices'])}d")
+            # Refresh official Midcap 150 / Smallcap 250 benchmarks (not
+            # synthetic constituent averages — those were corrupting MID/SML RS).
+            await refresh_mid_smallcap_benchmarks(session)
 
     # Step 3: DO NOT mutate historical_cache prices in place (was causing chg% drift).
     # Instead, keep historical close as the immutable baseline and use live price
@@ -3958,8 +4056,10 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         # IBD-style percentile-rank scale that didn't match the Pine
         # Script numbers at all (e.g. showing 96 while RS-TV showed 72).
         nifty_prices    = nifty_cache.get('prices', [])
-        midcap_prices   = midcap_cache.get('prices', [])   or nifty_prices
-        smallcap_prices = smallcap_cache.get('prices', []) or nifty_prices
+        # Do NOT fall back to Nifty for Mid/Small — that made MID/SML RS
+        # identical to Nifty RS and looked "wrong" for most stocks.
+        midcap_prices   = midcap_cache.get('prices', []) or []
+        smallcap_prices = smallcap_cache.get('prices', []) or []
 
         # Compute the raw series ONCE per stock, reuse for current value,
         # 15-day history, and (via debug block below) diagnostics — avoids
@@ -5716,35 +5816,12 @@ async def run_live_scan_service():
         log.info("Loading historical data cache at startup…")
         await load_historical_cache(session)
 
-        # Step 3b: Build synthetic Midcap/Smallcap indices AFTER history is loaded
-        global midcap_cache, smallcap_cache
-
-        # Build fresh from constituents
-        fresh_mid = build_synthetic_index(list(MIDCAP),   historical_cache, min_stocks=50)
-        fresh_sml = build_synthetic_index(list(SMALLCAP), historical_cache, min_stocks=80)
-
-        # Merge with accumulated DB history
-        db_mid = await load_index_history_from_db(session, "Midcap 150")
-        db_sml = await load_index_history_from_db(session, "Smallcap 250")
-
-        def merge_prices(db, fresh):
-            fp = fresh.get('prices', [])
-            if db and len(db) > len(fp):
-                return db[:-len(fp)] + fp
-            return fp
-
-        mid_prices = merge_prices(db_mid, fresh_mid)
-        sml_prices = merge_prices(db_sml, fresh_sml)
-
-        midcap_cache   = {'prices': mid_prices}
-        smallcap_cache = {'prices': sml_prices}
-
-        # Save back to DB
-        if mid_prices: await save_index_history_to_db(session, "Midcap 150",   mid_prices)
-        if sml_prices: await save_index_history_to_db(session, "Smallcap 250", sml_prices)
-
-        log.info(f"✅ Midcap index: {len(mid_prices)}d (DB had {len(db_mid)}d)")
-        log.info(f"✅ Smallcap index: {len(sml_prices)}d (DB had {len(db_sml)}d)")
+        # Step 3b: Official Midcap 150 / Smallcap 250 benchmarks for MID/SML RS.
+        # load_index_cache (above) already pulled Upstox history into
+        # index_history_cache; load_full_history_once may have Yahoo/DB.
+        # refresh_* merges those cleanly and discards any previously
+        # corrupted synthetic-stitched series in Supabase.
+        await refresh_mid_smallcap_benchmarks(session)
 
         # Step 3c: Load full 2yr history at startup — from Supabase first
         # (fast, zero Yahoo calls), falling back to Yahoo only for symbols
