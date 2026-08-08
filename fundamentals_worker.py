@@ -267,14 +267,37 @@ def _parse_iso_ts(value):
 def _gemini_api_key(feature: str = '') -> str:
     """Resolve API key for a use-case (single key — legacy / non-batch features).
     Order: GEMINI_API_KEY_<FEATURE> → GEMINI_API_KEY.
+    About also checks Railway Key1 / KEY1 / GEMINI_API_KEY_KEY1 first.
     Features: ABOUT, PPT, TRANSCRIPT, RESULTS, VALUATION, THEMES,
     FLAGS, HIGHLIGHTS, ASKS."""
     feat = (feature or '').strip().upper()
+    if feat == 'ABOUT':
+        dedicated = _gemini_about_dedicated_key()
+        if dedicated:
+            return dedicated
     if feat:
         specific = (os.getenv(f'GEMINI_API_KEY_{feat}') or '').strip()
         if specific:
             return specific
     return (os.getenv('GEMINI_API_KEY') or '').strip()
+
+
+def _gemini_about_dedicated_key() -> str:
+    """About-only key — Railway var Key1 (fresh quota), not shared round-robin."""
+    for name in ('Key1', 'KEY1', 'GEMINI_API_KEY_KEY1'):
+        k = (os.getenv(name) or '').strip()
+        if k:
+            return k
+    return (os.getenv('GEMINI_API_KEY_ABOUT') or '').strip()
+
+
+def _gemini_about_key_source() -> str:
+    for name in ('Key1', 'KEY1', 'GEMINI_API_KEY_KEY1'):
+        if (os.getenv(name) or '').strip():
+            return name
+    if (os.getenv('GEMINI_API_KEY_ABOUT') or '').strip():
+        return 'GEMINI_API_KEY_ABOUT'
+    return ''
 
 
 _GEMINI_BATCH_KEY_POOL: tuple[str, ...] | None = None
@@ -368,7 +391,10 @@ def _gemini_api_key_any(*features: str) -> str:
 
 
 def _gemini_api_key_about() -> str:
-    """Company Overview / About — first key in shared batch pool (if any)."""
+    """Company Overview / About — dedicated Key1 when set, else shared pool."""
+    dedicated = _gemini_about_dedicated_key()
+    if dedicated:
+        return dedicated
     pool = _gemini_batch_key_pool()
     if pool:
         return pool[0]
@@ -3941,7 +3967,7 @@ async def extract_about_company(session: aiohttp.ClientSession, symbol: str, ppt
     Returns {'about': dict|None, 'error': bool, 'rate_limited': bool}."""
     error_result = {'about': None, 'error': True, 'rate_limited': False}
     no_content_result = {'about': None, 'error': False, 'rate_limited': False}
-    api_key = _gemini_api_key_next('ABOUT')
+    api_key = _gemini_api_key_about()
     if not api_key:
         return error_result
 
@@ -5747,11 +5773,10 @@ async def fundamentals_worker_main():
     if pool:
         log.info(f"  📘 About/Results/PPT/concall Gemini pool: "
                  f"{_gemini_keys_fingerprint_summary(pool)}")
-    about_src = ('GEMINI_API_KEY_ABOUT'
-                 if (os.getenv('GEMINI_API_KEY_ABOUT') or '').strip()
-                 else ('shared-pool' if pool else 'none'))
+    about_src = _gemini_about_key_source() or ('shared-pool' if pool else 'none')
     log.info(f"  📘 About will call Gemini with {about_src} "
-             f"{_gemini_key_fingerprint(about_k)} (round-robin across pool)")
+             f"{_gemini_key_fingerprint(about_k)}"
+             f"{' (dedicated — not round-robin)' if _gemini_about_key_source() else ' (round-robin across pool)'}")
     if _about_company_manually_paused():
         left = max(0, int((_ABOUT_ENV_PAUSE_UNTIL or 0) - time.time()))
         log.warning(f"  📘 About-company: paused ~{left // 3600}h "
