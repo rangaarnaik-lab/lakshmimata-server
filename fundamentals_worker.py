@@ -235,8 +235,10 @@ def _gemini_key_fingerprint(api_key: str) -> str:
 
 
 def _gemini_semaphore_for(api_key: str) -> asyncio.Semaphore:
-    # Catchup default 2 so Results can use two free-tier slots when key allows.
-    n = max(1, int(os.getenv('GEMINI_MAX_CONCURRENT', '2')))
+    # Default 1 — one Gemini call at a time is more reliable on free tier
+    # (less 429 / INVALID_ARGUMENT pile-ups). Raise GEMINI_MAX_CONCURRENT
+    # only when the key clearly has headroom.
+    n = max(1, int(os.getenv('GEMINI_MAX_CONCURRENT', '1')))
     store = getattr(_gemini_semaphore_for, '_store', None)
     if store is None:
         store = {}
@@ -1358,24 +1360,27 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
         # big batch, one filing per symbol). Steady-state stays modest.
         catchup = _results_catchup_boosted()
         if catchup:
-            BATCH_SIZE = int(os.getenv('RESULTS_PDF_CATCHUP_BATCH_SIZE',
-                                       os.getenv('RESULTS_PDF_BATCH_SIZE', '40')))
+            # One stock per cycle by default — steadier free-tier progress
+            # than batching 10+ (bad PDFs were burning multiple slots/cycle).
+            # Do NOT fall through to RESULTS_PDF_BATCH_SIZE — that env is often
+            # left at 10 from older deploys and would defeat one-at-a-time.
+            BATCH_SIZE = int(os.getenv('RESULTS_PDF_CATCHUP_BATCH_SIZE', '1'))
             candidates_limit = int(os.getenv('RESULTS_PDF_CATCHUP_CANDIDATES_LIMIT',
                                              os.getenv('RESULTS_PDF_CANDIDATES_LIMIT', '12000')))
             lookback_days = int(os.getenv('RESULTS_PDF_CATCHUP_LOOKBACK_DAYS',
                                           os.getenv('RESULTS_PDF_LOOKBACK_DAYS', '365')))
             pacing = float(os.getenv('RESULTS_PDF_CATCHUP_PACING_SECONDS',
-                                     os.getenv('RESULTS_PDF_PACING_SECONDS', '4')))
+                                     os.getenv('RESULTS_PDF_PACING_SECONDS', '3')))
         else:
-            BATCH_SIZE = int(os.getenv('RESULTS_PDF_BATCH_SIZE', '5'))
+            BATCH_SIZE = int(os.getenv('RESULTS_PDF_BATCH_SIZE', '1'))
             candidates_limit = int(os.getenv('RESULTS_PDF_CANDIDATES_LIMIT', '2000'))
             lookback_days = int(os.getenv('RESULTS_PDF_LOOKBACK_DAYS', '90'))
-            pacing = float(os.getenv('RESULTS_PDF_PACING_SECONDS', '8'))
+            pacing = float(os.getenv('RESULTS_PDF_PACING_SECONDS', '5'))
         if not _key_status_logged or catchup:
             log.info(f"🎙️ Results extraction loop: active "
                       f"(catchup={catchup}, lookback={lookback_days}d, batch={BATCH_SIZE}, "
                       f"candidates_limit={candidates_limit}, pacing={pacing}s, "
-                      f"gemini_concurrent={os.getenv('GEMINI_MAX_CONCURRENT', '2')})")
+                      f"gemini_concurrent={os.getenv('GEMINI_MAX_CONCURRENT', '1')})")
             _key_status_logged = True
         try:
             since = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat()
