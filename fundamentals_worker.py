@@ -935,7 +935,9 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
     except Exception as e:
         log.warning(f"⚠️ Results PDF download failed for {symbol}: {type(e).__name__}: {e}")
         return error_result
-    if len(pdf_bytes) > 15_000_000:  # sanity cap - this one IS a genuine "won't process" case, safe to mark done
+    # Gemini inline PDF ~20MB request limit; base64 expands ~4/3, so keep
+    # raw PDF under ~12MB to avoid 400 INVALID_ARGUMENT loops.
+    if len(pdf_bytes) > 12_000_000:
         log.warning(f"⚠️ Results PDF too large for {symbol} ({len(pdf_bytes)} bytes) - skipping")
         return no_content_result
     pdf_b64 = base64.b64encode(pdf_bytes).decode('ascii')
@@ -1056,6 +1058,12 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
                             + f": {(body or '')[:180]}")
             else:
                 log.warning(f"⚠️ Gemini results extraction failed for {symbol} ({status}): {(body or '')[:200]}")
+            # 400 INVALID_ARGUMENT is permanent (bad/unsupported PDF for
+            # Gemini inline). Treating it as transient made RATNAMANI /
+            # IXIGO / SELMC burn a batch slot every cycle forever.
+            if status == 400:
+                log.warning(f"⚠️ {symbol}: Gemini rejected PDF (400) — marking skipped, will not retry")
+                return no_content_result
             return {
                 **error_result,
                 'rate_limited': pause,
