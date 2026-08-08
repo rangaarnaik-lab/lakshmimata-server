@@ -79,6 +79,7 @@ __all__ = [
     '_ANN_POSITIVE_PATTERNS',
     '_LAST_AI_PICKS_TS',
     '_LAST_FUNDAMENTALS_SYNC_TS',
+    '_LAST_RESULTS_DATES_SYNC_TS',
     '_MONTH_NAMES',
     '_NSE_ANNOUNCEMENTS_HEADER_SETS',
     '_ORDER_CANCEL_PATTERNS',
@@ -138,6 +139,7 @@ __all__ = [
     'last_eod_refresh_date',
     'last_eod_archive_ok_date',
     'load_fundamentals_batch',
+    'latest_results_cache',
     'load_fundamentals_from_supabase',
     'load_instrument_master',
     'log',
@@ -406,6 +408,7 @@ _SCREENER_HEADER_SETS = [
 
 # Cache fundamentals to avoid re-fetching every minute
 fundamentals_cache: dict = {}  # sym -> {market_cap, pe, roe, eps, debt_eq, promoter, fetched_at}
+latest_results_cache: dict = {}  # sym -> {period_ended, filed_at} — most recent quarterly results
 FUNDAMENTALS_TTL = 30 * 24 * 3600  # refresh monthly (data changes quarterly; monthly is a safe margin without re-fetching on every restart)
 
 _fundamentals_debug_count = 0  # caps detailed per-request diagnostic logging
@@ -462,6 +465,8 @@ _R2_STOCK_FIELDS = frozenset({
     'pb','roce','industry_pe','div_yield','cfo','fcf','cfo_pat',
     'nim','gnpa','nnpa','car','casa',
     'fundamental_score','fundamental_label',
+    'is_pead','days_since_results','last_results_date',
+    'is_canslim','canslim_score','canslim_flags',
     'ai_highlights','ai_key_metrics','ai_highlights_at',
     'emerging_themes','theme_evidence','theme_intensity',
     'themes_source','themes_at','themes_announced_at',
@@ -594,6 +599,7 @@ index_key_map: dict = {}     # normalized index name -> instrument key (e.g. NSE
 _LAST_AI_PICKS_TS = 0.0
 _zero_chg_debug_count = 0  # reset each run_scan cycle — caps zero-chg diagnostic logging
 _LAST_FUNDAMENTALS_SYNC_TS = 0.0
+_LAST_RESULTS_DATES_SYNC_TS = 0.0
 _AI_PICKS_REFRESH_INTERVAL_SEC = 3600  # ranking + rationale refresh at most hourly
 _AI_PICKS_TOP_N = 30
 
