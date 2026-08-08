@@ -86,7 +86,7 @@ def _set_results_catchup_idle(idle: bool, *, lookback_days: int | None = None,
                          f"{f', already={already}' if already is not None else ''})")
             log.info(f"🎙️ Results catchup idle{extra} — "
                      f"About Company may populate every "
-                     f"{int(os.getenv('ABOUT_COMPANY_CYCLE_SECONDS', '900'))}s")
+                     f"{int(os.getenv('ABOUT_COMPANY_CYCLE_SECONDS', '180'))}s")
             _RESULTS_CATCHUP_IDLE_LOGGED = True
     elif not _RESULTS_CATCHUP_IDLE and was:
         _RESULTS_CATCHUP_IDLE_LOGGED = False
@@ -179,7 +179,7 @@ def _about_company_manually_paused() -> bool:
         if not _ABOUT_ENV_PAUSE_RESUME_LOGGED:
             _ABOUT_ENV_PAUSE_RESUME_LOGGED = True
             log.info("▶️ About-company: Results catchup over — starting Company Overview "
-                     f"(every {int(os.getenv('ABOUT_COMPANY_CYCLE_SECONDS', '900'))}s)")
+                     f"(every {int(os.getenv('ABOUT_COMPANY_CYCLE_SECONDS', '180'))}s)")
         return False
     if time.time() < _ABOUT_ENV_PAUSE_UNTIL:
         return True
@@ -5150,7 +5150,7 @@ async def _about_company_loop(session: aiohttp.ClientSession):
             continue
         if _pause_logged:
             log.info("▶️ About-company: resuming — populating Company Overview "
-                     f"every {int(os.getenv('ABOUT_COMPANY_CYCLE_SECONDS', '900'))}s")
+                     f"every {int(os.getenv('ABOUT_COMPANY_CYCLE_SECONDS', '180'))}s")
         _pause_logged = False
         if await _idle_if_gemini_paused('about', 'About-company loop'):
             continue
@@ -5163,10 +5163,10 @@ async def _about_company_loop(session: aiohttp.ClientSession):
         # 5 stocks per cycle (3 in parallel). Override via env if needed.
         BATCH_SIZE = int(os.getenv('ABOUT_COMPANY_BATCH_SIZE', '5'))
         CONCURRENCY = max(1, int(os.getenv('ABOUT_COMPANY_CONCURRENCY', '3')))
-        # After Results catchup: populate Company Overview every 15 min by default.
+        # After Results catchup: populate Company Overview every 3 min by default.
         cycle_secs = int(os.getenv(
             'ABOUT_COMPANY_CYCLE_SECONDS',
-            '900' if _results_catchup_over() else '15'))
+            '180' if _results_catchup_over() else '15'))
         if not _key_status_logged:
             _web = os.getenv('ABOUT_COMPANY_WEB_SEARCH', '0')
             _about_k = _gemini_api_key_about()
@@ -5298,9 +5298,11 @@ async def _about_company_loop(session: aiohttp.ClientSession):
             existing_map[sym] = r
             if r.get('status') in ('done', 'skipped'):
                 _ABOUT_DONE_SYMS.add(sym)
+        universe_syms = set(ppt_by_sym) | set(tx_by_sym) | set(fund_by_sym) | set(meta_by_sym)
         _done_n = sum(1 for r in existing_map.values() if r.get('status') == 'done')
         log.info(f"📘 About-company: loaded {len(existing_map)} row(s), "
-                 f"{_done_n} done, in-memory skip={len(_ABOUT_DONE_SYMS)}")
+                 f"{_done_n} done, in-memory skip={len(_ABOUT_DONE_SYMS)}, "
+                 f"universe≈{len(universe_syms)}")
 
         # Priority: ABOUT_PRIORITY_SYMBOLS → filings → large-cap → rest.
         _prio = {
@@ -5357,6 +5359,7 @@ async def _about_company_loop(session: aiohttp.ClientSession):
                            sym, ppt, tx, src_at))
         ranked.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
         todo = [(sym, ppt, tx, src_at) for _, _, _, sym, ppt, tx, src_at in ranked[:BATCH_SIZE]]
+        missing_about_n = len(ranked)
 
         if todo:
             _web = os.getenv('ABOUT_COMPANY_WEB_SEARCH', '0')
@@ -5365,10 +5368,14 @@ async def _about_company_loop(session: aiohttp.ClientSession):
             _next = todo[0][0] if todo else '?'
             _why = (meta_by_sym.get(_next) or {}).get('_about_reason', '?')
             log.info(f"📘 About-company loop: {len(todo)} symbol(s) to generate "
-                      f"({_mode}; next={_next} reason={_why}; backlog≈{len(ranked)}; "
+                      f"({_mode}; next={_next} reason={_why}; "
+                      f"missing_about≈{missing_about_n}, done={_done_n}, "
+                      f"universe≈{len(universe_syms)}; "
                       f"key={_gemini_key_fingerprint(_gemini_api_key_about())})")
         else:
-            log.info("📘 About-company loop: nothing new")
+            log.info(f"📘 About-company loop: nothing new "
+                      f"(missing_about≈{missing_about_n}, done={_done_n}, "
+                      f"universe≈{len(universe_syms)})")
 
         hit_gemini_pause = False
         hit_hard_quota = False
@@ -5555,28 +5562,34 @@ async def _about_company_loop(session: aiohttp.ClientSession):
             _ABOUT_GEMINI_UNHEALTHY_SINCE = None
             _ABOUT_GEMINI_HARD_QUOTA = False
             _ABOUT_YIELD_TO_RESULTS_UNTIL = None
-            # After Results catchup: default 15 min between Company Overview batches.
+            # After Results catchup: default 3 min between Company Overview batches.
             cycle = int(os.getenv(
                 'ABOUT_COMPANY_CYCLE_SECONDS',
-                '900' if _results_catchup_over() else '15'))
+                '180' if _results_catchup_over() else '15'))
+            log.info(f"📘 About-company: batch complete "
+                      f"(missing_about≈{max(0, missing_about_n - gemini_ok)}, "
+                      f"done={_done_n + gemini_ok}, universe≈{len(universe_syms)}) "
+                      f"— next batch in {max(15, cycle)}s")
             await asyncio.sleep(max(15, cycle))
         elif not ranked:
             # All candidates done (or skipped). Recheck for new listings —
-            # every 15 min once Results is over, else long idle.
+            # every 3 min once Results is over, else long idle.
             idle = int(os.getenv(
                 'ABOUT_COMPANY_CATCHUP_DONE_SECONDS',
-                '900' if _results_catchup_over() else '21600'))
+                '180' if _results_catchup_over() else '21600'))
             log.info(f"📘 About-company: catchup complete "
-                      f"({_done_n} done, universe≈{len(set(ppt_by_sym)|set(tx_by_sym)|set(fund_by_sym)|set(meta_by_sym))}) "
+                      f"(missing_about≈0, done={_done_n}, "
+                      f"universe≈{len(universe_syms)}) "
                       f"— sleeping {idle}s until next refresh check")
             await asyncio.sleep(max(300 if not _results_catchup_over() else 60, idle))
         else:
-            # Transient empty batch — medium idle (15 min after Results over).
+            # Transient empty batch — medium idle (3 min after Results over).
             idle = int(os.getenv(
                 'ABOUT_COMPANY_IDLE_SECONDS',
-                '900' if _results_catchup_over() else '3600'))
+                '180' if _results_catchup_over() else '3600'))
             log.info(f"📘 About-company: nothing to generate "
-                      f"(backlog≈{len(ranked)}) — sleeping {idle}s")
+                      f"(missing_about≈{missing_about_n}, done={_done_n}, "
+                      f"universe≈{len(universe_syms)}) — sleeping {idle}s")
             await asyncio.sleep(max(120 if not _results_catchup_over() else 60, idle))
 
 
