@@ -9,11 +9,20 @@ Production Vercel is wired to `rangaarnaik-lab/Lakshmimata` **main**, which Curs
 
 ## Deploy to production
 
-1. Ensure **lakshmimata-server** repo secrets are set: `VERCEL_TOKEN`, `VERCEL_PROJECT_ID` (and `VERCEL_TEAM_ID` if applicable — copy from Lakshmimata repo secrets).
-2. Merge changes to `main` (patch or workflow), **or** run manually:
-   - [Deploy Lakshmimata Frontend workflow](https://github.com/rangaarnaik-lab/lakshmimata-server/actions/workflows/deploy-lakshmimata-frontend.yml) → **Run workflow**
+### Option A — GitHub Pages (no Vercel secrets)
 
-Merges that touch `deploy/frontend-pead-canslim.patch` or this workflow auto-trigger a production deploy.
+1. Repo **Settings → Pages → Build and deployment → Source: GitHub Actions** (one-time).
+2. Run [Deploy Lakshmimata Frontend](https://github.com/rangaarnaik-lab/lakshmimata-server/actions/workflows/deploy-lakshmimata-frontend.yml) or merge to `main`.
+
+The patched app is published to GitHub Pages even when Vercel secrets are missing.
+
+### Option B — Vercel (pocketrs-pro.vercel.app)
+
+Add `VERCEL_TOKEN` and `VERCEL_PROJECT_ID` to [lakshmimata-server secrets](https://github.com/rangaarnaik-lab/lakshmimata-server/settings/secrets/actions). The same workflow deploys to Vercel when those are set.
+
+## Database backfill (no frontend deploy)
+
+If `opm_pct` is null, production rates strong YoY as Excellent (e.g. APOLLO). Run `backfill_opm_pct.sql` in Supabase or `python3 scripts/backfill_opm_pct.py` — caps those cases to **Good** immediately on the live Vercel app.
 
 ## Regenerate the patch
 
