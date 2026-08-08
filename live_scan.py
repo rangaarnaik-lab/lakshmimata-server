@@ -41,6 +41,10 @@ def _template_pick_reasoning(r: dict) -> str:
         bits.append('EPS growing QoQ & YoY')
     if r.get('promoter_trend') == 'increasing':
         bits.append('promoter buying')
+    if r.get('is_canslim'):
+        bits.append(f"CANSLIM {r.get('canslim_score')}/7")
+    if r.get('is_pead'):
+        bits.append('PEAD')
     if not bits:
         bits.append('high composite score across signals')
     return ' + '.join(bits[:3])
@@ -1298,6 +1302,158 @@ def compute_fundamental_score(row: dict) -> float:
 
     return round(max(0.0, min(100.0, score + 50)), 1)  # centered at 50 so an all-neutral/unknown stock lands "Fair", not "Poor"
 
+def _parse_result_date(s):
+    """Parse financial_results period_ended / filed_at strings."""
+    if not s:
+        return None
+    s = str(s).strip()
+    for fmt, n in (('%d-%b-%Y', 11), ('%Y-%m-%d', 10), ('%d/%m/%Y', 10)):
+        try:
+            return datetime.strptime(s[:n], fmt).date()
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(s.replace('Z', '+00:00')).date()
+    except ValueError:
+        return None
+
+def compute_canslim(row: dict) -> dict:
+    """William O'Neil CANSLIM-style checklist — returns score (0-7),
+    comma-separated flags for letters that pass, and is_canslim when
+    at least 5 of 7 criteria fire. Adapted for Indian market data
+    (FII/DII instead of US institutional holders). Not a buy signal —
+    a confluence tag for growth/momentum screening."""
+    flags = []
+    rs = row.get('rs_tv') if row.get('rs_tv') is not None else row.get('rs')
+
+    eps_qoq, eps_yoy = row.get('eps_qoq'), row.get('eps_yoy')
+    if (isinstance(eps_qoq, (int, float)) and eps_qoq >= 15) or \
+       (isinstance(eps_yoy, (int, float)) and eps_yoy >= 20):
+        flags.append('C')
+
+    streak = row.get('eps_growth_streak')
+    if isinstance(eps_yoy, (int, float)) and eps_yoy >= 20 and \
+       isinstance(streak, (int, float)) and streak >= 2:
+        flags.append('A')
+
+    h52, last = row.get('high_52w'), row.get('last_price')
+    pct_from_high = ((last - h52) / h52 * 100) if h52 and last else None
+    if row.get('is_52wh_breakout') or row.get('is_s2_new_entry') or \
+       (isinstance(pct_from_high, (int, float)) and pct_from_high >= -10):
+        flags.append('N')
+
+    rvol = row.get('rvol')
+    if (isinstance(rvol, (int, float)) and rvol >= 1.3) or \
+       row.get('ibv_signal') or row.get('is_hy') or row.get('is_ht'):
+        flags.append('S')
+
+    if isinstance(rs, (int, float)) and rs >= 80:
+        flags.append('L')
+
+    if row.get('fii_trend') == 'increasing' or row.get('dii_trend') == 'increasing' or \
+       row.get('promoter_trend') == 'increasing':
+        flags.append('I')
+
+    if row.get('weinstein_stage') == 2 and row.get('rs_trend') in ('improving', 'flat', None):
+        flags.append('M')
+
+    score = len(flags)
+    return {
+        'is_canslim': score >= 5,
+        'canslim_score': score,
+        'canslim_flags': ','.join(flags) if flags else None,
+    }
+
+_PEAD_MIN_DAYS = 3
+_PEAD_MAX_DAYS = 60
+
+def compute_pead_tags(row: dict, results_meta: dict = None) -> dict:
+    """Post-Earnings Announcement Drift tag — stock reported within the
+  last ~3-60 days, EPS grew QoQ or YoY, and price/RS still drifting
+  positively. Uses filed_at when available, else period_ended."""
+    empty = {'is_pead': False, 'days_since_results': None, 'last_results_date': None}
+    if not results_meta:
+        return empty
+
+    filed = results_meta.get('filed_at')
+    period = results_meta.get('period_ended')
+    d = _parse_result_date(filed) or _parse_result_date(period)
+    if not d:
+        return empty
+
+    today = datetime.now(IST).date()
+    days = (today - d).days
+    base = {
+        'is_pead': False,
+        'days_since_results': days,
+        'last_results_date': d.isoformat(),
+    }
+    if days < _PEAD_MIN_DAYS or days > _PEAD_MAX_DAYS:
+        return base
+
+    eps_qoq, eps_yoy = row.get('eps_qoq'), row.get('eps_yoy')
+    if not ((isinstance(eps_yoy, (int, float)) and eps_yoy > 0) or
+            (isinstance(eps_qoq, (int, float)) and eps_qoq > 0)):
+        return base
+
+    rs = row.get('rs_tv') if row.get('rs_tv') is not None else row.get('rs')
+    drift = (
+        (isinstance(row.get('chg_m_pct'), (int, float)) and row['chg_m_pct'] > 0) or
+        (isinstance(row.get('chg_w_pct'), (int, float)) and row['chg_w_pct'] > 0) or
+        (isinstance(rs, (int, float)) and rs >= 70) or
+        row.get('rs_trend') == 'improving'
+    )
+    base['is_pead'] = bool(drift)
+    return base
+
+async def load_latest_results_dates(session: aiohttp.ClientSession):
+    """Load most recent financial_results row per symbol (filed_at +
+    period_ended) into latest_results_cache for PEAD tagging."""
+    global latest_results_cache
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    by_sym: dict = {}
+    PAGE = 1000
+    offset = 0
+    while True:
+        try:
+            page_headers = {**headers, "Range": f"{offset}-{offset + PAGE - 1}"}
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/financial_results",
+                params={'select': 'symbol,period_ended,filed_at'},
+                headers=page_headers,
+                timeout=aiohttp.ClientTimeout(total=60),
+            ) as r:
+                if r.status not in (200, 206):
+                    body = await r.text()
+                    log.warning(f"load_latest_results_dates failed: {r.status} {body[:200]}")
+                    break
+                page = await r.json()
+        except Exception as e:
+            log.warning(f"load_latest_results_dates error: {e}")
+            break
+
+        for row in page:
+            sym = (row.get('symbol') or '').upper()
+            if not sym:
+                continue
+            cand_d = _parse_result_date(row.get('filed_at')) or _parse_result_date(row.get('period_ended'))
+            if not cand_d:
+                continue
+            prev = by_sym.get(sym)
+            if not prev:
+                by_sym[sym] = row
+                continue
+            prev_d = _parse_result_date(prev.get('filed_at')) or _parse_result_date(prev.get('period_ended'))
+            if not prev_d or cand_d > prev_d:
+                by_sym[sym] = row
+
+        if len(page) < PAGE:
+            break
+        offset += PAGE
+
+    latest_results_cache = by_sym
+    log.info(f"  📅 Latest results dates loaded for {len(by_sym)} symbols")
+
 def compute_hy_ht_history(prices: list, volumes: list) -> dict:
     """
     Last-10-day history for HY (volume near 52-week max) and HT (volume
@@ -2310,6 +2466,21 @@ async def ensure_db_columns(session: aiohttp.ClientSession):
                 log.error("   NOTIFY pgrst, 'reload schema';")
     except Exception as e:
         log.warning(f"DB column check error (is_52wh_breakout): {e}")
+
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/stocks?select=is_pead,is_canslim&limit=1",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ DB columns OK — is_pead / is_canslim columns exist")
+            elif r.status == 400:
+                log.error("❌ PEAD/CANSLIM columns MISSING from stocks table! "
+                          "The per-scan upsert may be failing until this is fixed.")
+                log.error("   → Go to Supabase SQL Editor and run add_pead_canslim.sql")
+    except Exception as e:
+        log.warning(f"DB column check error (pead/canslim): {e}")
 
 
     try:
@@ -4562,6 +4733,8 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
     for row in processed:
         row['fundamental_score'] = compute_fundamental_score(row)
         row['fundamental_label'] = fundamental_score_label(row['fundamental_score'])
+        row.update(compute_canslim(row))
+        row.update(compute_pead_tags(row, latest_results_cache.get(row['sym'])))
 
     # Step 5.3: Periodic fundamentals-cache sync from Supabase — NOT a
     # rescrape, just a cheap read. This live-scan process only ever
@@ -4577,7 +4750,7 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
     # load_fundamentals_from_supabase() makes no Screener.in/Upstox
     # calls of its own, so syncing hourly costs nothing at the API
     # level — it just keeps this process's in-memory view current.
-    global _LAST_FUNDAMENTALS_SYNC_TS
+    global _LAST_FUNDAMENTALS_SYNC_TS, _LAST_RESULTS_DATES_SYNC_TS
     if time.time() - _LAST_FUNDAMENTALS_SYNC_TS > 3600:
         try:
             await load_fundamentals_from_supabase(session)
@@ -4585,6 +4758,12 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             log.info("  🔄 Fundamentals cache synced from Supabase")
         except Exception as e:
             log.warning(f"⚠️ Fundamentals cache sync failed: {e}")
+    if time.time() - _LAST_RESULTS_DATES_SYNC_TS > 3600:
+        try:
+            await load_latest_results_dates(session)
+            _LAST_RESULTS_DATES_SYNC_TS = time.time()
+        except Exception as e:
+            log.warning(f"⚠️ Results dates cache sync failed: {e}")
 
     # Step 5.35: AI Best Picks — composite score + AI rationale for the
     # top candidates, recomputed at most once per hour (ranking doesn't
@@ -5018,6 +5197,9 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'cfo', 'fcf', 'cfo_pat',
             'nim', 'gnpa', 'nnpa', 'car', 'casa',
             'peg_ratio',
+            # PEAD / CANSLIM strategy tags (add_pead_canslim.sql)
+            'is_pead', 'days_since_results', 'last_results_date',
+            'is_canslim', 'canslim_score', 'canslim_flags',
         }
         history_rows = []
         for p in processed:
@@ -5907,6 +6089,11 @@ async def run_live_scan_service():
         except Exception as e:
             import traceback
             log.error(f"Startup fundamentals load error: {e}\n{traceback.format_exc()}")
+
+        try:
+            await load_latest_results_dates(session)
+        except Exception as e:
+            log.warning(f"Startup results-dates load error (non-fatal): {e}")
 
         log.info("✅ Proceeding to initial scan…")
 
