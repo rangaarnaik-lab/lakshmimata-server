@@ -1,5 +1,8 @@
 {
   "name": "Lakshmimata (server + frontend)",
+  "repositoryDependencies": [
+    "github.com/rangaarnaik-lab/Lakshmimata"
+  ],
   "install": "./.cursor/scripts/install.sh",
   "terminals": [
     {
