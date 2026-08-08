@@ -80,21 +80,27 @@ def _gemini_jobs_hard_paused() -> bool:
 
 
 def _gemini_jobs_hard_pause_seconds() -> int:
-    return max(3600, int(os.getenv(
+    # Billing/hard quota only — default 2h (was 24h; overnight catchup stalled).
+    return max(900, int(os.getenv(
         'GEMINI_JOBS_HARD_PAUSE_SECONDS',
-        os.getenv('RESULTS_HARD_QUOTA_COOLDOWN_SECONDS', '86400'))))  # 24h
+        os.getenv('RESULTS_HARD_QUOTA_COOLDOWN_SECONDS', '7200'))))  # 2h
+
+
+def _gemini_jobs_soft_pause_seconds() -> int:
+    """Short RPM 429 backoff — keep catchup moving overnight."""
+    return max(60, int(os.getenv('GEMINI_JOBS_SOFT_PAUSE_SECONDS', '180')))  # 3m
 
 
 def _begin_gemini_jobs_hard_pause(reason: str, seconds: int | None = None):
-    """Stop every Gemini worker loop — Results failing means stop burning quota.
+    """Park Gemini batch loops after hard billing quota.
     After the sleep window, About + Results auto-resume (no redeploy needed)."""
     global _GEMINI_JOBS_PAUSED_UNTIL, _ABOUT_YIELD_TO_RESULTS_UNTIL
-    sec = _gemini_jobs_hard_pause_seconds() if seconds is None else max(3600, int(seconds))
+    sec = _gemini_jobs_hard_pause_seconds() if seconds is None else max(900, int(seconds))
     _GEMINI_JOBS_PAUSED_UNTIL = time.time() + sec
     # Don't yield About→Results while the whole Gemini job is dead.
     _ABOUT_YIELD_TO_RESULTS_UNTIL = None
     log.error(
-        f"🛑 Gemini jobs HARD STOP for {sec}s (~{sec // 3600}h) — {reason}. "
+        f"🛑 Gemini jobs HARD STOP for {sec}s (~{sec / 3600:.1f}h) — {reason}. "
         f"About + Results will auto-start again after "
         f"{datetime.fromtimestamp(_GEMINI_JOBS_PAUSED_UNTIL, tz=timezone.utc).isoformat()}. "
         f"Override with GEMINI_JOBS_HARD_PAUSE_SECONDS.")
@@ -229,7 +235,8 @@ def _gemini_key_fingerprint(api_key: str) -> str:
 
 
 def _gemini_semaphore_for(api_key: str) -> asyncio.Semaphore:
-    n = max(1, int(os.getenv('GEMINI_MAX_CONCURRENT', '1')))
+    # Catchup default 2 so Results can use two free-tier slots when key allows.
+    n = max(1, int(os.getenv('GEMINI_MAX_CONCURRENT', '2')))
     store = getattr(_gemini_semaphore_for, '_store', None)
     if store is None:
         store = {}
@@ -1300,12 +1307,14 @@ async def _fetch_results_announcement_candidates(
 
 
 def _results_catchup_boosted() -> bool:
-    """High-throughput Results PDF mode while About is stopped / yielded,
-    or RESULTS_PDF_CATCHUP=1 for a dedicated catchup deploy."""
-    if _about_company_manually_paused():
-        return True
-    v = (os.getenv('RESULTS_PDF_CATCHUP') or '').strip().lower()
+    """High-throughput Results PDF mode — ON by default until backlog is cleared.
+    Set RESULTS_PDF_CATCHUP=0 to force slow steady-state pacing."""
+    v = (os.getenv('RESULTS_PDF_CATCHUP') or '1').strip().lower()
+    if v in ('0', 'false', 'no', 'off'):
+        return False
     if v in ('1', 'true', 'yes', 'on'):
+        return True
+    if _about_company_manually_paused():
         return True
     until = _ABOUT_YIELD_TO_RESULTS_UNTIL
     return bool(until and time.time() < until)
@@ -1342,13 +1351,13 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
         catchup = _results_catchup_boosted()
         if catchup:
             BATCH_SIZE = int(os.getenv('RESULTS_PDF_CATCHUP_BATCH_SIZE',
-                                       os.getenv('RESULTS_PDF_BATCH_SIZE', '25')))
+                                       os.getenv('RESULTS_PDF_BATCH_SIZE', '40')))
             candidates_limit = int(os.getenv('RESULTS_PDF_CATCHUP_CANDIDATES_LIMIT',
-                                             os.getenv('RESULTS_PDF_CANDIDATES_LIMIT', '10000')))
+                                             os.getenv('RESULTS_PDF_CANDIDATES_LIMIT', '12000')))
             lookback_days = int(os.getenv('RESULTS_PDF_CATCHUP_LOOKBACK_DAYS',
                                           os.getenv('RESULTS_PDF_LOOKBACK_DAYS', '365')))
             pacing = float(os.getenv('RESULTS_PDF_CATCHUP_PACING_SECONDS',
-                                     os.getenv('RESULTS_PDF_PACING_SECONDS', '6')))
+                                     os.getenv('RESULTS_PDF_PACING_SECONDS', '4')))
         else:
             BATCH_SIZE = int(os.getenv('RESULTS_PDF_BATCH_SIZE', '5'))
             candidates_limit = int(os.getenv('RESULTS_PDF_CANDIDATES_LIMIT', '2000'))
@@ -1357,7 +1366,8 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
         if not _key_status_logged or catchup:
             log.info(f"🎙️ Results extraction loop: active "
                       f"(catchup={catchup}, lookback={lookback_days}d, batch={BATCH_SIZE}, "
-                      f"candidates_limit={candidates_limit}, pacing={pacing}s)")
+                      f"candidates_limit={candidates_limit}, pacing={pacing}s, "
+                      f"gemini_concurrent={os.getenv('GEMINI_MAX_CONCURRENT', '2')})")
             _key_status_logged = True
         try:
             since = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat()
@@ -1418,44 +1428,40 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
         else:
             log.info(f"🎙️ Results extraction loop: checked {len(candidates)} announcement(s) "
                       f"({len(concall_rows)} matched, already={len(already)}), nothing new")
+        soft_backoff = False
         for i, row in enumerate(todo):
             if i > 0:
-                # Pacing between calls — free tier ~15 RPM; catchup uses
-                # slightly tighter spacing (default 6s) to clear backlog.
+                # Pacing between calls — catchup default ~4s for free-tier RPM.
                 await asyncio.sleep(pacing)
-            # Prefer the dedicated financial-results feed's PDF link
-            # over the general announcement's attachment when available -
-            # that feed only contains actual results filings (unlike the
-            # general announcements feed, which mixes cover letters/
-            # board-outcome notices under the same 'results' category),
-            # so it's far less likely to hand back a cover-letter-only
-            # document. Falls back to the general announcement's
-            # attachment if the dedicated feed hasn't synced this
-            # filing yet (confirmed lag of up to a few days) or has
-            # nothing for this symbol+period.
             pdf_url = row['attachment_url']
-            period_ended_guess = _extract_period_ended_from_text(row.get('subject') or '')
-            if period_ended_guess:
-                try:
-                    better_url = await fetch_results_pdf_url_for_symbol(
-                        session, row['symbol'], period_ended_guess, debug=False)
-                    if better_url:
-                        pdf_url = better_url
-                except Exception as e:
-                    log.warning(f"⚠️ Dedicated results-feed lookup failed for {row['symbol']}: "
-                                 f"{type(e).__name__}: {e}")
+            # Skip slow NSE results-feed lookup during catchup (attachment URL is enough).
+            if not catchup:
+                period_ended_guess = _extract_period_ended_from_text(row.get('subject') or '')
+                if period_ended_guess:
+                    try:
+                        better_url = await fetch_results_pdf_url_for_symbol(
+                            session, row['symbol'], period_ended_guess, debug=False)
+                        if better_url:
+                            pdf_url = better_url
+                    except Exception as e:
+                        log.warning(f"⚠️ Dedicated results-feed lookup failed for {row['symbol']}: "
+                                     f"{type(e).__name__}: {e}")
             result = await extract_results_from_pdf(session, row['symbol'], pdf_url)
             if result['error']:
-                # Quota / 429 / 5xx → stop ALL Gemini jobs (do not keep burning).
-                if result.get('hard_quota') or result.get('rate_limited'):
-                    why = ('HARD QUOTA' if result.get('hard_quota')
-                           else f"Gemini pause signal on {row['symbol']}")
+                # Billing/hard quota → multi-hour pause. RPM 429 → short backoff only
+                # (24h hard-stop was killing overnight catchup after ~1 failure).
+                if result.get('hard_quota'):
                     _begin_gemini_jobs_hard_pause(
-                        f"Results PDF failed ({why})")
+                        f"Results PDF HARD QUOTA on {row['symbol']}")
+                    break
+                if result.get('rate_limited'):
+                    soft = _gemini_jobs_soft_pause_seconds()
+                    log.warning(f"⚠️ Results PDF rate-limited on {row['symbol']} "
+                                f"— soft backoff {soft}s then continue catchup")
+                    soft_backoff = True
+                    await asyncio.sleep(soft)
                     break
                 # Other transient failure - don't save; retry later.
-                # Confirmed in production (2026-08-04): saving 'skipped'
-                # on timeout permanently stuck symbols as already done.
                 log.info(f"  🎙️ {row['symbol']}: will retry next cycle (transient error, not saved)")
                 continue
             summary = result['summary']
@@ -1602,19 +1608,22 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
                         log.info(f"  🎙️ {row['symbol']}: results PDF had no usable summary, marked skipped")
             except Exception as e:
                 log.warning(f"⚠️ Concall loop: save failed for {row['symbol']}: {type(e).__name__}: {e}")
-            await asyncio.sleep(2)  # small gap between Gemini calls
+            if not catchup:
+                await asyncio.sleep(1)
         if _gemini_jobs_hard_paused():
             left = max(0, int((_GEMINI_JOBS_PAUSED_UNTIL or 0) - time.time()))
             log.error(f"🛑 Results extraction: batch aborted — Gemini hard stop "
-                      f"({left}s / ~{left // 3600}h left) — sleeping, then auto-restart")
+                      f"({left}s / ~{left / 3600:.1f}h left) — sleeping, then auto-restart")
             await _sleep_while_gemini_hard_paused()
             continue
+        if soft_backoff:
+            continue  # already slept; immediately pull next batch
         if todo:
             log.info(f"🎙️ Results extraction loop: batch complete"
                       f"{' (catchup)' if catchup else ''}")
         # Catchup: keep churning; steady-state: polite idle.
         if catchup:
-            await asyncio.sleep(20 if todo else 60)
+            await asyncio.sleep(5 if todo else 20)
         else:
             await asyncio.sleep(120 if todo else 300)
 
