@@ -276,7 +276,7 @@ async def _gemini_generate(session: aiohttp.ClientSession, url: str, body: dict,
             # Batch jobs pace for free-tier RPM; Ask AI uses a short gap.
             gap = float(os.getenv(
                 'GEMINI_ASK_MIN_GAP_SECONDS' if priority else 'GEMINI_MIN_GAP_SECONDS',
-                '1' if priority else '4'))
+                '1' if priority else '3'))
             await asyncio.sleep(max(0.0, gap))
     except (asyncio.TimeoutError, TimeoutError, aiohttp.ServerTimeoutError):
         return 408, {}, 'timeout'
