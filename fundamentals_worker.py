@@ -5298,9 +5298,11 @@ async def _about_company_loop(session: aiohttp.ClientSession):
             existing_map[sym] = r
             if r.get('status') in ('done', 'skipped'):
                 _ABOUT_DONE_SYMS.add(sym)
+        universe_syms = set(ppt_by_sym) | set(tx_by_sym) | set(fund_by_sym) | set(meta_by_sym)
         _done_n = sum(1 for r in existing_map.values() if r.get('status') == 'done')
         log.info(f"📘 About-company: loaded {len(existing_map)} row(s), "
-                 f"{_done_n} done, in-memory skip={len(_ABOUT_DONE_SYMS)}")
+                 f"{_done_n} done, in-memory skip={len(_ABOUT_DONE_SYMS)}, "
+                 f"universe≈{len(universe_syms)}")
 
         # Priority: ABOUT_PRIORITY_SYMBOLS → filings → large-cap → rest.
         _prio = {
@@ -5357,6 +5359,7 @@ async def _about_company_loop(session: aiohttp.ClientSession):
                            sym, ppt, tx, src_at))
         ranked.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
         todo = [(sym, ppt, tx, src_at) for _, _, _, sym, ppt, tx, src_at in ranked[:BATCH_SIZE]]
+        missing_about_n = len(ranked)
 
         if todo:
             _web = os.getenv('ABOUT_COMPANY_WEB_SEARCH', '0')
@@ -5365,10 +5368,14 @@ async def _about_company_loop(session: aiohttp.ClientSession):
             _next = todo[0][0] if todo else '?'
             _why = (meta_by_sym.get(_next) or {}).get('_about_reason', '?')
             log.info(f"📘 About-company loop: {len(todo)} symbol(s) to generate "
-                      f"({_mode}; next={_next} reason={_why}; backlog≈{len(ranked)}; "
+                      f"({_mode}; next={_next} reason={_why}; "
+                      f"missing_about≈{missing_about_n}, done={_done_n}, "
+                      f"universe≈{len(universe_syms)}; "
                       f"key={_gemini_key_fingerprint(_gemini_api_key_about())})")
         else:
-            log.info("📘 About-company loop: nothing new")
+            log.info(f"📘 About-company loop: nothing new "
+                      f"(missing_about≈{missing_about_n}, done={_done_n}, "
+                      f"universe≈{len(universe_syms)})")
 
         hit_gemini_pause = False
         hit_hard_quota = False
@@ -5559,6 +5566,10 @@ async def _about_company_loop(session: aiohttp.ClientSession):
             cycle = int(os.getenv(
                 'ABOUT_COMPANY_CYCLE_SECONDS',
                 '180' if _results_catchup_over() else '15'))
+            log.info(f"📘 About-company: batch complete "
+                      f"(missing_about≈{max(0, missing_about_n - gemini_ok)}, "
+                      f"done={_done_n + gemini_ok}, universe≈{len(universe_syms)}) "
+                      f"— next batch in {max(15, cycle)}s")
             await asyncio.sleep(max(15, cycle))
         elif not ranked:
             # All candidates done (or skipped). Recheck for new listings —
@@ -5567,7 +5578,8 @@ async def _about_company_loop(session: aiohttp.ClientSession):
                 'ABOUT_COMPANY_CATCHUP_DONE_SECONDS',
                 '180' if _results_catchup_over() else '21600'))
             log.info(f"📘 About-company: catchup complete "
-                      f"({_done_n} done, universe≈{len(set(ppt_by_sym)|set(tx_by_sym)|set(fund_by_sym)|set(meta_by_sym))}) "
+                      f"(missing_about≈0, done={_done_n}, "
+                      f"universe≈{len(universe_syms)}) "
                       f"— sleeping {idle}s until next refresh check")
             await asyncio.sleep(max(300 if not _results_catchup_over() else 60, idle))
         else:
@@ -5576,7 +5588,8 @@ async def _about_company_loop(session: aiohttp.ClientSession):
                 'ABOUT_COMPANY_IDLE_SECONDS',
                 '180' if _results_catchup_over() else '3600'))
             log.info(f"📘 About-company: nothing to generate "
-                      f"(backlog≈{len(ranked)}) — sleeping {idle}s")
+                      f"(missing_about≈{missing_about_n}, done={_done_n}, "
+                      f"universe≈{len(universe_syms)}) — sleeping {idle}s")
             await asyncio.sleep(max(120 if not _results_catchup_over() else 60, idle))
 
 
