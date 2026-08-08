@@ -86,7 +86,7 @@ def _set_results_catchup_idle(idle: bool, *, lookback_days: int | None = None,
                          f"{f', already={already}' if already is not None else ''})")
             log.info(f"🎙️ Results catchup idle{extra} — "
                      f"About Company may populate every "
-                     f"{int(os.getenv('ABOUT_COMPANY_CYCLE_SECONDS', '180'))}s")
+                     f"{_about_company_cycle_seconds()}s")
             _RESULTS_CATCHUP_IDLE_LOGGED = True
     elif not _RESULTS_CATCHUP_IDLE and was:
         _RESULTS_CATCHUP_IDLE_LOGGED = False
@@ -95,12 +95,41 @@ def _set_results_catchup_idle(idle: bool, *, lookback_days: int | None = None,
         log.info("🎙️ Results catchup busy again — About Company yields to Results")
 
 
+def _gemini_focus_allowed_by_env(feature: str) -> bool:
+    """Env-only GEMINI_FOCUS / pause flags (no yield/idle state — safe for
+    _results_catchup_over and cycle defaults)."""
+    if feature == 'results':
+        if (os.getenv('PAUSE_RESULTS_EXTRACTION') or '0').strip().lower() in (
+                '1', 'true', 'yes', 'on'):
+            return False
+    raw = (os.getenv('GEMINI_FOCUS') or 'all').strip().lower()
+    if not raw or raw in ('all', '*'):
+        return True
+    allowed = {x.strip() for x in raw.split(',') if x.strip()}
+    if feature == 'results' and allowed == {'about'}:
+        inc = (os.getenv('GEMINI_FOCUS_ABOUT_INCLUDES_RESULTS') or '0').strip().lower()
+        return inc in ('1', 'true', 'yes', 'on')
+    return feature in allowed
+
+
+def _about_company_cycle_seconds() -> int:
+    """Seconds between About batches. About-only backfill defaults to 15s."""
+    explicit = (os.getenv('ABOUT_COMPANY_CYCLE_SECONDS') or '').strip()
+    if explicit:
+        return max(15, int(explicit))
+    if not _gemini_focus_allowed_by_env('results'):
+        return 15
+    return 180 if _results_catchup_over() else 15
+
+
 def _results_catchup_over() -> bool:
     """True when Results catchup has nothing pending (or catchup is off).
     Does not call _results_catchup_boosted() — that can call back into
     About-pause helpers and recurse."""
     v = (os.getenv('RESULTS_PDF_CATCHUP') or '1').strip().lower()
     if v in ('0', 'false', 'no', 'off'):
+        return True
+    if not _gemini_focus_allowed_by_env('results'):
         return True
     return bool(_RESULTS_CATCHUP_IDLE)
 
@@ -179,7 +208,7 @@ def _about_company_manually_paused() -> bool:
         if not _ABOUT_ENV_PAUSE_RESUME_LOGGED:
             _ABOUT_ENV_PAUSE_RESUME_LOGGED = True
             log.info("▶️ About-company: Results catchup over — starting Company Overview "
-                     f"(every {int(os.getenv('ABOUT_COMPANY_CYCLE_SECONDS', '180'))}s)")
+                     f"(every {_about_company_cycle_seconds()}s)")
         return False
     if time.time() < _ABOUT_ENV_PAUSE_UNTIL:
         return True
@@ -5174,7 +5203,7 @@ async def _about_company_loop(session: aiohttp.ClientSession):
             continue
         if _pause_logged:
             log.info("▶️ About-company: resuming — populating Company Overview "
-                     f"every {int(os.getenv('ABOUT_COMPANY_CYCLE_SECONDS', '180'))}s")
+                     f"every {_about_company_cycle_seconds()}s")
         _pause_logged = False
         if await _idle_if_gemini_paused('about', 'About-company loop'):
             continue
@@ -5187,17 +5216,16 @@ async def _about_company_loop(session: aiohttp.ClientSession):
         # 5 stocks per cycle (3 in parallel). Override via env if needed.
         BATCH_SIZE = int(os.getenv('ABOUT_COMPANY_BATCH_SIZE', '5'))
         CONCURRENCY = max(1, int(os.getenv('ABOUT_COMPANY_CONCURRENCY', '3')))
-        # After Results catchup: populate Company Overview every 3 min by default.
-        cycle_secs = int(os.getenv(
-            'ABOUT_COMPANY_CYCLE_SECONDS',
-            '180' if _results_catchup_over() else '15'))
+        cycle_secs = _about_company_cycle_seconds()
         if not _key_status_logged:
             _web = os.getenv('ABOUT_COMPANY_WEB_SEARCH', '0')
             _about_k = _gemini_api_key_about()
+            _results_note = ('' if _gemini_focus_allowed_by_env('results')
+                             else ', Results extraction paused')
             log.info(f"📘 About-company loop: active "
                       f"({'web search' if _web.strip() not in ('0', 'false', 'False') else 'filings-only'}) "
                       f"(batch={BATCH_SIZE}, concurrency={CONCURRENCY}, "
-                      f"cycle={cycle_secs}s, "
+                      f"cycle={cycle_secs}s{_results_note}, "
                       f"key={_gemini_key_fingerprint(_about_k)}, "
                       f"ABOUT_COMPANY_WEB_SEARCH={_web}, "
                       f"GEMINI_FOCUS={os.getenv('GEMINI_FOCUS', 'all')})")
@@ -5575,10 +5603,7 @@ async def _about_company_loop(session: aiohttp.ClientSession):
             _ABOUT_GEMINI_UNHEALTHY_SINCE = None
             _ABOUT_GEMINI_HARD_QUOTA = False
             _ABOUT_YIELD_TO_RESULTS_UNTIL = None
-            # After Results catchup: default 3 min between Company Overview batches.
-            cycle = int(os.getenv(
-                'ABOUT_COMPANY_CYCLE_SECONDS',
-                '180' if _results_catchup_over() else '15'))
+            cycle = _about_company_cycle_seconds()
             log.info(f"📘 About-company: batch complete "
                       f"(missing_about≈{max(0, missing_about_n - gemini_ok)}, "
                       f"done={_done_n + gemini_ok}, universe≈{len(universe_syms)}) "
@@ -5772,14 +5797,7 @@ def _gemini_focus_allows(feature: str) -> bool:
             return False
         if feature == 'results':
             return True
-    raw = (os.getenv('GEMINI_FOCUS') or 'all').strip().lower()
-    if not raw or raw in ('all', '*'):
-        return True
-    allowed = {x.strip() for x in raw.split(',') if x.strip()}
-    # About-first deploys: after 24h pauses both About and Results should run.
-    if allowed == {'about'}:
-        allowed = {'about', 'results'}
-    return feature in allowed
+    return _gemini_focus_allowed_by_env(feature)
 
 
 async def _idle_if_gemini_paused(feature: str, label: str):
@@ -5794,6 +5812,9 @@ async def _idle_if_gemini_paused(feature: str, label: str):
         log.info(f"⏸️ {label}: paused (PAUSE_ABOUT_COMPANY — Results catchup active)")
     elif feature == 'results' and (_ABOUT_YIELD_TO_RESULTS_UNTIL or _about_company_manually_paused()):
         log.info(f"⏸️ {label}: waiting for About→Results handoff")
+    elif feature == 'results' and not _gemini_focus_allowed_by_env('results'):
+        pause = os.getenv('PAUSE_RESULTS_EXTRACTION') or os.getenv('GEMINI_FOCUS') or 'about'
+        log.info(f"⏸️ {label}: paused ({pause}) — About Company has Gemini quota")
     else:
         log.info(f"⏸️ {label}: paused (GEMINI_FOCUS={why})")
     while not _gemini_focus_allows(feature):
