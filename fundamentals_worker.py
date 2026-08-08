@@ -5122,6 +5122,30 @@ async def _fundamentals_ai_highlights_loop(session: aiohttp.ClientSession):
         await asyncio.sleep(CHECK_INTERVAL)
 
 
+async def _supabase_fetch_all(session: aiohttp.ClientSession, table: str, headers: dict,
+                              *, select: str, order: str | None = None,
+                              page_size: int = 1000, max_rows: int = 10000) -> list:
+    """Page through PostgREST until exhausted (About metadata / company_abouts)."""
+    out, offset = [], 0
+    base = {'select': select}
+    if order:
+        base['order'] = order
+    while offset < max_rows:
+        params = {**base, 'limit': str(page_size), 'offset': str(offset)}
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/{table}", headers=headers,
+            params=params, timeout=aiohttp.ClientTimeout(total=60),
+        ) as r:
+            page = await r.json() if r.status == 200 else []
+        if not isinstance(page, list) or not page:
+            break
+        out.extend(page)
+        if len(page) < page_size:
+            break
+        offset += page_size
+    return out
+
+
 async def _about_company_loop(session: aiohttp.ClientSession):
     """Build AI About Company briefs via Gemini Google Search (+ Screener /
     PPT / concall context when available). Works even when filings are missing."""
@@ -5197,60 +5221,38 @@ async def _about_company_loop(session: aiohttp.ClientSession):
                 timeout=aiohttp.ClientTimeout(total=30)
             ) as r:
                 tx_rows = await r.json() if r.status == 200 else []
-            # PK is `sym` (not symbol). industry/sector live on stocks;
-            # stock_fundamentals may lack those columns in prod.
-            async with session.get(
-                f"{SUPABASE_URL}/rest/v1/stock_fundamentals", headers=headers,
-                params={'select': 'sym,market_cap',
-                        'order': 'market_cap.desc.nullslast', 'limit': '800'},
-                timeout=aiohttp.ClientTimeout(total=30)
-            ) as r:
-                fund_rows = await r.json() if r.status == 200 else []
-                if not isinstance(fund_rows, list):
-                    fund_rows = []
-            # Sector/industry for prompts — from live stocks table (always present).
-            async with session.get(
-                f"{SUPABASE_URL}/rest/v1/stocks", headers=headers,
-                params={'select': 'sym,sector,industry,market_cap',
-                        'order': 'market_cap.desc.nullslast', 'limit': '1200'},
-                timeout=aiohttp.ClientTimeout(total=30)
-            ) as r:
-                stock_rows = await r.json() if r.status == 200 else []
-                if not isinstance(stock_rows, list):
-                    stock_rows = []
+            # PK is `sym` (not symbol). Paginate — default limits capped universe at ~1100.
+            fund_rows = await _supabase_fetch_all(
+                session, 'stock_fundamentals', headers,
+                select='sym,market_cap', order='market_cap.desc.nullslast')
+            stock_rows = await _supabase_fetch_all(
+                session, 'stocks', headers,
+                select='sym,sector,industry,market_cap', order='market_cap.desc.nullslast')
             # Minimal columns first — selecting sources/image_url 400s the whole
             # read when those migrations weren't applied, which made existing=[]
             # every cycle and stuck the loop on BAJFINANCE forever.
-            existing = []
-            async with session.get(
-                f"{SUPABASE_URL}/rest/v1/company_abouts", headers=headers,
-                params={
-                    'select': 'symbol,source_announced_at,status',
-                    'order': 'symbol.asc',
-                    'limit': '5000',
-                },
-                timeout=aiohttp.ClientTimeout(total=30)
-            ) as r:
-                raw = await r.text()
-                try:
-                    body = json.loads(raw) if raw else None
-                except Exception:
-                    body = None
-                if r.status != 200:
-                    log.warning(f"📘 About-company loop: company_abouts read failed "
-                                f"({r.status}): {raw[:220]}")
-                    if r.status in (404, 400):
+            existing = await _supabase_fetch_all(
+                session, 'company_abouts', headers,
+                select='symbol,source_announced_at,status', order='symbol.asc')
+            if not isinstance(existing, list):
+                existing = []
+            if not existing:
+                # Distinguish empty table vs hard failure (table missing).
+                async with session.get(
+                    f"{SUPABASE_URL}/rest/v1/company_abouts", headers=headers,
+                    params={'select': 'symbol', 'limit': '1'},
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as r_probe:
+                    raw = await r_probe.text()
+                    if r_probe.status in (404, 400):
+                        log.warning(f"📘 About-company loop: company_abouts read failed "
+                                    f"({r_probe.status}): {raw[:220]}")
                         log.warning("📘 Run ensure_company_abouts.sql in Supabase.")
                         await asyncio.sleep(600)
                         continue
-                    existing = []
-                elif isinstance(body, list):
-                    existing = body
-                elif isinstance(body, dict) and body.get('code'):
-                    log.warning("📘 About-company loop: company_abouts table missing? "
-                                "Run ensure_company_abouts.sql in Supabase.")
-                    await asyncio.sleep(600)
-                    continue
+                    if r_probe.status != 200:
+                        log.warning(f"📘 About-company loop: company_abouts read failed "
+                                    f"({r_probe.status}): {raw[:220]}")
             # Optional enrich for web-backfill decisions (ignore if cols missing).
             if existing and os.getenv('ABOUT_COMPANY_WEB_SEARCH', '0').strip() not in (
                     '0', 'false', 'False'):
@@ -5298,11 +5300,22 @@ async def _about_company_loop(session: aiohttp.ClientSession):
             existing_map[sym] = r
             if r.get('status') in ('done', 'skipped'):
                 _ABOUT_DONE_SYMS.add(sym)
-        universe_syms = set(ppt_by_sym) | set(tx_by_sym) | set(fund_by_sym) | set(meta_by_sym)
+        universe_syms = (
+            {s.strip().upper() for s in ALL_STOCKS if s}
+            if len(ALL_STOCKS) > 100
+            else set(ppt_by_sym) | set(tx_by_sym) | set(fund_by_sym) | set(meta_by_sym)
+        )
+        for sym in universe_syms:
+            static = SECTOR_INDUSTRY_LOOKUP.get(sym) or {}
+            if not static:
+                continue
+            row = meta_by_sym.setdefault(sym, {})
+            row.setdefault('sector', static.get('sector'))
+            row.setdefault('industry', static.get('industry'))
         _done_n = sum(1 for r in existing_map.values() if r.get('status') == 'done')
         log.info(f"📘 About-company: loaded {len(existing_map)} row(s), "
                  f"{_done_n} done, in-memory skip={len(_ABOUT_DONE_SYMS)}, "
-                 f"universe≈{len(universe_syms)}")
+                 f"universe≈{len(universe_syms)} (tracked={len(ALL_STOCKS)})")
 
         # Priority: ABOUT_PRIORITY_SYMBOLS → filings → large-cap → rest.
         _prio = {
