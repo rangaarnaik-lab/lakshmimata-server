@@ -1,7 +1,7 @@
 From 6f6fa6d1e04adbb770e9f4c0c060fdbea7666ed4 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Sat, 8 Aug 2026 13:03:21 +0000
-Subject: [PATCH 1/2] Show Leisure - Restaurants industry for QSR stocks
+Subject: [PATCH 1/3] Show Leisure - Restaurants industry for QSR stocks
 
 - Peer-group overrides for 9 QSR tickers (StockEdge-style grouping)
 - Alias Restaurants -> Leisure - Restaurants in Industries tab
@@ -58,11 +58,10 @@ index ac99caf..924210a 100644
 -- 
 2.43.0
 
-
 From 45b127d17cbde2792bdbaeb05cbf1f3e62665e08 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Sat, 8 Aug 2026 14:20:24 +0000
-Subject: [PATCH 2/2] Add PEAD and CANSLIM badges, presets, and filters
+Subject: [PATCH 2/3] Add PEAD and CANSLIM badges, presets, and filters
 
 Map is_pead/is_canslim fields from snapshot, show strategy badges
 in the stock table, and add Quick Filter presets for both.
@@ -171,6 +170,186 @@ index d91217f..bbd8dfb 100644
      hist:       row.rs_hist || [],
      rsTrend: {
        trend: row.rs_trend || 'flat',
+-- 
+2.43.0
+
+From 733c7ae20d72fcf28459a3016abce35f4f6752a1 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sat, 8 Aug 2026 15:32:20 +0000
+Subject: [PATCH 3/3] Fix Excellent Result rating when OPM compresses or other
+ income spikes
+
+QoQ recovery was promoting back to Excellent after OPM caps applied.
+Use a maxTierIdx ceiling and fold other-income spike into the rating.
+---
+ src/App.jsx | 104 ++++++++++++++++++++++++++--------------------------
+ 1 file changed, 53 insertions(+), 51 deletions(-)
+
+diff --git a/src/App.jsx b/src/App.jsx
+index 440c02a..2883c90 100644
+--- a/src/App.jsx
++++ b/src/App.jsx
+@@ -3581,11 +3581,7 @@ function ResultsHistoryTable({symbol}){
+     {label:yoyRow?yoyRow.period_ended:'—', row:yoyRow},
+   ]
+   const pct=(now,then)=>(now==null||then==null||then===0)?null:((now-then)/Math.abs(then)*100)
+-  const opm = r => {
+-    if (r?.opm_pct != null) return r.opm_pct
+-    return (r?.sales && r?.pbt != null && r?.other_income != null && r.sales !== 0)
+-      ? (r.pbt - r.other_income) / r.sales * 100 : null
+-  }
++  const opm = effectiveOpm
+   const qoqFor = (metric, backendVal) => backendVal != null ? backendVal : pct(metric(current), metric(prevQtr))
+   const metrics = [
+     {label:'Sales (₹Cr)', get:r=>r?.sales, yoyPct:pct(current.sales, yoyRow?.sales),
+@@ -5687,7 +5683,7 @@ const GUIDE_QA = [
+   {keys:['ppt','presentation','slide'],
+     answer:'Open a stock → PPT tab. Same History chips as Concall when multiple decks exist. Shows slide story, financial highlights, strategy, risks, and Watch Next when available.'},
+   {keys:['excellent','result rating','weak result','good result','neutral result'],
+-    answer:'Result quality (Excellent/Good/Neutral/Weak) comes from Sales & PAT vs the same quarter last year, with QoQ and OPM checks. Headline PAT declines are capped — sales up + profit down will not stay Excellent.'},
++    answer:'Result quality (Excellent/Good/Neutral/Weak) comes from Sales & PAT YoY, with OPM and other-income checks. Margin compression or an other-income spike caps the badge — QoQ recovery cannot override those caps. Headline PAT declines are capped too.'},
+   {keys:['rrg','rotation','rs-ratio','rs-momentum','leading','improving','weakening','lagging','jdk'],
+     answer:'Rotate uses a StockCharts-style Relative Rotation Graph. X = JdK RS-Ratio (relative-strength trend), Y = JdK RS-Momentum (how fast that trend is changing), both centered at 100. Leading = both > 100; Weakening = Ratio > 100 but Momentum < 100; Lagging = both < 100; Improving = Momentum > 100 while Ratio still < 100. Idealized path is clockwise. Built from daily RS-TV / sector avg RS history.'},
+   {keys:['peer','ranking','jewellery','industry'],
+@@ -7421,6 +7417,14 @@ export class ErrorBoundary extends React.Component {
+ const _RESULTS_ANN_KEYWORDS_JS = ['financial result', 'quarterly result',
+   'results for the quarter', 'unaudited results', 'audited results']
+ 
++/** Operating margin % — prefer stored opm_pct, else derive from PBT − other income. */
++function effectiveOpm(row){
++  if(!row) return null
++  if(row.opm_pct != null) return row.opm_pct
++  return (row.sales && row.pbt != null && row.other_income != null && row.sales !== 0)
++    ? (row.pbt - row.other_income) / row.sales * 100 : null
++}
++
+ /**
+  * Excellent/Good/Neutral/Weak quality rating from a symbol's results
+  * history (current quarter vs previous quarter vs same-quarter-last-
+@@ -7439,9 +7443,14 @@ const _RESULTS_ANN_KEYWORDS_JS = ['financial result', 'quarterly result',
+  * Excellent also needs a non-flat sequential print: strong YoY alone
+  * with flat/soft QoQ (e.g. POCL Sales 0% QoQ, PAT −4% QoQ) is Good
+  * at best — otherwise every base-effect YoY spike would look Excellent.
++ *
++ * Margin + other-income caps are tracked as maxTierIdx so a later QoQ
++ * "recovery" bump cannot undo them (APOLLO-style: PAT/Sales YoY strong
++ * but OPM −4pp and other income spiked — not Excellent).
+  */
+ function computeResultRating(hist){
+   if(!hist || hist.length===0) return null
++  const tiers = ['Weak','Neutral','Good','Excellent']
+   const current = hist[0]
+   const prevQtr = hist[1]||null
+   const curDate = new Date(current.period_ended)
+@@ -7460,9 +7469,12 @@ function computeResultRating(hist){
+   const rawPatYoy = pct(current.pat, yoyRow?.pat)
+   const adjPatYoy = pct(adjPat(current), adjPat(yoyRow))
+   const patYoy = adjPatYoy ?? rawPatYoy
+-  const opmYoy = pct(current.opm_pct, yoyRow?.opm_pct)
+-  const opmPp = (current.opm_pct!=null && yoyRow?.opm_pct!=null)
+-    ? (current.opm_pct - yoyRow.opm_pct) : null
++  const curOpm = effectiveOpm(current)
++  const yoyOpm = effectiveOpm(yoyRow)
++  const opmYoy = pct(curOpm, yoyOpm)
++  const opmPp = (curOpm!=null && yoyOpm!=null) ? (curOpm - yoyOpm) : null
++  const otherIncomeSpike = (current.other_income!=null && prevQtr?.other_income!=null &&
++    prevQtr.other_income>0.5 && current.other_income > prevQtr.other_income*1.5)
+   let resultRating = null
+   if (patYoy!=null && salesYoy!=null) {
+     if (patYoy>=20 && salesYoy>=10) resultRating='Excellent'
+@@ -7478,60 +7490,50 @@ function computeResultRating(hist){
+     resultRating = patYoy>=25?'Excellent':patYoy>0?'Good':patYoy<-10?'Weak':'Neutral'
+   }
+ 
++  // Ceiling on how good the badge can get — QoQ bumps cannot exceed this.
++  let maxTierIdx = tiers.length - 1
++
+   // Headline PAT gate — reported profit is what the market prints.
+-  // If it fell, cap the badge even when adjusted-for-exceptionals YoY
+-  // looks strong (prior-year one-offs distorting the base).
+-  if (resultRating && rawPatYoy!=null && rawPatYoy < 0) {
+-    const tiers = ['Weak','Neutral','Good','Excellent']
+-    let idx = tiers.indexOf(resultRating)
+-    if (rawPatYoy <= -15) idx = Math.min(idx, 0)      // Weak
+-    else idx = Math.min(idx, 1)                        // Neutral max
+-    resultRating = tiers[idx]
+-  }
+-
+-  // Operating-margin gates (when OPM is on file).
+-  // Soft compression: Excellent needs margin not clearly worse YoY.
+-  // Hard collapse: Neutral max (unchanged from prior logic).
+-  if (resultRating) {
+-    const tiers = ['Weak','Neutral','Good','Excellent']
+-    let idx = tiers.indexOf(resultRating)
+-    const softCompress = (opmYoy!=null && opmYoy <= -5) || (opmPp!=null && opmPp <= -1)
+-    const hardCollapse = (opmYoy!=null && opmYoy <= -20) || (opmPp!=null && opmPp <= -3)
+-    if (hardCollapse) {
+-      idx = Math.min(idx, 1) // Neutral max
+-      if (opmYoy!=null && opmYoy <= -35 && (rawPatYoy==null || rawPatYoy < 0)) idx = Math.min(idx, 0)
+-    } else if (softCompress) {
+-      idx = Math.min(idx, 2) // Good max — not Excellent
++  if (rawPatYoy!=null && rawPatYoy < 0) {
++    maxTierIdx = rawPatYoy <= -15 ? 0 : Math.min(maxTierIdx, 1)
++  }
++
++  // Operating-margin gates (same OPM definition as the Results table).
++  const softCompress = (opmYoy!=null && opmYoy <= -5) || (opmPp!=null && opmPp <= -1)
++  const hardCollapse = (opmYoy!=null && opmYoy <= -20) || (opmPp!=null && opmPp <= -3)
++  if (hardCollapse) {
++    maxTierIdx = Math.min(maxTierIdx, 1) // Neutral max
++    if (opmYoy!=null && opmYoy <= -35 && (rawPatYoy==null || rawPatYoy < 0)) {
++      maxTierIdx = Math.min(maxTierIdx, 0)
+     }
+-    resultRating = tiers[idx]
++  } else if (softCompress) {
++    maxTierIdx = Math.min(maxTierIdx, 2) // Good max — not Excellent
++  }
++
++  // Other-income spike + margin down → profit growth may not be operating.
++  if (otherIncomeSpike) {
++    const marginDown = (opmPp!=null && opmPp < 0) || (opmYoy!=null && opmYoy < 0)
++    maxTierIdx = Math.min(maxTierIdx, marginDown ? 1 : 2) // Neutral or Good max
+   }
+ 
+-  // QoQ tier-shift: a YoY-only verdict can miss fast deceleration or
+-  // recovery. Shift one tier when the sequential trend meaningfully
+-  // contradicts the YoY story, without fully overriding it.
+-  if (resultRating && prevQtr) {
++  if (!resultRating) return null
++  let idx = Math.min(tiers.indexOf(resultRating), maxTierIdx)
++
++  // QoQ tier-shift: sequential trend can nudge within the quality ceiling.
++  if (prevQtr) {
+     const patQoq = pct(adjPat(current), adjPat(prevQtr))
+     const salesQoq = pct(current.sales, prevQtr.sales)
+-    const tiers = ['Weak','Neutral','Good','Excellent']
+-    let idx = tiers.indexOf(resultRating)
+     if (patQoq!=null) {
+       const decelerating = patQoq <= -15 && (salesQoq==null || salesQoq <= 0)
+       const recovering = patQoq >= 15 && (salesQoq==null || salesQoq >= 0)
+-      // Sequentially flat/soft: strong YoY alone is not Excellent
+-      // (POCL-style: Sales ~0% QoQ, PAT slightly down).
+-      const sequentiallyFlat = (salesQoq==null || salesQoq <= 2)
+-        && patQoq <= 2
+-      // Don't let QoQ recovery promote past the headline-PAT gate
+-      const maxIdx = (rawPatYoy!=null && rawPatYoy <= -15) ? 0
+-        : (rawPatYoy!=null && rawPatYoy < 0) ? 1
+-        : tiers.length-1
++      const sequentiallyFlat = (salesQoq==null || salesQoq <= 2) && patQoq <= 2
+       if (decelerating && idx > 0) idx -= 1
+-      else if (recovering && idx < maxIdx) idx += 1
+-      if (sequentiallyFlat) idx = Math.min(idx, 2) // Good max
++      else if (recovering && idx < maxTierIdx) idx += 1
++      if (sequentiallyFlat) idx = Math.min(idx, 2)
+     }
+-    resultRating = tiers[idx]
+   }
+-  return resultRating
++
++  return tiers[Math.min(idx, maxTierIdx)]
+ }
+ 
+ export default function App(){
 -- 
 2.43.0
 
