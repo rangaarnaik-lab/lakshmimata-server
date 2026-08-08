@@ -37,7 +37,7 @@ ABREL,Construction,Realty
 ABSLAMC,Finance & Investments,Financials
 ACC,Cement - North India,Building Materials
 ACCELYA,Computers - Software - Medium / Small,I.T
-ACCURACY,Miscellaneous,Transportation
+ACCURACY,Transportation,Transportation
 ACE,Engineering,Industrials
 ACEINTEG,Diversified - Medium / Small,Miscellaneous
 ACI,Chemicals,Chemicals
@@ -48,10 +48,10 @@ ACUTAAS,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 ADANIENSOL,Power Generation And Supply,Power & Utilities
 ADANIENT,Trading,Services
 ADANIGREEN,Power Generation And Supply,Power & Utilities
-ADANIPORTS,Miscellaneous,Transportation
+ADANIPORTS,Transportation,Transportation
 ADANIPOWER,Power Generation And Supply,Power & Utilities
 ADFFOODS,Food - Processing - Indian,Fmcg
-ADL,Miscellaneous,Building Materials
+ADL,Building Materials,Building Materials
 ADOR,Electrodes - Welding Equipment,Industrials
 ADROITINFO,Computers - Software - Medium / Small,I.T
 ADSL,Computers - Software - Medium / Small,I.T
@@ -61,7 +61,7 @@ ADVANIHOTR,Hotels,Services
 ADVENTHTL,Hotels,Services
 ADVENZYMES,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
 AEGISLOG,Trading,Services
-AEGISVOPAK,Miscellaneous,Transportation
+AEGISVOPAK,Transportation,Transportation
 AEPL,Electric Equipment,Industrials
 AEQUS,Engineering,Aerospace & Defence
 AEROENTER,Steel - Medium / Small,Metals & Mining
@@ -77,8 +77,8 @@ AGARIND,Petrochemicals,Energy
 AGARWALEYE,Healthcare,Healthcare
 AGI,Packaging,Industrials
 AGIIL,Construction,Industrials
-AGL,Miscellaneous,Transportation
-AGRITECH,Miscellaneous,Fmcg
+AGL,Transportation,Transportation
+AGRITECH,Fmcg,Fmcg
 AGROPHOS,Fertilizers,Chemicals
 AHCL,Chemicals,Chemicals
 AHLADA,Steel - Medium / Small,Metals & Mining
@@ -88,7 +88,7 @@ AHLWEST,Hotels,Services
 AIAENG,Castings & Forgings,Industrials
 AIIL,Finance & Investments,Financials
 AIRAN,Computers - Software - Medium / Small,I.T
-AIROLAM,Miscellaneous,Building Materials
+AIROLAM,Building Materials,Building Materials
 AJANTPHARM,Pharmaceuticals - Indian - Formulations,Healthcare
 AJAXENGG,Engineering,Industrials
 AJMERA,Construction,Industrials
@@ -110,7 +110,7 @@ ALIVUS,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
 ALKALI,Chemicals,Chemicals
 ALKEM,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
 ALKYLAMINE,Chemicals,Chemicals
-ALLCARGO,Miscellaneous,Transportation
+ALLCARGO,Transportation,Transportation
 ALLDIGI,Computers - Software - Medium / Small,I.T
 ALLTIME,Plastics Products,Plastic Products
 ALMONDZ,Finance & Investments,Financials
@@ -146,7 +146,7 @@ ANUP,Engineering,Industrials
 ANURAS,Chemicals,Chemicals
 APARINDS,Electric Equipment,Industrials
 APCL,Cement - South India,Building Materials
-APCOTEXIND,Miscellaneous,Chemicals
+APCOTEXIND,Chemicals,Chemicals
 APEX,Aquaculture,Fmcg
 APLAPOLLO,Steel - Large,Industrials
 APLLTD,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
@@ -158,7 +158,7 @@ APOLSINHOT,Hotels,Services
 APTECHT,Computers - Education,I.T
 APTUS,Finance - Housing,Financials
 AQYLON,Entertainment / Electronic Media Software,Media
-ARCHIDPLY,Miscellaneous,Building Materials
+ARCHIDPLY,Building Materials,Building Materials
 ARCHIES,Trading,Consumer Discretionary
 ARE&M,Auto Ancillaries,Auto
 ARENTERP,Trading,Metals & Mining
@@ -170,9 +170,9 @@ ARIHANTSUP,Construction,Industrials
 ARIS,Trading,Services
 ARKADE,Construction,Industrials
 ARMANFIN,Finance & Investments,Financials
-AROGRANITE,Miscellaneous,Consumer Discretionary
+AROGRANITE,Consumer Discretionary,Consumer Discretionary
 ARROWGREEN,Plastics Products,Plastic Products
-ARSHIYA,Miscellaneous,Transportation
+ARSHIYA,Transportation,Transportation
 ARSSBL,Finance & Investments,Financials
 ARTEMISMED,Healthcare,Healthcare
 ARTNIRMAN,Construction,Industrials
@@ -206,9 +206,9 @@ ASTRAZEN,Pharmaceuticals - Multinational,Healthcare
 ASTRON,Paper,Building Materials
 ATALREAL,Construction,Industrials
 ATAM,Engineering,Industrials
-ATGL,Miscellaneous,Energy
+ATGL,Energy,Energy
 ATHERENERG,Automobiles - Scooters And 3 - Wheelers,Auto
-ATL,Miscellaneous,Transportation
+ATL,Transportation,Transportation
 ATLANTAA,Engineering - Turnkey Services,Industrials
 ATLANTAELE,Electric Equipment,Industrials
 ATLASCYCLE,Cycles And Accessories,Consumer Discretionary
@@ -225,12 +225,12 @@ AVADHSUGAR,Sugar,Fmcg
 AVALON,Electronics - Components,Consumer Discretionary
 AVANTEL,Telecommunications - Equipment,Aerospace & Defence
 AVANTIFEED,Food - Processing - Indian,Fmcg
-AVG,Miscellaneous,Transportation
+AVG,Transportation,Transportation
 AVL,Trading,Consumer Discretionary
 AVONMORE,Finance & Investments,Financials
 AVROIND,Plastics Products,Plastic Products
 AVTNPL,Solvent Extraction,Fmcg
-AWFIS,Miscellaneous,Co-Working
+AWFIS,Co-Working,Co-Working
 AWHCL,Miscellaneous,Miscellaneous
 AWL,Solvent Extraction,Fmcg
 AXISBANK,Banks - Private Sector,Bank
@@ -330,7 +330,7 @@ BIRLACORPN,Cement - North India,Building Materials
 BIRLAMONEY,Finance & Investments,Financials
 BIRLANU,Cement Products,Building Materials
 BIRLAPREC,Engineering,Industrials
-BLACKBUCK,Miscellaneous,Transportation
+BLACKBUCK,Transportation,Transportation
 BLACKROSE,Trading,Chemicals
 BLAL,Construction,Industrials
 BLBLIMITED,Finance & Investments,Financials
@@ -365,8 +365,8 @@ BRIGHOTEL,Hotels,Services
 BRITANNIA,Food - Processing - Mnc,Fmcg
 BRNL,Construction,Industrials
 BROOKS,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
-BSE,Miscellaneous,Financials
-BSHSL,Miscellaneous,Fmcg
+BSE,Financials,Financials
+BSHSL,Fmcg,Fmcg
 BSL,Textiles - Processing,Textiles
 BSOFT,Computers - Software - Medium / Small,I.T
 BTML,Entertainment / Electronic Media Software,Media
@@ -378,7 +378,7 @@ BYKE,Hotels,Services
 CALSOFT,Computers - Software - Medium / Small,I.T
 CAMLINFINE,Chemicals,Chemicals
 CAMPUS,Leather / Leather Products,Consumer Discretionary
-CAMS,Miscellaneous,Financials
+CAMS,Financials,Financials
 CANBK,Banks - Public Sector,Bank
 CANFINHOME,Finance - Housing,Financials
 CANHLIFE,Finance & Investments,Financials
@@ -389,15 +389,15 @@ CAPITALSFB,Banks - Private Sector,Bank
 CAPLIPOINT,Pharmaceuticals - Indian - Formulations,Healthcare
 CAPTRUST,Finance & Investments,Financials
 CARBORUNIV,Abrasives And Grinding Wheels,Industrials
-CARERATING,Miscellaneous,Financials
-CARTRADE,Miscellaneous,Consumer Discretionary
+CARERATING,Financials,Financials
+CARTRADE,Consumer Discretionary,Consumer Discretionary
 CARYSIL,Domestic Appliances,Consumer Discretionary
 CASTROLIND,Chemicals,Chemicals
-CCAVENUE,Miscellaneous,I.T
+CCAVENUE,I.T,I.T
 CCCL,Construction,Industrials
 CCHHL,Hotels,Services
 CCL,Tea,Fmcg
-CDSL,Miscellaneous,Financials
+CDSL,Financials,Financials
 CEATLTD,Tyres,Auto
 CEIGALL,Construction,Industrials
 CEINSYS,Computers - Software - Medium / Small,I.T
@@ -409,7 +409,7 @@ CENTEXT,Aluminium And Aluminium Products,Metals & Mining
 CENTRALBK,Banks - Public Sector,Bank
 CENTRUM,Finance & Investments,Financials
 CENTUM,Electronics - Components,Consumer Discretionary
-CENTURYPLY,Miscellaneous,Building Materials
+CENTURYPLY,Building Materials,Building Materials
 CERA,Ceramics - Tiles / Sanitaryware,Building Materials
 CEREBRAINT,Computers - Hardware,I.T
 CESC,Power Generation And Supply,Power & Utilities
@@ -435,7 +435,7 @@ CINEVISTA,Construction,Industrials
 CIPLA,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
 CLEAN,Chemicals,Chemicals
 CLEANMAX,Power Generation And Supply,Power & Utilities
-CLEDUCATE,Miscellaneous,Services
+CLEDUCATE,Services,Services
 CLSEL,Food - Processing - Indian,Fmcg
 CMPDI,Miscellaneous,Miscellaneous
 CMRGREEN,Miscellaneous,Miscellaneous
@@ -452,7 +452,7 @@ COMFINTE,Trading,Services
 COMPINFO,Trading,Services
 COMPUSOFT,Computers - Education,I.T
 COMSYN,Packaging,Industrials
-CONCOR,Miscellaneous,Transportation
+CONCOR,Transportation,Transportation
 CONCORDBIO,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
 CONFIPET,Miscellaneous,Miscellaneous
 CONSOFINVT,Finance & Investments,Financials
@@ -465,15 +465,15 @@ CORONA,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
 COSMOFIRST,Packaging,Industrials
 COUNCODOS,Construction,Industrials
 CPCAP,Finance & Investments,Financials
-CPEDU,Miscellaneous,Services
+CPEDU,Services,Services
 CPPLUS,Trading,Consumer Discretionary
 CRAFTSMAN,Auto Ancillaries,Auto
 CRAMC,Finance & Investments,Financials
 CREATIVEYE,Entertainment / Electronic Media Software,Media
 CREDITACC,Finance & Investments,Financials
 CREST,Finance & Investments,Financials
-CRISIL,Miscellaneous,Financials
-CRIZAC,Miscellaneous,Services
+CRISIL,Financials,Financials
+CRIZAC,Services,Services
 CROMPTON,Electric Equipment,Consumer Discretionary
 CROWN,Miscellaneous,Miscellaneous
 CSBBANK,Banks - Private Sector,Bank
@@ -522,7 +522,7 @@ DEEDEV,Steel - Medium / Small,Metals & Mining
 DEEPAKFERT,Chemicals,Chemicals
 DEEPAKNTR,Chemicals,Chemicals
 DEEPINDS,Oil Drilling / Allied Services,Energy
-DELHIVERY,Miscellaneous,Transportation
+DELHIVERY,Transportation,Transportation
 DELPHIFX,Finance & Investments,Financials
 DELTACORP,Recreation / Amusement Parks,Miscellaneous
 DELTAMAGNT,Textiles - Products,Textiles
@@ -530,7 +530,7 @@ DEN,Entertainment / Electronic Media Software,Media
 DENORA,Electrodes - Graphites,Industrials
 DENTA,Construction,Industrials
 DEVIT,Computers - Software - Medium / Small,I.T
-DEVX,Miscellaneous,Co-Working
+DEVX,Co-Working,Co-Working
 DEVYANI,Hotels,Consumer Discretionary
 DGCONTENT,Entertainment / Electronic Media Software,Media
 DHAMPURSUG,Sugar,Fmcg
@@ -606,9 +606,9 @@ ELECON,Engineering,Industrials
 ELECTCAST,Castings & Forgings,Industrials
 ELECTHERM,Steel - Medium / Small,Metals & Mining
 ELGIEQUIP,Compressors / Drilling Equipment,Industrials
-ELGIRUBCO,Miscellaneous,Fmcg
+ELGIRUBCO,Fmcg,Fmcg
 ELIN,Electronics - Components,Consumer Discretionary
-ELITECON,Miscellaneous,Fmcg
+ELITECON,Fmcg,Fmcg
 ELPROINTL,Construction,Industrials
 EMAMILTD,Personal Care - Indian,Fmcg
 EMAMIPAP,Paper,Building Materials
@@ -641,7 +641,7 @@ ESCORTS,Automobiles - Tractors,Auto
 ESSARSHPNG,Shipping,Transportation
 ESSENTIA,Trading,Services
 ESTER,Packaging,Industrials
-ETERNAL,Miscellaneous,I.T
+ETERNAL,I.T,I.T
 ETHOSLTD,Trading,Consumer Discretionary
 EUREKAFORB,Domestic Appliances,Consumer Discretionary
 EUROBOND,Aluminium And Aluminium Products,Metals & Mining
@@ -695,8 +695,8 @@ FRONTSP,Auto Ancillaries,Auto
 FSL,Computers - Software - Medium / Small,I.T
 FUSION,Finance & Investments,Financials
 GABRIEL,Auto Ancillaries,Auto
-GAEL,Miscellaneous,Fmcg
-GAIL,Miscellaneous,Energy
+GAEL,Fmcg,Fmcg
+GAIL,Energy,Energy
 GALAPREC,Fasteners,Industrials
 GALAXYSURF,Chemicals,Chemicals
 GALLANTT,Steel - Medium / Small,Metals & Mining
@@ -712,7 +712,7 @@ GARFIBRES,Textiles - Products,Textiles
 GARUDA,Engineering - Turnkey Services,Industrials
 GATECH,Computers - Software - Medium / Small,I.T
 GATECHDVR,Computers - Software - Medium / Small,I.T
-GATEWAY,Miscellaneous,Transportation
+GATEWAY,Transportation,Transportation
 GAUDIUMIVF,Healthcare,Healthcare
 GAYAHWS,Construction,Industrials
 GAYAPROJ,Construction,Industrials
@@ -730,7 +730,7 @@ GFLLIMITED,Finance & Investments,Financials
 GHCL,Chemicals,Chemicals
 GHCLTEXTIL,Textiles - Spinning - Synthetic / Blended,Textiles
 GICHSGFIN,Finance - Housing,Financials
-GICL,Miscellaneous,Transportation
+GICL,Transportation,Transportation
 GICRE,Finance & Investments,Financials
 GILLANDERS,Tea,Fmcg
 GILLETTE,Personal Care - Multinational,Fmcg
@@ -742,14 +742,14 @@ GLAND,Pharmaceuticals - Indian - Formulations,Healthcare
 GLAXO,Pharmaceuticals - Multinational,Healthcare
 GLENMARK,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
 GLFL,Finance & Investments,Financials
-GLOBAL,Miscellaneous,Services
+GLOBAL,Services,Services
 GLOBALE,Textiles - Products,Textiles
 GLOBALVECT,Transport - Airlines,Transportation
 GLOBE,Textiles - Products,Textiles
 GLOBECIVIL,Construction,Industrials
 GLOBUSSPR,Breweries & Distilleries,Fmcg
 GLOSTERLTD,Textiles - Jute - Yarn / Products,Textiles
-GLOTTIS,Miscellaneous,Transportation
+GLOTTIS,Transportation,Transportation
 GMBREW,Breweries & Distilleries,Fmcg
 GMDCLTD,Mining / Minerals / Metals,Metals & Mining
 GMMPFAUDLR,Engineering,Industrials
@@ -779,7 +779,7 @@ GOODYEAR,Tyres,Auto
 GOPAL,Food - Processing - Indian,Fmcg
 GOYALALUM,Trading,Services
 GPIL,Steel - Medium / Small,Metals & Mining
-GPPL,Miscellaneous,Transportation
+GPPL,Transportation,Transportation
 GPTHEALTH,Healthcare,Healthcare
 GPTINFRA,Construction,Industrials
 GRADIENTE,Entertainment / Electronic Media Software,Media
@@ -791,20 +791,20 @@ GRAUWEIL,Chemicals,Chemicals
 GRAVISSHO,Hotels,Services
 GRAVITA,Mining / Minerals / Metals,Metals & Mining
 GREAVESCOT,Engines,Industrials
-GREENLAM,Miscellaneous,Building Materials
-GREENPANEL,Miscellaneous,Building Materials
-GREENPLY,Miscellaneous,Building Materials
+GREENLAM,Building Materials,Building Materials
+GREENPANEL,Building Materials,Building Materials
+GREENPLY,Building Materials,Building Materials
 GREENPOWER,Power Generation And Supply,Power & Utilities
 GRINDWELL,Abrasives And Grinding Wheels,Industrials
 GRINFRA,Construction,Industrials
 GRMOVER,Food - Processing - Indian,Fmcg
 GROBTEA,Tea,Fmcg
 GROWW,Finance & Investments,Financials
-GRPLTD,Miscellaneous,Fmcg
+GRPLTD,Fmcg,Fmcg
 GRSE,Defence,Aerospace & Defence
 GRWRHITECH,Packaging,Industrials
 GSFC,Fertilizers,Chemicals
-GSLSU,Miscellaneous,Consumer Discretionary
+GSLSU,Consumer Discretionary,Consumer Discretionary
 GSPCROP,Pesticides / Agrochemicals - Indian,Chemicals
 GSS,Computers - Software - Medium / Small,I.T
 GTECJAINX,Computers - Education,I.T
@@ -830,7 +830,7 @@ HAPPSTMNDS,Computers - Software - Medium / Small,I.T
 HAPPYFORGE,Castings & Forgings,Industrials
 HARDWYN,Trading,Services
 HARIOMPIPE,Steel - Medium / Small,Metals & Mining
-HARRMALAYA,Miscellaneous,Fmcg
+HARRMALAYA,Fmcg,Fmcg
 HARSHA,Engineering,Industrials
 HATHWAY,Telecommunications - Service Provider,Telecom-Service
 HATSUN,Food - Processing - Indian,Fmcg
@@ -885,7 +885,7 @@ HITECHGEAR,Auto Ancillaries,Auto
 HLEGLAS,Engineering,Industrials
 HLVLTD,Hotels,Services
 HMAAGRO,Food - Processing - Indian,Fmcg
-HMT,Miscellaneous,Consumer Discretionary
+HMT,Consumer Discretionary,Consumer Discretionary
 HMVL,Entertainment / Electronic Media Software,Media
 HNDFDS,Diversified - Large,Fmcg
 HOMEFIRST,Finance - Housing,Financials
@@ -910,12 +910,12 @@ ICICIBANK,Banks - Private Sector,Bank
 ICICIGI,Finance & Investments,Financials
 ICICIPRULI,Finance & Investments,Financials
 ICIL,Textiles - Cotton/Blended,Textiles
-ICRA,Miscellaneous,Financials
+ICRA,Financials,Financials
 IDBI,Banks - Private Sector,Bank
 IDEA,Telecommunications - Service Provider,Telecom-Service
 IDEAFORGE,Engineering,Aerospace & Defence
 IDFCFIRSTB,Banks - Private Sector,Bank
-IEX,Miscellaneous,Financials
+IEX,Financials,Financials
 IFBAGRO,Breweries & Distilleries,Fmcg
 IFBIND,Domestic Appliances,Consumer Discretionary
 IFCI,Finance - Term-Lending Institutions,Financials
@@ -923,7 +923,7 @@ IFGLEXPOR,Refractories / Intermediates,Building Materials
 IGARASHI,Electric Equipment,Industrials
 IGCL,Pesticides / Agrochemicals - Indian,Chemicals
 IGIL,Miscellaneous,Miscellaneous
-IGL,Miscellaneous,Energy
+IGL,Energy,Energy
 IGPL,Chemicals,Chemicals
 IIFL,Finance & Investments,Financials
 IIFLCAPS,Finance & Investments,Financials
@@ -938,18 +938,18 @@ IMPAL,Auto Ancillaries,Auto
 INA,Electric Equipment,Industrials
 INCREDIBLE,Steel - Medium / Small,Metals & Mining
 INDBANK,Finance & Investments,Financials
-INDGN,Miscellaneous,Healthcare
+INDGN,Healthcare,Healthcare
 INDHOTEL,Hotels,Services
 INDIACEM,Cement - South India,Building Materials
 INDIAGLYCO,Breweries & Distilleries,Fmcg
-INDIAMART,Miscellaneous,I.T
+INDIAMART,I.T,I.T
 INDIANB,Banks - Public Sector,Bank
 INDIANCARD,Textiles - Products,Textiles
 INDIANHUME,Construction,Industrials
 INDIASHLTR,Finance - Housing,Financials
 INDIGO,Transport - Airlines,Transportation
 INDIGOPNTS,Paints / Varnishes,Building Materials
-INDIQUBE,Miscellaneous,Co-Working
+INDIQUBE,Co-Working,Co-Working
 INDNIPPON,Auto Ancillaries,Auto
 INDOAMIN,Chemicals,Chemicals
 INDOBORAX,Chemicals,Chemicals
@@ -959,7 +959,7 @@ INDORAMA,Textiles - Manmade,Textiles
 INDOSTAR,Finance & Investments,Financials
 INDOTECH,Electric Equipment,Industrials
 INDOTHAI,Finance & Investments,Financials
-INDOUS,Miscellaneous,Fmcg
+INDOUS,Fmcg,Fmcg
 INDOWIND,Power Generation And Supply,Power & Utilities
 INDPRUD,Finance & Investments,Financials
 INDRAMEDCO,Healthcare,Healthcare
@@ -982,7 +982,7 @@ INSPIRISYS,Computers - Software - Medium / Small,I.T
 INTELLECT,Computers - Software - Medium / Small,I.T
 INTENTECH,Computers - Software - Medium / Small,I.T
 INTERARCH,Steel - Medium / Small,Metals & Mining
-INTLCONV,Miscellaneous,Fmcg
+INTLCONV,Fmcg,Fmcg
 INVENTURE,Finance & Investments,Financials
 INVPRECQ,Castings & Forgings,Industrials
 IOB,Banks - Public Sector,Bank
@@ -998,8 +998,8 @@ IREDA,Finance - Term-Lending Institutions,Financials
 IRFC,Finance - Term-Lending Institutions,Financials
 IRIS,Computers - Software - Medium / Small,I.T
 IRISDOREME,Textiles - Products,Consumer Discretionary
-IRMENERGY,Miscellaneous,Energy
-ISFT,Miscellaneous,I.T
+IRMENERGY,Energy,Energy
+ISFT,I.T,I.T
 ISGEC,Engineering - Turnkey Services,Industrials
 ISHANCH,Dyes And Pigments,Chemicals
 ITC,Cigarettes,Fmcg
@@ -1009,7 +1009,7 @@ ITI,Telecommunications - Equipment,Aerospace & Defence
 IVALUE,Computers - Hardware,I.T
 IVC,Finance & Investments,Financials
 IVP,Chemicals,Chemicals
-IWP,Miscellaneous,Fmcg
+IWP,Fmcg,Fmcg
 IXIGO,Travel Agencies,I.T
 IZMO,Computers - Software - Medium / Small,I.T
 J&KBANK,Banks - Private Sector,Bank
@@ -1020,7 +1020,7 @@ JAICORPLTD,Plastics Products,Plastic Products
 JAINREC,Mining / Minerals / Metals,Metals & Mining
 JAIPURKURT,Textiles - Products,Textiles
 JAMNAAUTO,Auto Ancillaries,Auto
-JARO,Miscellaneous,Services
+JARO,Services,Services
 JASH,Engineering,Industrials
 JAYAGROGN,Chemicals,Chemicals
 JAYBARMARU,Auto Ancillaries,Auto
@@ -1062,7 +1062,7 @@ JSWCEMENT,Cement - North India,Building Materials
 JSWDULUX,Paints / Varnishes,Building Materials
 JSWENERGY,Power Generation And Supply,Power & Utilities
 JSWHL,Finance & Investments,Financials
-JSWINFRA,Miscellaneous,Transportation
+JSWINFRA,Transportation,Transportation
 JSWSTEEL,Steel - Large,Metals & Mining
 JTEKTINDIA,Auto Ancillaries,Auto
 JTLIND,Steel - Medium / Small,Metals & Mining
@@ -1071,7 +1071,7 @@ JUBLFOOD,Hotels,Consumer Discretionary
 JUBLINGREA,Chemicals,Chemicals
 JUBLPHARMA,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 JUNIPER,Hotels,Services
-JUSTDIAL,Miscellaneous,I.T
+JUSTDIAL,I.T,I.T
 JWL,Engineering,Industrials
 JYOTHYLAB,Personal Care - Indian,Fmcg
 JYOTICNC,Engineering,Industrials
@@ -1097,21 +1097,21 @@ KARMAENG,Power Generation And Supply,Power & Utilities
 KARURVYSYA,Banks - Private Sector,Bank
 KAUSHALYA,Hotels,Services
 KAVDEFENCE,Telecommunications - Equipment,Aerospace & Defence
-KAYA,Miscellaneous,Healthcare
+KAYA,Healthcare,Healthcare
 KAYNES,Electronics - Components,Consumer Discretionary
 KCP,Cement - South India,Building Materials
 KCPSUGIND,Sugar,Fmcg
-KDDL,Miscellaneous,Consumer Discretionary
+KDDL,Consumer Discretionary,Consumer Discretionary
 KEC,Transmisson Line Towers / Equipment,Industrials
 KECL,Electric Equipment,Industrials
-KEEPLEARN,Miscellaneous,Services
+KEEPLEARN,Services,Services
 KEI,Cables - Power,Industrials
 KELLTONTEC,Computers - Software - Medium / Small,I.T
 KENNAMET,Castings & Forgings,Industrials
 KERNEX,Electronics - Components,Consumer Discretionary
 KESORAMIND,Miscellaneous,Miscellaneous
 KEYFINSERV,Finance & Investments,Financials
-KFINTECH,Miscellaneous,Financials
+KFINTECH,Financials,Financials
 KHADIM,Leather / Leather Products,Consumer Discretionary
 KHAICHEM,Fertilizers,Chemicals
 KHAITANLTD,Trading,Services
@@ -1132,7 +1132,7 @@ KISSHT,Finance & Investments,I.T
 KITEX,Textiles - Products,Consumer Discretionary
 KKCL,Textiles - Products,Consumer Discretionary
 KLBRENG-B,Engineering,Industrials
-KMEW,Miscellaneous,Transportation
+KMEW,Transportation,Transportation
 KMSUGAR,Sugar,Fmcg
 KNAGRI,Solvent Extraction,Fmcg
 KNRCON,Construction,Industrials
@@ -1167,7 +1167,7 @@ KROSS,Auto Ancillaries,Auto
 KRSNAA,Healthcare,Healthcare
 KRYSTAL,Miscellaneous,Miscellaneous
 KSB,Pumps,Industrials
-KSCL,Miscellaneous,Fmcg
+KSCL,Fmcg,Fmcg
 KSHINTL,Mining / Minerals / Metals,Metals & Mining
 KSHITIJPOL,Printing & Stationery,Miscellaneous
 KSL,Steel - Medium / Small,Metals & Mining
@@ -1238,7 +1238,7 @@ M&M,Automobiles - Passenger Cars,Auto
 M&MFIN,Finance & Investments,Financials
 MAANALU,Aluminium And Aluminium Products,Metals & Mining
 MACPOWER,Engineering,Industrials
-MADHAV,Miscellaneous,Consumer Discretionary
+MADHAV,Consumer Discretionary,Consumer Discretionary
 MADHAVIPL,Construction,Industrials
 MADHUCON,Construction,Industrials
 MADRASFERT,Fertilizers,Chemicals
@@ -1251,7 +1251,7 @@ MAHASTEEL,Steel - Medium / Small,Metals & Mining
 MAHEPC,Plastics Products,Plastic Products
 MAHESHWARI,Trading,Services
 MAHLIFE,Construction,Industrials
-MAHLOG,Miscellaneous,Transportation
+MAHLOG,Transportation,Transportation
 MAHSCOOTER,Finance & Investments,Financials
 MAHSEAMLES,Steel - Large,Industrials
 MAITHANALL,Mining / Minerals / Metals,Metals & Mining
@@ -1301,17 +1301,17 @@ MAZDOCK,Defence,Aerospace & Defence
 MBAPL,Fertilizers,Chemicals
 MBEL,Construction,Industrials
 MBLINFRA,Construction,Industrials
-MCCHRLS-B,Miscellaneous,Realty
+MCCHRLS-B,Realty,Realty
 MCL,Mining / Minerals / Metals,Metals & Mining
 MCLEODRUSS,Tea,Fmcg
 MCLOUD,Computers - Software - Medium / Small,I.T
-MCX,Miscellaneous,Financials
+MCX,Financials,Financials
 MEDANTA,Healthcare,Healthcare
 MEDIASSIST,Miscellaneous,Miscellaneous
 MEDICAMEQ,Pharmaceuticals - Indian - Formulations,Healthcare
 MEDICO,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
 MEDPLUS,Trading,Consumer Discretionary
-MEESHO,Miscellaneous,I.T
+MEESHO,I.T,I.T
 MEGASTAR,Food - Processing - Indian,Fmcg
 MEIL,Electric Equipment,Industrials
 MENNPIS,Auto Ancillaries,Auto
@@ -1324,12 +1324,12 @@ METROPOLIS,Healthcare,Healthcare
 MFML,Textiles - Products,Textiles
 MFSL,Miscellaneous,Miscellaneous
 MGEL,Trading,Services
-MGL,Miscellaneous,Energy
+MGL,Energy,Energy
 MHLXMIRU,Textiles - Processing,Textiles
 MHRIL,Hotels,Services
 MICEL,Electronics - Components,Consumer Discretionary
 MIDHANI,Steel - Medium / Small,Aerospace & Defence
-MIDWESTLTD,Miscellaneous,Consumer Discretionary
+MIDWESTLTD,Consumer Discretionary,Consumer Discretionary
 MINDACORP,Auto Ancillaries,Auto
 MINDTECK,Computers - Software - Medium / Small,I.T
 MIRZAINT,Leather / Leather Products,Consumer Discretionary
@@ -1339,7 +1339,7 @@ MMFL,Castings & Forgings,Industrials
 MMP,Aluminium And Aluminium Products,Metals & Mining
 MMTC,Trading,Services
 MMWL,Entertainment / Electronic Media Software,Media
-MOBIKWIK,Miscellaneous,I.T
+MOBIKWIK,I.T,I.T
 MODINATUR,Solvent Extraction,Fmcg
 MODIRUBBER,Miscellaneous,Miscellaneous
 MODIS,Construction,Industrials
@@ -1360,7 +1360,7 @@ MOSCHIP,Computers - Hardware,I.T
 MOTHERSON,Auto Ancillaries,Auto
 MOTILALOFS,Finance & Investments,Financials
 MOTISONS,Diamond Cutting / Jewellery,Consumer Discretionary
-MOTOGENFIN,Miscellaneous,Realty
+MOTOGENFIN,Realty,Realty
 MPHASIS,Computers - Software - Large,I.T
 MPSLTD,Computers - Software - Medium / Small,I.T
 MRF,Tyres,Auto
@@ -1369,7 +1369,7 @@ MSPL,Steel - Medium / Small,Metals & Mining
 MSTCLTD,Trading,I.T
 MSUMI,Auto Ancillaries,Auto
 MTARTECH,Engineering,Aerospace & Defence
-MTEDUCARE,Miscellaneous,Services
+MTEDUCARE,Services,Services
 MTNL,Telecommunications - Service Provider,Telecom
 MUFIN,Finance & Investments,Financials
 MUFTI,Trading,Consumer Discretionary
@@ -1392,16 +1392,16 @@ NAHARINDUS,Textiles - Cotton/Blended,Textiles
 NAHARPOLY,Packaging,Industrials
 NAHARSPING,Textiles - Cotton/Blended,Textiles
 NAM-INDIA,Finance & Investments,Financials
-NARMADA,Miscellaneous,Fmcg
+NARMADA,Fmcg,Fmcg
 NATCAPSUQ,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
 NATCOPHARM,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
-NATHBIOGEN,Miscellaneous,Fmcg
+NATHBIOGEN,Fmcg,Fmcg
 NATIONALUM,Aluminium And Aluminium Products,Metals & Mining
 NATIONSTD,Construction,Industrials
-NAUKRI,Miscellaneous,I.T
+NAUKRI,I.T,I.T
 NAVA,Diversified - Large,Miscellaneous
 NAVINFLUOR,Chemicals,Chemicals
-NAVKARCORP,Miscellaneous,Transportation
+NAVKARCORP,Transportation,Transportation
 NAVKARURB,Construction,Industrials
 NAVNETEDUL,Printing & Stationery,Miscellaneous
 NAZARA,Telecommunications - Service Provider,I.T
@@ -1415,7 +1415,7 @@ NDLVENTURE,Finance & Investments,Financials
 NDRAUTO,Auto Ancillaries,Auto
 NDTV,Entertainment / Electronic Media Software,Media
 NEAGI,Tea,Fmcg
-NECCLTD,Miscellaneous,Transportation
+NECCLTD,Transportation,Transportation
 NECLIFE,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
 NELCAST,Castings & Forgings,Industrials
 NELCO,Telecommunications - Service Provider,Telecom
@@ -1477,7 +1477,7 @@ NUVAMA,Finance & Investments,Financials
 NUVOCO,Cement - North India,Building Materials
 NYKAA,Trading,I.T
 OAL,Chemicals,Chemicals
-OBCL,Miscellaneous,Transportation
+OBCL,Transportation,Transportation
 OBEROIRLTY,Construction,Realty
 OCCLLTD,Chemicals,Chemicals
 ODIGMA,Computers - Software - Medium / Small,I.T
@@ -1488,7 +1488,7 @@ OLAELEC,Automobiles - Motorcycles / Mopeds,Auto
 OLECTRA,Automobiles - Lcvs / Hcvs,Auto
 OMAXAUTO,Auto Ancillaries,Auto
 OMAXE,Construction,Industrials
-OMFREIGHT,Miscellaneous,Transportation
+OMFREIGHT,Transportation,Transportation
 OMINFRAL,Engineering - Turnkey Services,Industrials
 OMNI,Engineering,Industrials
 OMPOWER,Transmisson Line Towers / Equipment,Industrials
@@ -1520,7 +1520,7 @@ OSIAHYPER,Trading,Consumer Discretionary
 OSWALAGRO,Trading,Services
 OSWALGREEN,Diversified - Medium / Small,Miscellaneous
 OSWALPUMPS,Pumps,Industrials
-OSWALSEEDS,Miscellaneous,Fmcg
+OSWALSEEDS,Fmcg,Fmcg
 PACEDIGITK,Engineering - Turnkey Services,Telecom
 PAGEIND,Textiles - Products,Consumer Discretionary
 PAISALO,Finance & Investments,Financials
@@ -1545,10 +1545,10 @@ PASUPTAC,Textiles - Manmade,Textiles
 PATANJALI,Solvent Extraction,Fmcg
 PATELENG,Construction,Industrials
 PATELRMART,Trading,Consumer Discretionary
-PATINTLOG,Miscellaneous,Transportation
+PATINTLOG,Transportation,Transportation
 PAUSHAKLTD,Chemicals,Chemicals
 PAVNAIND,Auto Ancillaries,Auto
-PAYTM,Miscellaneous,I.T
+PAYTM,I.T,I.T
 PCBL,Chemicals,Chemicals
 PCJEWELLER,Diamond Cutting / Jewellery,Consumer Discretionary
 PDMJEPAPER,Paper,Building Materials
@@ -1557,10 +1557,10 @@ PEARLPOLY,Trading,Plastic Products
 PENIND,Steel - Medium / Small,Metals & Mining
 PENINLAND,Construction,Industrials
 PERSISTENT,Computers - Software - Large,I.T
-PETRONET,Miscellaneous,Energy
+PETRONET,Energy,Energy
 PFC,Finance - Term-Lending Institutions,Financials
 PFIZER,Pharmaceuticals - Multinational,Healthcare
-PFOCUS,Miscellaneous,Realty
+PFOCUS,Realty,Realty
 PFS,Finance & Investments,Financials
 PGEL,Electronics - Components,Consumer Discretionary
 PGHH,Personal Care - Multinational,Fmcg
@@ -1573,11 +1573,11 @@ PIGL,Electric Equipment,Industrials
 PIIND,Pesticides / Agrochemicals - Indian,Chemicals
 PILANIINVS,Finance & Investments,Financials
 PILITA,Plastics Products,Plastic Products
-PINELABS,Miscellaneous,I.T
+PINELABS,I.T,I.T
 PIONEEREMB,Textiles - Products,Textiles
 PIONRINV,Finance & Investments,Financials
 PITTIENG,Engineering,Industrials
-PIXTRANS,Miscellaneous,Fmcg
+PIXTRANS,Fmcg,Fmcg
 PKTEA,Tea,Fmcg
 PLASTIBLEN,Chemicals,Chemicals
 PLATIND,Chemicals,Chemicals
@@ -1592,7 +1592,7 @@ PNGJL,Diamond Cutting / Jewellery,Consumer Discretionary
 PNGSREVA,Trading,Consumer Discretionary
 POCL,Mining / Minerals / Metals,Metals & Mining
 PODDARMENT,Dyes And Pigments,Chemicals
-POKARNA,Miscellaneous,Consumer Discretionary
+POKARNA,Consumer Discretionary,Consumer Discretionary
 POLICYBZR,Computers - Software - Medium / Small,I.T
 POLYCAB,Cables - Power,Industrials
 POLYMED,Healthcare,Healthcare
@@ -1627,7 +1627,7 @@ PRICOLLTD,Auto Ancillaries,Auto
 PRIMESECU,Finance & Investments,Financials
 PRIMO,Chlor Alkali / Soda Ash,Chemicals
 PRINCEPIPE,Plastics Products,Plastic Products
-PRITI,Miscellaneous,Consumer Discretionary
+PRITI,Consumer Discretionary,Consumer Discretionary
 PRITIKAUTO,Auto Ancillaries,Auto
 PRIVISCL,Chemicals,Chemicals
 PROSTARM,Trading,Industrials
@@ -1646,7 +1646,7 @@ PURVA,Construction,Industrials
 PVP,Construction,Industrials
 PVRINOX,Entertainment / Electronic Media Software,Media
 PVSL,Trading,Consumer Discretionary
-PWL,Miscellaneous,Services
+PWL,Services,Services
 PYRAMID,Packaging,Industrials
 QMSMEDI,Trading,Healthcare
 QPOWER,Electric Equipment,Industrials
@@ -1720,14 +1720,14 @@ RHFL,Finance - Housing,Financials
 RHIM,Refractories / Intermediates,Building Materials
 RHL,Hotels,Services
 RICOAUTO,Auto Ancillaries,Auto
-RIIL,Miscellaneous,Transportation
+RIIL,Transportation,Transportation
 RISHABH,Electric Equipment,Industrials
-RITCO,Miscellaneous,Transportation
+RITCO,Transportation,Transportation
 RITES,Miscellaneous,Miscellaneous
 RKDL,Breweries & Distilleries,Fmcg
 RKEC,Construction,Industrials
 RKFORGE,Castings & Forgings,Industrials
-RKSWAMY,Miscellaneous,Media
+RKSWAMY,Media,Media
 RMC,Electric Equipment,Industrials
 RMDRIP,Plastics Products,Plastic Products
 RML,Auto Ancillaries,Auto
@@ -1756,14 +1756,14 @@ RSWM,Textiles - Cotton/Blended,Textiles
 RSYSTEMS,Computers - Software - Medium / Small,I.T
 RTNINDIA,Finance & Investments,Financials
 RTNPOWER,Power Generation And Supply,Power & Utilities
-RUBFILA,Miscellaneous,Fmcg
+RUBFILA,Fmcg,Fmcg
 RUBICON,Pharmaceuticals - Indian - Formulations,Healthcare
 RUBYMILLS,Textiles - Composite,Textiles
 RUCHINFRA,Miscellaneous,Miscellaneous
 RUCHIRA,Paper,Building Materials
 RUDRA,Steel - Medium / Small,Metals & Mining
 RUPA,Textiles - Products,Textiles
-RUSHIL,Miscellaneous,Building Materials
+RUSHIL,Building Materials,Building Materials
 RUSTOMJEE,Construction,Industrials
 RVHL,Construction,Industrials
 RVNL,Construction,Industrials
@@ -1795,7 +1795,7 @@ SAMBHAAV,Entertainment / Electronic Media Software,Media
 SAMBHV,Steel - Medium / Small,Metals & Mining
 SAMHI,Hotels,Services
 SAMMAANCAP,Finance - Housing,Financials
-SAMPANN,Miscellaneous,Fmcg
+SAMPANN,Fmcg,Fmcg
 SANATHAN,Textiles - Cotton/Blended,Textiles
 SANDESH,Entertainment / Electronic Media Software,Media
 SANDHAR,Auto Ancillaries,Auto
@@ -1806,7 +1806,7 @@ SANGINITA,Chemicals,Chemicals
 SANOFI,Pharmaceuticals - Multinational,Healthcare
 SANOFICONR,Pharmaceuticals - Multinational,Healthcare
 SANSERA,Auto Ancillaries,Auto
-SANSTAR,Miscellaneous,Fmcg
+SANSTAR,Fmcg,Fmcg
 SANWARIA,Food - Processing - Indian,Fmcg
 SAPPHIRE,Hotels,Consumer Discretionary
 SAPPL,Paper,Building Materials
@@ -1831,7 +1831,7 @@ SCHAEFFLER,Bearings,Industrials
 SCHAND,Printing & Stationery,Miscellaneous
 SCHNEIDER,Electric Equipment,Industrials
 SCI,Shipping,Transportation
-SCILAL,Miscellaneous,Services
+SCILAL,Services,Services
 SCODATUBES,Steel - Medium / Small,Metals & Mining
 SCPL,Food - Processing - Indian,Fmcg
 SDBL,Breweries & Distilleries,Fmcg
@@ -1839,7 +1839,7 @@ SEAMECLTD,Miscellaneous,Miscellaneous
 SECMARK,Computers - Software - Medium / Small,I.T
 SECURKLOUD,Computers - Software - Medium / Small,I.T
 SEDEMAC,Electronics - Components,Consumer Discretionary
-SEIL,Miscellaneous,Services
+SEIL,Services,Services
 SEJALLTD,Glass & Glass Products,Building Materials
 SELMC,Textiles - Cotton/Blended,Textiles
 SEMAC,Engineering - Turnkey Services,Industrials
@@ -1852,7 +1852,7 @@ SETCO,Auto Ancillaries,Auto
 SETL,Engineering,Industrials
 SETUINFRA,Construction,Industrials
 SEYAIND,Chemicals,Chemicals
-SFL,Miscellaneous,Consumer Discretionary
+SFL,Consumer Discretionary,Consumer Discretionary
 SGFIN,Finance & Investments,Financials
 SGIL,Castings & Forgings,Industrials
 SGL,Textiles - Processing,Textiles
@@ -1902,7 +1902,7 @@ SHYAMCENT,Mining / Minerals / Metals,Metals & Mining
 SHYAMMETL,Steel - Large,Metals & Mining
 SHYAMTEL,Trading,Services
 SICAGEN,Trading,Services
-SICALLOG,Miscellaneous,Transportation
+SICALLOG,Transportation,Transportation
 SIEMENS,Electric Equipment,Industrials
 SIGACHI,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
 SIGIND,Trading,Services
@@ -1920,7 +1920,7 @@ SILVERTUC,Computers - Software - Medium / Small,I.T
 SIMBHALS,Sugar,Fmcg
 SIMPLEXINF,Construction,Industrials
 SINCLAIR,Hotels,Services
-SINDHUTRAD,Miscellaneous,Transportation
+SINDHUTRAD,Transportation,Transportation
 SINGERIND,Engineering,Industrials
 SINTERCOM,Auto Ancillaries,Auto
 SIRCA,Trading,Building Materials
@@ -1935,12 +1935,12 @@ SKIPPER,Engineering,Industrials
 SKMEGGPROD,Food - Processing - Indian,Fmcg
 SKYGOLD,Diamond Cutting / Jewellery,Consumer Discretionary
 SMARTLINK,Computers - Hardware,I.T
-SMARTWORKS,Miscellaneous,Co-Working
+SMARTWORKS,Co-Working,Co-Working
 SMCGLOBAL,Finance & Investments,Financials
 SMLMAH,Automobiles - Lcvs / Hcvs,Auto
 SMLT,Steel - Medium / Small,Metals & Mining
 SMSPHARMA,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
-SNOWMAN,Miscellaneous,Transportation
+SNOWMAN,Transportation,Transportation
 SOBHA,Construction,Realty
 SOFTTECH,Computers - Software - Medium / Small,I.T
 SOLARA,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
@@ -1949,16 +1949,16 @@ SOLARWORLD,Engineering - Turnkey Services,Power & Utilities
 SOLEX,Electric Equipment,Industrials
 SOMANYCERA,Ceramics - Tiles / Sanitaryware,Building Materials
 SOMATEX,Construction,Industrials
-SOMICONVEY,Miscellaneous,Fmcg
+SOMICONVEY,Fmcg,Fmcg
 SONACOMS,Auto Ancillaries,Auto
-SONAMLTD,Miscellaneous,Consumer Discretionary
+SONAMLTD,Consumer Discretionary,Consumer Discretionary
 SONATSOFTW,Computers - Software - Medium / Small,I.T
 SOTL,Petrochemicals,Energy
 SOUTHBANK,Banks - Private Sector,Bank
 SOUTHWEST,Mining / Minerals / Metals,Metals & Mining
 SPAL,Textiles - Products,Consumer Discretionary
 SPANDANA,Finance & Investments,Financials
-SPARC,Miscellaneous,Healthcare
+SPARC,Healthcare,Healthcare
 SPCENET,Trading,Services
 SPECIALITY,Hotels,Services
 SPECTRUM,Electric Equipment,Industrials
@@ -1978,7 +1978,7 @@ SRTL,Textiles - Cotton/Blended,Textiles
 SSDL,Trading,Textiles
 SSWL,Auto Ancillaries,Auto
 STALLION,Chemicals,Chemicals
-STANLEY,Miscellaneous,Consumer Discretionary
+STANLEY,Consumer Discretionary,Consumer Discretionary
 STAR,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
 STARCEMENT,Cement - North India,Building Materials
 STARHEALTH,Finance & Investments,Financials
@@ -1995,7 +1995,7 @@ STLTECH,Cables - Telephone,Industrials
 STOVEKRAFT,Domestic Appliances,Consumer Discretionary
 STUDDS,Plastics Products,Plastic Products
 STYL,Computers - Software - Medium / Small,I.T
-STYLAMIND,Miscellaneous,Building Materials
+STYLAMIND,Building Materials,Building Materials
 STYLEBAAZA,Trading,Consumer Discretionary
 STYRENIX,Petrochemicals,Energy
 SUBEXLTD,Computers - Software - Medium / Small,I.T
@@ -2003,7 +2003,7 @@ SUBROS,Auto Ancillaries,Auto
 SUDARCOLOR,Dyes And Pigments,Chemicals
 SUDARSCHEM,Dyes And Pigments,Chemicals
 SUDEEPPHRM,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
-SUKHJITS,Miscellaneous,Fmcg
+SUKHJITS,Fmcg,Fmcg
 SULA,Breweries & Distilleries,Fmcg
 SUMEETINDS,Textiles - Manmade,Textiles
 SUMICHEM,Pesticides / Agrochemicals - Indian,Chemicals
@@ -2037,27 +2037,27 @@ SURYALAXMI,Textiles - Cotton/Blended,Textiles
 SURYAROSNI,Steel - Large,Industrials
 SURYODAY,Banks - Private Sector,Bank
 SUTLEJTEX,Textiles - Cotton/Blended,Textiles
-SUVEN,Miscellaneous,Healthcare
-SUVIDHAA,Miscellaneous,I.T
+SUVEN,Healthcare,Healthcare
+SUVIDHAA,I.T,I.T
 SUYOG,Transmisson Line Towers / Equipment,Telecom
 SUZLON,Electric Equipment,Industrials
-SVLL,Miscellaneous,Transportation
+SVLL,Transportation,Transportation
 SVPGLOB,Textiles - Spinning - Synthetic / Blended,Textiles
 SWANCORP,Textiles - Products,Textiles
-SWANDEF,Miscellaneous,Transportation
+SWANDEF,Transportation,Transportation
 SWARAJENG,Engines,Industrials
 SWELECTES,Electric Equipment,Industrials
-SWIGGY,Miscellaneous,I.T
+SWIGGY,I.T,I.T
 SWSOLAR,Engineering - Turnkey Services,Industrials
 SYMPHONY,Domestic Appliances,Consumer Discretionary
 SYNCOMF,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
-SYNGENE,Miscellaneous,Healthcare
+SYNGENE,Healthcare,Healthcare
 SYRMA,Electronics - Components,Consumer Discretionary
 SYSTMTXC,Finance & Investments,Financials
 TAALTECH,Transport - Airlines,Transportation
 TAINWALCHM,Trading,Services
 TAJGVK,Hotels,Services
-TAKE,Miscellaneous,Healthcare
+TAKE,Healthcare,Healthcare
 TALBROAUTO,Auto Ancillaries,Auto
 TAMBOLIIN,Finance & Investments,Financials
 TANLA,Computers - Software - Medium / Small,I.T
@@ -2066,7 +2066,7 @@ TARAPUR,Electric Equipment,Industrials
 TARC,Construction,Industrials
 TARIL,Electric Equipment,Industrials
 TARMAT,Construction,Industrials
-TARSONS,Miscellaneous,Healthcare
+TARSONS,Healthcare,Healthcare
 TASTYBITE,Food - Processing - Indian,Fmcg
 TATACAP,Finance & Investments,Financials
 TATACHEM,Chemicals,Chemicals
@@ -2081,8 +2081,8 @@ TATVA,Chemicals,Chemicals
 TBOTEK,Travel Agencies,I.T
 TBZ,Diamond Cutting / Jewellery,Consumer Discretionary
 TCC,Construction,Industrials
-TCI,Miscellaneous,Transportation
-TCIEXP,Miscellaneous,Transportation
+TCI,Transportation,Transportation
+TCIEXP,Transportation,Transportation
 TCIFINANCE,Finance & Investments,Financials
 TCPLPACK,Packaging,Industrials
 TCS,Computers - Software - Large,I.T
@@ -2117,15 +2117,15 @@ THOMASCOTT,Textiles - Products,Consumer Discretionary
 THYROCARE,Healthcare,Healthcare
 TI,Breweries & Distilleries,Fmcg
 TICL,Construction,Industrials
-TIGERLOGS,Miscellaneous,Transportation
+TIGERLOGS,Transportation,Transportation
 TIIL,Steel - Medium / Small,Metals & Mining
 TIINDIA,Steel - Large,Industrials
 TIJARIA,Plastics Products,Plastic Products
 TIL,Engineering,Industrials
 TIMETECHNO,Plastics Products,Plastic Products
-TIMEX,Miscellaneous,Consumer Discretionary
+TIMEX,Consumer Discretionary,Consumer Discretionary
 TIMKEN,Bearings,Industrials
-TINNARUBR,Miscellaneous,Fmcg
+TINNARUBR,Fmcg,Fmcg
 TIPSFILMS,Entertainment / Electronic Media Software,Media
 TIPSMUSIC,Entertainment / Electronic Media Software,Media
 TIRUMALCHM,Chemicals,Chemicals
@@ -2142,8 +2142,8 @@ TOKYOPLAST,Plastics Products,Plastic Products
 TOLINS,Tyres,Auto
 TORNTPHARM,Pharmaceuticals - Indian - Formulations,Healthcare
 TORNTPOWER,Power Generation And Supply,Power & Utilities
-TOTAL,Miscellaneous,Transportation
-TOUCHWOOD,Miscellaneous,Media
+TOTAL,Transportation,Transportation
+TOUCHWOOD,Media,Media
 TPHQ,Trading,Services
 TPLPLASTEH,Packaging,Industrials
 TRACXN,Computers - Software - Medium / Small,I.T
@@ -2151,9 +2151,9 @@ TRANSPEK,Chemicals,Chemicals
 TRANSRAILL,Engineering - Turnkey Services,Industrials
 TRANSWORLD,Shipping,Transportation
 TRAVELFOOD,Hotels,Consumer Discretionary
-TREEHOUSE,Miscellaneous,Services
+TREEHOUSE,Services,Services
 TREJHARA,Computers - Software - Medium / Small,I.T
-TREL,Miscellaneous,Transportation
+TREL,Transportation,Transportation
 TRENT,Trading,Consumer Discretionary
 TRF,Engineering,Industrials
 TRIDENT,Textiles - Cotton/Blended,Textiles
@@ -2171,7 +2171,7 @@ TURTLEMINT,Computers - Software - Medium / Small,I.T
 TVSELECT,Computers - Hardware,I.T
 TVSHLTD,Finance & Investments,Financials
 TVSMOTOR,Automobiles - Motorcycles / Mopeds,Auto
-TVSSCS,Miscellaneous,Transportation
+TVSSCS,Transportation,Transportation
 TVSSRICHAK,Tyres,Auto
 TVTODAY,Entertainment / Electronic Media Software,Media
 TVVISION,Entertainment / Electronic Media Software,Media
@@ -2208,7 +2208,7 @@ UNIVCABLES,Cables - Power,Industrials
 UNIVPHOTO,Photographic And Allied Products,Consumer Discretionary
 UNOMINDA,Auto Ancillaries,Auto
 UPL,Pesticides / Agrochemicals - Indian,Chemicals
-URBANCO,Miscellaneous,I.T
+URBANCO,I.T,I.T
 URJA,Automobiles - Motorcycles / Mopeds,Auto
 USHAMART,Steel - Medium / Small,Metals & Mining
 USK,Construction,Industrials
@@ -2236,11 +2236,11 @@ VEDL,Mining / Minerals / Metals,Metals & Mining
 VEDPOWER,Power Generation And Supply,Power & Utilities
 VEEDOL,Chemicals,Chemicals
 VELJAN,Engineering,Industrials
-VENKEYS,Miscellaneous,Fmcg
+VENKEYS,Fmcg,Fmcg
 VENTIVE,Hotels,Services
 VENUSPIPES,Steel - Medium / Small,Metals & Mining
 VENUSREM,Pharmaceuticals - Indian - Formulations,Healthcare
-VERANDA,Miscellaneous,Services
+VERANDA,Services,Services
 VERTOZ,Computers - Software - Medium / Small,I.T
 VESUVIUS,Refractories / Intermediates,Building Materials
 VETO,Electric Equipment,Industrials
@@ -2256,7 +2256,7 @@ VIKASECO,Diversified - Medium / Small,Miscellaneous
 VIKASLIFE,Trading,Services
 VIKRAMSOLR,Electric Equipment,Industrials
 VIKRAN,Transmisson Line Towers / Equipment,Industrials
-VIMTALABS,Miscellaneous,Healthcare
+VIMTALABS,Healthcare,Healthcare
 VINATIORGA,Chemicals,Chemicals
 VINCOFE,Trading,Consumer Discretionary
 VINDHYATEL,Construction,Industrials
@@ -2287,7 +2287,7 @@ VOLTAMP,Electric Equipment,Industrials
 VOLTAS,Air-Conditioners,Consumer Discretionary
 VPRPL,Construction,Industrials
 VRAJ,Steel - Sponge Iron,Metals & Mining
-VRLLOG,Miscellaneous,Transportation
+VRLLOG,Transportation,Transportation
 VSSL,Steel - Medium / Small,Metals & Mining
 VSTIND,Cigarettes,Fmcg
 VSTL,Steel - Medium / Small,Metals & Mining
@@ -2300,7 +2300,7 @@ WABAG,Engineering - Turnkey Services,Industrials
 WAKEFIT,Textiles - Jute - Yarn / Products,Textiles
 WALCHANNAG,Engineering,Industrials
 WANBURY,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
-WCIL,Miscellaneous,Transportation
+WCIL,Transportation,Transportation
 WEALTH,Finance & Investments,Financials
 WEBELSOLAR,Electric Equipment,Industrials
 WEIZMANIND,Textiles - Processing,Textiles
@@ -2311,14 +2311,14 @@ WELSPLSOL,Steel - Medium / Small,Metals & Mining
 WELSPUNLIV,Textiles - Products,Textiles
 WENDT,Abrasives And Grinding Wheels,Industrials
 WESTLIFE,Hotels,Consumer Discretionary
-WEWORK,Miscellaneous,Co-Working
+WEWORK,Co-Working,Co-Working
 WHEELS,Auto Ancillaries,Auto
 WHIRLPOOL,Domestic Appliances,Consumer Discretionary
 WILLAMAGOR,Finance & Investments,Financials
 WINDLAS,Pharmaceuticals - Indian - Formulations,Healthcare
 WINDMACHIN,Engineering,Industrials
 WINSOME,Textiles - Cotton/Blended,Textiles
-WIPL,Miscellaneous,Building Materials
+WIPL,Building Materials,Building Materials
 WIPRO,Computers - Software - Large,I.T
 WOCKPHARMA,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
 WONDERLA,Recreation / Amusement Parks,Media
