@@ -47,9 +47,14 @@ ensure_frontend() {
 
 write_frontend_env() {
   local frontend="$1"
-  # Prefer Cloud Agent secrets when present; otherwise leave existing .env alone.
+  # Lakshmimata already commits a working .env (Supabase anon + owner token).
+  # Only override when Cloud Agent secrets are explicitly provided.
   if [[ -z "${VITE_SUPABASE_URL:-}" || -z "${VITE_SUPABASE_ANON_KEY:-}" ]]; then
-    echo "[install] VITE_SUPABASE_* secrets not set; skipping .env rewrite" >&2
+    if [[ -f "${frontend}/.env" ]]; then
+      echo "[install] using committed frontend .env (no Cloud Agent VITE_* secrets needed)" >&2
+    else
+      echo "[install] warning: frontend .env missing and no VITE_* secrets set" >&2
+    fi
     return 0
   fi
   umask 077

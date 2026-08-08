@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Read-only Cloud Agent smoke test for Lakshmimata server (+ optional frontend)."""
+"""Cloud Agent smoke test using the frontend's committed Supabase .env.
+
+Backend Railway workers still expect process env vars when you run them; this
+smoke path does not require separate Cloud Agent secrets because Lakshmimata
+already ships VITE_SUPABASE_* (and can read owner_token from Supabase).
+"""
 from __future__ import annotations
 
 import asyncio
@@ -10,46 +15,7 @@ from pathlib import Path
 
 import aiohttp
 
-REQUIRED = ("UPSTOX_ANALYTICS_TOKEN", "SUPABASE_URL", "SUPABASE_SERVICE_KEY")
 SERVER_ROOT = Path(__file__).resolve().parents[2]
-
-
-def check_env() -> None:
-    missing = [name for name in REQUIRED if not os.getenv(name)]
-    if missing:
-        raise SystemExit(f"Missing required secrets: {', '.join(missing)}")
-
-
-async def check_upstox(session: aiohttp.ClientSession) -> int:
-    token = os.environ["UPSTOX_ANALYTICS_TOKEN"]
-    url = "https://api.upstox.com/v2/instruments"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-    }
-    async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=60)) as resp:
-        resp.raise_for_status()
-        data = await resp.json()
-    instruments = data.get("data", [])
-    return sum(
-        1
-        for i in instruments
-        if i.get("exchange") == "NSE"
-        and i.get("instrument_type") == "EQ"
-        and i.get("trading_symbol")
-    )
-
-
-async def check_supabase(session: aiohttp.ClientSession) -> int:
-    url = f"{os.environ['SUPABASE_URL']}/rest/v1/stock_fundamentals?select=sym&limit=1"
-    headers = {
-        "apikey": os.environ["SUPABASE_SERVICE_KEY"],
-        "Authorization": f"Bearer {os.environ['SUPABASE_SERVICE_KEY']}",
-    }
-    async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-        resp.raise_for_status()
-        rows = await resp.json()
-    return len(rows)
 
 
 def find_frontend() -> Path | None:
@@ -65,16 +31,69 @@ def find_frontend() -> Path | None:
     return None
 
 
-def check_frontend_build(frontend: Path) -> None:
-    env = os.environ.copy()
-    env.setdefault("VITE_SUPABASE_URL", "https://example.supabase.co")
-    env.setdefault("VITE_SUPABASE_ANON_KEY", "placeholder")
-    subprocess.run(
-        ["npm", "run", "build"],
-        cwd=frontend,
-        env=env,
-        check=True,
+def load_dotenv(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not path.is_file():
+        return values
+    for line in path.read_text().splitlines():
+        raw = line.strip()
+        if not raw or raw.startswith("#") or "=" not in raw:
+            continue
+        key, _, value = raw.partition("=")
+        values[key.strip()] = value.strip().strip('"').strip("'")
+    return values
+
+
+def bootstrap_from_frontend_env(frontend: Path) -> tuple[str, str]:
+    """Map frontend Vite env into names shared.py expects (read-only use)."""
+    env = load_dotenv(frontend / ".env")
+    url = os.getenv("SUPABASE_URL") or env.get("VITE_SUPABASE_URL") or ""
+    key = (
+        os.getenv("SUPABASE_SERVICE_KEY")
+        or os.getenv("VITE_SUPABASE_ANON_KEY")
+        or env.get("VITE_SUPABASE_ANON_KEY")
+        or ""
     )
+    token = (
+        os.getenv("UPSTOX_ANALYTICS_TOKEN")
+        or os.getenv("VITE_OWNER_UPSTOX_TOKEN")
+        or env.get("VITE_OWNER_UPSTOX_TOKEN")
+        or ""
+    )
+    if not url or not key:
+        raise SystemExit(
+            f"Missing Supabase URL/key in {frontend / '.env'} "
+            "(expected VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY)"
+        )
+    os.environ.setdefault("SUPABASE_URL", url)
+    os.environ.setdefault("SUPABASE_SERVICE_KEY", key)
+    # shared.py imports require this name even for local helpers.
+    os.environ.setdefault("UPSTOX_ANALYTICS_TOKEN", token or "unused-for-local-helpers")
+    return url, key
+
+
+async def check_supabase(session: aiohttp.ClientSession, url: str, key: str) -> int:
+    endpoint = f"{url.rstrip('/')}/rest/v1/stock_fundamentals?select=sym&limit=1"
+    headers = {"apikey": key, "Authorization": f"Bearer {key}"}
+    async with session.get(endpoint, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+        resp.raise_for_status()
+        rows = await resp.json()
+    return len(rows)
+
+
+async def check_owner_token(session: aiohttp.ClientSession, url: str, key: str) -> None:
+    endpoint = f"{url.rstrip('/')}/rest/v1/owner_token?select=id&limit=1"
+    headers = {"apikey": key, "Authorization": f"Bearer {key}"}
+    async with session.get(endpoint, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+        resp.raise_for_status()
+        rows = await resp.json()
+    if not rows:
+        raise SystemExit("owner_token table readable but empty")
+    print("Supabase owner_token readable")
+
+
+def check_frontend_build(frontend: Path) -> None:
+    subprocess.run(["npm", "run", "build"], cwd=frontend, check=True)
     dist = frontend / "dist" / "index.html"
     if not dist.is_file():
         raise SystemExit(f"frontend build missing {dist}")
@@ -82,7 +101,12 @@ def check_frontend_build(frontend: Path) -> None:
 
 
 async def main() -> None:
-    check_env()
+    frontend = find_frontend()
+    if frontend is None:
+        raise SystemExit("frontend checkout not found — run .cursor/scripts/install.sh first")
+
+    url, key = bootstrap_from_frontend_env(frontend)
+    print(f"using Supabase credentials from {frontend / '.env'}")
 
     sys.path.insert(0, str(SERVER_ROOT))
     from shared import get_sector, is_market_open
@@ -93,18 +117,11 @@ async def main() -> None:
 
     connector = aiohttp.TCPConnector(limit=10, ssl=False)
     async with aiohttp.ClientSession(connector=connector) as session:
-        nse_count = await check_upstox(session)
-        print(f"Upstox instruments ok ({nse_count} NSE equities)")
-
-        row_count = await check_supabase(session)
+        row_count = await check_supabase(session, url, key)
         print(f"Supabase read ok (stock_fundamentals sample rows={row_count})")
+        await check_owner_token(session, url, key)
 
-    frontend = find_frontend()
-    if frontend is None:
-        print("frontend not found; skipped frontend build check")
-    else:
-        check_frontend_build(frontend)
-
+    check_frontend_build(frontend)
     print("smoke test passed")
 
 
