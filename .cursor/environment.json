@@ -1,0 +1,16 @@
+{
+  "name": "Lakshmimata Server",
+  "install": "./.cursor/scripts/install.sh",
+  "terminals": [
+    {
+      "name": "live-scan",
+      "command": "python3 main.py",
+      "description": "Live NSE scanner worker (default SERVICE_MODE)."
+    },
+    {
+      "name": "fundamentals-worker",
+      "command": "SERVICE_MODE=fundamentals python3 main.py",
+      "description": "Fundamentals and announcements worker."
+    }
+  ]
+}
