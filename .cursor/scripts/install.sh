@@ -9,11 +9,13 @@ echo "[install] server root: $SERVER_ROOT"
 python3 -m pip install --user -r requirements.txt
 
 find_frontend() {
+  # Prefer inside the writable workspace. Sibling ../Lakshmimata only works
+  # on a laptop checkout layout — Cloud Agents cannot create /Lakshmimata.
   local candidates=(
-    "${SERVER_ROOT}/../Lakshmimata"
     "${SERVER_ROOT}/Lakshmimata"
     "/workspace/Lakshmimata"
     "/opt/cursor/lakshmimata-stack/Lakshmimata"
+    "${SERVER_ROOT}/../Lakshmimata"
   )
   local path
   for path in "${candidates[@]}"; do
@@ -30,7 +32,7 @@ ensure_frontend() {
   if frontend="$(find_frontend)"; then
     echo "[install] frontend found: $frontend" >&2
   else
-    frontend="${SERVER_ROOT}/../Lakshmimata"
+    frontend="${SERVER_ROOT}/Lakshmimata"
     echo "[install] cloning frontend into $frontend" >&2
     mkdir -p "$(dirname "$frontend")"
     if [[ -d "$frontend/.git" ]]; then
@@ -38,7 +40,12 @@ ensure_frontend() {
       git -C "$frontend" checkout -f main
       git -C "$frontend" reset --hard origin/main
     else
-      git clone --depth 1 https://github.com/rangaarnaik-lab/Lakshmimata.git "$frontend"
+      git clone --depth 1 https://github.com/rangaarnaik-lab/Lakshmimata.git "$frontend" \
+        || { echo "[install] frontend clone failed: $frontend" >&2; return 1; }
+    fi
+    if [[ ! -f "${frontend}/package.json" ]]; then
+      echo "[install] frontend missing package.json at $frontend" >&2
+      return 1
     fi
     frontend="$(cd "$frontend" && pwd)"
   fi
@@ -70,11 +77,20 @@ write_frontend_env() {
 
 install_frontend() {
   local frontend="$1"
+  if [[ -z "$frontend" || ! -f "${frontend}/package.json" ]]; then
+    echo "[install] refuse npm: invalid frontend root '$frontend'" >&2
+    return 1
+  fi
   cd "$frontend"
   # Repo may ship a non-executable node_modules/.bin; always reinstall cleanly.
   rm -rf node_modules
+  # Prefer npm ci; fall back to npm install when lockfile drifts from package.json
+  # (common across Cloud Agent vs laptop npm versions / partial lock updates).
   if [[ -f package-lock.json ]]; then
-    npm ci
+    npm ci || {
+      echo "[install] npm ci failed (lock drift?) — falling back to npm install" >&2
+      npm install
+    }
   else
     npm install
   fi

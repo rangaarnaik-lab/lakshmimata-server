@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 
+# Cloud Agent clones frontend beside/inside the server workspace
+Lakshmimata/
+
