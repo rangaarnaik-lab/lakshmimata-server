@@ -8,8 +8,17 @@ on:
       - 'deploy/frontend-pead-canslim.patch'
       - '.github/workflows/deploy-lakshmimata-frontend.yml'
 
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: deploy-lakshmimata-frontend
+  cancel-in-progress: true
+
 jobs:
-  deploy:
+  build:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -38,24 +47,56 @@ jobs:
       - name: Build frontend
         run: |
           cd frontend
-          # package-lock.json on Lakshmimata main is out of sync (missing lucide-react)
           npm install
           chmod -R u+x node_modules/.bin 2>/dev/null || true
           node node_modules/vite/bin/vite.js build
 
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+          retention-days: 1
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: frontend/dist
+
+  deploy-vercel:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download dist
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: dist
+
       - name: Deploy to Vercel production
+        continue-on-error: true
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
           VERCEL_TEAM_ID: ${{ secrets.VERCEL_TEAM_ID }}
         run: |
           if [ -z "$VERCEL_TOKEN" ] || [ -z "$VERCEL_PROJECT_ID" ]; then
-            echo "::error::Add VERCEL_TOKEN and VERCEL_PROJECT_ID to lakshmimata-server repo secrets (copy from Lakshmimata repo secrets)."
-            exit 1
+            echo "::warning::Skipping Vercel — add VERCEL_TOKEN and VERCEL_PROJECT_ID to deploy to pocketrs-pro.vercel.app"
+            exit 0
           fi
-          cd frontend
           ARGS=(--prod --token="$VERCEL_TOKEN" --yes)
           if [ -n "$VERCEL_TEAM_ID" ]; then
             ARGS+=(--scope="$VERCEL_TEAM_ID")
           fi
           npx vercel deploy dist "${ARGS[@]}"
+
+  deploy-pages:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
