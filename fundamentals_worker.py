@@ -265,7 +265,7 @@ def _parse_iso_ts(value):
 # When multiple GEMINI_API_KEY_* are set, each key gets its own semaphore so
 # About/PPT/etc. can burn separate free-tier quotas in parallel.
 def _gemini_api_key(feature: str = '') -> str:
-    """Resolve API key for a use-case.
+    """Resolve API key for a use-case (single key — legacy / non-batch features).
     Order: GEMINI_API_KEY_<FEATURE> → GEMINI_API_KEY.
     Features: ABOUT, PPT, TRANSCRIPT, RESULTS, VALUATION, THEMES,
     FLAGS, HIGHLIGHTS, ASKS."""
@@ -275,6 +275,78 @@ def _gemini_api_key(feature: str = '') -> str:
         if specific:
             return specific
     return (os.getenv('GEMINI_API_KEY') or '').strip()
+
+
+_GEMINI_BATCH_KEY_POOL: tuple[str, ...] | None = None
+_GEMINI_RR_INDEX = 0
+
+
+def _gemini_batch_key_pool() -> tuple[str, ...]:
+    """Shared deduped pool for About, Results, PPT, and concall/transcript.
+
+    Order: GEMINI_KEY_POOL (comma list) if set, else feature keys
+    (GEMINI_KEY_POOL_FEATURES or ABOUT,RESULTS,PPT,TRANSCRIPT), then
+    GEMINI_API_KEY, then any other GEMINI_API_KEY_* env vars."""
+    global _GEMINI_BATCH_KEY_POOL
+    if _GEMINI_BATCH_KEY_POOL is not None:
+        return _GEMINI_BATCH_KEY_POOL
+    override = (os.getenv('GEMINI_KEY_POOL') or '').strip()
+    if override:
+        keys = list(dict.fromkeys(k.strip() for k in override.split(',') if k.strip()))
+        _GEMINI_BATCH_KEY_POOL = tuple(keys)
+        return _GEMINI_BATCH_KEY_POOL
+    raw_feats = (os.getenv('GEMINI_KEY_POOL_FEATURES')
+                 or 'ABOUT,RESULTS,PPT,TRANSCRIPT').strip()
+    priority_feats: list[str] = []
+    for f in raw_feats.split(','):
+        f = f.strip().upper()
+        if f in ('DEFAULT', 'GEMINI_API_KEY'):
+            priority_feats.append('')
+        elif f:
+            priority_feats.append(f)
+    if '' not in priority_feats:
+        priority_feats.append('')
+    seen: set[str] = set()
+    keys: list[str] = []
+    for feat in priority_feats:
+        if feat == '':
+            k = (os.getenv('GEMINI_API_KEY') or '').strip()
+        else:
+            k = (os.getenv(f'GEMINI_API_KEY_{feat}') or '').strip()
+        if k and k not in seen:
+            keys.append(k)
+            seen.add(k)
+    include_rest = (os.getenv('GEMINI_KEY_POOL_ALL') or '1').strip().lower() not in (
+        '0', 'false', 'no', 'off')
+    if include_rest:
+        for name, val in sorted(os.environ.items()):
+            if not name.startswith('GEMINI_API_KEY'):
+                continue
+            k = (val or '').strip()
+            if k and k not in seen:
+                keys.append(k)
+                seen.add(k)
+    _GEMINI_BATCH_KEY_POOL = tuple(keys)
+    return _GEMINI_BATCH_KEY_POOL
+
+
+def _gemini_api_key_next(feature: str = '') -> str:
+    """Round-robin next key from the shared batch pool (per Gemini HTTP call)."""
+    pool = _gemini_batch_key_pool()
+    if not pool:
+        return _gemini_api_key(feature)
+    global _GEMINI_RR_INDEX
+    key = pool[_GEMINI_RR_INDEX % len(pool)]
+    _GEMINI_RR_INDEX += 1
+    return key
+
+
+def _gemini_keys_fingerprint_summary(keys: tuple[str, ...], limit: int = 6) -> str:
+    if not keys:
+        return 'none'
+    fps = [_gemini_key_fingerprint(k) for k in keys[:limit]]
+    tail = f', +{len(keys) - limit} more' if len(keys) > limit else ''
+    return f'round-robin×{len(keys)} ({", ".join(fps)}{tail})'
 
 
 def _gemini_api_key_any(*features: str) -> str:
@@ -296,14 +368,20 @@ def _gemini_api_key_any(*features: str) -> str:
 
 
 def _gemini_api_key_about() -> str:
-    """Company Overview / About — use ABOUT key if set, else any GEMINI_API_KEY*."""
+    """Company Overview / About — first key in shared batch pool (if any)."""
+    pool = _gemini_batch_key_pool()
+    if pool:
+        return pool[0]
     return _gemini_api_key_any(
         'ABOUT', '', 'RESULTS', 'PPT', 'TRANSCRIPT', 'ASKS',
         'VALUATION', 'THEMES', 'FLAGS', 'HIGHLIGHTS')
 
 
 def _gemini_api_key_results() -> str:
-    """Results PDF extraction — use RESULTS key if set, else any GEMINI_API_KEY*."""
+    """Results PDF extraction — first key in shared batch pool (if any)."""
+    pool = _gemini_batch_key_pool()
+    if pool:
+        return pool[0]
     return _gemini_api_key_any(
         'RESULTS', '', 'ABOUT', 'PPT', 'TRANSCRIPT', 'ASKS',
         'VALUATION', 'THEMES', 'FLAGS', 'HIGHLIGHTS')
@@ -591,7 +669,7 @@ async def extract_ppt_summary(session: aiohttp.ClientSession, symbol: str, attac
     usable was found (safe to mark done)."""
     error_result = {'summary': None, 'error': True}
     no_content_result = {'summary': None, 'error': False}
-    api_key = _gemini_api_key('PPT')
+    api_key = _gemini_api_key_next('PPT')
     if not api_key or not attachment_url:
         return error_result
     try:
@@ -778,7 +856,7 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
     results pipeline can't be affected by changes here."""
     error_result = {'summary': None, 'error': True}
     no_content_result = {'summary': None, 'error': False}
-    api_key = _gemini_api_key('TRANSCRIPT')
+    api_key = _gemini_api_key_next('TRANSCRIPT')
     if not api_key or not attachment_url:
         return error_result
     try:
@@ -1005,7 +1083,7 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
         'financial_data': None, 'comparison_data': None, 'yoy_data': None,
         'summary': None, 'error': False, 'rate_limited': False, 'hard_quota': False,
     }
-    api_key = _gemini_api_key_results()
+    api_key = _gemini_api_key_next('RESULTS')
     if not api_key or not attachment_url:
         return error_result  # not a real "no content" case - just not configured/no URL, don't mark as processed
     # Stage 1: download the PDF. Separate try/except so a timeout here
@@ -1440,7 +1518,7 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
             continue
         if await _idle_if_gemini_paused('results', 'Results extraction loop'):
             continue
-        if not _gemini_api_key_results():
+        if not _gemini_batch_key_pool():
             if not _key_status_logged:
                 log.warning("🎙️ Results extraction loop: no GEMINI_API_KEY* set - loop is idle, "
                             "checking every 5 min in case one gets added")
@@ -2410,7 +2488,7 @@ async def _ppt_summary_loop(session: aiohttp.ClientSession):
     while True:
         if await _idle_if_gemini_paused('ppt', 'PPT summary loop'):
             continue
-        if not _gemini_api_key('PPT'):
+        if not _gemini_batch_key_pool():
             if not _key_status_logged:
                 log.warning("🎙️ PPT summary loop: GEMINI_API_KEY not set - loop is idle")
                 _key_status_logged = True
@@ -2535,7 +2613,7 @@ async def _transcript_summary_loop(session: aiohttp.ClientSession):
     while True:
         if await _idle_if_gemini_paused('transcript', 'Transcript summary loop'):
             continue
-        if not _gemini_api_key('TRANSCRIPT'):
+        if not _gemini_batch_key_pool():
             if not _key_status_logged:
                 log.warning("🎙️ Transcript summary loop: GEMINI_API_KEY not set - loop is idle")
                 _key_status_logged = True
@@ -3863,7 +3941,7 @@ async def extract_about_company(session: aiohttp.ClientSession, symbol: str, ppt
     Returns {'about': dict|None, 'error': bool, 'rate_limited': bool}."""
     error_result = {'about': None, 'error': True, 'rate_limited': False}
     no_content_result = {'about': None, 'error': False, 'rate_limited': False}
-    api_key = _gemini_api_key_about()
+    api_key = _gemini_api_key_next('ABOUT')
     if not api_key:
         return error_result
 
@@ -5207,7 +5285,7 @@ async def _about_company_loop(session: aiohttp.ClientSession):
         _pause_logged = False
         if await _idle_if_gemini_paused('about', 'About-company loop'):
             continue
-        if not _gemini_api_key_about():
+        if not _gemini_batch_key_pool():
             if not _key_status_logged:
                 log.warning("📘 About-company loop: no GEMINI_API_KEY* set - loop is idle")
                 _key_status_logged = True
@@ -5219,14 +5297,13 @@ async def _about_company_loop(session: aiohttp.ClientSession):
         cycle_secs = _about_company_cycle_seconds()
         if not _key_status_logged:
             _web = os.getenv('ABOUT_COMPANY_WEB_SEARCH', '0')
-            _about_k = _gemini_api_key_about()
             _results_note = ('' if _gemini_focus_allowed_by_env('results')
                              else ', Results extraction paused')
             log.info(f"📘 About-company loop: active "
                       f"({'web search' if _web.strip() not in ('0', 'false', 'False') else 'filings-only'}) "
                       f"(batch={BATCH_SIZE}, concurrency={CONCURRENCY}, "
                       f"cycle={cycle_secs}s{_results_note}, "
-                      f"key={_gemini_key_fingerprint(_about_k)}, "
+                      f"keys={_gemini_keys_fingerprint_summary(_gemini_batch_key_pool())}, "
                       f"ABOUT_COMPANY_WEB_SEARCH={_web}, "
                       f"GEMINI_FOCUS={os.getenv('GEMINI_FOCUS', 'all')})")
             _key_status_logged = True
@@ -5412,7 +5489,7 @@ async def _about_company_loop(session: aiohttp.ClientSession):
                       f"({_mode}; next={_next} reason={_why}; "
                       f"missing_about≈{missing_about_n}, done={_done_n}, "
                       f"universe≈{len(universe_syms)}; "
-                      f"key={_gemini_key_fingerprint(_gemini_api_key_about())})")
+                      f"keys={_gemini_keys_fingerprint_summary(_gemini_batch_key_pool())})")
         else:
             log.info(f"📘 About-company loop: nothing new "
                       f"(missing_about≈{missing_about_n}, done={_done_n}, "
@@ -5666,11 +5743,15 @@ async def fundamentals_worker_main():
     else:
         log.warning("  Gemini keys: none configured")
     about_k = _gemini_api_key_about()
+    pool = _gemini_batch_key_pool()
+    if pool:
+        log.info(f"  📘 About/Results/PPT/concall Gemini pool: "
+                 f"{_gemini_keys_fingerprint_summary(pool)}")
     about_src = ('GEMINI_API_KEY_ABOUT'
                  if (os.getenv('GEMINI_API_KEY_ABOUT') or '').strip()
-                 else ('any-GEMINI_API_KEY*' if about_k else 'none'))
+                 else ('shared-pool' if pool else 'none'))
     log.info(f"  📘 About will call Gemini with {about_src} "
-             f"{_gemini_key_fingerprint(about_k)}")
+             f"{_gemini_key_fingerprint(about_k)} (round-robin across pool)")
     if _about_company_manually_paused():
         left = max(0, int((_ABOUT_ENV_PAUSE_UNTIL or 0) - time.time()))
         log.warning(f"  📘 About-company: paused ~{left // 3600}h "
