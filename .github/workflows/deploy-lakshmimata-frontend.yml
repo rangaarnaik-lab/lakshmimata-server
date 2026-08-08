@@ -2,6 +2,11 @@ name: Deploy Lakshmimata Frontend
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'deploy/frontend-pead-canslim.patch'
+      - '.github/workflows/deploy-lakshmimata-frontend.yml'
 
 jobs:
   deploy:
@@ -33,7 +38,8 @@ jobs:
       - name: Build frontend
         run: |
           cd frontend
-          npm ci || npm install
+          # package-lock.json on Lakshmimata main is out of sync (missing lucide-react)
+          npm install
           chmod -R u+x node_modules/.bin 2>/dev/null || true
           node node_modules/vite/bin/vite.js build
 
