@@ -63,6 +63,46 @@ _GEMINI_JOBS_PAUSED_UNTIL: float | None = None
 # PAUSE_ABOUT_COMPANY=1 → timed pause (24h) then About auto-resumes.
 _ABOUT_ENV_PAUSE_UNTIL: float | None = None
 _ABOUT_ENV_PAUSE_RESUME_LOGGED = False
+# Results catchup queue empty — About Company may start (every 15 min).
+_RESULTS_CATCHUP_IDLE = False
+_RESULTS_CATCHUP_IDLE_LOGGED = False
+
+
+def _set_results_catchup_idle(idle: bool, *, lookback_days: int | None = None,
+                              matched: int | None = None, already: int | None = None):
+    """Flip Results-catchup-idle flag; when True, About Company may populate."""
+    global _RESULTS_CATCHUP_IDLE, _RESULTS_CATCHUP_IDLE_LOGGED
+    global _ABOUT_YIELD_TO_RESULTS_UNTIL, _ABOUT_ENV_PAUSE_RESUME_LOGGED
+    was = _RESULTS_CATCHUP_IDLE
+    _RESULTS_CATCHUP_IDLE = bool(idle)
+    if _RESULTS_CATCHUP_IDLE and not was:
+        # Results backlog clear — stop yielding Gemini away from About.
+        _ABOUT_YIELD_TO_RESULTS_UNTIL = None
+        if not _RESULTS_CATCHUP_IDLE_LOGGED:
+            extra = ''
+            if lookback_days is not None:
+                extra = (f" (lookback={lookback_days}d"
+                         f"{f', matched={matched}' if matched is not None else ''}"
+                         f"{f', already={already}' if already is not None else ''})")
+            log.info(f"🎙️ Results catchup idle{extra} — "
+                     f"About Company may populate every "
+                     f"{int(os.getenv('ABOUT_COMPANY_CYCLE_SECONDS', '900'))}s")
+            _RESULTS_CATCHUP_IDLE_LOGGED = True
+    elif not _RESULTS_CATCHUP_IDLE and was:
+        _RESULTS_CATCHUP_IDLE_LOGGED = False
+        # Allow About pause/resume logs again on the next idle handoff.
+        _ABOUT_ENV_PAUSE_RESUME_LOGGED = False
+        log.info("🎙️ Results catchup busy again — About Company yields to Results")
+
+
+def _results_catchup_over() -> bool:
+    """True when Results catchup has nothing pending (or catchup is off).
+    Does not call _results_catchup_boosted() — that can call back into
+    About-pause helpers and recurse."""
+    v = (os.getenv('RESULTS_PDF_CATCHUP') or '1').strip().lower()
+    if v in ('0', 'false', 'no', 'off'):
+        return True
+    return bool(_RESULTS_CATCHUP_IDLE)
 
 
 def _gemini_jobs_hard_paused() -> bool:
@@ -116,9 +156,9 @@ async def _sleep_while_gemini_hard_paused():
 
 
 def _about_company_manually_paused() -> bool:
-    """PAUSE_ABOUT_COMPANY=1 parks About for 24h, then auto-resumes (same
-    window as Gemini hard stop). Default off. After the window, About runs
-    again even if the env var is still set (until process restart)."""
+    """PAUSE_ABOUT_COMPANY=1 parks About while Results catchup still has
+    work. Once Results catchup goes idle (or the timed window ends),
+    About starts populating even if the env var is still set."""
     global _ABOUT_ENV_PAUSE_UNTIL, _ABOUT_ENV_PAUSE_RESUME_LOGGED
     v = (os.getenv('PAUSE_ABOUT_COMPANY') or '0').strip().lower()
     if v not in ('1', 'true', 'yes', 'on'):
@@ -130,9 +170,17 @@ def _about_company_manually_paused() -> bool:
         _ABOUT_ENV_PAUSE_UNTIL = time.time() + sec
         _ABOUT_ENV_PAUSE_RESUME_LOGGED = False
         log.warning(
-            f"📘 About-company: PAUSE_ABOUT_COMPANY on — paused {sec}s (~{sec // 3600}h). "
-            f"Will auto-start again after "
+            f"📘 About-company: PAUSE_ABOUT_COMPANY on — paused until Results "
+            f"catchup is idle (or after {sec}s / ~{sec // 3600}h). "
+            f"Fallback auto-start: "
             f"{datetime.fromtimestamp(_ABOUT_ENV_PAUSE_UNTIL, tz=timezone.utc).isoformat()}")
+    # Results catchup finished → start Company Overview now (don't wait 24h).
+    if _results_catchup_over():
+        if not _ABOUT_ENV_PAUSE_RESUME_LOGGED:
+            _ABOUT_ENV_PAUSE_RESUME_LOGGED = True
+            log.info("▶️ About-company: Results catchup over — starting Company Overview "
+                     f"(every {int(os.getenv('ABOUT_COMPANY_CYCLE_SECONDS', '900'))}s)")
+        return False
     if time.time() < _ABOUT_ENV_PAUSE_UNTIL:
         return True
     if not _ABOUT_ENV_PAUSE_RESUME_LOGGED:
@@ -216,6 +264,20 @@ def _gemini_api_key_any(*features: str) -> str:
         if k and k not in seen:
             return k
     return ''
+
+
+def _gemini_api_key_about() -> str:
+    """Company Overview / About — use ABOUT key if set, else any GEMINI_API_KEY*."""
+    return _gemini_api_key_any(
+        'ABOUT', '', 'RESULTS', 'PPT', 'TRANSCRIPT', 'ASKS',
+        'VALUATION', 'THEMES', 'FLAGS', 'HIGHLIGHTS')
+
+
+def _gemini_api_key_results() -> str:
+    """Results PDF extraction — use RESULTS key if set, else any GEMINI_API_KEY*."""
+    return _gemini_api_key_any(
+        'RESULTS', '', 'ABOUT', 'PPT', 'TRANSCRIPT', 'ASKS',
+        'VALUATION', 'THEMES', 'FLAGS', 'HIGHLIGHTS')
 
 
 def _gemini_ask_model() -> str:
@@ -914,7 +976,7 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
         'financial_data': None, 'comparison_data': None, 'yoy_data': None,
         'summary': None, 'error': False, 'rate_limited': False, 'hard_quota': False,
     }
-    api_key = _gemini_api_key('RESULTS')
+    api_key = _gemini_api_key_results()
     if not api_key or not attachment_url:
         return error_result  # not a real "no content" case - just not configured/no URL, don't mark as processed
     # Stage 1: download the PDF. Separate try/except so a timeout here
@@ -1349,10 +1411,10 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
             continue
         if await _idle_if_gemini_paused('results', 'Results extraction loop'):
             continue
-        if not _gemini_api_key('RESULTS'):
+        if not _gemini_api_key_results():
             if not _key_status_logged:
-                log.warning("🎙️ Results extraction loop: GEMINI_API_KEY not set - loop is idle, "
-                            "checking every 5 min in case it gets added")
+                log.warning("🎙️ Results extraction loop: no GEMINI_API_KEY* set - loop is idle, "
+                            "checking every 5 min in case one gets added")
                 _key_status_logged = True
             await asyncio.sleep(300)  # check again in 5 min in case the key gets added
             continue
@@ -1367,8 +1429,9 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
             BATCH_SIZE = int(os.getenv('RESULTS_PDF_CATCHUP_BATCH_SIZE', '1'))
             candidates_limit = int(os.getenv('RESULTS_PDF_CATCHUP_CANDIDATES_LIMIT',
                                              os.getenv('RESULTS_PDF_CANDIDATES_LIMIT', '12000')))
+            # 90d is enough for Results catchup (same window as steady-state).
             lookback_days = int(os.getenv('RESULTS_PDF_CATCHUP_LOOKBACK_DAYS',
-                                          os.getenv('RESULTS_PDF_LOOKBACK_DAYS', '365')))
+                                          os.getenv('RESULTS_PDF_LOOKBACK_DAYS', '90')))
             pacing = float(os.getenv('RESULTS_PDF_CATCHUP_PACING_SECONDS',
                                      os.getenv('RESULTS_PDF_PACING_SECONDS', '3')))
         else:
@@ -1376,12 +1439,20 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
             candidates_limit = int(os.getenv('RESULTS_PDF_CANDIDATES_LIMIT', '2000'))
             lookback_days = int(os.getenv('RESULTS_PDF_LOOKBACK_DAYS', '90'))
             pacing = float(os.getenv('RESULTS_PDF_PACING_SECONDS', '5'))
-        if not _key_status_logged or catchup:
+        # Log "active" once at start, and again only when catchup mode
+        # flips — not every empty idle cycle.
+        if not _key_status_logged:
             log.info(f"🎙️ Results extraction loop: active "
                       f"(catchup={catchup}, lookback={lookback_days}d, batch={BATCH_SIZE}, "
                       f"candidates_limit={candidates_limit}, pacing={pacing}s, "
                       f"gemini_concurrent={os.getenv('GEMINI_MAX_CONCURRENT', '1')})")
             _key_status_logged = True
+            _concall_summary_loop._last_catchup = catchup
+        elif catchup != getattr(_concall_summary_loop, '_last_catchup', catchup):
+            log.info(f"🎙️ Results extraction loop: mode change "
+                      f"(catchup={catchup}, lookback={lookback_days}d, batch={BATCH_SIZE}, "
+                      f"candidates_limit={candidates_limit}, pacing={pacing}s)")
+            _concall_summary_loop._last_catchup = catchup
         try:
             since = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat()
             # DB-level pre-filter on subject/category keywords - confirmed
@@ -1438,9 +1509,24 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
                       f"(catchup={catchup}, missing_fr≈{missing_n}, "
                       f"candidates={len(candidates)}, matched={len(concall_rows)}, "
                       f"pending={len(pending)}, already={len(already)})")
+            _concall_summary_loop._idle_streak = 0
+            if catchup:
+                _set_results_catchup_idle(False)
         else:
-            log.info(f"🎙️ Results extraction loop: checked {len(candidates)} announcement(s) "
-                      f"({len(concall_rows)} matched, already={len(already)}), nothing new")
+            idle_streak = getattr(_concall_summary_loop, '_idle_streak', 0) + 1
+            _concall_summary_loop._idle_streak = idle_streak
+            # First empty cycle (and rare heartbeats) only — avoid the
+            # 2026-08-08 log flood of "nothing new" every ~20s.
+            if idle_streak == 1 or idle_streak % 30 == 0:
+                log.info(f"🎙️ Results extraction loop: checked {len(candidates)} announcement(s) "
+                          f"({len(concall_rows)} matched, already={len(already)}), nothing new"
+                          f"{f' (idle#{idle_streak})' if idle_streak > 1 else ''}")
+            if catchup:
+                _set_results_catchup_idle(
+                    True, lookback_days=lookback_days,
+                    matched=len(concall_rows), already=len(already))
+            else:
+                _set_results_catchup_idle(True)
         soft_backoff = False
         for i, row in enumerate(todo):
             if i > 0:
@@ -1545,6 +1631,18 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
             yoy = raw_yoy if yoy_consistent else await _sanity_check_sales_outlier(
                 session, raw_yoy, row['symbol'], row['attachment_url'])
 
+            # Deduplicate: some Standalone-only PDFs expose only current +
+            # YoY columns. Gemini sometimes labels the YoY column as both
+            # comparison and YoY (GREENPANEL 2026-08-08: both came back as
+            # 30-Jun-2025). Saving the same period twice wastes a row and
+            # corrupts QoQ% — keep it as YoY only.
+            if (comp and yoy and comp.get('period_ended') and yoy.get('period_ended')
+                    and str(comp['period_ended']).strip().lower()
+                    == str(yoy['period_ended']).strip().lower()):
+                log.info(f"  ℹ️ {row['symbol']}: comparison period equals YoY "
+                          f"({comp['period_ended']}) — keeping YoY only")
+                comp = None
+
             # All three periods saved together in ONE batch, not three
             # separate calls, specifically so compute_results_yoy_qoq
             # (called inside save_financial_results_to_db) can see all
@@ -1634,9 +1732,21 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
         if todo:
             log.info(f"🎙️ Results extraction loop: batch complete"
                       f"{' (catchup)' if catchup else ''}")
-        # Catchup: keep churning; steady-state: polite idle.
+        # Catchup: keep churning while there's work; when the queue is
+        # empty, sleep a long time (About-company pattern) instead of
+        # re-scanning every 20s and flooding logs. Steady-state stays
+        # polite either way.
         if catchup:
-            await asyncio.sleep(5 if todo else 20)
+            if todo:
+                await asyncio.sleep(5)
+            else:
+                idle = int(os.getenv('RESULTS_PDF_CATCHUP_DONE_SECONDS', '1800'))  # 30m
+                streak = getattr(_concall_summary_loop, '_idle_streak', 1)
+                if streak == 1:
+                    log.info(f"🎙️ Results extraction loop: catchup idle "
+                              f"(lookback={lookback_days}d, matched={len(concall_rows)}, "
+                              f"already={len(already)}) — sleeping {idle}s until next check")
+                await asyncio.sleep(max(60, idle))
         else:
             await asyncio.sleep(120 if todo else 300)
 
@@ -3724,7 +3834,7 @@ async def extract_about_company(session: aiohttp.ClientSession, symbol: str, ppt
     Returns {'about': dict|None, 'error': bool, 'rate_limited': bool}."""
     error_result = {'about': None, 'error': True, 'rate_limited': False}
     no_content_result = {'about': None, 'error': False, 'rate_limited': False}
-    api_key = _gemini_api_key('ABOUT')
+    api_key = _gemini_api_key_about()
     if not api_key:
         return error_result
 
@@ -5026,34 +5136,45 @@ async def _about_company_loop(session: aiohttp.ClientSession):
                       f"— sleeping, then auto-restart with Results")
             await _sleep_while_gemini_hard_paused()
             continue
-        # PAUSE_ABOUT_COMPANY=1 — timed 24h park; Results catchup runs; then About resumes.
+        # PAUSE_ABOUT_COMPANY=1 — park while Results catchup still has work.
+        # Once Results goes idle, About starts even if the env var is still set.
         if _about_company_manually_paused():
             if not _pause_logged:
                 left = max(0, int((_ABOUT_ENV_PAUSE_UNTIL or 0) - time.time()))
                 log.warning(
-                    f"📘 About-company: paused ({left}s left) — Results catchup active. "
-                    f"About auto-starts after this window.")
+                    f"📘 About-company: paused (waiting for Results catchup idle; "
+                    f"fallback {left}s) — Company Overview starts when Results is over.")
                 _pause_logged = True
-            left = max(60, int((_ABOUT_ENV_PAUSE_UNTIL or time.time()) - time.time()))
-            await asyncio.sleep(min(3600, left))
+            # Poll often so we notice Results catchup going idle quickly.
+            await asyncio.sleep(30)
             continue
+        if _pause_logged:
+            log.info("▶️ About-company: resuming — populating Company Overview "
+                     f"every {int(os.getenv('ABOUT_COMPANY_CYCLE_SECONDS', '900'))}s")
         _pause_logged = False
         if await _idle_if_gemini_paused('about', 'About-company loop'):
             continue
-        if not _gemini_api_key('ABOUT'):
+        if not _gemini_api_key_about():
             if not _key_status_logged:
-                log.warning("📘 About-company loop: GEMINI_API_KEY not set - loop is idle")
+                log.warning("📘 About-company loop: no GEMINI_API_KEY* set - loop is idle")
                 _key_status_logged = True
             await asyncio.sleep(300)
             continue
         # 5 stocks per cycle (3 in parallel). Override via env if needed.
         BATCH_SIZE = int(os.getenv('ABOUT_COMPANY_BATCH_SIZE', '5'))
         CONCURRENCY = max(1, int(os.getenv('ABOUT_COMPANY_CONCURRENCY', '3')))
+        # After Results catchup: populate Company Overview every 15 min by default.
+        cycle_secs = int(os.getenv(
+            'ABOUT_COMPANY_CYCLE_SECONDS',
+            '900' if _results_catchup_over() else '15'))
         if not _key_status_logged:
             _web = os.getenv('ABOUT_COMPANY_WEB_SEARCH', '0')
+            _about_k = _gemini_api_key_about()
             log.info(f"📘 About-company loop: active "
                       f"({'web search' if _web.strip() not in ('0', 'false', 'False') else 'filings-only'}) "
                       f"(batch={BATCH_SIZE}, concurrency={CONCURRENCY}, "
+                      f"cycle={cycle_secs}s, "
+                      f"key={_gemini_key_fingerprint(_about_k)}, "
                       f"ABOUT_COMPANY_WEB_SEARCH={_web}, "
                       f"GEMINI_FOCUS={os.getenv('GEMINI_FOCUS', 'all')})")
             _key_status_logged = True
@@ -5245,7 +5366,7 @@ async def _about_company_loop(session: aiohttp.ClientSession):
             _why = (meta_by_sym.get(_next) or {}).get('_about_reason', '?')
             log.info(f"📘 About-company loop: {len(todo)} symbol(s) to generate "
                       f"({_mode}; next={_next} reason={_why}; backlog≈{len(ranked)}; "
-                      f"key={_gemini_key_fingerprint(_gemini_api_key('ABOUT'))})")
+                      f"key={_gemini_key_fingerprint(_gemini_api_key_about())})")
         else:
             log.info("📘 About-company loop: nothing new")
 
@@ -5434,21 +5555,29 @@ async def _about_company_loop(session: aiohttp.ClientSession):
             _ABOUT_GEMINI_UNHEALTHY_SINCE = None
             _ABOUT_GEMINI_HARD_QUOTA = False
             _ABOUT_YIELD_TO_RESULTS_UNTIL = None
-            await asyncio.sleep(int(os.getenv('ABOUT_COMPANY_CYCLE_SECONDS', '15')))
+            # After Results catchup: default 15 min between Company Overview batches.
+            cycle = int(os.getenv(
+                'ABOUT_COMPANY_CYCLE_SECONDS',
+                '900' if _results_catchup_over() else '15'))
+            await asyncio.sleep(max(15, cycle))
         elif not ranked:
-            # All candidates done (or skipped). Rarely re-check for new
-            # filings / new listings — do NOT hammer Gemini / Supabase.
-            idle = int(os.getenv('ABOUT_COMPANY_CATCHUP_DONE_SECONDS', '21600'))  # 6h
+            # All candidates done (or skipped). Recheck for new listings —
+            # every 15 min once Results is over, else long idle.
+            idle = int(os.getenv(
+                'ABOUT_COMPANY_CATCHUP_DONE_SECONDS',
+                '900' if _results_catchup_over() else '21600'))
             log.info(f"📘 About-company: catchup complete "
                       f"({_done_n} done, universe≈{len(set(ppt_by_sym)|set(tx_by_sym)|set(fund_by_sym)|set(meta_by_sym))}) "
                       f"— sleeping {idle}s until next refresh check")
-            await asyncio.sleep(max(300, idle))
+            await asyncio.sleep(max(300 if not _results_catchup_over() else 60, idle))
         else:
-            # Transient empty batch — medium idle.
-            idle = int(os.getenv('ABOUT_COMPANY_IDLE_SECONDS', '3600'))  # 1h
+            # Transient empty batch — medium idle (15 min after Results over).
+            idle = int(os.getenv(
+                'ABOUT_COMPANY_IDLE_SECONDS',
+                '900' if _results_catchup_over() else '3600'))
             log.info(f"📘 About-company: nothing to generate "
                       f"(backlog≈{len(ranked)}) — sleeping {idle}s")
-            await asyncio.sleep(max(120, idle))
+            await asyncio.sleep(max(120 if not _results_catchup_over() else 60, idle))
 
 
 async def fundamentals_worker_main():
@@ -5485,10 +5614,10 @@ async def fundamentals_worker_main():
         log.info(f"  Gemini keys: {', '.join(_feat_keys)}")
     else:
         log.warning("  Gemini keys: none configured")
-    about_k = _gemini_api_key('ABOUT')
+    about_k = _gemini_api_key_about()
     about_src = ('GEMINI_API_KEY_ABOUT'
                  if (os.getenv('GEMINI_API_KEY_ABOUT') or '').strip()
-                 else ('GEMINI_API_KEY' if about_k else 'none'))
+                 else ('any-GEMINI_API_KEY*' if about_k else 'none'))
     log.info(f"  📘 About will call Gemini with {about_src} "
              f"{_gemini_key_fingerprint(about_k)}")
     if _about_company_manually_paused():
@@ -5610,6 +5739,9 @@ def _gemini_focus_allows(feature: str) -> bool:
             return True
     until = _ABOUT_YIELD_TO_RESULTS_UNTIL
     if until and time.time() < until:
+        # Results catchup idle → let About populate Company Overview.
+        if feature == 'about' and _results_catchup_over():
+            return True
         if feature == 'about':
             return False
         if feature == 'results':
