@@ -3442,8 +3442,18 @@ async def load_index_cache(session: aiohttp.ClientSession):
     # Alternative key formats to try if primary fails
     KEY_ALTERNATIVES = {
         "Midcap 150":   ["NSE_INDEX|Nifty Midcap 150", "NSE_INDEX|NIFTY MIDCAP 150", "NSE_INDEX|Nifty MidCap 150"],
-        "Smallcap 250": ["NSE_INDEX|Nifty Smallcap 250", "NSE_INDEX|NIFTY SMALLCAP 250", "NSE_INDEX|Nifty SmallCap 250"],
-        "Microcap 250": ["NSE_INDEX|Nifty Microcap 250", "NSE_INDEX|NIFTY MICROCAP 250", "NSE_INDEX|Nifty MicroCap 250"],
+        # NSE/Upstox often abbreviate Smallcap → Smlcap (live quotes use
+        # NIFTY MIDCAP 150 style; historical keys differ by product).
+        "Smallcap 250": [
+            "NSE_INDEX|Nifty Smlcap 250", "NSE_INDEX|NIFTY SMLCAP 250",
+            "NSE_INDEX|Nifty Smallcap 250", "NSE_INDEX|NIFTY SMALLCAP 250",
+            "NSE_INDEX|Nifty SmallCap 250",
+        ],
+        "Microcap 250": [
+            "NSE_INDEX|Nifty Microcap 250", "NSE_INDEX|NIFTY MICROCAP 250",
+            "NSE_INDEX|Nifty MicroCap 250", "NSE_INDEX|Nifty Mcrcap 250",
+            "NSE_INDEX|NIFTY MCRCAP 250",
+        ],
         # Newer additions — exact Upstox naming for these is less certain
         # than the well-established ones above, so try a few common
         # variants each (same self-healing approach as Mid/Small/Microcap).
@@ -4979,32 +4989,44 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
     # this only runs once daily, unlike the main stocks upsert which
     # fails every ~scan and becomes obvious fast). Added an explicit
     # verification step below so a failure here is loud, not silent.
-    if is_first_eod_today:
-        snapshot_date = now_ist.strftime('%Y-%m-%d')
-        log.info(f"  📸 Archiving EOD snapshot for {snapshot_date}…")
+    # Archive on first EOD of the day, and retry later EOD cycles if
+    # stock_history never verified (schema mismatch used to leave the
+    # day empty until the next calendar day).
+    global last_eod_archive_ok_date
+    snapshot_date = now_ist.strftime('%Y-%m-%d')
+    need_eod_archive = (
+        scan_type == 'batch_eod'
+        and (is_first_eod_today or last_eod_archive_ok_date != snapshot_date)
+    )
+    if need_eod_archive:
+        if not is_first_eod_today:
+            log.info(f"  📸 Retrying EOD stock_history archive for {snapshot_date} "
+                     f"(previous attempt did not verify)…")
+        else:
+            log.info(f"  📸 Archiving EOD snapshot for {snapshot_date}…")
 
+        # Fields on live `stocks` / `processed` that are NOT on
+        # stock_history. One unknown column → PostgREST 400 on the
+        # whole batch (PGRST204). 2026-08-08: `car` (bank CAR) killed
+        # the entire EOD archive (0/2384). Keep this list in sync when
+        # adding fundamentals to stocks without a matching history column.
+        _STOCK_HISTORY_SKIP = {
+            'last_updated', 'scan_type',
+            'best_pick_score', 'fundamental_score', 'fundamental_label',
+            # Valuation / cash-flow / bank ratios (add_valuation_cashflow_bank.sql)
+            'pb', 'roce', 'industry_pe', 'div_yield',
+            'cfo', 'fcf', 'cfo_pat',
+            'nim', 'gnpa', 'nnpa', 'car', 'casa',
+            'peg_ratio',
+        }
         history_rows = []
         for p in processed:
-            # Exclude fields added to `processed` AFTER stock_history's
-            # schema was created (best_pick_score/fundamental_score/
-            # fundamental_label, from the AI Best Picks and Fundamental
-            # Rating features) — confirmed via production log that their
-            # presence here breaks the ENTIRE upsert (PostgREST rejects
-            # the whole batch if even one column doesn't exist in the
-            # target table), silently failing today's EOD archive
-            # (0/2380 rows) even though everything else about the scan
-            # succeeded. These are daily-recomputed "current state"
-            # outputs, not core historical data worth preserving anyway
-            # — simplest fix is excluding them here rather than growing
-            # stock_history's schema every time a new field is added to
-            # the live scanner.
-            row = {k: v for k, v in p.items()
-                   if k not in ('last_updated', 'scan_type', 'best_pick_score',
-                                'fundamental_score', 'fundamental_label')}
+            row = {k: v for k, v in p.items() if k not in _STOCK_HISTORY_SKIP}
             row['snapshot_date'] = snapshot_date
             history_rows.append(row)
         await supabase_upsert(session, 'stock_history', history_rows, on_conflict='snapshot_date,sym')
 
+        archive_ok = False
         try:
             verify_headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
                                "Prefer": "count=exact"}
@@ -5018,12 +5040,13 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
                     if '/' in cr:
                         saved_count = int(cr.split('/')[-1])
                 if saved_count >= len(history_rows) * 0.9:  # allow small variance
+                    archive_ok = True
+                    last_eod_archive_ok_date = snapshot_date
                     log.info(f"  ✅ EOD snapshot verified: {saved_count} stocks saved for {snapshot_date}")
                 else:
                     log.error(f"  ❌ EOD snapshot for {snapshot_date} likely FAILED — only {saved_count}/"
                                f"{len(history_rows)} rows found. This usually means stock_history's schema "
-                               f"is missing a column stocks has. Check Supabase: the columns on both tables "
-                               f"should match.")
+                               f"is missing a column stocks has. Will retry on next EOD cycle.")
         except Exception as e:
             log.warning(f"EOD snapshot verification check failed: {e}")
 

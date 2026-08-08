@@ -136,6 +136,7 @@ __all__ = [
     'is_market_open',
     'json',
     'last_eod_refresh_date',
+    'last_eod_archive_ok_date',
     'load_fundamentals_batch',
     'load_fundamentals_from_supabase',
     'load_instrument_master',
@@ -503,6 +504,9 @@ opens_cache: dict = {}  # sym -> [opens] — parallel to historical_cache, track
 last_eod_refresh_date: Optional[str] = None  # IST date string — ensures the
 # expensive EOD refresh (full Yahoo re-fetch + fundamentals) runs only ONCE
 # per day, not on every single scan cycle while the market stays closed.
+last_eod_archive_ok_date: Optional[str] = None  # set only after stock_history
+# EOD snapshot verifies — so a failed archive (e.g. schema mismatch) retries
+# on later batch_eod cycles without re-running the heavy Yahoo refresh.
 nifty_cache: dict = {}        # {'prices': [...]} — Nifty index daily closes for TV RS calc
 midcap_cache: dict = {}       # {'prices': [...]} — official Nifty Midcap 150 closes for MID RS
 smallcap_cache: dict = {}     # {'prices': [...]} — official Nifty Smallcap 250 closes for SML RS
