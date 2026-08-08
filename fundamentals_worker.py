@@ -670,21 +670,94 @@ def _bullets_from_structured_sections(sections, *title_hints):
     return None
 
 
+_STRUCTURED_TITLE_HINTS = {
+    'financial_highlights': ('financial performance', 'financial highlights', 'results'),
+    'cost_margin_commentary': ('margin outlook', 'cost', 'margin'),
+    'operational_kpis': ('segment performance', 'operational', 'kpi', 'volume'),
+    'outlook_guidance': ('growth strategy', 'outlook', 'guidance', 'target'),
+    'expansion_capex': ('capex', 'capacity', 'expansion', 'facility', 'plant'),
+    'competitive_positioning': ('new business', 'order', 'customer win', 'wins', 'competitive'),
+    'capital_allocation': ('capital allocation', 'dividend', 'buyback', 'cash'),
+    'risks_flagged': ('risk', 'headwind', 'challenge'),
+    'key_concerns': ('analyst', 'q&a', 'concern', 'question'),
+    'management_changes': ('management change', 'appointment', 'resignation', 'succession'),
+    'regulatory_legal': ('regulatory', 'legal', 'litigation', 'approval'),
+    'watch_next': ('watch next',),
+}
+
+_LEGACY_SECTION_LABELS = {
+    'financial_highlights': 'Financial Highlights',
+    'cost_margin_commentary': 'Cost & Margin',
+    'operational_kpis': 'Operational KPIs',
+    'outlook_guidance': 'Outlook & Guidance',
+    'expansion_capex': 'Expansion / Capex',
+    'competitive_positioning': 'Competitive Position',
+    'capital_allocation': 'Capital Allocation',
+    'risks_flagged': 'Risks Flagged',
+    'key_concerns': 'Analyst Concerns (Q&A)',
+    'management_changes': 'Management Changes',
+    'regulatory_legal': 'Regulatory / Legal',
+    'watch_next': 'Watch Next',
+}
+
+
+def _normalize_bullet_key(b) -> str:
+    return re.sub(r'\s+', ' ', (b or '').strip().lower())
+
+
+def _structured_covers_legacy(structured, field_key: str) -> bool:
+    hints = _STRUCTURED_TITLE_HINTS.get(field_key, ())
+    for sec in structured or []:
+        t = (sec.get('title') or '').lower()
+        if any(h in t for h in hints):
+            return True
+    return False
+
+
+def _merge_legacy_into_structured_sections(structured, summary: dict):
+    """Add missing legacy sections into structured_sections; merge unique bullets
+    when a themed heading already exists — never drop content."""
+    structured = [dict(s) for s in (structured or [])]
+    seen = set()
+    for sec in structured:
+        for b in sec.get('bullets') or []:
+            seen.add(_normalize_bullet_key(b))
+    for field, label in _LEGACY_SECTION_LABELS.items():
+        bullets = _clean_section_bullets(summary.get(field))
+        if not bullets:
+            continue
+        if _structured_covers_legacy(structured, field):
+            hints = _STRUCTURED_TITLE_HINTS.get(field, ())
+            for sec in structured:
+                t = (sec.get('title') or '').lower()
+                if not any(h in t for h in hints):
+                    continue
+                existing = {_normalize_bullet_key(b) for b in sec.get('bullets') or []}
+                merged = list(sec.get('bullets') or [])
+                for b in bullets:
+                    nk = _normalize_bullet_key(b)
+                    if nk not in existing and nk not in seen:
+                        merged.append(b)
+                        seen.add(nk)
+                sec['bullets'] = merged
+                break
+        else:
+            new_bullets = []
+            for b in bullets:
+                nk = _normalize_bullet_key(b)
+                if nk not in seen:
+                    new_bullets.append(b)
+                    seen.add(nk)
+            if new_bullets:
+                structured.append({'title': label, 'bullets': new_bullets})
+    return _clean_structured_sections(structured, max_sections=20) or structured
+
+
 def _legacy_fields_from_structured_sections(sections: list) -> dict:
     """Map themed sections into legacy jsonb columns for radar / simple view."""
     if not sections:
         return {}
-    mapping = {
-        'financial_highlights': ('financial performance', 'financial highlights', 'results'),
-        'cost_margin_commentary': ('margin outlook', 'cost', 'margin'),
-        'operational_kpis': ('segment performance', 'operational', 'kpi', 'volume'),
-        'outlook_guidance': ('growth strategy', 'outlook', 'guidance', 'target'),
-        'expansion_capex': ('capex', 'capacity', 'expansion', 'facility', 'plant'),
-        'competitive_positioning': ('new business', 'order', 'customer win', 'wins'),
-        'capital_allocation': ('capital allocation', 'dividend', 'buyback', 'cash'),
-        'risks_flagged': ('risk', 'headwind', 'challenge'),
-        'key_concerns': ('analyst', 'q&a', 'concern', 'question'),
-    }
+    mapping = _STRUCTURED_TITLE_HINTS
     out = {}
     used = set()
     for field, hints in mapping.items():
@@ -1029,16 +1102,21 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
         "WATCH_NEXT: 2-4 short bullets of concrete near-term signals to track after this "
         "call (e.g. 'Q2 disbursement acceleration', 'NIM expansion vs 1.65% target'). "
         "Derive only from guidance, risks, or Q&A — never invent. Null if nothing concrete.\n\n"
-        "STRUCTURED_SECTIONS (REQUIRED when has_content=true): Build an earnings-call "
-        "highlights report like a professional Twitter/LinkedIn concall thread — 8 to 14 "
-        "thematic sections, each with a short Title Case heading and 3-12 bullet facts.\n"
-        "Always include these sections when discussed (skip only if truly not mentioned):\n"
+        "STRUCTURED_SECTIONS (REQUIRED when has_content=true): IN ADDITION to every legacy "
+        "field above, build an earnings-call highlights deck like a professional concall thread — "
+        "8 to 16 thematic sections, each with a short Title Case heading and 3-12 bullet facts. "
+        "Do NOT skip legacy jsonb fields — populate BOTH structured_sections AND the matching "
+        "legacy arrays (financial_highlights, key_concerns, watch_next, etc.).\n"
+        "Always include these structured headings when discussed (skip only if truly not mentioned):\n"
         "- Management Commentary\n"
         "- Financial Performance (revenue, EBITDA, PAT, margins, cash, ROCE — with numbers)\n"
         "- Segment Performance (PV, 2W, exports, divisions — with mix % if given)\n"
         "- New Business Wins / Order Wins (OEM names, contracts)\n"
-        "- Margin Outlook\n"
-        "- Growth Strategy\n"
+        "- Margin Outlook (also fill cost_margin_commentary)\n"
+        "- Growth Strategy (also fill outlook_guidance)\n"
+        "- Analyst Concerns (Q&A) (also fill key_concerns)\n"
+        "- Risks Flagged (also fill risks_flagged)\n"
+        "- Expansion / Capex, Capital Allocation, Management Changes, Regulatory / Legal when discussed\n"
         "Also add dynamic sections for major topics on THIS call (subsidiaries, new products, "
         "capacity, exports, display/EV themes, etc.) — use specific headings from the call.\n"
         "End with a section titled exactly 'Key Takeaway' (1-3 bullets summarizing the call).\n"
@@ -1152,7 +1230,6 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
                   'regulatory_legal', 'key_concerns', 'theme_evidence')
     }
     if structured:
-        summary['structured_sections'] = structured
         for k, v in _legacy_fields_from_structured_sections(structured).items():
             if not summary.get(k):
                 summary[k] = v
@@ -1161,6 +1238,9 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
     # Always persist an array (possibly empty) so watch_next IS NULL means
     # "pre-migration row" and backfill can stop after one re-extract.
     summary['watch_next'] = _clean_bullets(parsed.get('watch_next')) or []
+    merged_structured = _merge_legacy_into_structured_sections(structured, summary)
+    if merged_structured:
+        summary['structured_sections'] = merged_structured
     summary['overall_summary'] = (parsed.get('overall_summary') or '').strip()[:1500] or None
     if not summary['overall_summary']:
         summary['overall_summary'] = _synthesize_overall_summary(summary)
