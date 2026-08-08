@@ -608,6 +608,99 @@ def _clean_bullets(v):
         bullets.append(text)
     return bullets[:6] or None
 
+
+def _clean_section_bullets(v, max_bullets: int = 12):
+    """Like _clean_bullets but allows longer earnings-call highlight lists."""
+    if isinstance(v, str):
+        raw = v.strip()
+        if raw.startswith('['):
+            try:
+                parsed = json.loads(raw)
+                v = parsed if isinstance(parsed, list) else None
+            except Exception:
+                v = [raw] if raw else None
+        elif raw:
+            v = [raw]
+        else:
+            v = None
+    if not isinstance(v, list):
+        return None
+    bullets = []
+    for b in v:
+        if not b:
+            continue
+        text = str(b).strip()[:280]
+        if not text or len(text) < 6:
+            continue
+        if text.lower().replace(' ', '_') in _BULLET_NOISE or text.lower() in _BULLET_NOISE:
+            continue
+        bullets.append(text)
+    return bullets[:max_bullets] or None
+
+
+def _clean_structured_sections(v, max_sections: int = 16):
+    """Earnings-call highlight deck: [{title, bullets}, ...]."""
+    if isinstance(v, str):
+        try:
+            v = json.loads(v)
+        except Exception:
+            return None
+    if not isinstance(v, list):
+        return None
+    out = []
+    for item in v:
+        if not isinstance(item, dict):
+            continue
+        title = (item.get('title') or '').strip()[:140]
+        bullets = _clean_section_bullets(item.get('bullets'), max_bullets=12)
+        if title and bullets:
+            out.append({'title': title, 'bullets': bullets})
+        if len(out) >= max_sections:
+            break
+    return out or None
+
+
+def _bullets_from_structured_sections(sections, *title_hints):
+    hints = [h.lower() for h in title_hints]
+    for sec in sections or []:
+        t = (sec.get('title') or '').lower()
+        if any(h in t for h in hints):
+            b = sec.get('bullets')
+            return b if b else None
+    return None
+
+
+def _legacy_fields_from_structured_sections(sections: list) -> dict:
+    """Map themed sections into legacy jsonb columns for radar / simple view."""
+    if not sections:
+        return {}
+    mapping = {
+        'financial_highlights': ('financial performance', 'financial highlights', 'results'),
+        'cost_margin_commentary': ('margin outlook', 'cost', 'margin'),
+        'operational_kpis': ('segment performance', 'operational', 'kpi', 'volume'),
+        'outlook_guidance': ('growth strategy', 'outlook', 'guidance', 'target'),
+        'expansion_capex': ('capex', 'capacity', 'expansion', 'facility', 'plant'),
+        'competitive_positioning': ('new business', 'order', 'customer win', 'wins'),
+        'capital_allocation': ('capital allocation', 'dividend', 'buyback', 'cash'),
+        'risks_flagged': ('risk', 'headwind', 'challenge'),
+        'key_concerns': ('analyst', 'q&a', 'concern', 'question'),
+    }
+    out = {}
+    used = set()
+    for field, hints in mapping.items():
+        for i, sec in enumerate(sections):
+            if i in used:
+                continue
+            t = (sec.get('title') or '').lower()
+            if any(h in t for h in hints):
+                bullets = _clean_bullets(sec.get('bullets'))
+                if bullets:
+                    out[field] = bullets
+                    used.add(i)
+                break
+    return out
+
+
 def _infer_guidance_direction(gd, outlook_bullets):
     """Prefer the model's explicit enum; if missing, derive a coarse
     direction from outlook bullets already extracted from the same
@@ -632,6 +725,7 @@ def _infer_guidance_direction(gd, outlook_bullets):
     # Any forward-looking target without an explicit raise/cut is a
     # reiteration of outlook, not "not discussed".
     return 'reiterated'
+
 
 def _synthesize_overall_summary(summary: dict):
     """Last-resort narrative when Gemini left overall_summary empty but
@@ -935,6 +1029,24 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
         "WATCH_NEXT: 2-4 short bullets of concrete near-term signals to track after this "
         "call (e.g. 'Q2 disbursement acceleration', 'NIM expansion vs 1.65% target'). "
         "Derive only from guidance, risks, or Q&A — never invent. Null if nothing concrete.\n\n"
+        "STRUCTURED_SECTIONS (REQUIRED when has_content=true): Build an earnings-call "
+        "highlights report like a professional Twitter/LinkedIn concall thread — 8 to 14 "
+        "thematic sections, each with a short Title Case heading and 3-12 bullet facts.\n"
+        "Always include these sections when discussed (skip only if truly not mentioned):\n"
+        "- Management Commentary\n"
+        "- Financial Performance (revenue, EBITDA, PAT, margins, cash, ROCE — with numbers)\n"
+        "- Segment Performance (PV, 2W, exports, divisions — with mix % if given)\n"
+        "- New Business Wins / Order Wins (OEM names, contracts)\n"
+        "- Margin Outlook\n"
+        "- Growth Strategy\n"
+        "Also add dynamic sections for major topics on THIS call (subsidiaries, new products, "
+        "capacity, exports, display/EV themes, etc.) — use specific headings from the call.\n"
+        "End with a section titled exactly 'Key Takeaway' (1-3 bullets summarizing the call).\n"
+        "Each bullet: one crisp fact with numbers/units where available; no buy/sell advice.\n\n"
+        "REPORT_TITLE: e.g. 'SJS ENTERPRISES | Q1 FY27 EARNINGS CALL HIGHLIGHTS' using "
+        "company name + quarter from the transcript. Null if unknown.\n\n"
+        "KEY_TAKEAWAY: One sentence (max 40 words) distilling the call — also mirrored in the "
+        "'Key Takeaway' section bullets.\n\n"
         + _THEME_PROMPT_BLOCK +
         "Bullet format for every array field: short scannable phrases, not paragraphs; "
         "no trailing period required; never insert enum tokens or JSON field names as bullets."
@@ -962,6 +1074,20 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
             "regulatory_legal": _bullet_field,
             "key_concerns": _bullet_field,
             "watch_next": _bullet_field,
+            "structured_sections": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "bullets": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["title", "bullets"],
+                },
+                "nullable": True,
+            },
+            "report_title": {"type": "string", "nullable": True},
+            "key_takeaway": {"type": "string", "nullable": True},
             "emerging_themes": _theme_field,
             "theme_evidence": _bullet_field,
             "theme_intensity": {"type": "string",
@@ -1017,6 +1143,7 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
         return error_result
     if not parsed.get('has_content'):
         return no_content_result
+    structured = _clean_structured_sections(parsed.get('structured_sections'))
     summary = {
         k: _clean_bullets(parsed.get(k))
         for k in ('financial_highlights', 'cost_margin_commentary', 'expansion_capex',
@@ -1024,6 +1151,13 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
                   'competitive_positioning', 'operational_kpis', 'risks_flagged',
                   'regulatory_legal', 'key_concerns', 'theme_evidence')
     }
+    if structured:
+        summary['structured_sections'] = structured
+        for k, v in _legacy_fields_from_structured_sections(structured).items():
+            if not summary.get(k):
+                summary[k] = v
+    summary['report_title'] = (parsed.get('report_title') or '').strip()[:200] or None
+    summary['key_takeaway'] = (parsed.get('key_takeaway') or '').strip()[:500] or None
     # Always persist an array (possibly empty) so watch_next IS NULL means
     # "pre-migration row" and backfill can stop after one re-extract.
     summary['watch_next'] = _clean_bullets(parsed.get('watch_next')) or []
@@ -1041,8 +1175,10 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
     if not summary['emerging_themes']:
         summary['theme_evidence'] = None
     if not any(v for k, v in summary.items() if k not in (
-            'guidance_direction', 'theme_intensity', 'management_tone', 'watch_next')):
-        return no_content_result
+            'guidance_direction', 'theme_intensity', 'management_tone', 'watch_next',
+            'structured_sections', 'report_title', 'key_takeaway')):
+        if not structured:
+            return no_content_result
     # Helpful for spotting thin reports in logs without dumping the whole payload
     missing_core = [k for k in ('overall_summary', 'key_concerns') if not summary.get(k)]
     if missing_core:
@@ -2074,6 +2210,8 @@ async def _fetch_processed_attachment_keys(session: aiohttp.ClientSession, table
         cols.append('theme_intensity')
     if reprocess_missing_themes and 'watch_next' not in cols:
         cols.append('watch_next')
+    if reprocess_missing_themes and 'structured_sections' not in cols:
+        cols.append('structured_sections')
     select = ','.join(cols)
     page_size = 1000
     offset = 0
@@ -2110,6 +2248,10 @@ async def _fetch_processed_attachment_keys(session: aiohttp.ClientSession, table
             if status == 'done' and reprocess_missing_themes and row.get('watch_next') is None:
                 thin.add(key)
                 continue
+            if (status == 'done' and reprocess_missing_themes
+                    and not row.get('structured_sections')):
+                thin.add(key)
+                continue
             if status in ('done', 'skipped', 'failed', 'pending'):
                 already.add(key)
         if len(rows) < page_size:
@@ -2124,7 +2266,7 @@ async def _fetch_theme_backfill_rows(session: aiohttp.ClientSession, table: str,
     Does not depend on corporate_announcements lookback, so old
     PPTs/transcripts still get re-read and section-filled."""
     # Prefer narrative gaps first (empty sections in the UI), then schema gaps.
-    for null_col in ('overall_summary', 'watch_next', 'theme_intensity'):
+    for null_col in ('overall_summary', 'structured_sections', 'watch_next', 'theme_intensity'):
         try:
             async with session.get(
                 f"{SUPABASE_URL}/rest/v1/{table}", headers=headers,
