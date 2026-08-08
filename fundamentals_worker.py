@@ -1257,7 +1257,7 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
     if not any(v for k, v in summary.items() if k not in (
             'guidance_direction', 'theme_intensity', 'management_tone', 'watch_next',
             'structured_sections', 'report_title', 'key_takeaway')):
-        if not structured:
+        if not merged_structured:
             return no_content_result
     # Helpful for spotting thin reports in logs without dumping the whole payload
     missing_core = [k for k in ('overall_summary', 'key_concerns') if not summary.get(k)]
