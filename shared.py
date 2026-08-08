@@ -319,6 +319,8 @@ EXTRA_STOCKS = [
     "DEEPAKFERT","GNFC","GSFC","RASHTRIYA","CHAMBAL","COROMANDEL",
     # Textiles  
     "GRASIM","VARDHMAN","RAYMOND","ARVIND","WELSPUNIND","TRIDENT",
+    # QSR / Restaurants (StockEdge: Leisure - Restaurants)
+    "UFBL","RBA","COFFEEDAY","DEVYANI","SAPPHIRE","SPECIALITY","WESTLIFE","THELEELA",
     # Pharma
     "IPCALAB","AJANTPHARM","NATCOPHARM","GRANULES","SOLARA","AARTI",
 ]
@@ -356,6 +358,8 @@ EXTRA_STOCKS = [
     "DEEPAKFERT","GNFC","GSFC","RASHTRIYA","CHAMBAL","COROMANDEL",
     # Textiles  
     "GRASIM","VARDHMAN","RAYMOND","ARVIND","WELSPUNIND","TRIDENT",
+    # QSR / Restaurants (StockEdge: Leisure - Restaurants)
+    "UFBL","RBA","COFFEEDAY","DEVYANI","SAPPHIRE","SPECIALITY","WESTLIFE","THELEELA",
     # Pharma
     "IPCALAB","AJANTPHARM","NATCOPHARM","GRANULES","SOLARA","AARTI",
 ]
@@ -1364,18 +1368,39 @@ async def fetch_upstox_fundamentals(session: aiohttp.ClientSession, sym: str, is
 
     return result if got_any else None
 
+# Quick-service / restaurant chains — our lookup table tags many as "Hotels";
+# StockEdge groups them under Leisure - Restaurants.
+QSR_INDUSTRY_OVERRIDES = {
+    'UFBL': 'Leisure - Restaurants',       # Barbeque Nation
+    'RBA': 'Leisure - Restaurants',        # Burger King
+    'COFFEEDAY': 'Leisure - Restaurants',
+    'DEVYANI': 'Leisure - Restaurants',
+    'JUBLFOOD': 'Leisure - Restaurants',
+    'SAPPHIRE': 'Leisure - Restaurants',
+    'SPECIALITY': 'Leisure - Restaurants',
+    'WESTLIFE': 'Leisure - Restaurants',  # McDonald's India
+    'THELEELA': 'Leisure - Restaurants',
+}
+QSR_SECTOR = 'Leisure Services'
+
 def get_industry(sym: str) -> Optional[str]:
     """Distinct 'Industry' value (finer-grained than Sector) shown
     alongside Sector in the Index/Sector tables. Prefers the live
     Upstox/Screener-fetched value when present (it can be more current
     than the static sheet), falling back to the static
     SECTOR_INDUSTRY_LOOKUP table otherwise."""
+    key = (sym or '').strip().upper()
+    if key in QSR_INDUSTRY_OVERRIDES:
+        return QSR_INDUSTRY_OVERRIDES[key]
     live = fundamentals_cache.get(sym, {}).get('industry')
     if live:
         return live
     return SECTOR_INDUSTRY_LOOKUP.get(sym, {}).get('industry')
 
 def get_sector(sym: str) -> str:
+    key = (sym or '').strip().upper()
+    if key in QSR_INDUSTRY_OVERRIDES:
+        return QSR_SECTOR
     for sector, stocks in SECTOR_MAP.items():
         if sym in stocks:
             return sector
