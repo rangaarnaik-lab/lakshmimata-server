@@ -504,8 +504,8 @@ last_eod_refresh_date: Optional[str] = None  # IST date string — ensures the
 # expensive EOD refresh (full Yahoo re-fetch + fundamentals) runs only ONCE
 # per day, not on every single scan cycle while the market stays closed.
 nifty_cache: dict = {}        # {'prices': [...]} — Nifty index daily closes for TV RS calc
-midcap_cache: dict = {}       # {'prices': [...]} — synthetic Midcap 150 index
-smallcap_cache: dict = {}     # {'prices': [...]} — synthetic Smallcap 250 index
+midcap_cache: dict = {}       # {'prices': [...]} — official Nifty Midcap 150 closes for MID RS
+smallcap_cache: dict = {}     # {'prices': [...]} — official Nifty Smallcap 250 closes for SML RS
 
 NIFTY_INSTRUMENT_KEY = "NSE_INDEX|Nifty 50"  # Upstox key for Nifty 50 index
 
@@ -515,6 +515,12 @@ INDEX_TRACKER = {
     "Nifty 50":       "NSE_INDEX|Nifty 50",
     "Nifty Next 50":  "NSE_INDEX|Nifty Next 50",
     "Nifty 500":      "NSE_INDEX|Nifty 500",
+    # Broad-cap benchmarks used for MID/SML RS (must stay here so
+    # load_index_cache + live quotes resolve the real index series —
+    # not a synthetic equal-weight average of constituents).
+    "Midcap 150":     "NSE_INDEX|Nifty Midcap 150",
+    "Smallcap 250":   "NSE_INDEX|Nifty Smallcap 250",
+    "Microcap 250":   "NSE_INDEX|Nifty Microcap 250",
     "Bank Nifty":     "NSE_INDEX|Nifty Bank",
     "IT":             "NSE_INDEX|Nifty IT",
     "Pharma":         "NSE_INDEX|Nifty Pharma",
