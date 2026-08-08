@@ -33,8 +33,9 @@ jobs:
       - name: Build frontend
         run: |
           cd frontend
-          npm ci
-          npm run build
+          npm ci || npm install
+          chmod -R u+x node_modules/.bin 2>/dev/null || true
+          node node_modules/vite/bin/vite.js build
 
       - name: Deploy to Vercel production
         env:
