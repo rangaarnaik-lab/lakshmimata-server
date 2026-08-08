@@ -300,6 +300,89 @@ def _gemini_about_key_source() -> str:
     return ''
 
 
+def _gemini_about_key_candidates() -> tuple[str, ...]:
+    """About tries Key1 first, then shared pool keys (deduped)."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for k in (_gemini_about_dedicated_key(),) + _gemini_batch_key_pool():
+        if k and k not in seen:
+            out.append(k)
+            seen.add(k)
+    if not out:
+        k = _gemini_api_key_any(
+            'ABOUT', '', 'RESULTS', 'PPT', 'TRANSCRIPT', 'ASKS',
+            'VALUATION', 'THEMES', 'FLAGS', 'HIGHLIGHTS')
+        if k:
+            out.append(k)
+    return tuple(out)
+
+
+_GEMINI_EXHAUSTED_UNTIL: dict[str, float] = {}
+
+
+def _gemini_key_store_id(api_key: str) -> str:
+    import hashlib
+    return hashlib.sha256((api_key or '').strip().encode()).hexdigest()[:20]
+
+
+def _gemini_key_exhausted_cooldown_seconds() -> int:
+    return max(300, int(os.getenv(
+        'GEMINI_KEY_EXHAUSTED_SECONDS',
+        os.getenv('GEMINI_JOBS_HARD_PAUSE_SECONDS', '7200'))))
+
+
+def _gemini_key_exhausted(api_key: str) -> bool:
+    sid = _gemini_key_store_id(api_key)
+    until = _GEMINI_EXHAUSTED_UNTIL.get(sid, 0)
+    if until and time.time() < until:
+        return True
+    if until:
+        _GEMINI_EXHAUSTED_UNTIL.pop(sid, None)
+    return False
+
+
+def _gemini_mark_key_exhausted(api_key: str, reason: str):
+    sec = _gemini_key_exhausted_cooldown_seconds()
+    _GEMINI_EXHAUSTED_UNTIL[_gemini_key_store_id(api_key)] = time.time() + sec
+    log.warning(
+        f"⚠️ Gemini key {_gemini_key_fingerprint(api_key)} marked exhausted "
+        f"for {sec}s (~{sec / 3600:.1f}h) — {reason}")
+
+
+def _gemini_available_keys(keys: tuple[str, ...] | list[str]) -> tuple[str, ...]:
+    return tuple(k for k in keys if k and not _gemini_key_exhausted(k))
+
+
+def _gemini_all_configured_keys() -> tuple[str, ...]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for k in _gemini_about_key_candidates() + _gemini_batch_key_pool():
+        if k and k not in seen:
+            out.append(k)
+            seen.add(k)
+    if not out:
+        k = (_gemini_api_key() or '').strip()
+        if k:
+            out.append(k)
+    return tuple(out)
+
+
+def _gemini_any_keys_available() -> bool:
+    return bool(_gemini_available_keys(_gemini_all_configured_keys()))
+
+
+def _gemini_maybe_global_hard_pause(reason: str) -> bool:
+    """Global hard-stop only when every configured key is exhausted."""
+    if _gemini_any_keys_available():
+        avail = _gemini_available_keys(_gemini_all_configured_keys())
+        log.warning(
+            f"⚠️ {reason} — other keys still available "
+            f"({_gemini_keys_fingerprint_summary(avail)}); continuing without global stop")
+        return False
+    _begin_gemini_jobs_hard_pause(reason)
+    return True
+
+
 _GEMINI_BATCH_KEY_POOL: tuple[str, ...] | None = None
 _GEMINI_RR_INDEX = 0
 
@@ -354,10 +437,14 @@ def _gemini_batch_key_pool() -> tuple[str, ...]:
 
 
 def _gemini_api_key_next(feature: str = '') -> str:
-    """Round-robin next key from the shared batch pool (per Gemini HTTP call)."""
-    pool = _gemini_batch_key_pool()
+    """Round-robin next key from the shared batch pool (skips exhausted keys)."""
+    pool = _gemini_available_keys(_gemini_batch_key_pool())
     if not pool:
-        return _gemini_api_key(feature)
+        raw = _gemini_batch_key_pool()
+        if not raw:
+            k = _gemini_api_key(feature)
+            return k if k and not _gemini_key_exhausted(k) else ''
+        return ''
     global _GEMINI_RR_INDEX
     key = pool[_GEMINI_RR_INDEX % len(pool)]
     _GEMINI_RR_INDEX += 1
@@ -391,16 +478,11 @@ def _gemini_api_key_any(*features: str) -> str:
 
 
 def _gemini_api_key_about() -> str:
-    """Company Overview / About — dedicated Key1 when set, else shared pool."""
-    dedicated = _gemini_about_dedicated_key()
-    if dedicated:
-        return dedicated
-    pool = _gemini_batch_key_pool()
-    if pool:
-        return pool[0]
-    return _gemini_api_key_any(
-        'ABOUT', '', 'RESULTS', 'PPT', 'TRANSCRIPT', 'ASKS',
-        'VALUATION', 'THEMES', 'FLAGS', 'HIGHLIGHTS')
+    """Company Overview / About — Key1 when available, else first free pool key."""
+    available = _gemini_available_keys(_gemini_about_key_candidates())
+    if available:
+        return available[0]
+    return ''
 
 
 def _gemini_api_key_results() -> str:
@@ -1109,9 +1191,10 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
         'financial_data': None, 'comparison_data': None, 'yoy_data': None,
         'summary': None, 'error': False, 'rate_limited': False, 'hard_quota': False,
     }
-    api_key = _gemini_api_key_next('RESULTS')
-    if not api_key or not attachment_url:
-        return error_result  # not a real "no content" case - just not configured/no URL, don't mark as processed
+    if not _gemini_any_keys_available():
+        return error_result
+    if not attachment_url:
+        return error_result
     # Stage 1: download the PDF. Separate try/except so a timeout here
     # is clearly distinguishable in logs from a Gemini-side timeout -
     # confirmed in production (2026-08-04) that a generic "TimeoutError:"
@@ -1231,49 +1314,63 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
     # Oct 16 2026) - cheap, fast, and handles PDF input natively.
     model = os.getenv('GEMINI_CONCALL_MODEL', 'gemini-3.1-flash-lite')
     gemini_timeout = int(os.getenv('GEMINI_TIMEOUT_SECONDS', '120'))
-    # Stage 2: the Gemini call itself (process-wide concurrency capped).
-    try:
-        status, data, body = await _gemini_generate(
-            session,
-            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
-            {
-                "contents": [{"parts": [
-                    {"inline_data": {"mime_type": "application/pdf", "data": pdf_b64}},
-                    {"text": prompt},
-                ]}],
-                "generationConfig": {"responseMimeType": "application/json", "responseSchema": schema},
-            },
-            gemini_timeout,
-            api_key=api_key,
-        )
-        if status != 200:
-            pause = status in (429, 500, 502, 503, 504) or status >= 500
-            hard_quota = status == 429 and _gemini_quota_exhausted(body)
-            if status == 429:
-                log.warning(f"⚠️ Gemini results 429 for {symbol}"
-                            + (" — HARD QUOTA" if hard_quota else " — rate limit")
-                            + f": {(body or '')[:180]}")
-            else:
-                log.warning(f"⚠️ Gemini results extraction failed for {symbol} ({status}): {(body or '')[:200]}")
-            # 400 INVALID_ARGUMENT is permanent (bad/unsupported PDF for
-            # Gemini inline). Treating it as transient made RATNAMANI /
-            # IXIGO / SELMC burn a batch slot every cycle forever.
-            if status == 400:
-                log.warning(f"⚠️ {symbol}: Gemini rejected PDF (400) — marking skipped, will not retry")
-                return no_content_result
-            return {
-                **error_result,
-                'rate_limited': pause,
-                'hard_quota': hard_quota,
-            }
-    except asyncio.TimeoutError:
-        log.warning(f"⚠️ Gemini call timed out for {symbol} ({gemini_timeout}s limit, "
-                     f"PDF was {len(pdf_bytes)} bytes) - consider raising GEMINI_TIMEOUT_SECONDS "
-                     f"if this recurs consistently, since it's a separate stage from the PDF download")
-        # Timeout is not quota — retry later; do not hard-stop all Gemini jobs.
+    # Stage 2: the Gemini call — try each available key before giving up.
+    keys = _gemini_available_keys(_gemini_batch_key_pool()) or _gemini_batch_key_pool()
+    status, data, body = 0, {}, ''
+    last_hard_quota = False
+    for api_key in keys:
+        try:
+            status, data, body = await _gemini_generate(
+                session,
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
+                {
+                    "contents": [{"parts": [
+                        {"inline_data": {"mime_type": "application/pdf", "data": pdf_b64}},
+                        {"text": prompt},
+                    ]}],
+                    "generationConfig": {"responseMimeType": "application/json", "responseSchema": schema},
+                },
+                gemini_timeout,
+                api_key=api_key,
+            )
+        except asyncio.TimeoutError:
+            log.warning(f"⚠️ Gemini call timed out for {symbol} ({gemini_timeout}s limit, "
+                         f"PDF was {len(pdf_bytes)} bytes) - consider raising GEMINI_TIMEOUT_SECONDS "
+                         f"if this recurs consistently, since it's a separate stage from the PDF download")
+            return error_result
+        except Exception as e:
+            log.warning(f"⚠️ Gemini call failed for {symbol}: {type(e).__name__}: {e}")
+            return error_result
+        if status == 200:
+            break
+        pause = status in (429, 500, 502, 503, 504) or status >= 500
+        hard_quota = status == 429 and _gemini_quota_exhausted(body)
+        if status == 429:
+            log.warning(f"⚠️ Gemini results 429 for {symbol} on {_gemini_key_fingerprint(api_key)}"
+                        + (" — HARD QUOTA" if hard_quota else " — rate limit")
+                        + f": {(body or '')[:180]}")
+        else:
+            log.warning(f"⚠️ Gemini results extraction failed for {symbol} ({status}): {(body or '')[:200]}")
+        if status == 400:
+            log.warning(f"⚠️ {symbol}: Gemini rejected PDF (400) — marking skipped, will not retry")
+            return no_content_result
+        if hard_quota:
+            last_hard_quota = True
+            _gemini_mark_key_exhausted(api_key, f"Results PDF on {symbol}")
+            continue
+        if status == 429:
+            log.warning(f"⚠️ Results {symbol}: RPM limit on {_gemini_key_fingerprint(api_key)} — trying next key")
+            continue
+        if pause:
+            return {**error_result, 'rate_limited': pause, 'hard_quota': False}
+        return {**error_result, 'rate_limited': pause, 'hard_quota': False}
+    else:
+        if last_hard_quota and not _gemini_any_keys_available():
+            return {**error_result, 'rate_limited': True, 'hard_quota': True, 'all_keys_exhausted': True}
+        if last_hard_quota:
+            return {**error_result, 'rate_limited': True, 'hard_quota': False}
         return error_result
-    except Exception as e:
-        log.warning(f"⚠️ Gemini call failed for {symbol}: {type(e).__name__}: {e}")
+    if status != 200:
         return error_result
     # Stage 3: parse the response.
     try:
@@ -1683,8 +1780,8 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
                 # Billing/hard quota → multi-hour pause. RPM 429 → short backoff only
                 # (24h hard-stop was killing overnight catchup after ~1 failure).
                 if result.get('hard_quota'):
-                    _begin_gemini_jobs_hard_pause(
-                        f"Results PDF HARD QUOTA on {row['symbol']}")
+                    _gemini_maybe_global_hard_pause(
+                        f"Results PDF HARD QUOTA on {row['symbol']} (all keys exhausted)")
                     break
                 if result.get('rate_limited'):
                     soft = _gemini_jobs_soft_pause_seconds()
@@ -3965,10 +4062,12 @@ async def extract_about_company(session: aiohttp.ClientSession, symbol: str, ppt
     across the public web, optionally grounded with Screener.in page text
     and existing PPT/concall summary fields. Also resolves website + logo.
     Returns {'about': dict|None, 'error': bool, 'rate_limited': bool}."""
-    error_result = {'about': None, 'error': True, 'rate_limited': False}
-    no_content_result = {'about': None, 'error': False, 'rate_limited': False}
-    api_key = _gemini_api_key_about()
-    if not api_key:
+    error_result = {'about': None, 'error': True, 'rate_limited': False, 'hard_quota': False}
+    no_content_result = {'about': None, 'error': False, 'rate_limited': False, 'hard_quota': False}
+    keys = _gemini_available_keys(_gemini_about_key_candidates())
+    if not keys:
+        if not _gemini_any_keys_available():
+            return {**error_result, 'hard_quota': True, 'all_keys_exhausted': True}
         return error_result
 
     screener_html = ''
@@ -4040,35 +4139,55 @@ async def extract_about_company(session: aiohttp.ClientSession, symbol: str, ppt
         # Grounding with Google Search — model searches the live web.
         body["tools"] = [{"google_search": {}}]
 
-    try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-        status, data, body_txt = await _gemini_generate(session, url, body, 120, api_key=api_key)
-        if status != 200:
-            # Some models reject tools+request; retry once without search.
-            if use_search and status in (400, 404):
+    data = {}
+    status = 0
+    body_txt = ''
+    last_hard_quota = False
+    for api_key in keys:
+        try:
+            url = (f"https://generativelanguage.googleapis.com/v1beta/models/{model}"
+                   f":generateContent?key={api_key}")
+            status, data, body_txt = await _gemini_generate(session, url, body, 120, api_key=api_key)
+            if status != 200 and use_search and status in (400, 404):
                 log.warning(f"⚠️ Gemini about-company web-search rejected for {symbol} "
-                            f"({status}) — retrying without search")
+                            f"({status}) on {_gemini_key_fingerprint(api_key)} — retrying without search")
                 body.pop('tools', None)
-                status, data, body2 = await _gemini_generate(session, url, body, 90, api_key=api_key)
-                body_txt = body2
-            if status != 200:
-                # 429 / 5xx / high-demand → pause About loop (caller sleeps hours).
-                pause = status in (429, 500, 502, 503, 504) or status >= 500
-                hard_quota = status == 429 and _gemini_quota_exhausted(body_txt)
-                log.warning(f"⚠️ Gemini about-company failed for {symbol} ({status})"
-                            + (" — HARD QUOTA" if hard_quota else "")
-                            + (" — will pause About loop" if pause else "")
-                            + f": {(body_txt or '')[:180]}")
+                status, data, body_txt = await _gemini_generate(session, url, body, 90, api_key=api_key)
+            if status == 200:
+                break
+            pause = status in (429, 500, 502, 503, 504) or status >= 500
+            hard_quota = status == 429 and _gemini_quota_exhausted(body_txt)
+            log.warning(f"⚠️ Gemini about-company failed for {symbol} ({status}) "
+                        f"on {_gemini_key_fingerprint(api_key)}"
+                        + (" — HARD QUOTA" if hard_quota else "")
+                        + f": {(body_txt or '')[:180]}")
+            if hard_quota:
+                last_hard_quota = True
+                _gemini_mark_key_exhausted(api_key, f"About on {symbol}")
+                continue
+            if status == 429:
+                log.warning(f"⚠️ About {symbol}: RPM limit on {_gemini_key_fingerprint(api_key)} — trying next key")
+                continue
+            if pause:
                 return {
                     'about': None, 'error': True,
-                    'rate_limited': pause, 'hard_quota': hard_quota,
+                    'rate_limited': pause, 'hard_quota': False,
                 }
-    except Exception as e:
-        # Timeouts / connection blips also pause — avoid burning cycles.
-        pause = type(e).__name__ in ('TimeoutError', 'ClientConnectorError', 'ServerTimeoutError')
-        log.warning(f"⚠️ Gemini about-company call failed for {symbol}: {type(e).__name__}: {e}"
-                    + (" — will pause About loop" if pause else ""))
-        return {'about': None, 'error': True, 'rate_limited': pause, 'hard_quota': False}
+            return error_result
+        except Exception as e:
+            pause = type(e).__name__ in ('TimeoutError', 'ClientConnectorError', 'ServerTimeoutError')
+            log.warning(f"⚠️ Gemini about-company call failed for {symbol} on "
+                        f"{_gemini_key_fingerprint(api_key)}: {type(e).__name__}: {e}"
+                        + (" — will pause About loop" if pause else ""))
+            return {'about': None, 'error': True, 'rate_limited': pause, 'hard_quota': False}
+    else:
+        if last_hard_quota and not _gemini_any_keys_available():
+            return {**error_result, 'rate_limited': True, 'hard_quota': True, 'all_keys_exhausted': True}
+        if last_hard_quota:
+            return {**error_result, 'rate_limited': True, 'hard_quota': False}
+        return error_result
+    if status != 200:
+        return error_result
 
     try:
         candidates = data.get('candidates', [])
@@ -5515,7 +5634,7 @@ async def _about_company_loop(session: aiohttp.ClientSession):
                       f"({_mode}; next={_next} reason={_why}; "
                       f"missing_about≈{missing_about_n}, done={_done_n}, "
                       f"universe≈{len(universe_syms)}; "
-                      f"keys={_gemini_keys_fingerprint_summary(_gemini_batch_key_pool())})")
+                      f"keys={_gemini_keys_fingerprint_summary(_gemini_available_keys(_gemini_about_key_candidates()) or _gemini_about_key_candidates())})")
         else:
             log.info(f"📘 About-company loop: nothing new "
                       f"(missing_about≈{missing_about_n}, done={_done_n}, "
@@ -5667,13 +5786,20 @@ async def _about_company_loop(session: aiohttp.ClientSession):
             if hit_hard_quota or _ABOUT_GEMINI_HARD_QUOTA:
                 _ABOUT_GEMINI_UNHEALTHY_SINCE = None
                 _ABOUT_GEMINI_HARD_QUOTA = False
-                _begin_about_yield_to_results(
-                    hard_cool,
-                    f"HARD QUOTA (ok={gemini_ok}, errors={gemini_errors}/{len(todo)}); "
-                    f"check AI Studio billing or GEMINI_API_KEY_ABOUT")
-                await asyncio.sleep(hard_cool)
-                _ABOUT_YIELD_TO_RESULTS_UNTIL = None
-                log.info("📘 About-company: hard pause done — resuming About; Results focus ends")
+                if not _gemini_any_keys_available():
+                    _begin_about_yield_to_results(
+                        hard_cool,
+                        f"HARD QUOTA (ok={gemini_ok}, errors={gemini_errors}/{len(todo)}); "
+                        f"all Gemini keys exhausted")
+                    await asyncio.sleep(hard_cool)
+                    _ABOUT_YIELD_TO_RESULTS_UNTIL = None
+                    log.info("📘 About-company: hard pause done — resuming About; Results focus ends")
+                else:
+                    avail = _gemini_available_keys(_gemini_all_configured_keys())
+                    log.warning(
+                        f"📘 About-company: one key hit quota — switching to "
+                        f"{_gemini_keys_fingerprint_summary(avail)}; continuing")
+                    await asyncio.sleep(max(15, retry_gap))
             else:
                 now = time.monotonic()
                 if _ABOUT_GEMINI_UNHEALTHY_SINCE is None:
@@ -5770,13 +5896,18 @@ async def fundamentals_worker_main():
         log.warning("  Gemini keys: none configured")
     about_k = _gemini_api_key_about()
     pool = _gemini_batch_key_pool()
+    avail = _gemini_available_keys(_gemini_all_configured_keys())
     if pool:
         log.info(f"  📘 About/Results/PPT/concall Gemini pool: "
                  f"{_gemini_keys_fingerprint_summary(pool)}")
+    if avail and len(avail) < len(_gemini_all_configured_keys()):
+        log.warning(f"  📘 Gemini keys exhausted (cooling down): "
+                    f"{len(_gemini_all_configured_keys()) - len(avail)} of "
+                    f"{len(_gemini_all_configured_keys())}")
     about_src = _gemini_about_key_source() or ('shared-pool' if pool else 'none')
     log.info(f"  📘 About will call Gemini with {about_src} "
              f"{_gemini_key_fingerprint(about_k)}"
-             f"{' (dedicated — not round-robin)' if _gemini_about_key_source() else ' (round-robin across pool)'}")
+             f"{' (dedicated — failover to pool on quota)' if _gemini_about_key_source() else ' (round-robin across pool)'}")
     if _about_company_manually_paused():
         left = max(0, int((_ABOUT_ENV_PAUSE_UNTIL or 0) - time.time()))
         log.warning(f"  📘 About-company: paused ~{left // 3600}h "
