@@ -1,0 +1,11 @@
+{
+  "name": "Lakshmimata (server + frontend)",
+  "install": "./.cursor/scripts/install.sh",
+  "terminals": [
+    {
+      "name": "frontend-dev",
+      "command": "bash -lc 'FRONTEND=\"\"; for d in ../Lakshmimata Lakshmimata /workspace/Lakshmimata /opt/cursor/lakshmimata-stack/Lakshmimata; do if [ -f \"$d/package.json\" ]; then FRONTEND=\"$d\"; break; fi; done; if [ -z \"$FRONTEND\" ]; then echo \"frontend missing — run install.sh first\"; exit 1; fi; cd \"$FRONTEND\" && npm run dev -- --host 0.0.0.0 --port 5173'",
+      "description": "Vite React frontend on :5173 using committed Lakshmimata/.env (Supabase anon)."
+    }
+  ]
+}
