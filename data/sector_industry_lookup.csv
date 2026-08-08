@@ -442,7 +442,7 @@ CMRGREEN,Miscellaneous,Miscellaneous
 CMSINFO,Miscellaneous,Miscellaneous
 COALINDIA,Mining / Minerals / Metals,Metals & Mining
 COASTCORP,Aquaculture,Fmcg
-COCHINSHIP,Miscellaneous,Aerospace & Defence
+COCHINSHIP,Defence,Aerospace & Defence
 COCKERILL,Engineering,Industrials
 COFFEEDAY,Hotels,Consumer Discretionary
 COFORGE,Computers - Software - Large,I.T
@@ -801,7 +801,7 @@ GRMOVER,Food - Processing - Indian,Fmcg
 GROBTEA,Tea,Fmcg
 GROWW,Finance & Investments,Financials
 GRPLTD,Miscellaneous,Fmcg
-GRSE,Miscellaneous,Aerospace & Defence
+GRSE,Defence,Aerospace & Defence
 GRWRHITECH,Packaging,Industrials
 GSFC,Fertilizers,Chemicals
 GSLSU,Miscellaneous,Consumer Discretionary
@@ -1297,7 +1297,7 @@ MAXHEALTH,Healthcare,Healthcare
 MAXIND,Finance & Investments,Financials
 MAYURUNIQ,Leather / Leather Products,Consumer Discretionary
 MAZDA,Engineering,Industrials
-MAZDOCK,Miscellaneous,Aerospace & Defence
+MAZDOCK,Defence,Aerospace & Defence
 MBAPL,Fertilizers,Chemicals
 MBEL,Construction,Industrials
 MBLINFRA,Construction,Industrials
@@ -2342,7 +2342,7 @@ ZEEMEDIA,Entertainment / Electronic Media Software,Media
 ZENITHEXPO,Leather / Leather Products,Consumer Discretionary
 ZENITHSTL,Steel - Medium / Small,Metals & Mining
 ZENSARTECH,Computers - Software - Medium / Small,I.T
-ZENTEC,Miscellaneous,Aerospace & Defence
+ZENTEC,Defence,Aerospace & Defence
 ZFCVINDIA,Auto Ancillaries,Auto
 ZFSTEERING,Auto Ancillaries,Auto
 ZIMLAB,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare

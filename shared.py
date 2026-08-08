@@ -1369,11 +1369,18 @@ def get_industry(sym: str) -> Optional[str]:
     alongside Sector in the Index/Sector tables. Prefers the live
     Upstox/Screener-fetched value when present (it can be more current
     than the static sheet), falling back to the static
-    SECTOR_INDUSTRY_LOOKUP table otherwise."""
+    SECTOR_INDUSTRY_LOOKUP table otherwise.
+
+    Exception: a live value of 'Miscellaneous' is too coarse to trust over
+    a curated CSV industry (e.g. MAZDOCK/GRSE/COCHINSHIP were dumping into
+    a junk peer group in the Results ranking panel). Prefer the static
+    industry whenever live is blank or Miscellaneous.
+    """
+    static = SECTOR_INDUSTRY_LOOKUP.get(sym, {}).get('industry')
     live = fundamentals_cache.get(sym, {}).get('industry')
-    if live:
+    if live and str(live).strip().lower() not in ('', 'miscellaneous'):
         return live
-    return SECTOR_INDUSTRY_LOOKUP.get(sym, {}).get('industry')
+    return static or live
 
 def get_sector(sym: str) -> str:
     for sector, stocks in SECTOR_MAP.items():
