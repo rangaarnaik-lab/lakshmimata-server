@@ -1736,6 +1736,55 @@ async def _symbols_with_financial_results(session: aiohttp.ClientSession, header
     return have
 
 
+async def _fetch_skipped_results_pdfs_for_retry(
+        session: aiohttp.ClientSession, headers: dict, have_fr: set[str],
+        *, limit: int = 40) -> list:
+    """Re-queue Results PDFs previously marked skipped/failed for symbols
+    that still have no financial_results row (cover-letter miss, Gemini
+    timeout marked wrongly, etc.). Without this, catchup goes idle while
+    thousands of stocks remain empty."""
+    out: list = []
+    seen_sym: set[str] = set()
+    page_size, offset = 1000, 0
+    while len(out) < limit and offset < 15000:
+        try:
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/concall_summaries", headers=headers,
+                params={'select': 'symbol,attachment_url,announced_at,status',
+                        'status': 'in.(skipped,failed)',
+                        'attachment_url': 'not.is.null',
+                        'order': 'announced_at.desc',
+                        'limit': str(page_size), 'offset': str(offset)},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as r:
+                if r.status != 200:
+                    break
+                rows = await r.json()
+        except Exception:
+            break
+        if not rows:
+            break
+        for row in rows:
+            sym = (row.get('symbol') or '').strip().upper()
+            url = row.get('attachment_url')
+            if not sym or not url or sym in have_fr or sym in seen_sym:
+                continue
+            seen_sym.add(sym)
+            out.append({
+                'symbol': sym,
+                'attachment_url': url,
+                'announced_at': row.get('announced_at'),
+                'subject': 'Results (retry skipped PDF)',
+                'category': 'Result',
+            })
+            if len(out) >= limit:
+                break
+        if len(rows) < page_size:
+            break
+        offset += page_size
+    return out
+
+
 async def _fetch_results_announcement_candidates(
         session: aiohttp.ClientSession, headers: dict,
         since: str, candidates_limit: int) -> list:
@@ -1814,16 +1863,17 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
         if catchup:
             # Default 10 stocks per cycle during catchup (override with
             # RESULTS_PDF_CATCHUP_BATCH_SIZE). Lower if free-tier 429s spike.
-            BATCH_SIZE = int(os.getenv('RESULTS_PDF_CATCHUP_BATCH_SIZE', '10'))
+            # Aggressive defaults while universe Results are still empty.
+            BATCH_SIZE = int(os.getenv('RESULTS_PDF_CATCHUP_BATCH_SIZE', '15'))
             candidates_limit = int(os.getenv('RESULTS_PDF_CATCHUP_CANDIDATES_LIMIT',
-                                             os.getenv('RESULTS_PDF_CANDIDATES_LIMIT', '12000')))
-            # 365d default — 90d left most of the universe without Results PDFs.
+                                             os.getenv('RESULTS_PDF_CANDIDATES_LIMIT', '15000')))
+            # 730d default — one year still left many filings outside the window.
             base_lb = int(os.getenv('RESULTS_PDF_CATCHUP_LOOKBACK_DAYS',
-                                    os.getenv('RESULTS_PDF_LOOKBACK_DAYS', '365')))
+                                    os.getenv('RESULTS_PDF_LOOKBACK_DAYS', '730')))
             escalated = int(getattr(_concall_summary_loop, '_catchup_lookback', 0) or 0)
             lookback_days = max(base_lb, escalated)
             pacing = float(os.getenv('RESULTS_PDF_CATCHUP_PACING_SECONDS',
-                                     os.getenv('RESULTS_PDF_PACING_SECONDS', '3')))
+                                     os.getenv('RESULTS_PDF_PACING_SECONDS', '2')))
         else:
             BATCH_SIZE = int(os.getenv('RESULTS_PDF_BATCH_SIZE', '10'))
             candidates_limit = int(os.getenv('RESULTS_PDF_CANDIDATES_LIMIT', '2000'))
@@ -1873,8 +1923,22 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
         pending = [row for row in concall_rows
                    if (row['symbol'], row['attachment_url']) not in already]
         have_fr: set[str] = set()
+        retry_n = 0
         if catchup:
             have_fr = await _symbols_with_financial_results(session, headers)
+            # Re-try skipped/failed PDFs for stocks that still have no numbers.
+            retry_on = (os.getenv('RESULTS_PDF_RETRY_SKIPPED') or '1').strip().lower()
+            if retry_on not in ('0', 'false', 'no', 'off'):
+                retry_rows = await _fetch_skipped_results_pdfs_for_retry(
+                    session, headers, have_fr, limit=max(BATCH_SIZE * 2, 30))
+                if retry_rows:
+                    retry_n = len(retry_rows)
+                    # Drop from already so this cycle can process them again.
+                    for rr in retry_rows:
+                        already.discard((rr['symbol'], rr['attachment_url']))
+                    pending.extend(retry_rows)
+                    log.info(f"🎙️ Results catchup: re-queueing {retry_n} skipped/failed "
+                              f"PDF(s) for symbols still missing financial_results")
             # Missing financial_results first, then newest filing — cover
             # many stocks, not many filings for the same few names.
             if pending:
@@ -1886,7 +1950,7 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
         todo = []
         seen_sym: set[str] = set()
         for row in pending:
-            sym = row.get('symbol')
+            sym = (row.get('symbol') or '').strip().upper()
             if catchup and sym in seen_sym:
                 continue
             if catchup and sym:
@@ -1897,8 +1961,11 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
         uni_n = len(ALL_STOCKS) or 0
         missing_fr_total = max(0, uni_n - len(have_fr)) if (catchup and uni_n) else 0
         missing_n = sum(1 for r in todo if r.get('symbol') not in have_fr) if have_fr else 0
+        # Don't hand Gemini to Concall/PPT while a large Results-numbers gap remains.
+        idle_missing_ok = int(os.getenv('RESULTS_CATCHUP_IDLE_MISSING_FR', '80'))
         progress_extra = (f"symbols_with_fr={len(have_fr)}, missing_fr≈{missing_fr_total}, "
                           f"universe≈{uni_n or '?'}, lookback={lookback_days}d"
+                          f"{f', retry_skipped={retry_n}' if retry_n else ''}"
                           if catchup else f"matched={len(concall_rows)}")
         log.info(_fmt_filings_progress(
             'Results PDF', loaded=len(already), pending=len(pending),
@@ -1922,13 +1989,18 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
                           f"missing_fr≈{missing_fr_total})"
                           f"{f' (idle#{idle_streak})' if idle_streak > 1 else ''}")
             if catchup:
-                # Still missing numbers → widen lookback before declaring idle.
-                max_lb = int(os.getenv('RESULTS_PDF_CATCHUP_MAX_LOOKBACK_DAYS', '730'))
-                if missing_fr_total > 50 and lookback_days < max_lb:
-                    nxt = min(max_lb, max(lookback_days * 2, 365))
+                # Still missing numbers → widen lookback / keep busy for BSE + retries.
+                max_lb = int(os.getenv('RESULTS_PDF_CATCHUP_MAX_LOOKBACK_DAYS', '1095'))
+                if missing_fr_total > idle_missing_ok and lookback_days < max_lb:
+                    nxt = min(max_lb, max(lookback_days * 2, 730))
                     _concall_summary_loop._catchup_lookback = nxt
                     log.info(f"🎙️ Results catchup: still missing_fr≈{missing_fr_total} "
                              f"— widening lookback {lookback_days}d → {nxt}d (keep catchup busy)")
+                    _set_results_catchup_idle(False)
+                elif missing_fr_total > idle_missing_ok:
+                    log.info(f"🎙️ Results catchup: no new PDF queue but missing_fr≈{missing_fr_total} "
+                              f"(>{idle_missing_ok}) — staying busy so BSE numbers + skipped "
+                              f"PDF retries keep priority over Concall/PPT")
                     _set_results_catchup_idle(False)
                 else:
                     _set_results_catchup_idle(
@@ -2107,10 +2179,13 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
                           f"in the same PDF - may be a genuine gap, or a missed extraction worth a "
                           f"manual check. PDF: {pdf_url}")
 
+            # Numbers without a prose summary still count as done — otherwise
+            # catchup never retries and "Results PDF AI" under-counts.
             payload = {
                 'symbol': row['symbol'], 'announced_at': row['announced_at'],
                 'attachment_url': row['attachment_url'],
-                'summary': summary, 'status': 'done' if summary else 'skipped',
+                'summary': summary,
+                'status': 'done' if (summary or fd) else 'skipped',
             }
             if fd and fd.get('result_rating'):
                 payload['result_rating'] = fd['result_rating']
@@ -2181,13 +2256,24 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
             if todo:
                 await asyncio.sleep(5)
             else:
-                idle = int(os.getenv('RESULTS_PDF_CATCHUP_DONE_SECONDS', '1800'))  # 30m
-                streak = getattr(_concall_summary_loop, '_idle_streak', 1)
-                if streak == 1:
-                    log.info(f"🎙️ Results extraction loop: catchup idle "
-                              f"(lookback={lookback_days}d, matched={len(concall_rows)}, "
-                              f"already={len(already)}) — sleeping {idle}s until next check")
-                await asyncio.sleep(max(60, idle))
+                # Still missing numbers → re-scan soon for skipped PDF retries.
+                # Only use the long "done" sleep once the FR gap is small.
+                idle_missing_ok = int(os.getenv('RESULTS_CATCHUP_IDLE_MISSING_FR', '80'))
+                if missing_fr_total > idle_missing_ok:
+                    wait = int(os.getenv('RESULTS_PDF_CATCHUP_RETRY_SECONDS', '90'))
+                    streak = getattr(_concall_summary_loop, '_idle_streak', 1)
+                    if streak == 1 or streak % 10 == 0:
+                        log.info(f"🎙️ Results catchup: waiting {wait}s then retry "
+                                  f"(missing_fr≈{missing_fr_total}, lookback={lookback_days}d)")
+                    await asyncio.sleep(max(30, wait))
+                else:
+                    idle = int(os.getenv('RESULTS_PDF_CATCHUP_DONE_SECONDS', '1800'))  # 30m
+                    streak = getattr(_concall_summary_loop, '_idle_streak', 1)
+                    if streak == 1:
+                        log.info(f"🎙️ Results extraction loop: catchup idle "
+                                  f"(lookback={lookback_days}d, matched={len(concall_rows)}, "
+                                  f"already={len(already)}) — sleeping {idle}s until next check")
+                    await asyncio.sleep(max(60, idle))
         else:
             await asyncio.sleep(120 if todo else 300)
 
@@ -7080,10 +7166,10 @@ async def _bse_missing_backfill_loop(session: aiohttp.ClientSession):
     non-matches - mostly ETFs/indices - is expected long-term, so a
     small remainder shouldn't be polled as aggressively as a real
     backlog)."""
-    BUSY_INTERVAL = int(os.getenv('BSE_MISSING_BUSY_SECONDS', '120'))   # 2 min when backlog
+    BUSY_INTERVAL = int(os.getenv('BSE_MISSING_BUSY_SECONDS', '60'))    # 1 min when backlog
     QUIET_INTERVAL = int(os.getenv('BSE_MISSING_QUIET_SECONDS', '1800'))  # 30 min otherwise
     BACKLOG_THRESHOLD = 30
-    BATCH = int(os.getenv('BSE_MISSING_BATCH_LIMIT', '300'))
+    BATCH = int(os.getenv('BSE_MISSING_BATCH_LIMIT', '400'))
     while True:
         if os.getenv('PAUSE_BSE_LOOPS'):
             await asyncio.sleep(60)
