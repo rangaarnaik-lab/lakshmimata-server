@@ -66,6 +66,26 @@ _ABOUT_ENV_PAUSE_RESUME_LOGGED = False
 # Results catchup queue empty — About Company may start (every 15 min).
 _RESULTS_CATCHUP_IDLE = False
 _RESULTS_CATCHUP_IDLE_LOGGED = False
+# About Company backlog empty — Results may use Gemini even if GEMINI_FOCUS=about.
+_ABOUT_CATCHUP_IDLE = False
+_ABOUT_CATCHUP_IDLE_LOGGED = False
+
+
+def _set_about_catchup_idle(idle: bool):
+    """Flip About-catchup-idle; when True, GEMINI_FOCUS=about unblocks Results."""
+    global _ABOUT_CATCHUP_IDLE, _ABOUT_CATCHUP_IDLE_LOGGED
+    was = _ABOUT_CATCHUP_IDLE
+    _ABOUT_CATCHUP_IDLE = bool(idle)
+    if _ABOUT_CATCHUP_IDLE and not was:
+        if not _ABOUT_CATCHUP_IDLE_LOGGED:
+            log.info(
+                "📘 About-company catchup idle — Results + PPT + concall may use Gemini "
+                "(GEMINI_FOCUS=about handoff; fill missing filings in parallel)"
+            )
+            _ABOUT_CATCHUP_IDLE_LOGGED = True
+    elif not _ABOUT_CATCHUP_IDLE and was:
+        _ABOUT_CATCHUP_IDLE_LOGGED = False
+        log.info("📘 About-company catchup busy again — filing loops yield under GEMINI_FOCUS=about")
 
 
 def _set_results_catchup_idle(idle: bool, *, lookback_days: int | None = None,
@@ -104,8 +124,9 @@ def _results_catchup_busy() -> bool:
 
 
 def _ppt_transcript_catchup_boosted() -> bool:
-    """Aggressive PPT + concall/transcript reads once Results catchup is idle."""
-    if not _results_catchup_over():
+    """Aggressive PPT + concall/transcript once About is done (or Results idle)."""
+    # About finished → fill PPT/concall in parallel with Results (ASAP).
+    if not _ABOUT_CATCHUP_IDLE and not _results_catchup_over():
         return False
     v = (os.getenv('PPT_TRANSCRIPT_CATCHUP') or '1').strip().lower()
     return v not in ('0', 'false', 'no', 'off')
@@ -5690,6 +5711,7 @@ async def _about_company_loop(session: aiohttp.ClientSession):
         missing_about_n = len(ranked)
 
         if todo:
+            _set_about_catchup_idle(False)
             _web = os.getenv('ABOUT_COMPANY_WEB_SEARCH', '0')
             _mode = ('web search' if _web.strip() not in ('0', 'false', 'False')
                      else 'filings-only')
@@ -5701,6 +5723,8 @@ async def _about_company_loop(session: aiohttp.ClientSession):
                       f"universe≈{len(universe_syms)}; "
                       f"keys={_gemini_keys_fingerprint_summary(_gemini_batch_key_pool())})")
         else:
+            # No About work left → unblock Results under GEMINI_FOCUS=about.
+            _set_about_catchup_idle(True)
             log.info(f"📘 About-company loop: nothing new "
                       f"(missing_about≈{missing_about_n}, done={_done_n}, "
                       f"universe≈{len(universe_syms)})")
@@ -6072,13 +6096,18 @@ def _gemini_focus_allows(feature: str) -> bool:
     (including during Results/About hard-stops — uses free Gemini).
     When About is stopped (PAUSE_ABOUT_COMPANY / hard-quota yield), Results PDF
     extraction is allowed even if GEMINI_FOCUS=about.
+    When About catchup is idle (backlog clear), Results + PPT + concall are
+    allowed under GEMINI_FOCUS=about so missing filings fill in parallel.
     When Results hits hard quota, batch Gemini features are blocked (not Ask)."""
     # Ask AI is interactive and must keep answering on free Gemini.
     if feature == 'asks':
         return True
     if _gemini_jobs_hard_paused():
         return False
-    # Results backlog first — park PPT/concall until Results catchup is idle.
+    # About backlog clear → Results + PPT + concall in parallel (ASAP).
+    if _ABOUT_CATCHUP_IDLE and feature in ('results', 'ppt', 'transcript'):
+        return True
+    # While About still has work: park PPT/concall until Results catchup idle.
     if feature in ('ppt', 'transcript'):
         if _results_catchup_busy():
             return False
@@ -6090,6 +6119,9 @@ def _gemini_focus_allows(feature: str) -> bool:
             return False
         if feature == 'results':
             return True
+    # About backlog clear → hand Gemini to Results (ignore GEMINI_FOCUS=about).
+    if feature == 'results' and _ABOUT_CATCHUP_IDLE:
+        return True
     until = _ABOUT_YIELD_TO_RESULTS_UNTIL
     if until and time.time() < until:
         # Results catchup idle → let About populate Company Overview.
@@ -6112,21 +6144,32 @@ async def _idle_if_gemini_paused(feature: str, label: str):
         log.error(f"🛑 {label}: Gemini HARD STOP ({left}s left)")
     elif feature == 'about' and _about_company_manually_paused():
         log.info(f"⏸️ {label}: paused (PAUSE_ABOUT_COMPANY — Results catchup active)")
-    elif feature == 'results' and (_ABOUT_YIELD_TO_RESULTS_UNTIL or _about_company_manually_paused()):
+    elif feature == 'results' and (
+            _ABOUT_YIELD_TO_RESULTS_UNTIL or _about_company_manually_paused()
+            or _ABOUT_CATCHUP_IDLE):
         log.info(f"⏸️ {label}: waiting for About→Results handoff")
     elif feature == 'results' and not _gemini_focus_allowed_by_env('results'):
         pause = os.getenv('PAUSE_RESULTS_EXTRACTION') or os.getenv('GEMINI_FOCUS') or 'about'
-        log.info(f"⏸️ {label}: paused ({pause}) — About Company has Gemini quota")
+        log.info(f"⏸️ {label}: paused ({pause}) — About Company has Gemini quota "
+                 f"(Results starts when About catchup is idle)")
     elif feature in ('ppt', 'transcript') and _results_catchup_busy():
         log.info(f"⏸️ {label}: paused — Results catchup active (PPT/concall start when Results is idle)")
     else:
         log.info(f"⏸️ {label}: paused (GEMINI_FOCUS={why})")
+    # Poll often while filing loops wait on About focus / yield — otherwise
+    # a 300s sleep can leave the worker stuck after About finishes.
+    _fast_poll = (
+        _ABOUT_YIELD_TO_RESULTS_UNTIL
+        or _about_company_manually_paused()
+        or (feature in ('results', 'ppt', 'transcript')
+            and not _gemini_focus_allowed_by_env(feature))
+        or (feature in ('ppt', 'transcript') and _results_catchup_busy())
+    )
     while not _gemini_focus_allows(feature):
         if _gemini_jobs_hard_paused():
             await _sleep_while_gemini_hard_paused()
         else:
-            await asyncio.sleep(
-                30 if (_ABOUT_YIELD_TO_RESULTS_UNTIL or _about_company_manually_paused()) else 300)
+            await asyncio.sleep(30 if _fast_poll else 300)
     if feature == 'results':
         log.info(f"▶️ {label}: active (Results catchup / focus allows results)")
     elif feature in ('ppt', 'transcript'):
