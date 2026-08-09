@@ -45,9 +45,18 @@ _BSE_NO_SCRIP_CODE = set()
 
 
 def _bse_loops_paused() -> bool:
-    """Only 1/true/yes/on pause BSE. Empty, unset, 0, false → run.
-    (Bare `if os.getenv(...)` treated '0'/'false' as paused.)"""
+    """Only 1/true/yes/on pause BSE calendar/etc. Empty/0/false → not paused."""
     return (os.getenv('PAUSE_BSE_LOOPS') or '').strip().lower() in (
+        '1', 'true', 'yes', 'on')
+
+
+def _bse_results_backfill_enabled() -> bool:
+    """BSE resultsSnapshot numbers are OFF by default — Results come from
+    Results PDFs via Gemini only. Set ENABLE_BSE_RESULTS=1 to re-enable
+    (still respects PAUSE_BSE_LOOPS)."""
+    if _bse_loops_paused():
+        return False
+    return (os.getenv('ENABLE_BSE_RESULTS') or '0').strip().lower() in (
         '1', 'true', 'yes', 'on')
 
 # About briefs successfully saved this process — never re-Gemini the same
@@ -2010,11 +2019,12 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
         retry_n = 0
         if catchup:
             have_fr = await _symbols_with_financial_results(session, headers)
-            # Re-try skipped/failed PDFs — OFF by default. When ON it was
-            # burning Gemini on the same RATNAMANI/IXIGO/SELMC 400s every
-            # batch while ~1300 missing stocks wait on BSE. Set
-            # RESULTS_PDF_RETRY_SKIPPED=1 only after permanent-skip is live.
-            retry_on = (os.getenv('RESULTS_PDF_RETRY_SKIPPED') or '0').strip().lower()
+            # Re-try skipped/failed PDFs for symbols still missing numbers.
+            # Default ON when BSE resultsSnapshot is off (PDF is the only
+            # numbers path). Permanent skips (400/oversized/empty) stay
+            # blacklisted via _RESULTS_PDF_NO_RETRY + summary markers.
+            _retry_default = '1' if not _bse_results_backfill_enabled() else '0'
+            retry_on = (os.getenv('RESULTS_PDF_RETRY_SKIPPED') or _retry_default).strip().lower()
             if retry_on in ('1', 'true', 'yes', 'on'):
                 retry_rows = await _fetch_skipped_results_pdfs_for_retry(
                     session, headers, have_fr, limit=max(BATCH_SIZE * 2, 30))
@@ -2082,7 +2092,7 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
                           f"{f' (idle#{idle_streak})' if idle_streak > 1 else ''}")
             if catchup:
                 # Keep Results priority until the numbers gap is small.
-                # Concall/PPT wait; BSE-missing fills FR rows in parallel.
+                # Numbers come from Results PDFs only (BSE snapshot off).
                 max_lb = int(os.getenv('RESULTS_PDF_CATCHUP_MAX_LOOKBACK_DAYS', '1095'))
                 if missing_fr_total > idle_missing_ok:
                     if lookback_days < max_lb:
@@ -2094,7 +2104,7 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
                     else:
                         log.info(f"🎙️ Results PDF queue empty (lookback={lookback_days}d) but "
                                   f"missing_fr≈{missing_fr_total} — holding Gemini on Results "
-                                  f"(Concall/PPT wait; BSE fills numbers)")
+                                  f"(retry skipped PDFs; Concall/PPT wait)")
                     _set_results_catchup_idle(False)
                 else:
                     _set_results_catchup_idle(
@@ -2252,7 +2262,7 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
             if not to_save and not summary:
                 await _mark_results_pdf_permanent(
                     session, headers, row, reason='no extractable results table',
-                    note='[No extractable results table — numbers via BSE/XBRL]')
+                    note='[No extractable results table — try another Results PDF / NSE XBRL]')
                 continue
             if fd:
                 rating_bit = f" rating={fd.get('result_rating')}" if fd.get('result_rating') else ""
@@ -6395,14 +6405,14 @@ async def fundamentals_worker_main():
             except Exception as e:
                 import traceback
                 log.error(f"BSE test failed: {e}\n{traceback.format_exc()}")
-        if os.getenv('BACKFILL_BSE_SYMBOLS') and not _bse_loops_paused():
+        if os.getenv('BACKFILL_BSE_SYMBOLS') and _bse_results_backfill_enabled():
             try:
                 syms = [s.strip().upper() for s in os.getenv('BACKFILL_BSE_SYMBOLS').split(',') if s.strip()]
                 await backfill_from_bse(session, syms)
             except Exception as e:
                 import traceback
                 log.error(f"BSE backfill failed: {e}\n{traceback.format_exc()}")
-        if os.getenv('BACKFILL_BSE_MISSING_LIMIT') and not _bse_loops_paused():
+        if os.getenv('BACKFILL_BSE_MISSING_LIMIT') and _bse_results_backfill_enabled():
             try:
                 await backfill_from_bse_missing(session, limit=int(os.getenv('BACKFILL_BSE_MISSING_LIMIT')))
             except Exception as e:
@@ -6420,6 +6430,9 @@ async def fundamentals_worker_main():
             except Exception as e:
                 import traceback
                 log.error(f"Screener CSV import failed: {e}\n{traceback.format_exc()}")
+        if not _bse_results_backfill_enabled():
+            log.info("📄 Results numbers: PDF/Gemini only "
+                     "(BSE resultsSnapshot OFF — set ENABLE_BSE_RESULTS=1 to re-enable)")
         await asyncio.gather(
             _fundamentals_loop(session),
             _market_cap_catchup_loop(session),
@@ -7272,8 +7285,8 @@ async def _bse_stale_results_loop(session: aiohttp.ClientSession):
     QUIET_INTERVAL = 1800    # 30 min otherwise
     BACKLOG_THRESHOLD = 30
     while True:
-        if _bse_loops_paused():
-            await asyncio.sleep(60)
+        if not _bse_results_backfill_enabled():
+            await asyncio.sleep(3600)
             continue
         try:
             remaining = await backfill_from_bse_stale(session, limit=200)
@@ -7285,32 +7298,20 @@ async def _bse_stale_results_loop(session: aiohttp.ClientSession):
         await asyncio.sleep(sleep_for)
 
 async def _bse_missing_backfill_loop(session: aiohttp.ClientSession):
-    """Automatically clears the backlog of tracked stocks with no
-    financial_results row at all (the ones that reported before today's
-    BSE/XBRL pipeline existed - confirmed ~2412 of them earlier). Was
-    previously a one-off manual process (set BACKFILL_BSE_MISSING_LIMIT,
-    redeploy, repeat ~12 times for 200 stocks/round) - this replaces that
-    with a permanent background loop so results actually finish
-    backfilling without manual steps. Adaptive interval, same pattern as
-    _bse_stale_results_loop: >30 stocks still missing -> check every 5
-    min; 30 or fewer -> check every 30 min (a handful of permanent
-    non-matches - mostly ETFs/indices - is expected long-term, so a
-    small remainder shouldn't be polled as aggressively as a real
-    backlog)."""
+    """Optional BSE resultsSnapshot backfill (OFF by default — PDF/Gemini
+    is the numbers source). Enable with ENABLE_BSE_RESULTS=1."""
     BUSY_INTERVAL = int(os.getenv('BSE_MISSING_BUSY_SECONDS', '60'))    # 1 min when backlog
     QUIET_INTERVAL = int(os.getenv('BSE_MISSING_QUIET_SECONDS', '1800'))  # 30 min otherwise
     BACKLOG_THRESHOLD = 30
     BATCH = int(os.getenv('BSE_MISSING_BATCH_LIMIT', '400'))
-    raw_pause = os.getenv('PAUSE_BSE_LOOPS')
-    if _bse_loops_paused():
-        log.warning(f"🏛️ BSE-missing loop: PAUSE_BSE_LOOPS={raw_pause!r} — numbers backfill is OFF "
-                    f"(set to 0/false/delete var to enable)")
+    if not _bse_results_backfill_enabled():
+        log.info("🏛️ BSE-missing loop: idle (ENABLE_BSE_RESULTS not set — "
+                 "Results numbers from PDF/Gemini only)")
     else:
-        log.info(f"🏛️ BSE-missing loop: active (batch={BATCH}, busy every {BUSY_INTERVAL}s, "
-                 f"PAUSE_BSE_LOOPS={raw_pause!r})")
+        log.info(f"🏛️ BSE-missing loop: active (batch={BATCH}, busy every {BUSY_INTERVAL}s)")
     while True:
-        if _bse_loops_paused():
-            await asyncio.sleep(60)
+        if not _bse_results_backfill_enabled():
+            await asyncio.sleep(3600)
             continue
         try:
             log.info(f"🏛️ BSE-missing cycle: fetching up to {BATCH} symbols…")
