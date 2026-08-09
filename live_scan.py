@@ -3235,6 +3235,22 @@ def is_scan_time() -> bool:
     close_time = now.replace(hour=MARKET_CLOSE_H, minute=MARKET_CLOSE_M, second=0, microsecond=0) + timedelta(minutes=30)
     return open_time <= now <= close_time
 
+
+def eod_still_needed() -> bool:
+    """True only on a weekday AFTER market close, if today's EOD hasn't run.
+    Previously `last_eod_refresh_date != today` alone forced full scans all
+    night and all weekend after every redeploy — burning Upstox/compute when
+    the market is closed."""
+    now = datetime.now(IST)
+    if now.weekday() >= 5:
+        return False
+    close_time = now.replace(
+        hour=MARKET_CLOSE_H, minute=MARKET_CLOSE_M, second=0, microsecond=0)
+    if now < close_time:
+        return False
+    today = now.strftime('%Y-%m-%d')
+    return last_eod_refresh_date != today
+
 async def load_all_history_from_supabase(session: aiohttp.ClientSession) -> list:
     """
     Load previously-fetched full-history rows straight from Supabase —
@@ -6095,23 +6111,28 @@ async def run_live_scan_service():
         except Exception as e:
             log.warning(f"Startup results-dates load error (non-fatal): {e}")
 
-        log.info("✅ Proceeding to initial scan…")
-
-
-        # Step 4: Run initial scan
+        # Step 4: Initial scan — only during market window or pending
+        # weekday EOD. Night/weekend redeploys used to always run a full
+        # batch_eod here and then keep scanning via eod_pending_today.
         SCAN_TIMEOUT = 900
         ist_now_initial = datetime.now(IST)
-        if is_market_open():
-            initial_scan_type = 'live'
-        elif ist_now_initial.hour < 9 or (ist_now_initial.hour == 9 and ist_now_initial.minute < 15):
-            initial_scan_type = 'batch_morning'
+        if is_scan_time() or eod_still_needed():
+            if is_market_open():
+                initial_scan_type = 'live'
+            elif ist_now_initial.hour < 9 or (ist_now_initial.hour == 9 and ist_now_initial.minute < 15):
+                initial_scan_type = 'batch_morning'
+            else:
+                initial_scan_type = 'batch_eod'
+            log.info(f"✅ Proceeding to initial scan: {initial_scan_type} "
+                      f"(current time {ist_now_initial.strftime('%H:%M IST')})")
+            try:
+                await asyncio.wait_for(run_scan(session, initial_scan_type), timeout=SCAN_TIMEOUT)
+            except asyncio.TimeoutError:
+                log.error(f"⏱ Initial scan exceeded {SCAN_TIMEOUT}s timeout — aborting and continuing to main loop")
         else:
-            initial_scan_type = 'batch_eod'
-        log.info(f"Initial scan type detected: {initial_scan_type} (current time {ist_now_initial.strftime('%H:%M IST')})")
-        try:
-            await asyncio.wait_for(run_scan(session, initial_scan_type), timeout=SCAN_TIMEOUT)
-        except asyncio.TimeoutError:
-            log.error(f"⏱ Initial scan exceeded {SCAN_TIMEOUT}s timeout — aborting and continuing to main loop")
+            log.info(f"⏸️ Outside market hours ({ist_now_initial.strftime('%H:%M IST')}) — "
+                      f"skipping initial scan; will wake for next session "
+                      f"({MARKET_OPEN_H}:{MARKET_OPEN_M:02d}–{MARKET_CLOSE_H}:{MARKET_CLOSE_M:02d} IST)")
 
         # NOTE: the legacy per-stock Yahoo "extend short history" background
         # task is no longer needed here — load_history_at_startup()
@@ -6127,21 +6148,10 @@ async def run_live_scan_service():
                 now = time.time()
                 elapsed = now - last_scan
 
-                # Cost gating: this loop previously ran full scans (hitting
-                # Upstox for ~2,400 stocks + writing to Supabase) every
-                # UPDATE_INTERVAL unconditionally, 24/7 — including nights
-                # and weekends, when nothing about the market is actually
-                # changing. is_scan_time() already existed (market hours +
-                # 30min buffer) but was never used to gate anything, only
-                # to pick a label. Now: scan normally during that window;
-                # outside it, still allow ONE more scan if today's EOD
-                # snapshot/digest hasn't run yet (so that still completes
-                # shortly after close), then go quiet with a long sleep
-                # instead of polling every 5s and burning compute for no
-                # reason.
-                today_check = datetime.now(IST).strftime('%Y-%m-%d')
-                eod_pending_today = last_eod_refresh_date != today_check
-                should_scan_now = is_scan_time() or eod_pending_today
+                # Cost gating: scan during market hours (+30m buffer); after
+                # weekday close allow EOD until it completes; nights/weekends
+                # stay quiet (long sleep). Redeploys must NOT force 24/7 scans.
+                should_scan_now = is_scan_time() or eod_still_needed()
 
                 if should_scan_now and elapsed >= UPDATE_INTERVAL:
                     scan_type = 'live' if is_market_open() else 'batch_eod'
