@@ -50,6 +50,7 @@ _ABOUT_DONE_SYMS: set[str] = set()
 # backlog can advance; cleared on process restart.
 _ABOUT_SAVE_FAILS: dict[str, int] = {}
 _ABOUT_OPTIONAL_COLS_MISSING = False  # set True after PGRST204 on image/sources
+_RESULT_RATING_COLS_MISSING = False  # set True after PGRST204 on result_rating*
 # When Gemini starts failing: retry for ~10 min, then long-pause.
 _ABOUT_GEMINI_UNHEALTHY_SINCE: float | None = None
 # Hard quota / billing 429 — skip short retry, go straight to long cooldown.
@@ -1416,7 +1417,19 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
         "schedules with no qualitative commentary of this kind (common for smaller "
         "companies), or if it's just a cover letter with no real content to summarize, leave "
         "summary null. Do not add commentary or opinions beyond what's stated in the "
-        "document, and never invent facts, figures, or context not literally present in it."
+        "document, and never invent facts, figures, or context not literally present in it.\n\n"
+        "RESULT RATING: If has_results_table is true and you extracted current + YoY (or at "
+        "least PAT YoY) figures, also set result_rating to one of Excellent|Good|Neutral|Weak "
+        "for the CURRENT quarter only, using these rules on the numbers you extracted: "
+        "(1) Prefer PAT after stripping exceptional_item when present. (2) Excellent if "
+        "PAT YoY >=20% AND Sales YoY >=10%; Weak if PAT YoY <=-15% OR both Sales and PAT "
+        "YoY negative; Good if both Sales and PAT YoY positive but not Excellent; else "
+        "Neutral. (3) Cap the label if reported (headline) PAT YoY is negative — Weak if "
+        "<=-15%, else Neutral max. (4) Cap if operating margin (approx (PBT-other_income)/Sales) "
+        "compressed sharply YoY. (5) Cap Excellent→Good if sequential QoQ is flat/soft. "
+        "Also set result_rating_note to one short sentence (<=40 words) citing the key "
+        "Sales/PAT YoY (and QoQ if used) that drove the label. Leave both null if there "
+        "aren't enough figures to judge."
     )
     schema = {
         "type": "object",
@@ -1449,6 +1462,11 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
             "yoy_exceptional_item": {"type": "number", "nullable": True},
             "yoy_pat": {"type": "number", "nullable": True},
             "yoy_eps": {"type": "number", "nullable": True},
+            "result_rating": {"type": "string", "nullable": True,
+                "enum": ["Excellent", "Good", "Neutral", "Weak"],
+                "description": "Quality label for the CURRENT quarter only"},
+            "result_rating_note": {"type": "string", "nullable": True,
+                "description": "One short sentence (<=40 words) citing Sales/PAT YoY (and QoQ if used)"},
             "summary": {"type": "string", "nullable": True},
         },
         "required": ["has_results_table"],
@@ -1540,6 +1558,15 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
                 for k in ('sales', 'other_income', 'pbt', 'exceptional_item', 'pat', 'eps'):
                     if parsed.get(k) is not None:
                         financial_data[k] = parsed[k]
+                # Gemini's provisional rating/note — deterministic compute
+                # in compute_results_yoy_qoq overwrites result_rating when
+                # YoY/QoQ history is available; note is kept as context.
+                rr = parsed.get('result_rating')
+                if rr in ('Excellent', 'Good', 'Neutral', 'Weak'):
+                    financial_data['result_rating'] = rr
+                note = (parsed.get('result_rating_note') or '').strip()[:240] or None
+                if note:
+                    financial_data['result_rating_note'] = note
 
         # Comparison rows (sequential prior quarter and YoY), from the
         # same Consolidated table Gemini already read for the current
@@ -1762,6 +1789,7 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
     iteration so the feature activates automatically as soon as the key
     is added, without needing a restart-triggered one-off backfill like
     the BSE loops needed."""
+    global _RESULT_RATING_COLS_MISSING
     headers = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
     _key_status_logged = False
     while True:
@@ -2042,8 +2070,9 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
             if to_save:
                 await save_financial_results_to_db(session, to_save)
             if fd:
+                rating_bit = f" rating={fd.get('result_rating')}" if fd.get('result_rating') else ""
                 log.info(f"  🎙️ {row['symbol']}: extracted {fd['period_ended']} "
-                          f"{fd['result_type']} figures from PDF")
+                          f"{fd['result_type']} figures from PDF{rating_bit}")
             if comp:
                 # See extract_results_from_pdf's docstring for why this
                 # is worth saving even though the current period
@@ -2083,6 +2112,13 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
                 'attachment_url': row['attachment_url'],
                 'summary': summary, 'status': 'done' if summary else 'skipped',
             }
+            if fd and fd.get('result_rating'):
+                payload['result_rating'] = fd['result_rating']
+            if fd and fd.get('result_rating_note'):
+                payload['result_rating_note'] = fd['result_rating_note']
+            if _RESULT_RATING_COLS_MISSING:
+                payload.pop('result_rating', None)
+                payload.pop('result_rating_note', None)
             try:
                 async with session.post(
                     f"{SUPABASE_URL}/rest/v1/concall_summaries", headers={**headers,
@@ -2091,11 +2127,35 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
                 ) as r:
                     if r.status not in (200, 201, 204):
                         body = await r.text()
-                        log.warning(f"⚠️ Concall loop: save returned {r.status} for {row['symbol']} "
-                                     f"(is the concall_summaries table created with PK "
-                                     f"(symbol, attachment_url)?): {body[:300]}")
+                        if ('result_rating' in body or 'PGRST204' in body) and (
+                                'result_rating' in payload or 'result_rating_note' in payload):
+                            _RESULT_RATING_COLS_MISSING = True
+                            payload.pop('result_rating', None)
+                            payload.pop('result_rating_note', None)
+                            async with session.post(
+                                f"{SUPABASE_URL}/rest/v1/concall_summaries", headers={**headers,
+                                    'Content-Type': 'application/json',
+                                    'Prefer': 'resolution=merge-duplicates'},
+                                json=payload, timeout=aiohttp.ClientTimeout(total=15)
+                            ) as r2:
+                                if r2.status not in (200, 201, 204):
+                                    body2 = await r2.text()
+                                    log.warning(f"⚠️ Concall loop: save returned {r2.status} for "
+                                                 f"{row['symbol']}: {body2[:300]}")
+                                elif summary:
+                                    log.info(f"  🎙️ {row['symbol']}: results summary saved "
+                                              f"(rating cols missing — run add_result_rating.sql)")
+                                else:
+                                    log.info(f"  🎙️ {row['symbol']}: results PDF had no usable "
+                                              f"summary, marked skipped")
+                        else:
+                            log.warning(f"⚠️ Concall loop: save returned {r.status} for {row['symbol']} "
+                                         f"(is the concall_summaries table created with PK "
+                                         f"(symbol, attachment_url)?): {body[:300]}")
                     elif summary:
-                        log.info(f"  🎙️ {row['symbol']}: results summary saved")
+                        log.info(f"  🎙️ {row['symbol']}: results summary saved"
+                                  + (f" rating={payload.get('result_rating')}"
+                                     if payload.get('result_rating') else ""))
                     else:
                         log.info(f"  🎙️ {row['symbol']}: results PDF had no usable summary, marked skipped")
             except Exception as e:
@@ -6424,6 +6484,169 @@ def _pct_change(new, old):
         return None  # can't express a meaningful % change from a zero base
     return round((new - old) / abs(old) * 100, 2)
 
+def _effective_opm(row):
+    """Same OPM definition as the frontend Results table / rating chip."""
+    if not row:
+        return None
+    if row.get('opm_pct') is not None:
+        try:
+            return float(row['opm_pct'])
+        except (TypeError, ValueError):
+            pass
+    sales, pbt, oi = row.get('sales'), row.get('pbt'), row.get('other_income')
+    try:
+        sales = float(sales) if sales is not None else None
+        pbt = float(pbt) if pbt is not None else None
+        oi = float(oi) if oi is not None else None
+    except (TypeError, ValueError):
+        return None
+    if sales and pbt is not None and oi is not None and sales != 0:
+        return (pbt - oi) / sales * 100
+    return None
+
+def _period_sort_key(period_ended):
+    try:
+        return datetime.strptime(_norm_date(period_ended), '%Y-%m-%d')
+    except (ValueError, TypeError):
+        return datetime.min
+
+def compute_result_rating(hist: list):
+    """Excellent/Good/Neutral/Weak — port of App.jsx computeResultRating
+    so PDF catchup / BSE / XBRL saves store the same label the UI shows."""
+    if not hist:
+        return None
+    tiers = ['Weak', 'Neutral', 'Good', 'Excellent']
+    current = hist[0]
+    prev_qtr = hist[1] if len(hist) > 1 else None
+    try:
+        cur_date = _period_sort_key(current.get('period_ended'))
+        if cur_date == datetime.min:
+            return None
+    except Exception:
+        return None
+
+    def _yoy_match(h):
+        try:
+            d = _period_sort_key(h.get('period_ended'))
+            if d == datetime.min:
+                return False
+            years_back = cur_date.year - d.year
+            day_diff = abs((d.month * 30 + d.day) - (cur_date.month * 30 + cur_date.day))
+            return years_back == 1 and day_diff <= 20
+        except Exception:
+            return False
+
+    yoy_row = next((h for h in hist[1:] if _yoy_match(h)), None)
+
+    def _adj_pat(row):
+        if row is None or row.get('pat') is None:
+            return None
+        try:
+            return float(row['pat']) - float(row.get('exceptional_item') or 0)
+        except (TypeError, ValueError):
+            return None
+
+    def _pct(now, then):
+        return _pct_change(now, then)
+
+    sales_yoy = _pct(current.get('sales'), (yoy_row or {}).get('sales'))
+    raw_pat_yoy = _pct(current.get('pat'), (yoy_row or {}).get('pat'))
+    adj_pat_yoy = _pct(_adj_pat(current), _adj_pat(yoy_row))
+    pat_yoy = adj_pat_yoy if adj_pat_yoy is not None else raw_pat_yoy
+    cur_opm = _effective_opm(current)
+    yoy_opm = _effective_opm(yoy_row)
+    opm_yoy = _pct(cur_opm, yoy_opm)
+    opm_pp = (cur_opm - yoy_opm) if (cur_opm is not None and yoy_opm is not None) else None
+    try:
+        cur_oi = float(current['other_income']) if current.get('other_income') is not None else None
+        prev_oi = float(prev_qtr['other_income']) if prev_qtr and prev_qtr.get('other_income') is not None else None
+    except (TypeError, ValueError, KeyError):
+        cur_oi, prev_oi = None, None
+    other_income_spike = (
+        cur_oi is not None and prev_oi is not None
+        and prev_oi > 0.5 and cur_oi > prev_oi * 1.5
+    )
+
+    result_rating = None
+    if pat_yoy is not None and sales_yoy is not None:
+        if pat_yoy >= 20 and sales_yoy >= 10:
+            result_rating = 'Excellent'
+        elif pat_yoy <= -15:
+            result_rating = 'Weak'
+        elif pat_yoy > 0 and sales_yoy > 0:
+            result_rating = 'Good'
+        elif pat_yoy < 0 and sales_yoy < 0:
+            result_rating = 'Weak'
+        else:
+            result_rating = 'Neutral'
+    elif pat_yoy is not None:
+        if pat_yoy >= 25:
+            result_rating = 'Excellent'
+        elif pat_yoy > 0:
+            result_rating = 'Good'
+        elif pat_yoy < -10:
+            result_rating = 'Weak'
+        else:
+            result_rating = 'Neutral'
+
+    if not result_rating:
+        return None
+
+    max_tier_idx = len(tiers) - 1
+    if raw_pat_yoy is not None and raw_pat_yoy < 0:
+        max_tier_idx = 0 if raw_pat_yoy <= -15 else min(max_tier_idx, 1)
+
+    soft_compress = (opm_yoy is not None and opm_yoy <= -5) or (opm_pp is not None and opm_pp <= -1)
+    hard_collapse = (opm_yoy is not None and opm_yoy <= -20) or (opm_pp is not None and opm_pp <= -3)
+    if hard_collapse:
+        max_tier_idx = min(max_tier_idx, 1)
+        if opm_yoy is not None and opm_yoy <= -35 and (raw_pat_yoy is None or raw_pat_yoy < 0):
+            max_tier_idx = min(max_tier_idx, 0)
+    elif soft_compress:
+        max_tier_idx = min(max_tier_idx, 2)
+
+    if other_income_spike:
+        margin_down = (opm_pp is not None and opm_pp < 0) or (opm_yoy is not None and opm_yoy < 0)
+        max_tier_idx = min(max_tier_idx, 1 if margin_down else 2)
+
+    idx = min(tiers.index(result_rating), max_tier_idx)
+    if prev_qtr:
+        pat_qoq = _pct(_adj_pat(current), _adj_pat(prev_qtr))
+        sales_qoq = _pct(current.get('sales'), prev_qtr.get('sales'))
+        if pat_qoq is not None:
+            decelerating = pat_qoq <= -15 and (sales_qoq is None or sales_qoq <= 0)
+            recovering = pat_qoq >= 15 and (sales_qoq is None or sales_qoq >= 0)
+            sequentially_flat = (sales_qoq is None or sales_qoq <= 2) and pat_qoq <= 2
+            if decelerating and idx > 0:
+                idx -= 1
+            elif recovering and idx < max_tier_idx:
+                idx += 1
+            if sequentially_flat:
+                idx = min(idx, 2)
+
+    return tiers[min(idx, max_tier_idx)]
+
+def _attach_result_ratings(rows: list, history_by_symbol: dict) -> None:
+    """Set result_rating on each row using that period as 'current' vs history."""
+    for r in rows:
+        sym, pe = r.get('symbol'), r.get('period_ended')
+        if not sym or not pe:
+            continue
+        pool, seen = [], set()
+        for h in [r] + list(history_by_symbol.get(sym, []) or []):
+            hpe = h.get('period_ended')
+            if not hpe or hpe in seen:
+                continue
+            seen.add(hpe)
+            pool.append(h)
+        pool.sort(key=lambda x: _period_sort_key(x.get('period_ended')), reverse=True)
+        start = next((i for i, h in enumerate(pool) if h.get('period_ended') == pe), None)
+        if start is None:
+            continue
+        rating = compute_result_rating(pool[start:])
+        if rating:
+            r['result_rating'] = rating
+
 async def compute_results_yoy_qoq(session: aiohttp.ClientSession, rows: list) -> list:
     """Computes YoY and QoQ % change for sales/PAT/EPS and attaches them
     directly on each row (sales_yoy_pct, pat_yoy_pct, eps_yoy_pct,
@@ -6445,7 +6668,9 @@ async def compute_results_yoy_qoq(session: aiohttp.ClientSession, rows: list) ->
             async with session.get(
                 f"{SUPABASE_URL}/rest/v1/financial_results",
                 headers=headers,
-                params={'symbol': f'eq.{sym}', 'select': 'period_ended,sales,pat,eps',
+                params={'symbol': f'eq.{sym}',
+                        'select': 'period_ended,sales,pat,eps,other_income,pbt,'
+                                  'exceptional_item,opm_pct',
                         'order': 'period_ended.desc', 'limit': '8'},
                 timeout=aiohttp.ClientTimeout(total=15)
             ) as r:
@@ -6460,9 +6685,13 @@ async def compute_results_yoy_qoq(session: aiohttp.ClientSession, rows: list) ->
     for r in rows:
         sym = r.get('symbol')
         if sym and r.get('period_ended'):
-            history_by_symbol.setdefault(sym, []).append(
-                {'period_ended': r['period_ended'], 'sales': r.get('sales'),
-                 'pat': r.get('pat'), 'eps': r.get('eps')})
+            history_by_symbol.setdefault(sym, []).append({
+                'period_ended': r['period_ended'],
+                'sales': r.get('sales'), 'pat': r.get('pat'), 'eps': r.get('eps'),
+                'other_income': r.get('other_income'), 'pbt': r.get('pbt'),
+                'exceptional_item': r.get('exceptional_item'),
+                'opm_pct': r.get('opm_pct'),
+            })
 
     def _find_comparison(sym, period_ended, target_days, tolerance_days):
         # period_ended isn't reliably 'YYYY-MM-DD' - real data confirmed
@@ -6506,6 +6735,10 @@ async def compute_results_yoy_qoq(session: aiohttp.ClientSession, rows: list) ->
         if qoq:
             r['sales_qoq_pct'] = _pct_change(r.get('sales'), qoq.get('sales'))
             r['pat_qoq_pct'] = _pct_change(r.get('pat'), qoq.get('pat'))
+    # Quality label (Excellent/Good/Neutral/Weak) — same rules as the UI.
+    # Written while Results PDFs (and BSE/XBRL) are saved so the app can
+    # read a stored rating instead of recomputing every time.
+    _attach_result_ratings(rows, history_by_symbol)
     return rows
 
 async def save_financial_results_to_db(session: aiohttp.ClientSession, rows: list, skip_yoy_qoq: bool = False):
@@ -6525,6 +6758,11 @@ async def save_financial_results_to_db(session: aiohttp.ClientSession, rows: lis
     if not skip_yoy_qoq:
         rows = await compute_results_yoy_qoq(session, rows)
     rows = _dedupe_by_key(rows, ('symbol', 'period_ended', 'result_type'))
+    global _RESULT_RATING_COLS_MISSING
+    if _RESULT_RATING_COLS_MISSING:
+        for r in rows:
+            r.pop('result_rating', None)
+            r.pop('result_rating_note', None)
     all_keys = set()
     for r in rows:
         all_keys.update(r.keys())
@@ -6540,10 +6778,36 @@ async def save_financial_results_to_db(session: aiohttp.ClientSession, rows: lis
         async with session.post(url, headers=headers, json=rows,
                                 timeout=aiohttp.ClientTimeout(total=30)) as r:
             if r.status in (200, 201, 204):
-                log.info(f"  📊 Upserted {len(rows)} financial results to Supabase")
+                rated = sum(1 for x in rows if x.get('result_rating'))
+                log.info(f"  📊 Upserted {len(rows)} financial results to Supabase"
+                          + (f" ({rated} rated)" if rated else ""))
             else:
                 body = await r.text()
-                log.warning(f"⚠️ Financial results upsert failed ({r.status}): {body[:300]}")
+                if 'result_rating' in body or 'PGRST204' in body:
+                    _RESULT_RATING_COLS_MISSING = True
+                    for x in rows:
+                        x.pop('result_rating', None)
+                        x.pop('result_rating_note', None)
+                    # Rebuild key-union without rating cols and retry once.
+                    all_keys2 = set()
+                    for x in rows:
+                        all_keys2.update(x.keys())
+                    for x in rows:
+                        for k in list(x.keys()):
+                            if k not in all_keys2:
+                                x.pop(k, None)
+                        for k in all_keys2:
+                            x.setdefault(k, None)
+                    async with session.post(url, headers=headers, json=rows,
+                                            timeout=aiohttp.ClientTimeout(total=30)) as r2:
+                        if r2.status in (200, 201, 204):
+                            log.warning("⚠️ financial_results.result_rating missing — "
+                                        "ran add_result_rating.sql? Upserted without rating cols")
+                        else:
+                            body2 = await r2.text()
+                            log.warning(f"⚠️ Financial results upsert failed ({r2.status}): {body2[:300]}")
+                else:
+                    log.warning(f"⚠️ Financial results upsert failed ({r.status}): {body[:300]}")
     except Exception as e:
         log.warning(f"⚠️ Financial results upsert error: {type(e).__name__}: {e}")
 
@@ -7316,7 +7580,8 @@ async def backfill_results_yoy_qoq(session: aiohttp.ClientSession, days: int = 7
             async with session.get(
                 f"{SUPABASE_URL}/rest/v1/financial_results",
                 headers=headers,
-                params={'select': 'symbol,period_ended,result_type,sales,pat,eps',
+                params={'select': 'symbol,period_ended,result_type,sales,pat,eps,'
+                                  'other_income,pbt,exceptional_item,opm_pct',
                         'filed_at': f'gt.{since}',
                         'order': 'symbol.asc,period_ended.asc',
                         'offset': str(offset), 'limit': str(page_size)},
