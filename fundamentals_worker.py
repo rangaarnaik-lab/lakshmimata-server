@@ -271,6 +271,11 @@ def _gemini_focus_allowed_by_env(feature: str) -> bool:
         return True
     allowed = {x.strip() for x in raw.split(',') if x.strip()}
     if feature == 'results' and allowed == {'about'}:
+        # Results PDF catchup is the priority fill path — allow it under
+        # GEMINI_FOCUS=about unless explicitly disabled.
+        catchup_on = (os.getenv('RESULTS_PDF_CATCHUP') or '1').strip().lower()
+        if catchup_on not in ('0', 'false', 'no', 'off'):
+            return True
         inc = (os.getenv('GEMINI_FOCUS_ABOUT_INCLUDES_RESULTS') or '0').strip().lower()
         return inc in ('1', 'true', 'yes', 'on')
     return feature in allowed
@@ -1784,9 +1789,11 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
             BATCH_SIZE = int(os.getenv('RESULTS_PDF_CATCHUP_BATCH_SIZE', '10'))
             candidates_limit = int(os.getenv('RESULTS_PDF_CATCHUP_CANDIDATES_LIMIT',
                                              os.getenv('RESULTS_PDF_CANDIDATES_LIMIT', '12000')))
-            # 90d is enough for Results catchup (same window as steady-state).
-            lookback_days = int(os.getenv('RESULTS_PDF_CATCHUP_LOOKBACK_DAYS',
-                                          os.getenv('RESULTS_PDF_LOOKBACK_DAYS', '90')))
+            # 365d default — 90d left most of the universe without Results PDFs.
+            base_lb = int(os.getenv('RESULTS_PDF_CATCHUP_LOOKBACK_DAYS',
+                                    os.getenv('RESULTS_PDF_LOOKBACK_DAYS', '365')))
+            escalated = int(getattr(_concall_summary_loop, '_catchup_lookback', 0) or 0)
+            lookback_days = max(base_lb, escalated)
             pacing = float(os.getenv('RESULTS_PDF_CATCHUP_PACING_SECONDS',
                                      os.getenv('RESULTS_PDF_PACING_SECONDS', '3')))
         else:
@@ -1838,15 +1845,16 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
         pending = [row for row in concall_rows
                    if (row['symbol'], row['attachment_url']) not in already]
         have_fr: set[str] = set()
-        if catchup and pending:
+        if catchup:
             have_fr = await _symbols_with_financial_results(session, headers)
             # Missing financial_results first, then newest filing — cover
             # many stocks, not many filings for the same few names.
-            pending.sort(key=lambda r: (
-                0 if r.get('symbol') not in have_fr else 1,
-                -( _parse_iso_ts(r.get('announced_at')).timestamp()
-                   if _parse_iso_ts(r.get('announced_at')) else 0),
-            ))
+            if pending:
+                pending.sort(key=lambda r: (
+                    0 if r.get('symbol') not in have_fr else 1,
+                    -( _parse_iso_ts(r.get('announced_at')).timestamp()
+                       if _parse_iso_ts(r.get('announced_at')) else 0),
+                ))
         todo = []
         seen_sym: set[str] = set()
         for row in pending:
@@ -1858,15 +1866,19 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
             todo.append(row)
             if len(todo) >= BATCH_SIZE:
                 break
+        uni_n = len(ALL_STOCKS) or 0
+        missing_fr_total = max(0, uni_n - len(have_fr)) if (catchup and uni_n) else 0
         missing_n = sum(1 for r in todo if r.get('symbol') not in have_fr) if have_fr else 0
-        progress_extra = (f"symbols_with_fr={len(have_fr)}, universe≈{len(ALL_STOCKS) or '?'}"
-                          if have_fr else f"matched={len(concall_rows)}")
+        progress_extra = (f"symbols_with_fr={len(have_fr)}, missing_fr≈{missing_fr_total}, "
+                          f"universe≈{uni_n or '?'}, lookback={lookback_days}d"
+                          if catchup else f"matched={len(concall_rows)}")
         log.info(_fmt_filings_progress(
             'Results PDF', loaded=len(already), pending=len(pending),
             batch=len(todo), extra=progress_extra))
         if todo:
             log.info(f"🎙️ Results extraction loop: {len(todo)} stock(s) to process "
-                      f"(catchup={catchup}, missing_fr≈{missing_n}, "
+                      f"(catchup={catchup}, missing_fr_batch≈{missing_n}, "
+                      f"missing_fr_total≈{missing_fr_total}, "
                       f"candidates={len(candidates)}, matched={len(concall_rows)})")
             _concall_summary_loop._idle_streak = 0
             if catchup:
@@ -1878,12 +1890,22 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
             # 2026-08-08 log flood of "nothing new" every ~20s.
             if idle_streak == 1 or idle_streak % 30 == 0:
                 log.info(f"🎙️ Results extraction loop: nothing new "
-                          f"({len(concall_rows)} matched in lookback)"
+                          f"({len(concall_rows)} matched in lookback={lookback_days}d, "
+                          f"missing_fr≈{missing_fr_total})"
                           f"{f' (idle#{idle_streak})' if idle_streak > 1 else ''}")
             if catchup:
-                _set_results_catchup_idle(
-                    True, lookback_days=lookback_days,
-                    matched=len(concall_rows), already=len(already))
+                # Still missing numbers → widen lookback before declaring idle.
+                max_lb = int(os.getenv('RESULTS_PDF_CATCHUP_MAX_LOOKBACK_DAYS', '730'))
+                if missing_fr_total > 50 and lookback_days < max_lb:
+                    nxt = min(max_lb, max(lookback_days * 2, 365))
+                    _concall_summary_loop._catchup_lookback = nxt
+                    log.info(f"🎙️ Results catchup: still missing_fr≈{missing_fr_total} "
+                             f"— widening lookback {lookback_days}d → {nxt}d (keep catchup busy)")
+                    _set_results_catchup_idle(False)
+                else:
+                    _set_results_catchup_idle(
+                        True, lookback_days=lookback_days,
+                        matched=len(concall_rows), already=len(already))
             else:
                 _set_results_catchup_idle(True)
         soft_backoff = False
@@ -6794,15 +6816,16 @@ async def _bse_missing_backfill_loop(session: aiohttp.ClientSession):
     non-matches - mostly ETFs/indices - is expected long-term, so a
     small remainder shouldn't be polled as aggressively as a real
     backlog)."""
-    BUSY_INTERVAL = 300      # 5 min when backlog > threshold
-    QUIET_INTERVAL = 1800    # 30 min otherwise
+    BUSY_INTERVAL = int(os.getenv('BSE_MISSING_BUSY_SECONDS', '120'))   # 2 min when backlog
+    QUIET_INTERVAL = int(os.getenv('BSE_MISSING_QUIET_SECONDS', '1800'))  # 30 min otherwise
     BACKLOG_THRESHOLD = 30
+    BATCH = int(os.getenv('BSE_MISSING_BATCH_LIMIT', '300'))
     while True:
         if os.getenv('PAUSE_BSE_LOOPS'):
             await asyncio.sleep(60)
             continue
         try:
-            remaining = await backfill_from_bse_missing(session, limit=200)
+            remaining = await backfill_from_bse_missing(session, limit=BATCH)
         except Exception as e:
             import traceback
             log.error(f"BSE-missing backfill loop failed: {e}\n{traceback.format_exc()}")
