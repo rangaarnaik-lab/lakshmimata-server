@@ -1412,12 +1412,22 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
         "has no such separate line (most quarters don't have one). If a specific field isn't "
         "present in the table, leave that field null rather than guessing or calculating it "
         "yourself.\n\n"
+        "CURRENT PERIOD (CRITICAL — get this right): period_ended / sales / pat / eps / pbt / "
+        "other_income / exceptional_item must come from the CURRENT / LATEST quarter column "
+        "ONLY — the column whose quarter-end date is the most recent among quarterly columns "
+        "in that Consolidated table (usually the leftmost or rightmost 'Quarter ended …' "
+        "column, never a 9-month / YTD / annual / year-to-date column). Do NOT put prior-"
+        "quarter or year-ago figures into these primary fields. If you cannot identify the "
+        "latest quarterly column with certainty, set has_results_table false and leave all "
+        "financial fields null.\n\n"
         "COMPARISON PERIODS: Indian quarterly results tables typically show up to 3 "
         "columns of actual data side by side in the SAME Consolidated table: the current "
         "quarter, the immediately preceding (sequential) quarter, and the same quarter one "
         "year ago (YoY) - e.g. for a 'Quarter ended June 30, 2026' current column, look for "
         "both a 'Quarter ended March 31, 2026' column (sequential) and a 'Quarter ended "
-        "June 30, 2025' column (YoY) nearby. Extract BOTH comparison columns' figures if "
+        "June 30, 2025' column (YoY) nearby. Put sequential-quarter figures ONLY in "
+        "comparison_* fields and year-ago figures ONLY in yoy_* fields — never swap them "
+        "into the primary current-quarter fields. Extract BOTH comparison columns' figures if "
         "present, using the same rules as above (leave null if a field isn't shown, never "
         "estimate) - these are separate, real data points already visible in the document, "
         "not calculations. If only one or neither comparison column exists in the table, "
@@ -1450,7 +1460,7 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
             "has_results_table": {"type": "boolean",
                 "description": "true if the document contains an actual results table with financial figures"},
             "period_ended": {"type": "string", "nullable": True,
-                "description": "Quarter/year end date this result covers, YYYY-MM-DD format"},
+                "description": "CURRENT/LATEST quarter-end date only (most recent quarterly column), YYYY-MM-DD. Never prior quarter or YoY column."},
             "result_type": {"type": "string", "enum": ["Consolidated", "Standalone"], "nullable": True},
             "sales": {"type": "number", "nullable": True, "description": "Revenue from operations, Rs Crore"},
             "other_income": {"type": "number", "nullable": True, "description": "Rs Crore"},
@@ -7043,13 +7053,25 @@ def _parse_bse_resultsSnapshot(symbol: str, snapshot: dict) -> list:
     table = (snapshot.get('results_in_crores') or {}).get('data') or []
     periods = snapshot.get('periods') or []
     field_map = {'revenue': 'sales', 'net profit': 'pat', 'eps': 'eps', 'opm %': 'opm_pct'}
-    by_period = {}
-    for period_idx, period_label in enumerate(periods[:2]):  # LQ and SQ only, skip FY
-        period_ended = _bse_period_to_period_ended(period_label)
+    # Pick the two most recent *quarterly* columns by date — do not trust
+    # BSE's array order (may interleave FY or put older quarters first).
+    dated_cols = []
+    for period_idx, period_label in enumerate(periods):
+        period_ended = _bse_period_to_period_ended(period_label or '')
         if not period_ended:
+            continue  # skip FY / unparseable labels
+        try:
+            pe_dt = datetime.strptime(period_ended, '%d-%b-%Y')
+        except ValueError:
             continue
-        by_period[period_idx] = {'symbol': symbol, 'period_ended': period_ended,
-                                  'result_type': 'Consolidated'}
+        dated_cols.append((pe_dt, period_idx, period_ended))
+    dated_cols.sort(key=lambda t: t[0], reverse=True)
+    keep = dated_cols[:2]  # latest quarter + prior quarter for QoQ
+    by_period = {
+        period_idx: {'symbol': symbol, 'period_ended': period_ended,
+                     'result_type': 'Consolidated'}
+        for _, period_idx, period_ended in keep
+    }
     for title_row in table:
         if not title_row:
             continue
@@ -7066,7 +7088,9 @@ def _parse_bse_resultsSnapshot(symbol: str, snapshot: dict) -> list:
             except ValueError:
                 pass
     now_iso = datetime.now(timezone.utc).isoformat()
-    for period_idx, row in by_period.items():
+    # Save latest first in the returned list (UI/rating prefer newest).
+    for _, period_idx, _ in keep:
+        row = by_period[period_idx]
         # If BSE hasn't populated ANY of the actual financial fields yet
         # for this period (common right after a fresh announcement - the
         # PDF/filing is out before BSE indexes the structured snapshot
