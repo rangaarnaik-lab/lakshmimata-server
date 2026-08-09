@@ -2064,22 +2064,22 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
                           f"missing_fr≈{missing_fr_total})"
                           f"{f' (idle#{idle_streak})' if idle_streak > 1 else ''}")
             if catchup:
-                # Widen lookback once more if numbers still missing; after
-                # that, release Gemini even if missing_fr is high — the PDF
-                # announcement queue is exhausted (retry_skipped=0) and BSE
-                # fills numbers without needing Gemini locked on Results.
+                # Keep Results priority until the numbers gap is small.
+                # Concall/PPT wait; BSE-missing fills FR rows in parallel.
                 max_lb = int(os.getenv('RESULTS_PDF_CATCHUP_MAX_LOOKBACK_DAYS', '1095'))
-                if missing_fr_total > idle_missing_ok and lookback_days < max_lb:
-                    nxt = min(max_lb, max(lookback_days * 2, 730))
-                    _concall_summary_loop._catchup_lookback = nxt
-                    log.info(f"🎙️ Results catchup: still missing_fr≈{missing_fr_total} "
-                             f"— widening lookback {lookback_days}d → {nxt}d (keep catchup busy)")
+                if missing_fr_total > idle_missing_ok:
+                    if lookback_days < max_lb:
+                        nxt = min(max_lb, max(lookback_days * 2, 730))
+                        _concall_summary_loop._catchup_lookback = nxt
+                        log.info(f"🎙️ Results catchup: still missing_fr≈{missing_fr_total} "
+                                 f"— widening lookback {lookback_days}d → {nxt}d "
+                                 f"(Results keeps Gemini priority)")
+                    else:
+                        log.info(f"🎙️ Results PDF queue empty (lookback={lookback_days}d) but "
+                                  f"missing_fr≈{missing_fr_total} — holding Gemini on Results "
+                                  f"(Concall/PPT wait; BSE fills numbers)")
                     _set_results_catchup_idle(False)
                 else:
-                    if missing_fr_total > idle_missing_ok:
-                        log.info(f"🎙️ Results PDF queue empty (lookback={lookback_days}d) but "
-                                  f"missing_fr≈{missing_fr_total} — releasing Gemini to "
-                                  f"Concall/PPT; BSE-missing loop fills the numbers")
                     _set_results_catchup_idle(
                         True, lookback_days=lookback_days,
                         matched=len(concall_rows), already=len(already))
@@ -6511,9 +6511,6 @@ async def _idle_if_gemini_paused(feature: str, label: str):
     elif feature == 'ppt' and _concall_catchup_busy():
         log.info(f"⏸️ {label}: paused — Concall catchup has priority "
                  f"(PPT starts automatically when Concall is idle)")
-    elif feature == 'results' and _concall_catchup_busy():
-        log.info(f"⏸️ {label}: paused — Concall catchup has Gemini "
-                 f"(Results PDF queue already idle; BSE fills numbers)")
     else:
         log.info(f"⏸️ {label}: paused (GEMINI_FOCUS={why})")
     # Poll often while waiting on Results → Concall → PPT handoffs.
@@ -7273,6 +7270,10 @@ async def _bse_missing_backfill_loop(session: aiohttp.ClientSession):
     QUIET_INTERVAL = int(os.getenv('BSE_MISSING_QUIET_SECONDS', '1800'))  # 30 min otherwise
     BACKLOG_THRESHOLD = 30
     BATCH = int(os.getenv('BSE_MISSING_BATCH_LIMIT', '400'))
+    if os.getenv('PAUSE_BSE_LOOPS'):
+        log.warning("🏛️ BSE-missing loop: PAUSE_BSE_LOOPS is set — numbers backfill is OFF")
+    else:
+        log.info(f"🏛️ BSE-missing loop: active (batch={BATCH}, busy every {BUSY_INTERVAL}s)")
     while True:
         if os.getenv('PAUSE_BSE_LOOPS'):
             await asyncio.sleep(60)
