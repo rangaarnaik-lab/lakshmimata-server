@@ -6511,6 +6511,9 @@ async def _idle_if_gemini_paused(feature: str, label: str):
     elif feature == 'ppt' and _concall_catchup_busy():
         log.info(f"⏸️ {label}: paused — Concall catchup has priority "
                  f"(PPT starts automatically when Concall is idle)")
+    elif feature == 'results' and _concall_catchup_busy():
+        log.info(f"⏸️ {label}: paused — Concall catchup has Gemini "
+                 f"(Results PDF queue already idle; BSE fills numbers)")
     else:
         log.info(f"⏸️ {label}: paused (GEMINI_FOCUS={why})")
     # Poll often while waiting on Results → Concall → PPT handoffs.
