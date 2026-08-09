@@ -236,7 +236,8 @@ async def _log_worker_backlog_summary(session: aiohttp.ClientSession,
         except Exception:
             return 0
 
-    fr_syms = await _count_distinct_symbols('financial_results')
+    # Rich rows only (pbt or other_income) — thin BSE sales/PAT dumps don't count.
+    fr_syms = len(await _symbols_with_financial_results(session, headers))
     results_pdf = await _count_distinct_symbols('concall_summaries', status='done')
     ppt_done = await _count_distinct_symbols('ppt_summaries', status='done')
     tx_done = await _count_distinct_symbols('transcript_summaries', status='done')
@@ -1742,15 +1743,23 @@ async def backfill_exceptional_items(session: aiohttp.ClientSession, limit: int 
     log.info(f"🔁 Exceptional-items backfill complete: {done}/{len(rows)} symbol(s) had an exceptional item")
 
 async def _symbols_with_financial_results(session: aiohttp.ClientSession, headers: dict) -> set[str]:
-    """Symbols that already have at least one financial_results row."""
+    """Symbols with at least one *rich* financial_results row (PDF/XBRL).
+
+    Thin BSE snapshot rows (sales/PAT only, no pbt/other_income) do NOT
+    count — those left the UI with only 2 period columns and must be
+    re-read from Results PDFs."""
     have: set[str] = set()
     page_size, offset = 1000, 0
     while offset < 20000:
         try:
             async with session.get(
                 f"{SUPABASE_URL}/rest/v1/financial_results", headers=headers,
-                params={'select': 'symbol', 'order': 'symbol',
-                        'limit': str(page_size), 'offset': str(offset)},
+                params={
+                    'select': 'symbol',
+                    'or': '(pbt.not.is.null,other_income.not.is.null)',
+                    'order': 'symbol',
+                    'limit': str(page_size), 'offset': str(offset),
+                },
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as r:
                 if r.status != 200:
@@ -1767,6 +1776,88 @@ async def _symbols_with_financial_results(session: aiohttp.ClientSession, header
             break
         offset += page_size
     return have
+
+
+async def cleanup_thin_bse_financial_results(
+        session: aiohttp.ClientSession, *, hours: int = 72) -> int:
+    """Delete incomplete BSE resultsSnapshot rows (sales/PAT only, no
+    pbt/other_income) written in the last `hours`. Those filled the DB
+    with 2 period columns and blocked PDF catchup from treating the
+    symbol as still missing. Returns deleted row count (approx)."""
+    headers = {
+        'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}',
+        'Prefer': 'return=representation',
+    }
+    since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    deleted = 0
+    # Fetch thin keys then delete by PK — safer than a blind bulk DELETE.
+    thin: list[dict] = []
+    page_size, offset = 1000, 0
+    while offset < 30000:
+        try:
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/financial_results",
+                headers={'apikey': SUPABASE_KEY,
+                         'Authorization': f'Bearer {SUPABASE_KEY}'},
+                params={
+                    'select': 'symbol,period_ended,result_type',
+                    'pbt': 'is.null',
+                    'other_income': 'is.null',
+                    'sales': 'not.is.null',
+                    'filed_at': f'gte.{since}',
+                    'limit': str(page_size), 'offset': str(offset),
+                },
+                timeout=aiohttp.ClientTimeout(total=45),
+            ) as r:
+                if r.status != 200:
+                    body = await r.text()
+                    log.warning(f"⚠️ Thin-BSE cleanup fetch failed ({r.status}): {body[:200]}")
+                    break
+                batch = await r.json()
+        except Exception as e:
+            log.warning(f"⚠️ Thin-BSE cleanup fetch error: {type(e).__name__}: {e}")
+            break
+        if not batch:
+            break
+        thin.extend(batch)
+        if len(batch) < page_size:
+            break
+        offset += page_size
+    for row in thin:
+        sym = row.get('symbol')
+        pe = row.get('period_ended')
+        rt = row.get('result_type') or 'Consolidated'
+        if not sym or not pe:
+            continue
+        try:
+            async with session.delete(
+                f"{SUPABASE_URL}/rest/v1/financial_results",
+                headers=headers,
+                params={
+                    'symbol': f'eq.{sym}',
+                    'period_ended': f'eq.{pe}',
+                    'result_type': f'eq.{rt}',
+                    'pbt': 'is.null',
+                    'other_income': 'is.null',
+                },
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as r:
+                if r.status in (200, 204):
+                    deleted += 1
+                elif r.status != 404:
+                    body = await r.text()
+                    log.warning(f"⚠️ Thin-BSE cleanup delete {sym}/{pe}: "
+                                f"{r.status} {body[:120]}")
+        except Exception as e:
+            log.warning(f"⚠️ Thin-BSE cleanup delete {sym}: {type(e).__name__}: {e}")
+        if deleted and deleted % 100 == 0:
+            log.info(f"🧹 Thin-BSE cleanup progress: {deleted}/{len(thin)}…")
+    if deleted:
+        log.warning(f"🧹 Removed {deleted} thin BSE-only financial_results row(s) "
+                    f"(last {hours}h, no pbt/other_income) — PDF catchup will refill")
+    else:
+        log.info(f"🧹 Thin-BSE cleanup: no matching rows in last {hours}h")
+    return deleted
 
 
 def _results_pdf_no_retry_key(row: dict) -> tuple[str, str] | None:
@@ -1817,19 +1908,21 @@ async def _mark_results_pdf_permanent(
 async def _fetch_skipped_results_pdfs_for_retry(
         session: aiohttp.ClientSession, headers: dict, have_fr: set[str],
         *, limit: int = 40) -> list:
-    """Re-queue Results PDFs previously marked skipped/failed for symbols
-    that still have no financial_results row (cover-letter miss, Gemini
-    timeout marked wrongly, etc.). Without this, catchup goes idle while
-    thousands of stocks remain empty."""
+    """Re-queue Results PDFs previously marked skipped/failed/done for
+    symbols that still lack a *rich* financial_results row (cover-letter
+    miss, thin BSE-only numbers, Gemini timeout, etc.)."""
     out: list = []
     seen_sym: set[str] = set()
     page_size, offset = 1000, 0
-    while len(out) < limit and offset < 15000:
+    # Include done — thin BSE fill left many symbols "done" in summaries
+    # while FR rows were sales/PAT-only (2 columns in the UI).
+    statuses = 'in.(skipped,failed,done)'
+    while len(out) < limit and offset < 20000:
         try:
             async with session.get(
                 f"{SUPABASE_URL}/rest/v1/concall_summaries", headers=headers,
                 params={'select': 'symbol,attachment_url,announced_at,status,summary',
-                        'status': 'in.(skipped,failed)',
+                        'status': statuses,
                         'attachment_url': 'not.is.null',
                         'order': 'announced_at.desc',
                         'limit': str(page_size), 'offset': str(offset)},
@@ -1859,7 +1952,7 @@ async def _fetch_skipped_results_pdfs_for_retry(
                 'symbol': sym,
                 'attachment_url': url,
                 'announced_at': row.get('announced_at'),
-                'subject': 'Results (retry skipped PDF)',
+                'subject': 'Results (retry PDF — need rich numbers)',
                 'category': 'Result',
             })
             if len(out) >= limit:
@@ -6433,6 +6526,15 @@ async def fundamentals_worker_main():
         if not _bse_results_backfill_enabled():
             log.info("📄 Results numbers: PDF/Gemini only "
                      "(BSE resultsSnapshot OFF — set ENABLE_BSE_RESULTS=1 to re-enable)")
+        # Strip thin BSE-only rows (2-column mess) so PDF catchup refills.
+        _cleanup = (os.getenv('CLEANUP_THIN_BSE_RESULTS') or '1').strip().lower()
+        if _cleanup in ('1', 'true', 'yes', 'on'):
+            try:
+                hrs = int(os.getenv('CLEANUP_THIN_BSE_HOURS', '168'))  # 7d
+                await cleanup_thin_bse_financial_results(session, hours=hrs)
+            except Exception as e:
+                import traceback
+                log.error(f"Thin-BSE cleanup failed: {e}\n{traceback.format_exc()}")
         await asyncio.gather(
             _fundamentals_loop(session),
             _market_cap_catchup_loop(session),
@@ -7350,8 +7452,8 @@ async def _bse_targeted_results_loop(session: aiohttp.ClientSession):
     per second, to stay well clear of BSE's rate limiting."""
     CHECK_INTERVAL = 600  # 10 minutes
     while True:
-        if _bse_loops_paused():
-            await asyncio.sleep(60)
+        if not _bse_results_backfill_enabled():
+            await asyncio.sleep(3600)
             continue
         try:
             today = datetime.now(timezone.utc).date()
