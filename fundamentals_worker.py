@@ -51,13 +51,19 @@ def _bse_loops_paused() -> bool:
 
 
 def _bse_results_backfill_enabled() -> bool:
-    """BSE resultsSnapshot numbers are OFF by default — Results come from
-    Results PDFs via Gemini only. Set ENABLE_BSE_RESULTS=1 to re-enable
-    (still respects PAUSE_BSE_LOOPS)."""
+    """BSE resultsSnapshot numbers — OFF unless ENABLE_BSE_RESULTS=1.
+
+    Continuous targeted/missing/stale loops are never started anymore
+    (they wrote thin 2-column rows). This flag only unlocks rare
+    one-shot BACKFILL_BSE_* env runs."""
     if _bse_loops_paused():
         return False
     return (os.getenv('ENABLE_BSE_RESULTS') or '0').strip().lower() in (
         '1', 'true', 'yes', 'on')
+
+
+# Fingerprint so Railway logs prove this build is live.
+_BUILD_TAG = 'pdf-only-no-bse-v5'
 
 # About briefs successfully saved this process — never re-Gemini the same
 # symbol in-process even if Supabase read-back lags / timestamp compare glitches.
@@ -6435,6 +6441,7 @@ async def fundamentals_worker_main():
     """
     log.info("=" * 60)
     log.info("  Fundamentals + Announcements Worker — standalone process")
+    log.info(f"  build={_BUILD_TAG} (BSE resultsSnapshot numbers DISABLED)")
     log.info("  (SERVICE_MODE=fundamentals — live scan runs in a separate service)")
     log.info("=" * 60)
     _feat_keys = []
@@ -6535,9 +6542,8 @@ async def fundamentals_worker_main():
             except Exception as e:
                 import traceback
                 log.error(f"Screener CSV import failed: {e}\n{traceback.format_exc()}")
-        if not _bse_results_backfill_enabled():
-            log.info("📄 Results numbers: PDF/Gemini only "
-                     "(BSE resultsSnapshot OFF — set ENABLE_BSE_RESULTS=1 to re-enable)")
+        log.info(f"📄 build={_BUILD_TAG} — Results numbers from PDF/Gemini only; "
+                 f"continuous BSE resultsSnapshot loops REMOVED from gather")
         # Strip thin BSE-only rows (2-column mess) so PDF catchup refills.
         _cleanup = (os.getenv('CLEANUP_THIN_BSE_RESULTS') or '1').strip().lower()
         if _cleanup in ('1', 'true', 'yes', 'on'):
@@ -6547,23 +6553,15 @@ async def fundamentals_worker_main():
             except Exception as e:
                 import traceback
                 log.error(f"Thin-BSE cleanup failed: {e}\n{traceback.format_exc()}")
-        _loops = [
+        # Do NOT start targeted/missing/stale — those wrote the 2-column mess.
+        # Calendar only (meeting dates). Numbers = Results PDF AI.
+        await asyncio.gather(
             _fundamentals_loop(session),
             _market_cap_catchup_loop(session),
             _valuation_ai_catchup_loop(session),
             _announcements_loop(session),
             _results_loop(session),
             _bse_calendar_refresh_loop(session),  # dates only — not numbers
-        ]
-        if _bse_results_backfill_enabled():
-            _loops.extend([
-                _bse_targeted_results_loop(session),
-                _bse_missing_backfill_loop(session),
-                _bse_stale_results_loop(session),
-            ])
-        else:
-            log.info("🏛️ BSE numbers loops not started (targeted/missing/stale)")
-        _loops.extend([
             # Results PDF first (priority). PPT/concall/About self-pause while
             # Results catchup is busy — Ask-AI still starts immediately.
             _delayed(0, _concall_summary_loop(session)),
@@ -6577,8 +6575,7 @@ async def fundamentals_worker_main():
             _delayed(0, _stock_ai_asks_loop(session)),
             # Periodic plain-text pending counts for Results / PPT / Concall.
             _filings_backlog_status_loop(session),
-        ])
-        await asyncio.gather(*_loops)
+        )
 
 
 async def _delayed(seconds: float, coro):
@@ -7401,56 +7398,14 @@ async def backfill_from_bse(session: aiohttp.ClientSession, symbols: list):
     log.info(f"🏛️ BSE backfill complete: {len(all_rows)} period-rows from {len(symbols)} symbol(s)")
 
 async def _bse_stale_results_loop(session: aiohttp.ClientSession):
-    """Companion to _bse_missing_backfill_loop - that one only fills in
-    symbols with NO result at all; this one re-checks symbols that DO
-    have one, but it's aging (>100 days), to catch newly-announced
-    quarters for stocks whose result predates today's BSE pipeline.
-    Adaptive interval: >30 stocks still stale -> check every 5 min
-    (clear a real backlog fast); 30 or fewer -> check every 30 min
-    (steady-state trickle, no need to hammer BSE for a handful of
-    stragglers)."""
-    BUSY_INTERVAL = 300      # 5 min when backlog > threshold
-    QUIET_INTERVAL = 1800    # 30 min otherwise
-    BACKLOG_THRESHOLD = 30
-    while True:
-        if not _bse_results_backfill_enabled():
-            await asyncio.sleep(3600)
-            continue
-        try:
-            remaining = await backfill_from_bse_stale(session, limit=200)
-        except Exception as e:
-            import traceback
-            log.error(f"BSE-stale refresh loop failed: {e}\n{traceback.format_exc()}")
-            remaining = None
-        sleep_for = BUSY_INTERVAL if (remaining is not None and remaining > BACKLOG_THRESHOLD) else QUIET_INTERVAL
-        await asyncio.sleep(sleep_for)
+    """Disabled — continuous BSE numbers backfill removed (thin 2-col rows)."""
+    log.warning(f"🏛️ BSE-stale loop: EXIT immediately (build={_BUILD_TAG})")
+    return
 
 async def _bse_missing_backfill_loop(session: aiohttp.ClientSession):
-    """Optional BSE resultsSnapshot backfill (OFF by default — PDF/Gemini
-    is the numbers source). Enable with ENABLE_BSE_RESULTS=1."""
-    BUSY_INTERVAL = int(os.getenv('BSE_MISSING_BUSY_SECONDS', '60'))    # 1 min when backlog
-    QUIET_INTERVAL = int(os.getenv('BSE_MISSING_QUIET_SECONDS', '1800'))  # 30 min otherwise
-    BACKLOG_THRESHOLD = 30
-    BATCH = int(os.getenv('BSE_MISSING_BATCH_LIMIT', '400'))
-    if not _bse_results_backfill_enabled():
-        log.info("🏛️ BSE-missing loop: idle (ENABLE_BSE_RESULTS not set — "
-                 "Results numbers from PDF/Gemini only)")
-    else:
-        log.info(f"🏛️ BSE-missing loop: active (batch={BATCH}, busy every {BUSY_INTERVAL}s)")
-    while True:
-        if not _bse_results_backfill_enabled():
-            await asyncio.sleep(3600)
-            continue
-        try:
-            log.info(f"🏛️ BSE-missing cycle: fetching up to {BATCH} symbols…")
-            remaining = await backfill_from_bse_missing(session, limit=BATCH)
-            log.info(f"🏛️ BSE-missing cycle done: remaining≈{remaining}")
-        except Exception as e:
-            import traceback
-            log.error(f"BSE-missing backfill loop failed: {e}\n{traceback.format_exc()}")
-            remaining = None
-        sleep_for = BUSY_INTERVAL if (remaining is not None and remaining > BACKLOG_THRESHOLD) else QUIET_INTERVAL
-        await asyncio.sleep(sleep_for)
+    """Disabled — continuous BSE numbers backfill removed (thin 2-col rows)."""
+    log.warning(f"🏛️ BSE-missing loop: EXIT immediately (build={_BUILD_TAG})")
+    return
 
 async def _bse_calendar_refresh_loop(session: aiohttp.ClientSession):
     """Refreshes the upcoming_results calendar once a day - this data
@@ -7470,44 +7425,9 @@ async def _bse_calendar_refresh_loop(session: aiohttp.ClientSession):
         await asyncio.sleep(CHECK_INTERVAL)
 
 async def _bse_targeted_results_loop(session: aiohttp.ClientSession):
-    """Checks resultsSnapshot only for stocks whose scheduled BSE
-    meeting_date is today or within the last 2 days (covers slightly
-    delayed filings without polling everything). This is the
-    verify-what-you-need approach discussed with the user - a handful
-    of targeted stocks checked every 10 min, not thousands checked
-    per second, to stay well clear of BSE's rate limiting."""
-    CHECK_INTERVAL = 600  # 10 minutes
-    while True:
-        if not _bse_results_backfill_enabled():
-            await asyncio.sleep(3600)
-            continue
-        try:
-            today = datetime.now(timezone.utc).date()
-            since = (today - timedelta(days=2)).isoformat()
-            url = f"{SUPABASE_URL}/rest/v1/upcoming_results"
-            # PostgREST needs the two-sided date range combined via 'and',
-            # not two separate 'meeting_date' query params (which would
-            # collide - only the last one would apply).
-            params = {'select': 'symbol',
-                      'and': f'(meeting_date.gte.{since},meeting_date.lte.{today.isoformat()})'}
-            headers = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
-            symbols = []
-            try:
-                async with session.get(url, headers=headers, params=params,
-                                        timeout=aiohttp.ClientTimeout(total=15)) as r:
-                    if r.status == 200:
-                        symbols = [row['symbol'] for row in await r.json()]
-                    else:
-                        log.warning(f"⚠️ Upcoming-results query failed ({r.status})")
-            except Exception as e:
-                log.warning(f"⚠️ Upcoming-results query error: {type(e).__name__}: {e}")
-            if symbols:
-                log.info(f"📅 BSE targeted check: {len(symbols)} stock(s) with a result date in range")
-                await backfill_from_bse(session, symbols)
-        except Exception as e:
-            import traceback
-            log.error(f"BSE targeted results loop failed: {e}\n{traceback.format_exc()}")
-        await asyncio.sleep(CHECK_INTERVAL)
+    """Disabled — continuous BSE numbers backfill removed (thin 2-col rows)."""
+    log.warning(f"🏛️ BSE targeted loop: EXIT immediately (build={_BUILD_TAG})")
+    return
 
 def _parse_bse_meeting_date(date_str: str):
     """Converts BSE's 'meeting_date' format ('23 Oct 2023') to
