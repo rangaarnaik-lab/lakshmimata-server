@@ -51,6 +51,8 @@ _ABOUT_DONE_SYMS: set[str] = set()
 _ABOUT_SAVE_FAILS: dict[str, int] = {}
 _ABOUT_OPTIONAL_COLS_MISSING = False  # set True after PGRST204 on image/sources
 _RESULT_RATING_COLS_MISSING = False  # set True after PGRST204 on result_rating*
+# (symbol, attachment_url) permanently done for Gemini — never re-queue in-process.
+_RESULTS_PDF_NO_RETRY: set[tuple[str, str]] = set()
 # When Gemini starts failing: retry for ~10 min, then long-pause.
 _ABOUT_GEMINI_UNHEALTHY_SINCE: float | None = None
 # Hard quota / billing 429 — skip short retry, go straight to long cooldown.
@@ -1741,10 +1743,25 @@ async def _symbols_with_financial_results(session: aiohttp.ClientSession, header
     return have
 
 
+def _results_pdf_no_retry_key(row: dict) -> tuple[str, str] | None:
+    sym = (row.get('symbol') or '').strip().upper()
+    url = (row.get('attachment_url') or '').strip()
+    if not sym or not url:
+        return None
+    return (sym, url)
+
+
+def _remember_results_pdf_no_retry(row: dict) -> None:
+    key = _results_pdf_no_retry_key(row)
+    if key:
+        _RESULTS_PDF_NO_RETRY.add(key)
+
+
 async def _mark_results_pdf_permanent(
         session: aiohttp.ClientSession, headers: dict, row: dict, *,
         reason: str, note: str) -> None:
     """Mark a Results PDF as done so retry-skipped won't burn Gemini again."""
+    _remember_results_pdf_no_retry(row)
     try:
         async with session.post(
             f"{SUPABASE_URL}/rest/v1/concall_summaries", headers={**headers,
@@ -1803,6 +1820,8 @@ async def _fetch_skipped_results_pdfs_for_retry(
             sym = (row.get('symbol') or '').strip().upper()
             url = row.get('attachment_url')
             if not sym or not url or sym in have_fr or sym in seen_sym:
+                continue
+            if (sym, url) in _RESULTS_PDF_NO_RETRY:
                 continue
             # Permanent markers (oversized / Gemini 400 / empty table) —
             # never re-queue even if still status=skipped from older code.
@@ -1928,9 +1947,11 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
         # Log "active" once at start, and again only when catchup mode
         # flips — not every empty idle cycle.
         if not _key_status_logged:
+            retry_flag = (os.getenv('RESULTS_PDF_RETRY_SKIPPED') or '0').strip() or '0'
             log.info(f"🎙️ Results extraction loop: active "
-                      f"(catchup={catchup}, lookback={lookback_days}d, batch={BATCH_SIZE}, "
-                      f"candidates_limit={candidates_limit}, pacing={pacing}s, "
+                      f"(build=no-retry-v3, catchup={catchup}, lookback={lookback_days}d, "
+                      f"batch={BATCH_SIZE}, candidates_limit={candidates_limit}, "
+                      f"pacing={pacing}s, retry_skipped={retry_flag}, "
                       f"gemini_concurrent={os.getenv('GEMINI_MAX_CONCURRENT', '1')})")
             _key_status_logged = True
             _concall_summary_loop._last_catchup = catchup
@@ -1972,11 +1993,16 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
         retry_n = 0
         if catchup:
             have_fr = await _symbols_with_financial_results(session, headers)
-            # Re-try skipped/failed PDFs for stocks that still have no numbers.
-            retry_on = (os.getenv('RESULTS_PDF_RETRY_SKIPPED') or '1').strip().lower()
-            if retry_on not in ('0', 'false', 'no', 'off'):
+            # Re-try skipped/failed PDFs — OFF by default. When ON it was
+            # burning Gemini on the same RATNAMANI/IXIGO/SELMC 400s every
+            # batch while ~1300 missing stocks wait on BSE. Set
+            # RESULTS_PDF_RETRY_SKIPPED=1 only after permanent-skip is live.
+            retry_on = (os.getenv('RESULTS_PDF_RETRY_SKIPPED') or '0').strip().lower()
+            if retry_on in ('1', 'true', 'yes', 'on'):
                 retry_rows = await _fetch_skipped_results_pdfs_for_retry(
                     session, headers, have_fr, limit=max(BATCH_SIZE * 2, 30))
+                retry_rows = [rr for rr in retry_rows
+                              if _results_pdf_no_retry_key(rr) not in _RESULTS_PDF_NO_RETRY]
                 if retry_rows:
                     retry_n = len(retry_rows)
                     # Drop from already so this cycle can process them again.
@@ -1997,6 +2023,9 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
         seen_sym: set[str] = set()
         for row in pending:
             sym = (row.get('symbol') or '').strip().upper()
+            key = _results_pdf_no_retry_key(row)
+            if key and key in _RESULTS_PDF_NO_RETRY:
+                continue
             if catchup and sym in seen_sym:
                 continue
             if catchup and sym:
