@@ -1615,11 +1615,9 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
         # big batch, one filing per symbol). Steady-state stays modest.
         catchup = _results_catchup_boosted()
         if catchup:
-            # One stock per cycle by default — steadier free-tier progress
-            # than batching 10+ (bad PDFs were burning multiple slots/cycle).
-            # Do NOT fall through to RESULTS_PDF_BATCH_SIZE — that env is often
-            # left at 10 from older deploys and would defeat one-at-a-time.
-            BATCH_SIZE = int(os.getenv('RESULTS_PDF_CATCHUP_BATCH_SIZE', '1'))
+            # Default 10 stocks per cycle during catchup (override with
+            # RESULTS_PDF_CATCHUP_BATCH_SIZE). Lower if free-tier 429s spike.
+            BATCH_SIZE = int(os.getenv('RESULTS_PDF_CATCHUP_BATCH_SIZE', '10'))
             candidates_limit = int(os.getenv('RESULTS_PDF_CATCHUP_CANDIDATES_LIMIT',
                                              os.getenv('RESULTS_PDF_CANDIDATES_LIMIT', '12000')))
             # 90d is enough for Results catchup (same window as steady-state).
@@ -1628,7 +1626,7 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
             pacing = float(os.getenv('RESULTS_PDF_CATCHUP_PACING_SECONDS',
                                      os.getenv('RESULTS_PDF_PACING_SECONDS', '3')))
         else:
-            BATCH_SIZE = int(os.getenv('RESULTS_PDF_BATCH_SIZE', '1'))
+            BATCH_SIZE = int(os.getenv('RESULTS_PDF_BATCH_SIZE', '10'))
             candidates_limit = int(os.getenv('RESULTS_PDF_CANDIDATES_LIMIT', '2000'))
             lookback_days = int(os.getenv('RESULTS_PDF_LOOKBACK_DAYS', '90'))
             pacing = float(os.getenv('RESULTS_PDF_PACING_SECONDS', '5'))
