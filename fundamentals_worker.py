@@ -1332,12 +1332,12 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
     error_result = {
         'financial_data': None, 'comparison_data': None, 'yoy_data': None,
         'summary': None, 'error': True, 'rate_limited': False, 'hard_quota': False,
-        'oversized': False,
+        'oversized': False, 'rejected': False,
     }
     no_content_result = {
         'financial_data': None, 'comparison_data': None, 'yoy_data': None,
         'summary': None, 'error': False, 'rate_limited': False, 'hard_quota': False,
-        'oversized': False,
+        'oversized': False, 'rejected': False,
     }
     api_key = _gemini_api_key_next('RESULTS')
     if not api_key or not attachment_url:
@@ -1507,11 +1507,12 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
             else:
                 log.warning(f"⚠️ Gemini results extraction failed for {symbol} ({status}): {(body or '')[:200]}")
             # 400 INVALID_ARGUMENT is permanent (bad/unsupported PDF for
-            # Gemini inline). Treating it as transient made RATNAMANI /
-            # IXIGO / SELMC burn a batch slot every cycle forever.
+            # Gemini inline). Must return rejected=True so the catchup
+            # loop marks status=done — otherwise RESULTS_PDF_RETRY_SKIPPED
+            # re-queues RATNAMANI / IXIGO / SELMC every batch forever.
             if status == 400:
-                log.warning(f"⚠️ {symbol}: Gemini rejected PDF (400) — marking skipped, will not retry")
-                return no_content_result
+                log.warning(f"⚠️ {symbol}: Gemini rejected PDF (400) — permanent, will not retry")
+                return {**no_content_result, 'rejected': True}
             return {
                 **error_result,
                 'rate_limited': pause,
@@ -1740,6 +1741,36 @@ async def _symbols_with_financial_results(session: aiohttp.ClientSession, header
     return have
 
 
+async def _mark_results_pdf_permanent(
+        session: aiohttp.ClientSession, headers: dict, row: dict, *,
+        reason: str, note: str) -> None:
+    """Mark a Results PDF as done so retry-skipped won't burn Gemini again."""
+    try:
+        async with session.post(
+            f"{SUPABASE_URL}/rest/v1/concall_summaries", headers={**headers,
+                'Content-Type': 'application/json',
+                'Prefer': 'resolution=merge-duplicates'},
+            json={
+                'symbol': row['symbol'],
+                'announced_at': row.get('announced_at'),
+                'attachment_url': row['attachment_url'],
+                'summary': note,
+                'status': 'done',
+            },
+            timeout=aiohttp.ClientTimeout(total=15)
+        ) as r:
+            if r.status not in (200, 201, 204):
+                body = await r.text()
+                log.warning(f"⚠️ Permanent Results mark failed for {row['symbol']} "
+                             f"({reason}): {r.status} {body[:200]}")
+            else:
+                log.info(f"  🎙️ {row['symbol']}: {reason} marked done "
+                          f"(won’t re-queue; BSE fills numbers)")
+    except Exception as e:
+        log.warning(f"⚠️ Permanent Results mark failed for {row['symbol']} "
+                     f"({reason}): {type(e).__name__}: {e}")
+
+
 async def _fetch_skipped_results_pdfs_for_retry(
         session: aiohttp.ClientSession, headers: dict, have_fr: set[str],
         *, limit: int = 40) -> list:
@@ -1754,7 +1785,7 @@ async def _fetch_skipped_results_pdfs_for_retry(
         try:
             async with session.get(
                 f"{SUPABASE_URL}/rest/v1/concall_summaries", headers=headers,
-                params={'select': 'symbol,attachment_url,announced_at,status',
+                params={'select': 'symbol,attachment_url,announced_at,status,summary',
                         'status': 'in.(skipped,failed)',
                         'attachment_url': 'not.is.null',
                         'order': 'announced_at.desc',
@@ -1772,6 +1803,11 @@ async def _fetch_skipped_results_pdfs_for_retry(
             sym = (row.get('symbol') or '').strip().upper()
             url = row.get('attachment_url')
             if not sym or not url or sym in have_fr or sym in seen_sym:
+                continue
+            # Permanent markers (oversized / Gemini 400 / empty table) —
+            # never re-queue even if still status=skipped from older code.
+            summ = (row.get('summary') or '').strip()
+            if summ.startswith('['):
                 continue
             seen_sym.add(sym)
             out.append({
@@ -2054,33 +2090,17 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
                 # Other transient failure - don't save; retry later.
                 log.info(f"  🎙️ {row['symbol']}: will retry next cycle (transient error, not saved)")
                 continue
-            # Oversized PDFs can never succeed via Gemini — mark done so
-            # RESULTS_PDF_RETRY_SKIPPED doesn't burn the batch forever.
+            # Permanent Gemini failures — mark done so retry-skipped
+            # doesn't burn the batch on RATNAMANI / IXIGO / oversized forever.
             if result.get('oversized'):
-                try:
-                    async with session.post(
-                        f"{SUPABASE_URL}/rest/v1/concall_summaries", headers={**headers,
-                            'Content-Type': 'application/json',
-                            'Prefer': 'resolution=merge-duplicates'},
-                        json={
-                            'symbol': row['symbol'],
-                            'announced_at': row['announced_at'],
-                            'attachment_url': row['attachment_url'],
-                            'summary': '[PDF too large for Gemini — numbers via BSE/XBRL]',
-                            'status': 'done',
-                        },
-                        timeout=aiohttp.ClientTimeout(total=15)
-                    ) as r:
-                        if r.status not in (200, 201, 204):
-                            body = await r.text()
-                            log.warning(f"⚠️ Oversized PDF mark failed for {row['symbol']}: "
-                                         f"{r.status} {body[:200]}")
-                        else:
-                            log.info(f"  🎙️ {row['symbol']}: oversized PDF marked done "
-                                      f"(won’t re-queue; BSE fills numbers)")
-                except Exception as e:
-                    log.warning(f"⚠️ Oversized PDF mark failed for {row['symbol']}: "
-                                 f"{type(e).__name__}: {e}")
+                await _mark_results_pdf_permanent(
+                    session, headers, row, reason='oversized PDF',
+                    note='[PDF too large for Gemini — numbers via BSE/XBRL]')
+                continue
+            if result.get('rejected'):
+                await _mark_results_pdf_permanent(
+                    session, headers, row, reason='Gemini 400 rejected PDF',
+                    note='[Gemini rejected PDF (400) — numbers via BSE/XBRL]')
                 continue
             summary = result['summary']
             raw_fd = result['financial_data']
@@ -2179,6 +2199,13 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
             to_save = [r for r in (fd, comp, yoy) if r]
             if to_save:
                 await save_financial_results_to_db(session, to_save)
+            # Clean Gemini pass with nothing usable — mark done so retry
+            # doesn't re-burn the same cover-letter / empty filing forever.
+            if not to_save and not summary:
+                await _mark_results_pdf_permanent(
+                    session, headers, row, reason='no extractable results table',
+                    note='[No extractable results table — numbers via BSE/XBRL]')
+                continue
             if fd:
                 rating_bit = f" rating={fd.get('result_rating')}" if fd.get('result_rating') else ""
                 log.info(f"  🎙️ {row['symbol']}: extracted {fd['period_ended']} "
@@ -2255,12 +2282,11 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
                                     body2 = await r2.text()
                                     log.warning(f"⚠️ Concall loop: save returned {r2.status} for "
                                                  f"{row['symbol']}: {body2[:300]}")
-                                elif summary:
-                                    log.info(f"  🎙️ {row['symbol']}: results summary saved "
+                                elif payload.get('status') == 'done':
+                                    log.info(f"  🎙️ {row['symbol']}: results saved "
                                               f"(rating cols missing — run add_result_rating.sql)")
                                 else:
-                                    log.info(f"  🎙️ {row['symbol']}: results PDF had no usable "
-                                              f"summary, marked skipped")
+                                    log.info(f"  🎙️ {row['symbol']}: results PDF marked skipped")
                         else:
                             log.warning(f"⚠️ Concall loop: save returned {r.status} for {row['symbol']} "
                                          f"(is the concall_summaries table created with PK "
@@ -2269,8 +2295,13 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
                         log.info(f"  🎙️ {row['symbol']}: results summary saved"
                                   + (f" rating={payload.get('result_rating')}"
                                      if payload.get('result_rating') else ""))
+                    elif fd:
+                        log.info(f"  🎙️ {row['symbol']}: results numbers saved"
+                                  + (f" rating={payload.get('result_rating')}"
+                                     if payload.get('result_rating') else "")
+                                  + " (no prose summary)")
                     else:
-                        log.info(f"  🎙️ {row['symbol']}: results PDF had no usable summary, marked skipped")
+                        log.info(f"  🎙️ {row['symbol']}: results PDF marked skipped")
             except Exception as e:
                 log.warning(f"⚠️ Concall loop: save failed for {row['symbol']}: {type(e).__name__}: {e}")
             if not catchup:
