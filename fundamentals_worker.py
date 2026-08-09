@@ -143,8 +143,9 @@ def _fmt_filings_progress(label: str, *, loaded: int, pending: int,
             f"({pct}% done{tail})")
 
 
-async def _log_worker_backlog_summary(session: aiohttp.ClientSession):
-    """One-line startup snapshot: Results / PPT / concall / About loaded vs pending."""
+async def _log_worker_backlog_summary(session: aiohttp.ClientSession,
+                                      *, reason: str = 'snapshot'):
+    """Log loaded vs pending for Results / PPT / concall (and About)."""
     headers = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
     universe = len(ALL_STOCKS) if len(ALL_STOCKS) > 100 else 0
 
@@ -182,15 +183,41 @@ async def _log_worker_backlog_summary(session: aiohttp.ClientSession):
     ppt_done = await _count_distinct_symbols('ppt_summaries', status='done')
     tx_done = await _count_distinct_symbols('transcript_summaries', status='done')
     about_done = await _count_distinct_symbols('company_abouts', status='done')
-    uni = universe or max(fr_syms, about_done, 1)
+    uni = universe or max(fr_syms, about_done, results_pdf, ppt_done, tx_done, 1)
+    pending_results_nums = max(0, uni - fr_syms)
+    pending_results_pdf = max(0, uni - results_pdf)
+    pending_ppt = max(0, uni - ppt_done)
+    pending_concall = max(0, uni - tx_done)
+    pending_about = max(0, uni - about_done)
+    # Plain pending line — easy to spot in Railway logs.
     log.info(
-        f"📊 Worker backlog (universe≈{uni}): "
-        f"Results numbers={fr_syms} pending≈{max(0, uni - fr_syms)} | "
-        f"Results PDF AI={results_pdf} | "
-        f"PPT={ppt_done} pending≈{max(0, uni - ppt_done)} | "
-        f"Concall={tx_done} pending≈{max(0, uni - tx_done)} | "
-        f"About={about_done} pending≈{max(0, uni - about_done)}"
+        f"📊 Pending filings ({reason}, universe≈{uni}): "
+        f"Results PDF≈{pending_results_pdf} | "
+        f"PPT≈{pending_ppt} | "
+        f"Concall≈{pending_concall} | "
+        f"Results numbers≈{pending_results_nums}"
     )
+    log.info(
+        f"📊 Worker backlog loaded ({reason}): "
+        f"Results numbers={fr_syms}/{uni} | "
+        f"Results PDF AI={results_pdf}/{uni} | "
+        f"PPT={ppt_done}/{uni} | "
+        f"Concall={tx_done}/{uni} | "
+        f"About={about_done}/{uni} (pending≈{pending_about})"
+    )
+
+
+async def _filings_backlog_status_loop(session: aiohttp.ClientSession):
+    """Periodically print how many Results / PPT / concall are still pending."""
+    interval = max(60, int(os.getenv('FILINGS_BACKLOG_LOG_SECONDS', '300')))
+    # First periodic print after the first catchup window (startup already logs).
+    await asyncio.sleep(interval)
+    while True:
+        try:
+            await _log_worker_backlog_summary(session, reason='progress')
+        except Exception as e:
+            log.warning(f"📊 Pending filings summary skipped: {type(e).__name__}: {e}")
+        await asyncio.sleep(interval)
 
 
 def _gemini_focus_allowed_by_env(feature: str) -> bool:
@@ -5728,6 +5755,14 @@ async def _about_company_loop(session: aiohttp.ClientSession):
             log.info(f"📘 About-company loop: nothing new "
                       f"(missing_about≈{missing_about_n}, done={_done_n}, "
                       f"universe≈{len(universe_syms)})")
+            # Log pending Results/PPT/Concall once when About first goes idle.
+            if _ABOUT_CATCHUP_IDLE_LOGGED and not getattr(
+                    _about_company_loop, '_pending_logged_idle', False):
+                try:
+                    await _log_worker_backlog_summary(session, reason='about-idle')
+                    _about_company_loop._pending_logged_idle = True
+                except Exception as e:
+                    log.warning(f"📊 Pending filings summary skipped: {type(e).__name__}: {e}")
 
         hit_gemini_pause = False
         hit_hard_quota = False
@@ -5930,6 +5965,10 @@ async def _about_company_loop(session: aiohttp.ClientSession):
                       f"(missing_about≈0, done={_done_n}, "
                       f"universe≈{len(universe_syms)}) "
                       f"— sleeping {idle}s until next refresh check")
+            try:
+                await _log_worker_backlog_summary(session, reason='about-idle')
+            except Exception as e:
+                log.warning(f"📊 Pending filings summary skipped: {type(e).__name__}: {e}")
             await asyncio.sleep(max(300 if not _results_catchup_over() else 60, idle))
         else:
             # Transient empty batch — medium idle (3 min after Results over).
@@ -5998,7 +6037,7 @@ async def fundamentals_worker_main():
     async with aiohttp.ClientSession(connector=connector) as session:
         await load_instrument_master(session)  # needed for ISIN lookups (Upstox fundamentals API)
         try:
-            await _log_worker_backlog_summary(session)
+            await _log_worker_backlog_summary(session, reason='startup')
         except Exception as e:
             log.warning(f"📊 Worker backlog summary skipped: {type(e).__name__}: {e}")
         if os.getenv('BACKFILL_ANNOUNCEMENTS_DAYS'):
@@ -6081,6 +6120,8 @@ async def fundamentals_worker_main():
             _delayed(100, _mgmt_flags_loop(session)),
             # Ask AI starts immediately — interactive, not staggered with batch jobs.
             _delayed(0, _stock_ai_asks_loop(session)),
+            # Periodic plain-text pending counts for Results / PPT / Concall.
+            _filings_backlog_status_loop(session),
         )
 
 
