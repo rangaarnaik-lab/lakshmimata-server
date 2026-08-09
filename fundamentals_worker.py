@@ -63,9 +63,12 @@ _GEMINI_JOBS_PAUSED_UNTIL: float | None = None
 # PAUSE_ABOUT_COMPANY=1 → timed pause (24h) then About auto-resumes.
 _ABOUT_ENV_PAUSE_UNTIL: float | None = None
 _ABOUT_ENV_PAUSE_RESUME_LOGGED = False
-# Results catchup queue empty — About Company may start (every 15 min).
+# Results catchup queue empty — Concall catchup may start next.
 _RESULTS_CATCHUP_IDLE = False
 _RESULTS_CATCHUP_IDLE_LOGGED = False
+# Concall/transcript catchup queue empty — PPT catchup may start next.
+_CONCALL_CATCHUP_IDLE = False
+_CONCALL_CATCHUP_IDLE_LOGGED = False
 # About Company backlog empty — Results may use Gemini even if GEMINI_FOCUS=about.
 _ABOUT_CATCHUP_IDLE = False
 _ABOUT_CATCHUP_IDLE_LOGGED = False
@@ -79,8 +82,8 @@ def _set_about_catchup_idle(idle: bool):
     if _ABOUT_CATCHUP_IDLE and not was:
         if not _ABOUT_CATCHUP_IDLE_LOGGED:
             log.info(
-                "📘 About-company catchup idle — Results PDF has Gemini priority "
-                "(PPT/concall start after Results catchup is idle)"
+                "📘 About-company catchup idle — filing order: "
+                "Results PDF → Concall → PPT"
             )
             _ABOUT_CATCHUP_IDLE_LOGGED = True
     elif not _ABOUT_CATCHUP_IDLE and was:
@@ -90,7 +93,7 @@ def _set_about_catchup_idle(idle: bool):
 
 def _set_results_catchup_idle(idle: bool, *, lookback_days: int | None = None,
                               matched: int | None = None, already: int | None = None):
-    """Flip Results-catchup-idle flag; when True, About Company may populate."""
+    """Flip Results-catchup-idle flag; when True, Concall catchup may start."""
     global _RESULTS_CATCHUP_IDLE, _RESULTS_CATCHUP_IDLE_LOGGED
     global _ABOUT_YIELD_TO_RESULTS_UNTIL, _ABOUT_ENV_PAUSE_RESUME_LOGGED
     was = _RESULTS_CATCHUP_IDLE
@@ -105,15 +108,27 @@ def _set_results_catchup_idle(idle: bool, *, lookback_days: int | None = None,
                          f"{f', matched={matched}' if matched is not None else ''}"
                          f"{f', already={already}' if already is not None else ''})")
             log.info(f"🎙️ Results catchup idle{extra} — "
-                     f"PPT + concall/transcript catchup may start; "
-                     f"About Company may populate every "
-                     f"{_about_company_cycle_seconds()}s")
+                     f"starting Concall next (PPT after Concall is idle)")
             _RESULTS_CATCHUP_IDLE_LOGGED = True
     elif not _RESULTS_CATCHUP_IDLE and was:
         _RESULTS_CATCHUP_IDLE_LOGGED = False
         # Allow About pause/resume logs again on the next idle handoff.
         _ABOUT_ENV_PAUSE_RESUME_LOGGED = False
-        log.info("🎙️ Results catchup busy again — About Company yields to Results")
+        log.info("🎙️ Results catchup busy again — Concall/PPT yield to Results PDF")
+
+
+def _set_concall_catchup_idle(idle: bool):
+    """Flip Concall-catchup-idle; when True, PPT catchup may start."""
+    global _CONCALL_CATCHUP_IDLE, _CONCALL_CATCHUP_IDLE_LOGGED
+    was = _CONCALL_CATCHUP_IDLE
+    _CONCALL_CATCHUP_IDLE = bool(idle)
+    if _CONCALL_CATCHUP_IDLE and not was:
+        if not _CONCALL_CATCHUP_IDLE_LOGGED:
+            log.info("🎙️ Concall catchup idle — starting PPT next")
+            _CONCALL_CATCHUP_IDLE_LOGGED = True
+    elif not _CONCALL_CATCHUP_IDLE and was:
+        _CONCALL_CATCHUP_IDLE_LOGGED = False
+        log.info("🎙️ Concall catchup busy again — PPT yields to Concall")
 
 
 def _results_catchup_busy() -> bool:
@@ -123,12 +138,35 @@ def _results_catchup_busy() -> bool:
     return not _RESULTS_CATCHUP_IDLE
 
 
-def _ppt_transcript_catchup_boosted() -> bool:
-    """Aggressive PPT + concall/transcript only after Results PDF catchup is idle."""
-    if not _results_catchup_over():
-        return False
+def _filing_catchup_enabled() -> bool:
     v = (os.getenv('PPT_TRANSCRIPT_CATCHUP') or '1').strip().lower()
     return v not in ('0', 'false', 'no', 'off')
+
+
+def _concall_catchup_busy() -> bool:
+    """True after Results is idle while Concall/transcript catchup still has work."""
+    if not _results_catchup_over() or not _filing_catchup_enabled():
+        return False
+    return not _CONCALL_CATCHUP_IDLE
+
+
+def _transcript_catchup_boosted() -> bool:
+    """Aggressive Concall/transcript after Results PDF catchup is idle."""
+    if not _results_catchup_over() or not _filing_catchup_enabled():
+        return False
+    return True
+
+
+def _ppt_catchup_boosted() -> bool:
+    """Aggressive PPT only after Results AND Concall catchup are idle."""
+    if not _results_catchup_over() or not _CONCALL_CATCHUP_IDLE:
+        return False
+    return _filing_catchup_enabled()
+
+
+def _ppt_transcript_catchup_boosted() -> bool:
+    """Backward-compatible alias — prefer transcript then PPT helpers."""
+    return _transcript_catchup_boosted() or _ppt_catchup_boosted()
 
 
 def _fmt_filings_progress(label: str, *, loaded: int, pending: int,
@@ -2706,7 +2744,7 @@ async def _ppt_summary_loop(session: aiohttp.ClientSession):
                 _key_status_logged = True
             await asyncio.sleep(300)
             continue
-        catchup = _ppt_transcript_catchup_boosted()
+        catchup = _ppt_catchup_boosted()
         BATCH_SIZE = int(os.getenv(
             'PPT_CATCHUP_BATCH_SIZE' if catchup else 'PPT_BATCH_SIZE',
             '10' if catchup else '5'))
@@ -2852,7 +2890,7 @@ async def _transcript_summary_loop(session: aiohttp.ClientSession):
                 _key_status_logged = True
             await asyncio.sleep(300)
             continue
-        catchup = _ppt_transcript_catchup_boosted()
+        catchup = _transcript_catchup_boosted()
         BATCH_SIZE = int(os.getenv(
             'TRANSCRIPT_CATCHUP_BATCH_SIZE' if catchup else 'TRANSCRIPT_BATCH_SIZE',
             '10' if catchup else '5'))
@@ -2921,12 +2959,14 @@ async def _transcript_summary_loop(session: aiohttp.ClientSession):
             'Concall', loaded=len(already), pending=pending_tx, batch=len(todo),
             extra=f"matched={len(transcript_rows)}, thin={len(thin)}"))
         if todo:
+            _set_concall_catchup_idle(False)
             bf = sum(1 for r in todo if (r['symbol'], r['attachment_url']) in
                      {(b['symbol'], b['attachment_url']) for b in backfill})
             log.info(f"🎙️ Transcript summary loop: {len(todo)} transcript(s) to process "
                       f"({bf} theme-backfill; candidates={len(candidates)}, "
                       f"matched={len(transcript_rows)})")
         else:
+            _set_concall_catchup_idle(True)
             log.info(f"🎙️ Transcript summary loop: checked {len(candidates)} recent announcement(s) "
                       f"({len(transcript_rows)} matched transcript filter), nothing new")
         for i, row in enumerate(todo):
@@ -6103,13 +6143,12 @@ async def fundamentals_worker_main():
             _bse_targeted_results_loop(session),
             _bse_missing_backfill_loop(session),
             _bse_stale_results_loop(session),
-            # Stagger Gemini-heavy loops so boot doesn't stampede free-tier RPM.
-            # GEMINI_FOCUS=about starts About immediately; other Gemini loops self-pause.
+            # Results PDF first (priority). PPT/concall/About self-pause while
+            # Results catchup is busy — Ask-AI still starts immediately.
             _delayed(0, _concall_summary_loop(session)),
             _delayed(20, _transcript_summary_loop(session)),
             _delayed(40, _ppt_summary_loop(session)),
-            _delayed(0 if (os.getenv('GEMINI_FOCUS') or '').strip().lower() == 'about' else 60,
-                     _about_company_loop(session)),
+            _delayed(60, _about_company_loop(session)),
             _delayed(80, _fundamentals_ai_highlights_loop(session)),
             _delayed(10, _stock_themes_loop(session)),
             _delayed(100, _mgmt_flags_loop(session)),
@@ -6131,22 +6170,28 @@ def _gemini_focus_allows(feature: str) -> bool:
     Empty / all / * = every Gemini feature runs. Interactive Ask-AI always allowed
     (including during Results/About hard-stops — uses free Gemini).
 
-    Priority: Results PDF catchup first. While Results PDF backlog is active,
-    park PPT/concall/About/themes/etc. so Gemini reads results PDFs.
-    PPT/concall start only after Results catchup is idle.
+    Priority chain (automatic handoff):
+      1) Results PDF catchup
+      2) Concall/transcript catchup
+      3) PPT catchup
+    Ask-AI is never parked by this chain.
     When Results hits hard quota, batch Gemini features are blocked (not Ask)."""
     # Ask AI is interactive and must keep answering on free Gemini.
     if feature == 'asks':
         return True
     if _gemini_jobs_hard_paused():
         return False
-    # Results PDF catchup owns Gemini until the backlog is idle.
+    # 1) Results PDF owns Gemini until idle.
     if _results_catchup_busy():
         return feature == 'results'
-    # Results backlog clear → PPT/concall catchup may use Gemini.
-    if feature in ('ppt', 'transcript'):
-        if _ppt_transcript_catchup_boosted():
-            return True
+    # 2) Concall owns Gemini until idle (PPT waits).
+    if _concall_catchup_busy():
+        return feature == 'transcript'
+    # 3) PPT catchup after Results + Concall are idle.
+    if feature == 'ppt' and _ppt_catchup_boosted():
+        return True
+    if feature == 'transcript' and _transcript_catchup_boosted():
+        return True
     # About stopped / yielded → keep Results allowed (steady-state too).
     if _about_company_manually_paused():
         if feature == 'about':
@@ -6184,18 +6229,26 @@ async def _idle_if_gemini_paused(feature: str, label: str):
         pause = os.getenv('PAUSE_RESULTS_EXTRACTION') or os.getenv('GEMINI_FOCUS') or 'about'
         log.info(f"⏸️ {label}: paused ({pause}) — About Company has Gemini quota "
                  f"(Results starts when About catchup is idle)")
-    elif feature == 'about' and _results_catchup_busy():
-        log.info(f"⏸️ {label}: paused — Results PDF catchup has priority")
-    elif feature in ('ppt', 'transcript') and _results_catchup_busy():
-        log.info(f"⏸️ {label}: paused — Results PDF catchup has priority "
-                 f"(PPT/concall start when Results is idle)")
+    elif feature == 'about' and (_results_catchup_busy() or _concall_catchup_busy()):
+        stage = 'Results PDF' if _results_catchup_busy() else 'Concall'
+        log.info(f"⏸️ {label}: paused — {stage} catchup has priority")
+    elif feature == 'transcript' and _results_catchup_busy():
+        log.info(f"⏸️ {label}: paused — Results PDF first "
+                 f"(Concall starts automatically when Results is idle)")
+    elif feature == 'ppt' and _results_catchup_busy():
+        log.info(f"⏸️ {label}: paused — Results PDF first "
+                 f"(then Concall, then PPT)")
+    elif feature == 'ppt' and _concall_catchup_busy():
+        log.info(f"⏸️ {label}: paused — Concall catchup has priority "
+                 f"(PPT starts automatically when Concall is idle)")
     else:
         log.info(f"⏸️ {label}: paused (GEMINI_FOCUS={why})")
-    # Poll often while other loops wait on Results PDF priority.
+    # Poll often while waiting on Results → Concall → PPT handoffs.
     _fast_poll = (
         _ABOUT_YIELD_TO_RESULTS_UNTIL
         or _about_company_manually_paused()
         or _results_catchup_busy()
+        or _concall_catchup_busy()
         or (feature in ('results', 'ppt', 'transcript')
             and not _gemini_focus_allowed_by_env(feature))
     )
@@ -6205,9 +6258,11 @@ async def _idle_if_gemini_paused(feature: str, label: str):
         else:
             await asyncio.sleep(30 if _fast_poll else 300)
     if feature == 'results':
-        log.info(f"▶️ {label}: active (Results catchup / focus allows results)")
-    elif feature in ('ppt', 'transcript'):
-        log.info(f"▶️ {label}: active (Results catchup idle — PPT/concall catchup)")
+        log.info(f"▶️ {label}: active (Results PDF catchup)")
+    elif feature == 'transcript':
+        log.info(f"▶️ {label}: active (Results idle — Concall catchup)")
+    elif feature == 'ppt':
+        log.info(f"▶️ {label}: active (Concall idle — PPT catchup)")
     return True
 
 def rate_announcements_free(rows: list) -> list:
