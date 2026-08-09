@@ -1332,10 +1332,12 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
     error_result = {
         'financial_data': None, 'comparison_data': None, 'yoy_data': None,
         'summary': None, 'error': True, 'rate_limited': False, 'hard_quota': False,
+        'oversized': False,
     }
     no_content_result = {
         'financial_data': None, 'comparison_data': None, 'yoy_data': None,
         'summary': None, 'error': False, 'rate_limited': False, 'hard_quota': False,
+        'oversized': False,
     }
     api_key = _gemini_api_key_next('RESULTS')
     if not api_key or not attachment_url:
@@ -1361,10 +1363,12 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
         log.warning(f"⚠️ Results PDF download failed for {symbol}: {type(e).__name__}: {e}")
         return error_result
     # Gemini inline PDF ~20MB request limit; base64 expands ~4/3, so keep
-    # raw PDF under ~12MB to avoid 400 INVALID_ARGUMENT loops.
-    if len(pdf_bytes) > 12_000_000:
-        log.warning(f"⚠️ Results PDF too large for {symbol} ({len(pdf_bytes)} bytes) - skipping")
-        return no_content_result
+    # raw PDF under ~15MB to avoid 400 INVALID_ARGUMENT loops.
+    max_pdf = int(os.getenv('RESULTS_PDF_MAX_BYTES', str(15_000_000)))
+    if len(pdf_bytes) > max_pdf:
+        log.warning(f"⚠️ Results PDF too large for {symbol} ({len(pdf_bytes)} bytes) - skipping "
+                     f"(BSE/XBRL will fill numbers; will not re-queue)")
+        return {**no_content_result, 'oversized': True}
     pdf_b64 = base64.b64encode(pdf_bytes).decode('ascii')
     prompt = (
         "This is a document filed with NSE/BSE for an Indian listed company, related to "
@@ -1864,16 +1868,22 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
             # Default 10 stocks per cycle during catchup (override with
             # RESULTS_PDF_CATCHUP_BATCH_SIZE). Lower if free-tier 429s spike.
             # Aggressive defaults while universe Results are still empty.
+            # Catchup lookback/candidates are SEPARATE from steady-state
+            # RESULTS_PDF_LOOKBACK_DAYS (often 90 on Railway) — do not inherit
+            # that or catchup silently stays at 90d (seen 2026-08-09).
             BATCH_SIZE = int(os.getenv('RESULTS_PDF_CATCHUP_BATCH_SIZE', '15'))
-            candidates_limit = int(os.getenv('RESULTS_PDF_CATCHUP_CANDIDATES_LIMIT',
-                                             os.getenv('RESULTS_PDF_CANDIDATES_LIMIT', '15000')))
-            # 730d default — one year still left many filings outside the window.
-            base_lb = int(os.getenv('RESULTS_PDF_CATCHUP_LOOKBACK_DAYS',
-                                    os.getenv('RESULTS_PDF_LOOKBACK_DAYS', '730')))
+            candidates_limit = int(os.getenv('RESULTS_PDF_CATCHUP_CANDIDATES_LIMIT', '15000'))
+            base_lb = int(os.getenv('RESULTS_PDF_CATCHUP_LOOKBACK_DAYS', '730'))
             escalated = int(getattr(_concall_summary_loop, '_catchup_lookback', 0) or 0)
             lookback_days = max(base_lb, escalated)
             pacing = float(os.getenv('RESULTS_PDF_CATCHUP_PACING_SECONDS',
                                      os.getenv('RESULTS_PDF_PACING_SECONDS', '2')))
+            if not getattr(_concall_summary_loop, '_lookback_env_noted', False):
+                steady = (os.getenv('RESULTS_PDF_LOOKBACK_DAYS') or '').strip()
+                if steady and int(steady) < lookback_days:
+                    log.info(f"🎙️ Results catchup lookback={lookback_days}d "
+                              f"(ignoring RESULTS_PDF_LOOKBACK_DAYS={steady} for catchup)")
+                _concall_summary_loop._lookback_env_noted = True
         else:
             BATCH_SIZE = int(os.getenv('RESULTS_PDF_BATCH_SIZE', '10'))
             candidates_limit = int(os.getenv('RESULTS_PDF_CANDIDATES_LIMIT', '2000'))
@@ -2043,6 +2053,34 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
                     break
                 # Other transient failure - don't save; retry later.
                 log.info(f"  🎙️ {row['symbol']}: will retry next cycle (transient error, not saved)")
+                continue
+            # Oversized PDFs can never succeed via Gemini — mark done so
+            # RESULTS_PDF_RETRY_SKIPPED doesn't burn the batch forever.
+            if result.get('oversized'):
+                try:
+                    async with session.post(
+                        f"{SUPABASE_URL}/rest/v1/concall_summaries", headers={**headers,
+                            'Content-Type': 'application/json',
+                            'Prefer': 'resolution=merge-duplicates'},
+                        json={
+                            'symbol': row['symbol'],
+                            'announced_at': row['announced_at'],
+                            'attachment_url': row['attachment_url'],
+                            'summary': '[PDF too large for Gemini — numbers via BSE/XBRL]',
+                            'status': 'done',
+                        },
+                        timeout=aiohttp.ClientTimeout(total=15)
+                    ) as r:
+                        if r.status not in (200, 201, 204):
+                            body = await r.text()
+                            log.warning(f"⚠️ Oversized PDF mark failed for {row['symbol']}: "
+                                         f"{r.status} {body[:200]}")
+                        else:
+                            log.info(f"  🎙️ {row['symbol']}: oversized PDF marked done "
+                                      f"(won’t re-queue; BSE fills numbers)")
+                except Exception as e:
+                    log.warning(f"⚠️ Oversized PDF mark failed for {row['symbol']}: "
+                                 f"{type(e).__name__}: {e}")
                 continue
             summary = result['summary']
             raw_fd = result['financial_data']
