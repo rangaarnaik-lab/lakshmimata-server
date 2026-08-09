@@ -111,6 +111,67 @@ def _ppt_transcript_catchup_boosted() -> bool:
     return v not in ('0', 'false', 'no', 'off')
 
 
+def _fmt_filings_progress(label: str, *, loaded: int, pending: int,
+                          batch: int = 0, extra: str = '') -> str:
+    """Human-readable loaded / pending line for Railway logs."""
+    total = loaded + pending
+    pct = int(100 * loaded / total) if total > 0 else 0
+    batch_s = f", this_batch={batch}" if batch else ''
+    tail = f", {extra}" if extra else ''
+    return (f"📊 {label}: loaded={loaded}, pending≈{pending}{batch_s} "
+            f"({pct}% done{tail})")
+
+
+async def _log_worker_backlog_summary(session: aiohttp.ClientSession):
+    """One-line startup snapshot: Results / PPT / concall / About loaded vs pending."""
+    headers = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
+    universe = len(ALL_STOCKS) if len(ALL_STOCKS) > 100 else 0
+
+    async def _count_distinct_symbols(table: str, *, status: str | None = None) -> int:
+        try:
+            params: dict = {'select': 'symbol', 'limit': '1000'}
+            if status:
+                params['status'] = f'eq.{status}'
+            seen: set[str] = set()
+            offset = 0
+            while offset < 25000:
+                params['offset'] = str(offset)
+                async with session.get(
+                    f"{SUPABASE_URL}/rest/v1/{table}", headers=headers,
+                    params=params, timeout=aiohttp.ClientTimeout(total=30),
+                ) as r:
+                    if r.status != 200:
+                        break
+                    rows = await r.json()
+                if not rows:
+                    break
+                for row in rows:
+                    s = (row.get('symbol') or '').strip().upper()
+                    if s:
+                        seen.add(s)
+                if len(rows) < 1000:
+                    break
+                offset += 1000
+            return len(seen)
+        except Exception:
+            return 0
+
+    fr_syms = await _count_distinct_symbols('financial_results')
+    results_pdf = await _count_distinct_symbols('concall_summaries', status='done')
+    ppt_done = await _count_distinct_symbols('ppt_summaries', status='done')
+    tx_done = await _count_distinct_symbols('transcript_summaries', status='done')
+    about_done = await _count_distinct_symbols('company_abouts', status='done')
+    uni = universe or max(fr_syms, about_done, 1)
+    log.info(
+        f"📊 Worker backlog (universe≈{uni}): "
+        f"Results numbers={fr_syms} pending≈{max(0, uni - fr_syms)} | "
+        f"Results PDF AI={results_pdf} | "
+        f"PPT={ppt_done} pending≈{max(0, uni - ppt_done)} | "
+        f"Concall={tx_done} pending≈{max(0, uni - tx_done)} | "
+        f"About={about_done} pending≈{max(0, uni - about_done)}"
+    )
+
+
 def _gemini_focus_allowed_by_env(feature: str) -> bool:
     """Env-only GEMINI_FOCUS / pause flags (no yield/idle state — safe for
     _results_catchup_over and cycle defaults)."""
@@ -1711,11 +1772,15 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
             if len(todo) >= BATCH_SIZE:
                 break
         missing_n = sum(1 for r in todo if r.get('symbol') not in have_fr) if have_fr else 0
+        progress_extra = (f"symbols_with_fr={len(have_fr)}, universe≈{len(ALL_STOCKS) or '?'}"
+                          if have_fr else f"matched={len(concall_rows)}")
+        log.info(_fmt_filings_progress(
+            'Results PDF', loaded=len(already), pending=len(pending),
+            batch=len(todo), extra=progress_extra))
         if todo:
             log.info(f"🎙️ Results extraction loop: {len(todo)} stock(s) to process "
                       f"(catchup={catchup}, missing_fr≈{missing_n}, "
-                      f"candidates={len(candidates)}, matched={len(concall_rows)}, "
-                      f"pending={len(pending)}, already={len(already)})")
+                      f"candidates={len(candidates)}, matched={len(concall_rows)})")
             _concall_summary_loop._idle_streak = 0
             if catchup:
                 _set_results_catchup_idle(False)
@@ -1725,8 +1790,8 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
             # First empty cycle (and rare heartbeats) only — avoid the
             # 2026-08-08 log flood of "nothing new" every ~20s.
             if idle_streak == 1 or idle_streak % 30 == 0:
-                log.info(f"🎙️ Results extraction loop: checked {len(candidates)} announcement(s) "
-                          f"({len(concall_rows)} matched, already={len(already)}), nothing new"
+                log.info(f"🎙️ Results extraction loop: nothing new "
+                          f"({len(concall_rows)} matched in lookback)"
                           f"{f' (idle#{idle_streak})' if idle_streak > 1 else ''}")
             if catchup:
                 _set_results_catchup_idle(
@@ -2657,16 +2722,22 @@ async def _ppt_summary_loop(session: aiohttp.ClientSession):
             if len(todo) >= BATCH_SIZE:
                 break
         todo = todo[:BATCH_SIZE]
+        pending_ppt = sum(
+            1 for r in ppt_rows
+            if (r.get('symbol'), r.get('attachment_url')) not in already
+        ) + len(thin) + len(backfill)
+        log.info(_fmt_filings_progress(
+            'PPT', loaded=len(already), pending=pending_ppt, batch=len(todo),
+            extra=f"matched={len(ppt_rows)}, thin={len(thin)}"))
         if todo:
             bf = sum(1 for r in todo if (r['symbol'], r['attachment_url']) in
                      {(b['symbol'], b['attachment_url']) for b in backfill})
             log.info(f"🎙️ PPT summary loop: {len(todo)} presentation(s) to process "
                       f"({bf} section-backfill, candidates={len(candidates)}, "
-                      f"matched={len(ppt_rows)}, already={len(already)}, thin={len(thin)})")
+                      f"matched={len(ppt_rows)})")
         else:
             log.info(f"🎙️ PPT summary loop: checked {len(candidates)} recent announcement(s) "
-                      f"({len(ppt_rows)} matched presentation filter, already={len(already)}, "
-                      f"thin={len(thin)}), nothing new")
+                      f"({len(ppt_rows)} matched presentation filter), nothing new")
         for i, row in enumerate(todo):
             if i > 0:
                 await asyncio.sleep(pacing)
@@ -2795,15 +2866,22 @@ async def _transcript_summary_loop(session: aiohttp.ClientSession):
             if len(todo) >= BATCH_SIZE:
                 break
         todo = todo[:BATCH_SIZE]
+        pending_tx = sum(
+            1 for r in transcript_rows
+            if (r.get('symbol'), r.get('attachment_url')) not in already
+        ) + len(thin) + len(backfill)
+        log.info(_fmt_filings_progress(
+            'Concall', loaded=len(already), pending=pending_tx, batch=len(todo),
+            extra=f"matched={len(transcript_rows)}, thin={len(thin)}"))
         if todo:
             bf = sum(1 for r in todo if (r['symbol'], r['attachment_url']) in
                      {(b['symbol'], b['attachment_url']) for b in backfill})
             log.info(f"🎙️ Transcript summary loop: {len(todo)} transcript(s) to process "
                       f"({bf} theme-backfill; candidates={len(candidates)}, "
-                      f"matched={len(transcript_rows)}, already={len(already)}, thin={len(thin)})")
+                      f"matched={len(transcript_rows)})")
         else:
             log.info(f"🎙️ Transcript summary loop: checked {len(candidates)} recent announcement(s) "
-                      f"({len(transcript_rows)} matched transcript filter, already={len(already)}), nothing new")
+                      f"({len(transcript_rows)} matched transcript filter), nothing new")
         for i, row in enumerate(todo):
             if i > 0:
                 await asyncio.sleep(pacing)
@@ -5895,6 +5973,10 @@ async def fundamentals_worker_main():
     connector = aiohttp.TCPConnector(limit=20, ssl=False)
     async with aiohttp.ClientSession(connector=connector) as session:
         await load_instrument_master(session)  # needed for ISIN lookups (Upstox fundamentals API)
+        try:
+            await _log_worker_backlog_summary(session)
+        except Exception as e:
+            log.warning(f"📊 Worker backlog summary skipped: {type(e).__name__}: {e}")
         if os.getenv('BACKFILL_ANNOUNCEMENTS_DAYS'):
             try:
                 backfill_days = int(os.getenv('BACKFILL_ANNOUNCEMENTS_DAYS'))
