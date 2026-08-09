@@ -79,13 +79,13 @@ def _set_about_catchup_idle(idle: bool):
     if _ABOUT_CATCHUP_IDLE and not was:
         if not _ABOUT_CATCHUP_IDLE_LOGGED:
             log.info(
-                "📘 About-company catchup idle — Results + PPT + concall may use Gemini "
-                "(GEMINI_FOCUS=about handoff; fill missing filings in parallel)"
+                "📘 About-company catchup idle — Results PDF has Gemini priority "
+                "(PPT/concall start after Results catchup is idle)"
             )
             _ABOUT_CATCHUP_IDLE_LOGGED = True
     elif not _ABOUT_CATCHUP_IDLE and was:
         _ABOUT_CATCHUP_IDLE_LOGGED = False
-        log.info("📘 About-company catchup busy again — filing loops yield under GEMINI_FOCUS=about")
+        log.info("📘 About-company catchup busy again — yields while Results PDF catchup runs")
 
 
 def _set_results_catchup_idle(idle: bool, *, lookback_days: int | None = None,
@@ -124,9 +124,8 @@ def _results_catchup_busy() -> bool:
 
 
 def _ppt_transcript_catchup_boosted() -> bool:
-    """Aggressive PPT + concall/transcript once About is done (or Results idle)."""
-    # About finished → fill PPT/concall in parallel with Results (ASAP).
-    if not _ABOUT_CATCHUP_IDLE and not _results_catchup_over():
+    """Aggressive PPT + concall/transcript only after Results PDF catchup is idle."""
+    if not _results_catchup_over():
         return False
     v = (os.getenv('PPT_TRANSCRIPT_CATCHUP') or '1').strip().lower()
     return v not in ('0', 'false', 'no', 'off')
@@ -250,11 +249,11 @@ def _about_company_cycle_seconds() -> int:
 def _results_catchup_over() -> bool:
     """True when Results catchup has nothing pending (or catchup is off).
     Does not call _results_catchup_boosted() — that can call back into
-    About-pause helpers and recurse."""
+    About-pause helpers and recurse.
+    GEMINI_FOCUS exclusion must NOT count as over — otherwise PPT/About
+    wrongly unblock while Results PDF still has backlog."""
     v = (os.getenv('RESULTS_PDF_CATCHUP') or '1').strip().lower()
     if v in ('0', 'false', 'no', 'off'):
-        return True
-    if not _gemini_focus_allowed_by_env('results'):
         return True
     return bool(_RESULTS_CATCHUP_IDLE)
 
@@ -6131,37 +6130,33 @@ def _gemini_focus_allows(feature: str) -> bool:
     """GEMINI_FOCUS=about (or comma list) limits free-tier RPM to those loops.
     Empty / all / * = every Gemini feature runs. Interactive Ask-AI always allowed
     (including during Results/About hard-stops — uses free Gemini).
-    When About is stopped (PAUSE_ABOUT_COMPANY / hard-quota yield), Results PDF
-    extraction is allowed even if GEMINI_FOCUS=about.
-    When About catchup is idle (backlog clear), Results + PPT + concall are
-    allowed under GEMINI_FOCUS=about so missing filings fill in parallel.
+
+    Priority: Results PDF catchup first. While Results PDF backlog is active,
+    park PPT/concall/About/themes/etc. so Gemini reads results PDFs.
+    PPT/concall start only after Results catchup is idle.
     When Results hits hard quota, batch Gemini features are blocked (not Ask)."""
     # Ask AI is interactive and must keep answering on free Gemini.
     if feature == 'asks':
         return True
     if _gemini_jobs_hard_paused():
         return False
-    # About backlog clear → Results + PPT + concall in parallel (ASAP).
-    if _ABOUT_CATCHUP_IDLE and feature in ('results', 'ppt', 'transcript'):
-        return True
-    # While About still has work: park PPT/concall until Results catchup idle.
+    # Results PDF catchup owns Gemini until the backlog is idle.
+    if _results_catchup_busy():
+        return feature == 'results'
+    # Results backlog clear → PPT/concall catchup may use Gemini.
     if feature in ('ppt', 'transcript'):
-        if _results_catchup_busy():
-            return False
         if _ppt_transcript_catchup_boosted():
             return True
-    # About stopped → force Results catchup (ignore GEMINI_FOCUS=about).
+    # About stopped / yielded → keep Results allowed (steady-state too).
     if _about_company_manually_paused():
         if feature == 'about':
             return False
         if feature == 'results':
             return True
-    # About backlog clear → hand Gemini to Results (ignore GEMINI_FOCUS=about).
     if feature == 'results' and _ABOUT_CATCHUP_IDLE:
         return True
     until = _ABOUT_YIELD_TO_RESULTS_UNTIL
     if until and time.time() < until:
-        # Results catchup idle → let About populate Company Overview.
         if feature == 'about' and _results_catchup_over():
             return True
         if feature == 'about':
@@ -6189,18 +6184,20 @@ async def _idle_if_gemini_paused(feature: str, label: str):
         pause = os.getenv('PAUSE_RESULTS_EXTRACTION') or os.getenv('GEMINI_FOCUS') or 'about'
         log.info(f"⏸️ {label}: paused ({pause}) — About Company has Gemini quota "
                  f"(Results starts when About catchup is idle)")
+    elif feature == 'about' and _results_catchup_busy():
+        log.info(f"⏸️ {label}: paused — Results PDF catchup has priority")
     elif feature in ('ppt', 'transcript') and _results_catchup_busy():
-        log.info(f"⏸️ {label}: paused — Results catchup active (PPT/concall start when Results is idle)")
+        log.info(f"⏸️ {label}: paused — Results PDF catchup has priority "
+                 f"(PPT/concall start when Results is idle)")
     else:
         log.info(f"⏸️ {label}: paused (GEMINI_FOCUS={why})")
-    # Poll often while filing loops wait on About focus / yield — otherwise
-    # a 300s sleep can leave the worker stuck after About finishes.
+    # Poll often while other loops wait on Results PDF priority.
     _fast_poll = (
         _ABOUT_YIELD_TO_RESULTS_UNTIL
         or _about_company_manually_paused()
+        or _results_catchup_busy()
         or (feature in ('results', 'ppt', 'transcript')
             and not _gemini_focus_allowed_by_env(feature))
-        or (feature in ('ppt', 'transcript') and _results_catchup_busy())
     )
     while not _gemini_focus_allows(feature):
         if _gemini_jobs_hard_paused():
