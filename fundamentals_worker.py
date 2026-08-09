@@ -114,6 +114,8 @@ def _set_results_catchup_idle(idle: bool, *, lookback_days: int | None = None,
         _RESULTS_CATCHUP_IDLE_LOGGED = False
         # Allow About pause/resume logs again on the next idle handoff.
         _ABOUT_ENV_PAUSE_RESUME_LOGGED = False
+        # New Results wave → Concall must run again before PPT.
+        _set_concall_catchup_idle(False)
         log.info("🎙️ Results catchup busy again — Concall/PPT yield to Results PDF")
 
 
