@@ -85,6 +85,7 @@ def _set_results_catchup_idle(idle: bool, *, lookback_days: int | None = None,
                          f"{f', matched={matched}' if matched is not None else ''}"
                          f"{f', already={already}' if already is not None else ''})")
             log.info(f"🎙️ Results catchup idle{extra} — "
+                     f"PPT + concall/transcript catchup may start; "
                      f"About Company may populate every "
                      f"{_about_company_cycle_seconds()}s")
             _RESULTS_CATCHUP_IDLE_LOGGED = True
@@ -93,6 +94,21 @@ def _set_results_catchup_idle(idle: bool, *, lookback_days: int | None = None,
         # Allow About pause/resume logs again on the next idle handoff.
         _ABOUT_ENV_PAUSE_RESUME_LOGGED = False
         log.info("🎙️ Results catchup busy again — About Company yields to Results")
+
+
+def _results_catchup_busy() -> bool:
+    """True while Results PDF catchup mode is on and the queue is not yet idle."""
+    if not _results_catchup_boosted():
+        return False
+    return not _RESULTS_CATCHUP_IDLE
+
+
+def _ppt_transcript_catchup_boosted() -> bool:
+    """Aggressive PPT + concall/transcript reads once Results catchup is idle."""
+    if not _results_catchup_over():
+        return False
+    v = (os.getenv('PPT_TRANSCRIPT_CATCHUP') or '1').strip().lower()
+    return v not in ('0', 'false', 'no', 'off')
 
 
 def _gemini_focus_allowed_by_env(feature: str) -> bool:
@@ -2578,15 +2594,26 @@ async def _ppt_summary_loop(session: aiohttp.ClientSession):
                 _key_status_logged = True
             await asyncio.sleep(300)
             continue
-        BATCH_SIZE = int(os.getenv('PPT_BATCH_SIZE', '5'))
-        candidates_limit = int(os.getenv('PPT_CANDIDATES_LIMIT', '2000'))
-        if not _key_status_logged:
-            log.info(f"🎙️ PPT summary loop: GEMINI_API_KEY detected, active "
-                      f"(lookback={os.getenv('PPT_LOOKBACK_DAYS', '90')}d, batch={BATCH_SIZE}, "
-                      f"candidates_limit={candidates_limit})")
+        catchup = _ppt_transcript_catchup_boosted()
+        BATCH_SIZE = int(os.getenv(
+            'PPT_CATCHUP_BATCH_SIZE' if catchup else 'PPT_BATCH_SIZE',
+            '10' if catchup else '5'))
+        candidates_limit = int(os.getenv(
+            'PPT_CATCHUP_CANDIDATES_LIMIT' if catchup else 'PPT_CANDIDATES_LIMIT',
+            '5000' if catchup else '2000'))
+        lookback_days = int(os.getenv(
+            'PPT_CATCHUP_LOOKBACK_DAYS' if catchup else 'PPT_LOOKBACK_DAYS',
+            '365' if catchup else '90'))
+        pacing = float(os.getenv(
+            'PPT_CATCHUP_PACING_SECONDS' if catchup else 'RESULTS_PDF_PACING_SECONDS',
+            '3' if catchup else '8'))
+        if not _key_status_logged or catchup != getattr(_ppt_summary_loop, '_last_catchup', catchup):
+            log.info(f"🎙️ PPT summary loop: active "
+                      f"(catchup={catchup}, lookback={lookback_days}d, batch={BATCH_SIZE}, "
+                      f"candidates_limit={candidates_limit}, pacing={pacing}s)")
             _key_status_logged = True
+            _ppt_summary_loop._last_catchup = catchup
         try:
-            lookback_days = int(os.getenv('PPT_LOOKBACK_DAYS', '90'))
             since = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat()
             or_filter = '(' + ','.join(
                 f'subject.ilike.*{kw}*' for kw in _PPT_ANN_KEYWORDS) + ')'
@@ -2642,7 +2669,7 @@ async def _ppt_summary_loop(session: aiohttp.ClientSession):
                       f"thin={len(thin)}), nothing new")
         for i, row in enumerate(todo):
             if i > 0:
-                await asyncio.sleep(float(os.getenv('RESULTS_PDF_PACING_SECONDS', '8')))
+                await asyncio.sleep(pacing)
             result = await extract_ppt_summary(session, row['symbol'], row['attachment_url'])
             if result['error']:
                 log.info(f"  🎙️ {row['symbol']}: will retry presentation next cycle (transient error, not saved)")
@@ -2677,7 +2704,11 @@ async def _ppt_summary_loop(session: aiohttp.ClientSession):
                 log.warning(f"⚠️ PPT loop: save failed for {row['symbol']}: {type(e).__name__}: {e}")
         if todo:
             log.info("🎙️ PPT summary loop: batch complete")
-        await asyncio.sleep(120 if todo else 300)
+        if catchup:
+            await asyncio.sleep(int(os.getenv('PPT_CATCHUP_CYCLE_SECONDS', '15')) if todo
+                                else int(os.getenv('PPT_CATCHUP_IDLE_SECONDS', '120')))
+        else:
+            await asyncio.sleep(120 if todo else 300)
 
 async def _transcript_summary_loop(session: aiohttp.ClientSession):
     """Finds earnings-call TRANSCRIPT announcements (a different filing
@@ -2703,15 +2734,26 @@ async def _transcript_summary_loop(session: aiohttp.ClientSession):
                 _key_status_logged = True
             await asyncio.sleep(300)
             continue
-        BATCH_SIZE = int(os.getenv('TRANSCRIPT_BATCH_SIZE', '5'))
-        candidates_limit = int(os.getenv('TRANSCRIPT_CANDIDATES_LIMIT', '2000'))
-        if not _key_status_logged:
-            log.info(f"🎙️ Transcript summary loop: GEMINI_API_KEY detected, active "
-                      f"(lookback={os.getenv('TRANSCRIPT_LOOKBACK_DAYS', '90')}d, batch={BATCH_SIZE}, "
-                      f"candidates_limit={candidates_limit})")
+        catchup = _ppt_transcript_catchup_boosted()
+        BATCH_SIZE = int(os.getenv(
+            'TRANSCRIPT_CATCHUP_BATCH_SIZE' if catchup else 'TRANSCRIPT_BATCH_SIZE',
+            '10' if catchup else '5'))
+        candidates_limit = int(os.getenv(
+            'TRANSCRIPT_CATCHUP_CANDIDATES_LIMIT' if catchup else 'TRANSCRIPT_CANDIDATES_LIMIT',
+            '5000' if catchup else '2000'))
+        lookback_days = int(os.getenv(
+            'TRANSCRIPT_CATCHUP_LOOKBACK_DAYS' if catchup else 'TRANSCRIPT_LOOKBACK_DAYS',
+            '365' if catchup else '90'))
+        pacing = float(os.getenv(
+            'TRANSCRIPT_CATCHUP_PACING_SECONDS' if catchup else 'RESULTS_PDF_PACING_SECONDS',
+            '3' if catchup else '8'))
+        if not _key_status_logged or catchup != getattr(_transcript_summary_loop, '_last_catchup', catchup):
+            log.info(f"🎙️ Transcript summary loop: active "
+                      f"(catchup={catchup}, lookback={lookback_days}d, batch={BATCH_SIZE}, "
+                      f"candidates_limit={candidates_limit}, pacing={pacing}s)")
             _key_status_logged = True
+            _transcript_summary_loop._last_catchup = catchup
         try:
-            lookback_days = int(os.getenv('TRANSCRIPT_LOOKBACK_DAYS', '90'))
             since = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat()
             or_filter = '(' + ','.join(
                 f'subject.ilike.*{kw}*' for kw in _TRANSCRIPT_ANN_KEYWORDS) + ')'
@@ -2764,7 +2806,7 @@ async def _transcript_summary_loop(session: aiohttp.ClientSession):
                       f"({len(transcript_rows)} matched transcript filter, already={len(already)}), nothing new")
         for i, row in enumerate(todo):
             if i > 0:
-                await asyncio.sleep(float(os.getenv('RESULTS_PDF_PACING_SECONDS', '8')))
+                await asyncio.sleep(pacing)
             result = await extract_transcript_summary(session, row['symbol'], row['attachment_url'])
             if result['error']:
                 log.info(f"  🎙️ {row['symbol']}: will retry transcript next cycle (transient error, not saved)")
@@ -2800,7 +2842,11 @@ async def _transcript_summary_loop(session: aiohttp.ClientSession):
                 log.warning(f"⚠️ Transcript loop: save failed for {row['symbol']}: {type(e).__name__}: {e}")
         if todo:
             log.info("🎙️ Transcript summary loop: batch complete")
-        await asyncio.sleep(120 if todo else 300)  # faster while backlog remains
+        if catchup:
+            await asyncio.sleep(int(os.getenv('TRANSCRIPT_CATCHUP_CYCLE_SECONDS', '15')) if todo
+                                else int(os.getenv('TRANSCRIPT_CATCHUP_IDLE_SECONDS', '120')))
+        else:
+            await asyncio.sleep(120 if todo else 300)
 
 async def _results_loop(session: aiohttp.ClientSession):
     """Polls NSE's structured financial-results feed every 30 min — new
@@ -5950,6 +5996,12 @@ def _gemini_focus_allows(feature: str) -> bool:
         return True
     if _gemini_jobs_hard_paused():
         return False
+    # Results backlog first — park PPT/concall until Results catchup is idle.
+    if feature in ('ppt', 'transcript'):
+        if _results_catchup_busy():
+            return False
+        if _ppt_transcript_catchup_boosted():
+            return True
     # About stopped → force Results catchup (ignore GEMINI_FOCUS=about).
     if _about_company_manually_paused():
         if feature == 'about':
@@ -5983,6 +6035,8 @@ async def _idle_if_gemini_paused(feature: str, label: str):
     elif feature == 'results' and not _gemini_focus_allowed_by_env('results'):
         pause = os.getenv('PAUSE_RESULTS_EXTRACTION') or os.getenv('GEMINI_FOCUS') or 'about'
         log.info(f"⏸️ {label}: paused ({pause}) — About Company has Gemini quota")
+    elif feature in ('ppt', 'transcript') and _results_catchup_busy():
+        log.info(f"⏸️ {label}: paused — Results catchup active (PPT/concall start when Results is idle)")
     else:
         log.info(f"⏸️ {label}: paused (GEMINI_FOCUS={why})")
     while not _gemini_focus_allows(feature):
@@ -5993,6 +6047,8 @@ async def _idle_if_gemini_paused(feature: str, label: str):
                 30 if (_ABOUT_YIELD_TO_RESULTS_UNTIL or _about_company_manually_paused()) else 300)
     if feature == 'results':
         log.info(f"▶️ {label}: active (Results catchup / focus allows results)")
+    elif feature in ('ppt', 'transcript'):
+        log.info(f"▶️ {label}: active (Results catchup idle — PPT/concall catchup)")
     return True
 
 def rate_announcements_free(rows: list) -> list:
