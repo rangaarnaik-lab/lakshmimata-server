@@ -5965,10 +5965,6 @@ async def _about_company_loop(session: aiohttp.ClientSession):
                       f"(missing_about≈0, done={_done_n}, "
                       f"universe≈{len(universe_syms)}) "
                       f"— sleeping {idle}s until next refresh check")
-            try:
-                await _log_worker_backlog_summary(session, reason='about-idle')
-            except Exception as e:
-                log.warning(f"📊 Pending filings summary skipped: {type(e).__name__}: {e}")
             await asyncio.sleep(max(300 if not _results_catchup_over() else 60, idle))
         else:
             # Transient empty batch — medium idle (3 min after Results over).
