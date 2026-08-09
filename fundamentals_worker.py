@@ -43,6 +43,13 @@ if '_screener_disabled' not in globals():
 # worst case is one wasted retry per restart, not an ongoing drag.
 _BSE_NO_SCRIP_CODE = set()
 
+
+def _bse_loops_paused() -> bool:
+    """Only 1/true/yes/on pause BSE. Empty, unset, 0, false → run.
+    (Bare `if os.getenv(...)` treated '0'/'false' as paused.)"""
+    return (os.getenv('PAUSE_BSE_LOOPS') or '').strip().lower() in (
+        '1', 'true', 'yes', 'on')
+
 # About briefs successfully saved this process — never re-Gemini the same
 # symbol in-process even if Supabase read-back lags / timestamp compare glitches.
 _ABOUT_DONE_SYMS: set[str] = set()
@@ -6378,20 +6385,20 @@ async def fundamentals_worker_main():
             except Exception as e:
                 import traceback
                 log.error(f"BSE test failed: {e}\n{traceback.format_exc()}")
-        if os.getenv('BACKFILL_BSE_SYMBOLS') and not os.getenv('PAUSE_BSE_LOOPS'):
+        if os.getenv('BACKFILL_BSE_SYMBOLS') and not _bse_loops_paused():
             try:
                 syms = [s.strip().upper() for s in os.getenv('BACKFILL_BSE_SYMBOLS').split(',') if s.strip()]
                 await backfill_from_bse(session, syms)
             except Exception as e:
                 import traceback
                 log.error(f"BSE backfill failed: {e}\n{traceback.format_exc()}")
-        if os.getenv('BACKFILL_BSE_MISSING_LIMIT') and not os.getenv('PAUSE_BSE_LOOPS'):
+        if os.getenv('BACKFILL_BSE_MISSING_LIMIT') and not _bse_loops_paused():
             try:
                 await backfill_from_bse_missing(session, limit=int(os.getenv('BACKFILL_BSE_MISSING_LIMIT')))
             except Exception as e:
                 import traceback
                 log.error(f"BSE-missing backfill failed: {e}\n{traceback.format_exc()}")
-        if os.getenv('TEST_BSE_CALENDAR') and not os.getenv('PAUSE_BSE_LOOPS'):
+        if os.getenv('TEST_BSE_CALENDAR') and not _bse_loops_paused():
             try:
                 await fetch_and_save_upcoming_results_calendar(session)
             except Exception as e:
@@ -7241,7 +7248,7 @@ async def _bse_stale_results_loop(session: aiohttp.ClientSession):
     QUIET_INTERVAL = 1800    # 30 min otherwise
     BACKLOG_THRESHOLD = 30
     while True:
-        if os.getenv('PAUSE_BSE_LOOPS'):
+        if _bse_loops_paused():
             await asyncio.sleep(60)
             continue
         try:
@@ -7270,16 +7277,21 @@ async def _bse_missing_backfill_loop(session: aiohttp.ClientSession):
     QUIET_INTERVAL = int(os.getenv('BSE_MISSING_QUIET_SECONDS', '1800'))  # 30 min otherwise
     BACKLOG_THRESHOLD = 30
     BATCH = int(os.getenv('BSE_MISSING_BATCH_LIMIT', '400'))
-    if os.getenv('PAUSE_BSE_LOOPS'):
-        log.warning("🏛️ BSE-missing loop: PAUSE_BSE_LOOPS is set — numbers backfill is OFF")
+    raw_pause = os.getenv('PAUSE_BSE_LOOPS')
+    if _bse_loops_paused():
+        log.warning(f"🏛️ BSE-missing loop: PAUSE_BSE_LOOPS={raw_pause!r} — numbers backfill is OFF "
+                    f"(set to 0/false/delete var to enable)")
     else:
-        log.info(f"🏛️ BSE-missing loop: active (batch={BATCH}, busy every {BUSY_INTERVAL}s)")
+        log.info(f"🏛️ BSE-missing loop: active (batch={BATCH}, busy every {BUSY_INTERVAL}s, "
+                 f"PAUSE_BSE_LOOPS={raw_pause!r})")
     while True:
-        if os.getenv('PAUSE_BSE_LOOPS'):
+        if _bse_loops_paused():
             await asyncio.sleep(60)
             continue
         try:
+            log.info(f"🏛️ BSE-missing cycle: fetching up to {BATCH} symbols…")
             remaining = await backfill_from_bse_missing(session, limit=BATCH)
+            log.info(f"🏛️ BSE-missing cycle done: remaining≈{remaining}")
         except Exception as e:
             import traceback
             log.error(f"BSE-missing backfill loop failed: {e}\n{traceback.format_exc()}")
@@ -7294,7 +7306,7 @@ async def _bse_calendar_refresh_loop(session: aiohttp.ClientSession):
     call regardless of how many stocks are tracked."""
     CHECK_INTERVAL = 86400  # 24 hours
     while True:
-        if os.getenv('PAUSE_BSE_LOOPS'):
+        if _bse_loops_paused():
             await asyncio.sleep(60)
             continue
         try:
@@ -7313,7 +7325,7 @@ async def _bse_targeted_results_loop(session: aiohttp.ClientSession):
     per second, to stay well clear of BSE's rate limiting."""
     CHECK_INTERVAL = 600  # 10 minutes
     while True:
-        if os.getenv('PAUSE_BSE_LOOPS'):
+        if _bse_loops_paused():
             await asyncio.sleep(60)
             continue
         try:
