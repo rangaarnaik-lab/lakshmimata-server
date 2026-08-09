@@ -1386,7 +1386,7 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
     max_pdf = int(os.getenv('RESULTS_PDF_MAX_BYTES', str(15_000_000)))
     if len(pdf_bytes) > max_pdf:
         log.warning(f"⚠️ Results PDF too large for {symbol} ({len(pdf_bytes)} bytes) - skipping "
-                     f"(BSE/XBRL will fill numbers; will not re-queue)")
+                     f"(will not re-queue; try NSE XBRL / smaller filing)")
         return {**no_content_result, 'oversized': True}
     pdf_b64 = base64.b64encode(pdf_bytes).decode('ascii')
     prompt = (
@@ -1899,7 +1899,7 @@ async def _mark_results_pdf_permanent(
                              f"({reason}): {r.status} {body[:200]}")
             else:
                 log.info(f"  🎙️ {row['symbol']}: {reason} marked done "
-                          f"(won’t re-queue; BSE fills numbers)")
+                          f"(won’t re-queue)")
     except Exception as e:
         log.warning(f"⚠️ Permanent Results mark failed for {row['symbol']} "
                      f"({reason}): {type(e).__name__}: {e}")
@@ -2326,6 +2326,18 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
             # comparison and YoY (GREENPANEL 2026-08-08: both came back as
             # 30-Jun-2025). Saving the same period twice wastes a row and
             # corrupts QoQ% — keep it as YoY only.
+            if (comp and fd and comp.get('period_ended') and fd.get('period_ended')
+                    and str(comp['period_ended']).strip().lower()
+                    == str(fd['period_ended']).strip().lower()):
+                log.info(f"  ℹ️ {row['symbol']}: comparison period equals current "
+                          f"({comp['period_ended']}) — dropping comparison")
+                comp = None
+            if (yoy and fd and yoy.get('period_ended') and fd.get('period_ended')
+                    and str(yoy['period_ended']).strip().lower()
+                    == str(fd['period_ended']).strip().lower()):
+                log.info(f"  ℹ️ {row['symbol']}: YoY period equals current "
+                          f"({yoy['period_ended']}) — dropping YoY")
+                yoy = None
             if (comp and yoy and comp.get('period_ended') and yoy.get('period_ended')
                     and str(comp['period_ended']).strip().lower()
                     == str(yoy['period_ended']).strip().lower()):
@@ -6535,16 +6547,23 @@ async def fundamentals_worker_main():
             except Exception as e:
                 import traceback
                 log.error(f"Thin-BSE cleanup failed: {e}\n{traceback.format_exc()}")
-        await asyncio.gather(
+        _loops = [
             _fundamentals_loop(session),
             _market_cap_catchup_loop(session),
             _valuation_ai_catchup_loop(session),
             _announcements_loop(session),
             _results_loop(session),
-            _bse_calendar_refresh_loop(session),
-            _bse_targeted_results_loop(session),
-            _bse_missing_backfill_loop(session),
-            _bse_stale_results_loop(session),
+            _bse_calendar_refresh_loop(session),  # dates only — not numbers
+        ]
+        if _bse_results_backfill_enabled():
+            _loops.extend([
+                _bse_targeted_results_loop(session),
+                _bse_missing_backfill_loop(session),
+                _bse_stale_results_loop(session),
+            ])
+        else:
+            log.info("🏛️ BSE numbers loops not started (targeted/missing/stale)")
+        _loops.extend([
             # Results PDF first (priority). PPT/concall/About self-pause while
             # Results catchup is busy — Ask-AI still starts immediately.
             _delayed(0, _concall_summary_loop(session)),
@@ -6558,7 +6577,8 @@ async def fundamentals_worker_main():
             _delayed(0, _stock_ai_asks_loop(session)),
             # Periodic plain-text pending counts for Results / PPT / Concall.
             _filings_backlog_status_loop(session),
-        )
+        ])
+        await asyncio.gather(*_loops)
 
 
 async def _delayed(seconds: float, coro):
@@ -7341,6 +7361,12 @@ async def backfill_from_bse(session: aiohttp.ClientSession, symbols: list):
     doesn't carry those fields. Intentionally scoped to an explicit
     symbol list rather than all stocks, matching today's
     verify-before-widening approach."""
+    # Hard stop — even if a loop forgets the ENABLE_BSE_RESULTS gate
+    # (targeted loop previously kept writing thin 2-column rows).
+    if not _bse_results_backfill_enabled():
+        log.info(f"🏛️ BSE backfill skipped ({len(symbols)} symbol(s)) — "
+                 f"ENABLE_BSE_RESULTS off; PDF/Gemini only")
+        return
     from bse import BSE
     bse_client = await asyncio.to_thread(BSE, '/tmp')
     all_rows = []
