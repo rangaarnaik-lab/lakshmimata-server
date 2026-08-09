@@ -2064,7 +2064,10 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
                           f"missing_fr≈{missing_fr_total})"
                           f"{f' (idle#{idle_streak})' if idle_streak > 1 else ''}")
             if catchup:
-                # Still missing numbers → widen lookback / keep busy for BSE + retries.
+                # Widen lookback once more if numbers still missing; after
+                # that, release Gemini even if missing_fr is high — the PDF
+                # announcement queue is exhausted (retry_skipped=0) and BSE
+                # fills numbers without needing Gemini locked on Results.
                 max_lb = int(os.getenv('RESULTS_PDF_CATCHUP_MAX_LOOKBACK_DAYS', '1095'))
                 if missing_fr_total > idle_missing_ok and lookback_days < max_lb:
                     nxt = min(max_lb, max(lookback_days * 2, 730))
@@ -2072,12 +2075,11 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
                     log.info(f"🎙️ Results catchup: still missing_fr≈{missing_fr_total} "
                              f"— widening lookback {lookback_days}d → {nxt}d (keep catchup busy)")
                     _set_results_catchup_idle(False)
-                elif missing_fr_total > idle_missing_ok:
-                    log.info(f"🎙️ Results catchup: no new PDF queue but missing_fr≈{missing_fr_total} "
-                              f"(>{idle_missing_ok}) — staying busy so BSE numbers + skipped "
-                              f"PDF retries keep priority over Concall/PPT")
-                    _set_results_catchup_idle(False)
                 else:
+                    if missing_fr_total > idle_missing_ok:
+                        log.info(f"🎙️ Results PDF queue empty (lookback={lookback_days}d) but "
+                                  f"missing_fr≈{missing_fr_total} — releasing Gemini to "
+                                  f"Concall/PPT; BSE-missing loop fills the numbers")
                     _set_results_catchup_idle(
                         True, lookback_days=lookback_days,
                         matched=len(concall_rows), already=len(already))
