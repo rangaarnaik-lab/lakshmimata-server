@@ -312,6 +312,161 @@ async def backfill_index_history_30days(session: aiohttp.ClientSession, target_d
     else:
         log.error("index_history backfill: computed zero rows, aborting")
 
+def _parse_fiidii_date(raw) -> Optional[str]:
+    """NSE / history APIs use '10-Aug-2026' → ISO '2026-08-10'."""
+    if not raw:
+        return None
+    s = str(raw).strip()
+    for fmt in ('%d-%b-%Y', '%d-%b-%y', '%Y-%m-%d', '%d/%m/%Y'):
+        try:
+            return datetime.strptime(s, fmt).date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+def _num_cr(v) -> Optional[float]:
+    if v is None or v == '':
+        return None
+    try:
+        return float(str(v).replace(',', '').strip())
+    except (TypeError, ValueError):
+        return None
+
+async def _fetch_nse_fiidii_latest(session: aiohttp.ClientSession) -> list:
+    """Today's provisional cash FII/DII from NSE (fiidiiTradeReact)."""
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.nseindia.com/reports/fii-dii",
+    }
+    try:
+        async with session.get("https://www.nseindia.com/reports/fii-dii",
+                               headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as warm:
+            await warm.read()
+        async with session.get("https://www.nseindia.com/api/fiidiiTradeReact",
+                               headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as r:
+            if r.status != 200:
+                log.warning(f"NSE fiidiiTradeReact HTTP {r.status}")
+                return []
+            data = await r.json(content_type=None)
+    except Exception as e:
+        log.warning(f"NSE FII/DII fetch failed: {e}")
+        return []
+
+    if not isinstance(data, list):
+        return []
+    by_date: dict[str, dict] = {}
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        day = _parse_fiidii_date(item.get('date'))
+        if not day:
+            continue
+        row = by_date.setdefault(day, {'trade_date': day})
+        cat = str(item.get('category') or '').upper()
+        buy, sell, net = _num_cr(item.get('buyValue')), _num_cr(item.get('sellValue')), _num_cr(item.get('netValue'))
+        if 'FII' in cat or 'FPI' in cat:
+            row['fii_buy'], row['fii_sell'], row['fii_net'] = buy, sell, net
+        elif 'DII' in cat:
+            row['dii_buy'], row['dii_sell'], row['dii_net'] = buy, sell, net
+    return list(by_date.values())
+
+async def _fetch_fiidii_history_fallback(session: aiohttp.ClientSession) -> list:
+    """~60 session history when our table is empty (NSE only returns today)."""
+    url = "https://fii-diidata.mrchartist.com/api/history"
+    try:
+        async with session.get(url, headers={"User-Agent": "Mozilla/5.0"},
+                               timeout=aiohttp.ClientTimeout(total=25)) as r:
+            if r.status != 200:
+                log.warning(f"FII/DII history fallback HTTP {r.status}")
+                return []
+            data = await r.json(content_type=None)
+    except Exception as e:
+        log.warning(f"FII/DII history fallback failed: {e}")
+        return []
+    if not isinstance(data, list):
+        return []
+    rows = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        day = _parse_fiidii_date(item.get('date'))
+        if not day:
+            continue
+        rows.append({
+            'trade_date': day,
+            'fii_buy': _num_cr(item.get('fii_buy')),
+            'fii_sell': _num_cr(item.get('fii_sell')),
+            'fii_net': _num_cr(item.get('fii_net')),
+            'dii_buy': _num_cr(item.get('dii_buy')),
+            'dii_sell': _num_cr(item.get('dii_sell')),
+            'dii_net': _num_cr(item.get('dii_net')),
+        })
+    return rows
+
+async def fetch_and_store_fii_dii_daily(session: aiohttp.ClientSession):
+    """Populate fii_dii_daily for Market → FII/DII cards.
+
+    UI already reads this table; until this job existed the card stayed
+    empty ('Daily NSE provisional flows appear after market close…').
+    Run ensure_fii_dii_daily.sql once in Supabase if the table is missing.
+    """
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    existing_count = 0
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/fii_dii_daily?select=trade_date",
+            headers={**headers, "Prefer": "count=exact"},
+            timeout=aiohttp.ClientTimeout(total=15)
+        ) as r:
+            if r.status == 404 or r.status == 406:
+                body = await r.text()
+                if 'relation' in body.lower() or r.status == 404:
+                    log.error("❌ fii_dii_daily table missing — run ensure_fii_dii_daily.sql in Supabase")
+                    return
+            if r.status in (200, 206):
+                cr = r.headers.get('content-range', '')
+                if '/' in cr and cr.split('/')[-1].isdigit():
+                    existing_count = int(cr.split('/')[-1])
+    except Exception as e:
+        log.warning(f"fii_dii_daily count check failed: {e}")
+
+    rows_by_date: dict[str, dict] = {}
+    if existing_count < 10:
+        for row in await _fetch_fiidii_history_fallback(session):
+            rows_by_date[row['trade_date']] = row
+        log.info(f"  FII/DII history fallback loaded {len(rows_by_date)} day(s)")
+
+    for row in await _fetch_nse_fiidii_latest(session):
+        rows_by_date[row['trade_date']] = {**rows_by_date.get(row['trade_date'], {}), **row}
+
+    if not rows_by_date:
+        log.warning("FII/DII: no rows fetched from NSE or history fallback")
+        return
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    upsert_rows = []
+    for day, row in rows_by_date.items():
+        if row.get('fii_net') is None and row.get('dii_net') is None:
+            continue
+        upsert_rows.append({
+            'trade_date': day,
+            'fii_buy': row.get('fii_buy'),
+            'fii_sell': row.get('fii_sell'),
+            'fii_net': row.get('fii_net'),
+            'dii_buy': row.get('dii_buy'),
+            'dii_sell': row.get('dii_sell'),
+            'dii_net': row.get('dii_net'),
+            'fetched_at': now_iso,
+        })
+    if not upsert_rows:
+        return
+    await supabase_upsert(session, 'fii_dii_daily', upsert_rows, on_conflict='trade_date')
+    log.info(f"✅ fii_dii_daily upserted {len(upsert_rows)} day(s) "
+             f"(latest {max(r['trade_date'] for r in upsert_rows)})")
+
 async def backfill_market_breadth_history(session: aiohttp.ClientSession):
     """
     One-time backfill of daily market breadth (how many stocks advanced
@@ -5399,6 +5554,12 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
                 'total': len(processed),
             }], on_conflict='date')
 
+        # NSE provisional FII/DII cash flows for Market Overview / Smart Money
+        try:
+            await asyncio.wait_for(fetch_and_store_fii_dii_daily(session), timeout=60)
+        except Exception as e:
+            log.warning(f"EOD FII/DII fetch error (non-fatal): {e}")
+
         # Append today to the EMA-above-count line (backfilled for the
         # past month at startup) and the Stage 2 count. Stage 2 can only
         # ever accumulate going forward — it depends on RS-TV, a
@@ -6124,6 +6285,11 @@ async def run_live_scan_service():
             await asyncio.wait_for(backfill_ema_breadth_history(session), timeout=600)
         except Exception as e:
             log.warning(f"EMA breadth backfill error (non-fatal): {e}")
+
+        try:
+            await asyncio.wait_for(fetch_and_store_fii_dii_daily(session), timeout=60)
+        except Exception as e:
+            log.warning(f"FII/DII daily fetch error (non-fatal): {e}")
 
         try:
             await asyncio.wait_for(backfill_stock_history_30days(session), timeout=1500)
