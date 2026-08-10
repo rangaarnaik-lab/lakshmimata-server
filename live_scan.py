@@ -4840,7 +4840,7 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         # Save to Supabase so frontend can poll and show notifications
         await supabase_upsert(session, 'squeeze_alerts', new_fires, on_conflict='sym,fired_at')
 
-    # Step 5.4b: Detect NEW signal fires (HY/HT/PP/Stage2/Guppy) via
+    # Step 5.4b: Detect NEW signal fires (HY/HT/PP/Stage2/Guppy/RS>70) via
     # state-transition — reuses squeeze_alerts + frontend notification
     # pipeline. One row per signal type so users can enable/disable each
     # type independently. fired_at microsecond offsets avoid (sym,fired_at)
@@ -4871,6 +4871,31 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
                     'sector':     s.get('sector'),
                     'fired_at':   (now_ist + timedelta(microseconds=us_off)).isoformat(),
                 })
+        # RS Rating crossed above 70 (transition only — not every scan while above)
+        rs_val = s.get('rs_tv') if s.get('rs_tv') is not None else s.get('rs')
+        try:
+            rs_num = float(rs_val) if rs_val is not None else None
+        except (TypeError, ValueError):
+            rs_num = None
+        rs70_now = rs_num is not None and rs_num > 70
+        if rs70_now and not prev.get('rs70', False):
+            new_signal_fires.append({
+                'sym':        sym,
+                'fire_type':  'RS > 70',
+                'rs_tv':      s.get('rs_tv'),
+                'rs':         s.get('rs'),
+                'last_price': s.get('last_price'),
+                'chg_pct':    s.get('chg_pct'),
+                'sector':     s.get('sector'),
+                'fired_at':   (now_ist + timedelta(microseconds=6)).isoformat(),
+            })
+
+    def _rs70_flag(row):
+        v = row.get('rs_tv') if row.get('rs_tv') is not None else row.get('rs')
+        try:
+            return v is not None and float(v) > 70
+        except (TypeError, ValueError):
+            return False
 
     prev_hy_ht_state = {
         s['sym']: {
@@ -4879,6 +4904,7 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'pp':    bool(s.get('is_pp', False)),
             's2':    bool(s.get('is_s2_new_entry', False)),
             'guppy': bool(s.get('is_guppy_bullish_crossover', False)),
+            'rs70':  _rs70_flag(s),
         }
         for s in processed
     }

@@ -494,10 +494,10 @@ _r2_size_diagnostic_logged = False
 # Format: {sym: {'bb': bool, 'vcp': bool}}
 prev_squeeze_state: dict = {}
 
-# ── Signal fire state tracking (HY/HT/PP/Stage2/Guppy) ───────────────
+# ── Signal fire state tracking (HY/HT/PP/Stage2/Guppy/RS>70) ─────────
 # Same "only alert on the transition into firing" pattern as squeeze
 # state above. Format:
-# {sym: {'hy': bool, 'ht': bool, 'pp': bool, 's2': bool, 'guppy': bool}}
+# {sym: {'hy','ht','pp','s2','guppy','rs70': bool}}
 prev_hy_ht_state: dict = {}
 
 
