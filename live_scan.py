@@ -5193,16 +5193,15 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         for s in sector_rows
     ])
 
-    # Clean up stale sector rows — SECTOR_MAP has been restructured a
-    # few times over this project's history, and the upsert above only
-    # adds/updates CURRENT sectors, never removes ones that no longer
-    # exist. A leftover row (e.g. an old 'Engineering' category) keeps
-    # showing cached top_stocks/avg_rs from whenever it was last live,
-    # while the actual stocks table correctly has zero members for it
-    # now — confusing 'sector shows data but has 0 stocks when expanded'
-    # symptom. Runs once per scan; cheap (one SELECT + occasional DELETE).
+    # Clean up stale sector rows — upsert only adds/updates CURRENT
+    # sectors. Keep every name we just wrote (SECTOR_MAP + extras from
+    # get_sector()/lookup that have ≥3 members). Previously this used
+    # only SECTOR_MAP.keys(), which deleted valid lookup sectors right
+    # after upsert and left rank gaps (#1,#9,#10 missing in the UI).
     try:
-        current_sector_names = set(SECTOR_MAP.keys())
+        current_sector_names = {s['sector'] for s in sector_rows if s.get('sector')}
+        if not current_sector_names:
+            current_sector_names = set(SECTOR_MAP.keys())
         sec_headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
         async with session.get(
             f"{SUPABASE_URL}/rest/v1/sectors?select=sector",

@@ -1386,6 +1386,40 @@ QSR_INDUSTRY_OVERRIDES = {
 }
 QSR_SECTOR = 'Leisure Services'
 
+# NSE/Upstox "Bulk Drugs & Formln" is a catch-all that mixes CIPLA with IOLCP.
+# Split so industries + peer-style grouping stay comparable.
+PHARMA_FORMULATIONS = 'Pharmaceuticals - Indian - Formulations'
+PHARMA_BULK_DRUGS = 'Pharmaceuticals - Indian - Bulk Drugs'
+PHARMA_FORMULATION_SYMS = {
+    'AJANTPHARM','ALKEM','ALIVUS','AMRUTANJAN','APLLTD','AUROPHARMA','BAJAJHCARE',
+    'BIOCON','BLISSGVS','BROOKS','CAPLIPOINT','CIPLA','DRREDDY','EMCURE','ERIS',
+    'FDC','GLAND','GLENMARK','GUFICBIO','INDOCO','IPCALAB','JAGSNPHARM','JBCHEPHARM',
+    'LUPIN','MANKIND','MARKSANS','NATCOPHARM','ORCHPHARMA','PANACEABIO','PPLPHARMA',
+    'RPGLIFE','RUBICON','SUNPHARMA','THEMISMED','TORNTPHARM','UNICHEMLAB','WOCKPHARMA',
+    'ZOTA','ZYDUSLIFE','ALBERTDAVD','MEDICO','STAR','BAFNAPH','HESTERBIO','KILITCH',
+    'LINCOLN','MEDICAMEQ','SAIPARENT','SENORES','SHILPAMED','VENUSREM','WINDLAS',
+}
+PHARMA_BULK_API_SYMS = {
+    'AAREYDRUGS','AARTIDRUGS','AARTIPHARM','ACUTAAS','ADVENZYMES','AKUMS','ALPA',
+    'AMANTA','ANTHEM','ANUHPHR','BALAXI','BALPHARMA','BETA','BLUEJET','COHANCE',
+    'CONCORDBIO','CORONA','DCAL','DIVISLAB','GRANULES','GUJTHEM','HALEOSLABS','HIKAL',
+    'INDSWFTLAB','INNOVACAP','IOLCP','JUBLPHARMA','KOPRAN','KPL','KREBSBIO','LASA',
+    'LAURUSLABS','LYKALABS','MANGALAM','MOREPENLAB','NATCAPSUQ','NECLIFE','NEULANDLAB',
+    'NGLFINE','ONESOURCE','ORTINGLOBE','PAR','SAILIFE','SAKAR','SIGACHI','SMSPHARMA',
+    'SOLARA','SUDEEPPHRM','SUPRIYA','SYNCOMF','VAISHALI','VALIANTLAB','VINEETLAB',
+    'VIVIMEDLAB','VIYASH','WANBURY','ZIMLAB',
+}
+
+def _normalize_pharma_industry(sym: str, industry: Optional[str]) -> Optional[str]:
+    key = (sym or '').strip().upper()
+    if key in PHARMA_FORMULATION_SYMS:
+        return PHARMA_FORMULATIONS
+    if key in PHARMA_BULK_API_SYMS:
+        return PHARMA_BULK_DRUGS
+    if industry and re.search(r'Bulk Drugs\s*&\s*Form', industry, re.I):
+        return PHARMA_BULK_DRUGS
+    return industry
+
 def get_industry(sym: str) -> Optional[str]:
     """Distinct 'Industry' value (finer-grained than Sector) shown
     alongside Sector in the Index/Sector tables. Prefers the live
@@ -1396,9 +1430,8 @@ def get_industry(sym: str) -> Optional[str]:
     if key in QSR_INDUSTRY_OVERRIDES:
         return QSR_INDUSTRY_OVERRIDES[key]
     live = fundamentals_cache.get(sym, {}).get('industry')
-    if live:
-        return live
-    return SECTOR_INDUSTRY_LOOKUP.get(sym, {}).get('industry')
+    raw = live or SECTOR_INDUSTRY_LOOKUP.get(sym, {}).get('industry')
+    return _normalize_pharma_industry(key, raw)
 
 def get_sector(sym: str) -> str:
     key = (sym or '').strip().upper()

@@ -1,4 +1,4 @@
-symbol,industry,sector
+﻿symbol,industry,sector
 20MICRONS,Mining / Minerals / Metals,Metals & Mining
 21STCENMGM,Finance & Investments,Financials
 360ONE,Finance & Investments,Financials
@@ -18,7 +18,7 @@ AARON,Engineering,Industrials
 AARTECH,Electric Equipment,Industrials
 AARTIDRUGS,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 AARTIIND,Chemicals,Chemicals
-AARTIPHARM,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+AARTIPHARM,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 AARTISURF,Chemicals,Chemicals
 AARVI,Miscellaneous,Miscellaneous
 AAVAS,Finance - Housing,Financials
@@ -59,7 +59,7 @@ ADVAIT,Cables - Power,Industrials
 ADVANCE,Pesticides / Agrochemicals - Indian,Chemicals
 ADVANIHOTR,Hotels,Services
 ADVENTHTL,Hotels,Services
-ADVENZYMES,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+ADVENZYMES,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 AEGISLOG,Trading,Services
 AEGISVOPAK,Miscellaneous,Transportation
 AEPL,Electric Equipment,Industrials
@@ -100,25 +100,25 @@ AKI,Leather / Leather Products,Consumer Discretionary
 AKSHAR,Textiles - Cotton/Blended,Textiles
 AKSHARCHEM,Dyes And Pigments,Chemicals
 AKSHOPTFBR,Cables - Telephone,Industrials
-AKUMS,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+AKUMS,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 ALANKIT,Computers - Software - Medium / Small,I.T
-ALBERTDAVD,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+ALBERTDAVD,Pharmaceuticals - Indian - Formulations,Healthcare
 ALEMBICLTD,Construction,Industrials
 ALGOQUANT,Finance & Investments,Financials
 ALICON,Castings & Forgings,Industrials
-ALIVUS,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+ALIVUS,Pharmaceuticals - Indian - Formulations,Healthcare
 ALKALI,Chemicals,Chemicals
-ALKEM,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+ALKEM,Pharmaceuticals - Indian - Formulations,Healthcare
 ALKYLAMINE,Chemicals,Chemicals
 ALLCARGO,Miscellaneous,Transportation
 ALLDIGI,Computers - Software - Medium / Small,I.T
 ALLTIME,Plastics Products,Plastic Products
 ALMONDZ,Finance & Investments,Financials
 ALOKINDS,Textiles - Processing,Textiles
-ALPA,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+ALPA,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 ALPHAGEO,Miscellaneous,Miscellaneous
 AMAGI,Computers - Software - Medium / Small,I.T
-AMANTA,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+AMANTA,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 AMBALALSA,Trading,Healthcare
 AMBER,Air-Conditioners,Consumer Discretionary
 AMBICAAGAR,Chemicals,Chemicals
@@ -140,7 +140,7 @@ ANMOL,Trading,Services
 ANSALAPI,Construction,Industrials
 ANTELOPUS,Oil Drilling / Allied Services,Energy
 ANTGRAPHIC,Diversified - Medium / Small,Miscellaneous
-ANTHEM,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+ANTHEM,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 ANUHPHR,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 ANUP,Engineering,Industrials
 ANURAS,Chemicals,Chemicals
@@ -149,7 +149,7 @@ APCL,Cement - South India,Building Materials
 APCOTEXIND,Miscellaneous,Chemicals
 APEX,Aquaculture,Fmcg
 APLAPOLLO,Steel - Large,Industrials
-APLLTD,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+APLLTD,Pharmaceuticals - Indian - Formulations,Healthcare
 APOLLO,Electronics - Components,Aerospace & Defence
 APOLLOHOSP,Healthcare,Healthcare
 APOLLOPIPE,Plastics Products,Plastic Products
@@ -216,7 +216,7 @@ ATUL,Chemicals,Chemicals
 ATULAUTO,Automobiles - Scooters And 3 - Wheelers,Auto
 AUBANK,Banks - Private Sector,Bank
 AURIONPRO,Computers - Software - Medium / Small,I.T
-AUROPHARMA,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+AUROPHARMA,Pharmaceuticals - Indian - Formulations,Healthcare
 AURUM,Computers - Software - Medium / Small,I.T
 AUSOMENT,Trading,Consumer Discretionary
 AUTOAXLES,Auto Ancillaries,Auto
@@ -246,7 +246,7 @@ BAJAJ-AUTO,Automobiles - Scooters And 3 - Wheelers,Auto
 BAJAJCON,Personal Care - Indian,Fmcg
 BAJAJELEC,Domestic Appliances,Consumer Discretionary
 BAJAJFINSV,Finance & Investments,Financials
-BAJAJHCARE,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+BAJAJHCARE,Pharmaceuticals - Indian - Formulations,Healthcare
 BAJAJHFL,Finance - Housing,Financials
 BAJAJHIND,Sugar,Fmcg
 BAJAJHLDNG,Finance & Investments,Financials
@@ -257,11 +257,11 @@ BAJFINANCE,Finance & Investments,Financials
 BALAJEE,Packaging,Industrials
 BALAJITELE,Entertainment / Electronic Media Software,Media
 BALAMINES,Chemicals,Chemicals
-BALAXI,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+BALAXI,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 BALKRISHNA,Trading,Services
 BALKRISIND,Tyres,Auto
 BALMLAWRIE,Diversified - Large,Miscellaneous
-BALPHARMA,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+BALPHARMA,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 BALRAMCHIN,Sugar,Fmcg
 BALUFORGE,Castings & Forgings,Industrials
 BANARBEADS,Glass & Glass Products,Building Materials
@@ -323,7 +323,7 @@ BIKAJI,Food - Processing - Indian,Fmcg
 BIL,Leather / Leather Products,Consumer Discretionary
 BILVYAPAR,Miscellaneous,Miscellaneous
 BIMETAL,Bearings,Industrials
-BIOCON,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+BIOCON,Pharmaceuticals - Indian - Formulations,Healthcare
 BIOFILCHEM,Trading,Healthcare
 BIRLACABLE,Cables - Telephone,Industrials
 BIRLACORPN,Cement - North India,Building Materials
@@ -341,7 +341,7 @@ BLS,Computers - Software - Medium / Small,I.T
 BLSE,Computers - Software - Medium / Small,I.T
 BLUECOAST,Hotels,Services
 BLUEDART,Couriers,Transportation
-BLUEJET,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+BLUEJET,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 BLUESTARCO,Air-Conditioners,Consumer Discretionary
 BLUESTONE,Diamond Cutting / Jewellery,Consumer Discretionary
 BLUSPRING,Diversified - Large,Miscellaneous
@@ -364,7 +364,7 @@ BRIGADE,Construction,Realty
 BRIGHOTEL,Hotels,Services
 BRITANNIA,Food - Processing - Mnc,Fmcg
 BRNL,Construction,Industrials
-BROOKS,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+BROOKS,Pharmaceuticals - Indian - Formulations,Healthcare
 BSE,Miscellaneous,Financials
 BSHSL,Miscellaneous,Fmcg
 BSL,Textiles - Processing,Textiles
@@ -432,7 +432,7 @@ CIEINDIA,Castings & Forgings,Industrials
 CIFL,Finance & Investments,Financials
 CINELINE,Entertainment / Electronic Media Software,Media
 CINEVISTA,Construction,Industrials
-CIPLA,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+CIPLA,Pharmaceuticals - Indian - Formulations,Healthcare
 CLEAN,Chemicals,Chemicals
 CLEANMAX,Power Generation And Supply,Power & Utilities
 CLEDUCATE,Miscellaneous,Services
@@ -446,14 +446,14 @@ COCHINSHIP,Miscellaneous,Aerospace & Defence
 COCKERILL,Engineering,Industrials
 COFFEEDAY,Leisure - Restaurants,Leisure Services
 COFORGE,Computers - Software - Large,I.T
-COHANCE,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+COHANCE,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 COLPAL,Personal Care - Multinational,Fmcg
 COMFINTE,Trading,Services
 COMPINFO,Trading,Services
 COMPUSOFT,Computers - Education,I.T
 COMSYN,Packaging,Industrials
 CONCOR,Miscellaneous,Transportation
-CONCORDBIO,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+CONCORDBIO,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 CONFIPET,Miscellaneous,Miscellaneous
 CONSOFINVT,Finance & Investments,Financials
 CONTROLPR,Computers - Hardware,I.T
@@ -461,7 +461,7 @@ CORALFINAC,Finance - Housing,Financials
 CORDELIA,Hotels,Services
 CORDSCABLE,Cables - Power,Industrials
 COROMANDEL,Fertilizers,Chemicals
-CORONA,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+CORONA,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 COSMOFIRST,Packaging,Industrials
 COUNCODOS,Construction,Industrials
 CPCAP,Finance & Investments,Financials
@@ -504,7 +504,7 @@ DBL,Construction,Industrials
 DBOL,Sugar,Fmcg
 DBREALTY,Construction,Industrials
 DBSTOCKBRO,Finance & Investments,Financials
-DCAL,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+DCAL,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 DCBBANK,Banks - Private Sector,Bank
 DCI,Trading,I.T
 DCM,Castings & Forgings,Industrials
@@ -573,7 +573,7 @@ DRAGARWQ,Healthcare,Healthcare
 DRCSYSTEMS,Computers - Software - Medium / Small,I.T
 DREAMFOLKS,Miscellaneous,Miscellaneous
 DREDGECORP,Miscellaneous,Miscellaneous
-DRREDDY,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+DRREDDY,Pharmaceuticals - Indian - Formulations,Healthcare
 DSFCL,Chemicals,Chemicals
 DSSL,Computers - Software - Medium / Small,I.T
 DTIL,Tea,Fmcg
@@ -614,7 +614,7 @@ EMAMILTD,Personal Care - Indian,Fmcg
 EMAMIPAP,Paper,Building Materials
 EMAMIREAL,Construction,Industrials
 EMBDL,Construction,Industrials
-EMCURE,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+EMCURE,Pharmaceuticals - Indian - Formulations,Healthcare
 EMIL,Trading,Consumer Discretionary
 EMKAY,Finance & Investments,Financials
 EMMBI,Packaging,Industrials
@@ -661,7 +661,7 @@ FAIRCHEMOR,Chemicals,Chemicals
 FAZE3Q,Textiles - Processing,Textiles
 FCL,Chemicals,Chemicals
 FCSSOFT,Computers - Software - Medium / Small,I.T
-FDC,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+FDC,Pharmaceuticals - Indian - Formulations,Healthcare
 FEDDERSHOL,Finance & Investments,Financials
 FEDERALBNK,Banks - Private Sector,Bank
 FEDFINA,Finance & Investments,Financials
@@ -740,7 +740,7 @@ GKENERGY,Engineering - Turnkey Services,Industrials
 GKSL,Healthcare,Healthcare
 GLAND,Pharmaceuticals - Indian - Formulations,Healthcare
 GLAXO,Pharmaceuticals - Multinational,Healthcare
-GLENMARK,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+GLENMARK,Pharmaceuticals - Indian - Formulations,Healthcare
 GLFL,Finance & Investments,Financials
 GLOBAL,Miscellaneous,Services
 GLOBALE,Textiles - Products,Textiles
@@ -784,7 +784,7 @@ GPTHEALTH,Healthcare,Healthcare
 GPTINFRA,Construction,Industrials
 GRADIENTE,Entertainment / Electronic Media Software,Media
 GRANDOAK,Finance & Investments,Financials
-GRANULES,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+GRANULES,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 GRAPHITE,Electrodes - Graphites,Industrials
 GRASIM,Textiles - Manmade,Textiles
 GRAUWEIL,Chemicals,Chemicals
@@ -811,7 +811,7 @@ GTECJAINX,Computers - Education,I.T
 GTL,Telecommunications - Service Provider,Telecom-Service
 GTLINFRA,Transmisson Line Towers / Equipment,Telecom
 GTPL,Entertainment / Electronic Media Software,Media
-GUFICBIO,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+GUFICBIO,Pharmaceuticals - Indian - Formulations,Healthcare
 GUJALKALI,Chemicals,Chemicals
 GUJAPOLLO,Engineering,Industrials
 GUJRAFFIA,Packaging,Industrials
@@ -825,7 +825,7 @@ GVT&D,Electric Equipment,Industrials
 HAL,Engineering,Aerospace & Defence
 HALDER,Trading,Services
 HALDYNGL,Glass & Glass Products,Building Materials
-HALEOSLABS,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+HALEOSLABS,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 HAPPSTMNDS,Computers - Software - Medium / Small,I.T
 HAPPYFORGE,Castings & Forgings,Industrials
 HARDWYN,Trading,Services
@@ -953,7 +953,7 @@ INDIQUBE,Miscellaneous,Co-Working
 INDNIPPON,Auto Ancillaries,Auto
 INDOAMIN,Chemicals,Chemicals
 INDOBORAX,Chemicals,Chemicals
-INDOCO,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+INDOCO,Pharmaceuticals - Indian - Formulations,Healthcare
 INDOFARM,Diversified - Medium / Small,Miscellaneous
 INDORAMA,Textiles - Manmade,Textiles
 INDOSTAR,Finance & Investments,Financials
@@ -963,7 +963,7 @@ INDOUS,Miscellaneous,Fmcg
 INDOWIND,Power Generation And Supply,Power & Utilities
 INDPRUD,Finance & Investments,Financials
 INDRAMEDCO,Healthcare,Healthcare
-INDSWFTLAB,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+INDSWFTLAB,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 INDTERRAIN,Trading,Textiles
 INDUSINDBK,Banks - Private Sector,Bank
 INDUSTOWER,Transmisson Line Towers / Equipment,Telecom
@@ -971,7 +971,7 @@ INFOBEAN,Computers - Software - Medium / Small,I.T
 INFOMEDIA,Printing & Stationery,Miscellaneous
 INFY,Computers - Software - Large,I.T
 INGERRAND,Compressors / Drilling Equipment,Industrials
-INNOVACAP,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+INNOVACAP,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 INNOVANA,Computers - Software - Medium / Small,I.T
 INNOVISION,Miscellaneous,Miscellaneous
 INOXGREEN,Miscellaneous,Miscellaneous
@@ -987,9 +987,9 @@ INVENTURE,Finance & Investments,Financials
 INVPRECQ,Castings & Forgings,Industrials
 IOB,Banks - Public Sector,Bank
 IOC,Refineries,Energy
-IOLCP,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+IOLCP,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 IONEXCHANG,Engineering - Turnkey Services,Industrials
-IPCALAB,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+IPCALAB,Pharmaceuticals - Indian - Formulations,Healthcare
 IPL,Pesticides / Agrochemicals - Indian,Chemicals
 IRB,Construction,Industrials
 IRCON,Construction,Industrials
@@ -1014,7 +1014,7 @@ IXIGO,Travel Agencies,I.T
 IZMO,Computers - Software - Medium / Small,I.T
 J&KBANK,Banks - Private Sector,Bank
 JAGRAN,Entertainment / Electronic Media Software,Media
-JAGSNPHARM,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+JAGSNPHARM,Pharmaceuticals - Indian - Formulations,Healthcare
 JAIBALAJI,Steel - Large,Metals & Mining
 JAICORPLTD,Plastics Products,Plastic Products
 JAINREC,Mining / Minerals / Metals,Metals & Mining
@@ -1027,7 +1027,7 @@ JAYBARMARU,Auto Ancillaries,Auto
 JAYKAY,Engineering,Aerospace & Defence
 JAYNECOIND,Steel - Large,Metals & Mining
 JAYSREETEA,Tea,Fmcg
-JBCHEPHARM,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+JBCHEPHARM,Pharmaceuticals - Indian - Formulations,Healthcare
 JBMA,Auto Ancillaries,Auto
 JETFREIGHT,Transport - Airlines,Transportation
 JGCHEM,Chemicals,Chemicals
@@ -1139,7 +1139,7 @@ KNRCON,Construction,Industrials
 KOHINOOR,Food - Processing - Indian,Fmcg
 KOKUYOCMLN,Printing & Stationery,Miscellaneous
 KOLTEPATIL,Construction,Industrials
-KOPRAN,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+KOPRAN,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 KOTAKBANK,Banks - Private Sector,Bank
 KOTHARIPET,Petrochemicals,Energy
 KOTHARIPRO,Trading,Services
@@ -1150,7 +1150,7 @@ KPEL,Engineering - Turnkey Services,Industrials
 KPIGREEN,Power Generation And Supply,Power & Utilities
 KPIL,Transmisson Line Towers / Equipment,Industrials
 KPITTECH,Computers - Software - Medium / Small,I.T
-KPL,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+KPL,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 KPRMILL,Textiles - Products,Consumer Discretionary
 KRBL,Food - Processing - Indian,Fmcg
 KREBSBIO,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
@@ -1186,10 +1186,10 @@ LANCORHOL,Construction,Industrials
 LANDMARK,Trading,Consumer Discretionary
 LANDSMILL,Trading,Services
 LAOPALA,Glass & Glass Products,Building Materials
-LASA,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+LASA,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 LATENTVIEW,Computers - Software - Medium / Small,I.T
 LATTEYS,Pumps,Industrials
-LAURUSLABS,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+LAURUSLABS,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 LAXMICOT,Textiles - Cotton/Blended,Textiles
 LAXMIDENTL,Healthcare,Healthcare
 LAXMIINDIA,Finance & Investments,Financials
@@ -1229,10 +1229,10 @@ LTM,Computers - Software - Large,I.T
 LTTS,Computers - Software - Large,I.T
 LUMAXIND,Auto Ancillaries,Auto
 LUMAXTECH,Auto Ancillaries,Auto
-LUPIN,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+LUPIN,Pharmaceuticals - Indian - Formulations,Healthcare
 LUXIND,Textiles - Composite,Textiles
 LXCHEM,Chemicals,Chemicals
-LYKALABS,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+LYKALABS,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 LYPSAGEMS,Diamond Cutting / Jewellery,Consumer Discretionary
 M&M,Automobiles - Passenger Cars,Auto
 M&MFIN,Finance & Investments,Financials
@@ -1267,11 +1267,11 @@ MANALIPETC,Petrochemicals,Energy
 MANAPPURAM,Finance & Investments,Financials
 MANBA,Finance & Investments,Financials
 MANCREDIT,Finance & Investments,Financials
-MANGALAM,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+MANGALAM,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 MANGLMCEM,Cement - North India,Building Materials
 MANINDS,Steel - Medium / Small,Metals & Mining
 MANINFRA,Construction,Industrials
-MANKIND,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+MANKIND,Pharmaceuticals - Indian - Formulations,Healthcare
 MANOMAY,Textiles - Products,Textiles
 MANORAMA,Food - Processing - Indian,Fmcg
 MANORG,Chemicals,Chemicals
@@ -1309,7 +1309,7 @@ MCX,Miscellaneous,Financials
 MEDANTA,Healthcare,Healthcare
 MEDIASSIST,Miscellaneous,Miscellaneous
 MEDICAMEQ,Pharmaceuticals - Indian - Formulations,Healthcare
-MEDICO,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+MEDICO,Pharmaceuticals - Indian - Formulations,Healthcare
 MEDPLUS,Trading,Consumer Discretionary
 MEESHO,Miscellaneous,I.T
 MEGASTAR,Food - Processing - Indian,Fmcg
@@ -1355,7 +1355,7 @@ MONARCH,Finance & Investments,Financials
 MONEYBOXX,Finance & Investments,Financials
 MONTECARLO,Textiles - Products,Textiles
 MORARJEE,Textiles - Products,Textiles
-MOREPENLAB,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+MOREPENLAB,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 MOSCHIP,Computers - Hardware,I.T
 MOTHERSON,Auto Ancillaries,Auto
 MOTILALOFS,Finance & Investments,Financials
@@ -1393,8 +1393,8 @@ NAHARPOLY,Packaging,Industrials
 NAHARSPING,Textiles - Cotton/Blended,Textiles
 NAM-INDIA,Finance & Investments,Financials
 NARMADA,Miscellaneous,Fmcg
-NATCAPSUQ,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
-NATCOPHARM,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+NATCAPSUQ,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
+NATCOPHARM,Pharmaceuticals - Indian - Formulations,Healthcare
 NATHBIOGEN,Miscellaneous,Fmcg
 NATIONALUM,Aluminium And Aluminium Products,Metals & Mining
 NATIONSTD,Construction,Industrials
@@ -1416,7 +1416,7 @@ NDRAUTO,Auto Ancillaries,Auto
 NDTV,Entertainment / Electronic Media Software,Media
 NEAGI,Tea,Fmcg
 NECCLTD,Miscellaneous,Transportation
-NECLIFE,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+NECLIFE,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 NELCAST,Castings & Forgings,Industrials
 NELCO,Telecommunications - Service Provider,Telecom
 NEOGEN,Chemicals,Chemicals
@@ -1494,14 +1494,14 @@ OMNI,Engineering,Industrials
 OMPOWER,Transmisson Line Towers / Equipment,Industrials
 ONELIFECAP,Finance & Investments,Financials
 ONEPOINT,Computers - Software - Medium / Small,I.T
-ONESOURCE,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+ONESOURCE,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 ONGC,Oil Drilling / Allied Services,Energy
 ONMOBILE,Telecommunications - Service Provider,Telecom-Service
 ONWARDTEC,Computers - Software - Medium / Small,I.T
 OPTIEMUS,Trading,Telecom
 ORBTEXP,Textiles - Processing,Textiles
 ORCHASP,Computers - Software - Medium / Small,I.T
-ORCHPHARMA,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+ORCHPHARMA,Pharmaceuticals - Indian - Formulations,Healthcare
 ORICONENT,Packaging,Industrials
 ORIENTALTL,Trading,Services
 ORIENTBELL,Ceramics - Tiles / Sanitaryware,Building Materials
@@ -1515,7 +1515,7 @@ ORIENTTECH,Computers - Software - Medium / Small,I.T
 ORISSAMINE,Mining / Minerals / Metals,Metals & Mining
 ORKLAINDIA,Food - Processing - Indian,Fmcg
 ORTEL,Entertainment / Electronic Media Software,Media
-ORTINGLOBE,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+ORTINGLOBE,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 OSIAHYPER,Trading,Consumer Discretionary
 OSWALAGRO,Trading,Services
 OSWALGREEN,Diversified - Medium / Small,Miscellaneous
@@ -1527,7 +1527,7 @@ PAISALO,Finance & Investments,Financials
 PAKKA,Paper,Building Materials
 PALASHSECU,Finance & Investments,Financials
 PALREDTEC,Trading,Services
-PANACEABIO,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+PANACEABIO,Pharmaceuticals - Indian - Formulations,Healthcare
 PANACHE,Computers - Hardware,I.T
 PANAMAPET,Petrochemicals,Energy
 PANSARI,Construction,Industrials
@@ -1605,7 +1605,7 @@ POWERINDIA,Electric Equipment,Industrials
 POWERMECH,Engineering - Turnkey Services,Industrials
 PPAP,Auto Ancillaries,Auto
 PPL,Plastics Products,Plastic Products
-PPLPHARMA,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+PPLPHARMA,Pharmaceuticals - Indian - Formulations,Healthcare
 PRABHA,Oil Drilling / Allied Services,Energy
 PRADPME,Castings & Forgings,Industrials
 PRAENG,Diversified - Medium / Small,Miscellaneous
@@ -1742,7 +1742,7 @@ ROSSTECH,Engineering,Aerospace & Defence
 ROTO,Pumps,Industrials
 ROUTE,Computers - Software - Medium / Small,I.T
 RPEL,Refractories / Intermediates,Building Materials
-RPGLIFE,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+RPGLIFE,Pharmaceuticals - Indian - Formulations,Healthcare
 RPOWER,Power Generation And Supply,Power & Utilities
 RPPINFRA,Construction,Industrials
 RPPL,Packaging,Industrials
@@ -1781,9 +1781,9 @@ SAGILITY,Computers - Software - Medium / Small,I.T
 SAHLIBHFI,Finance & Investments,Financials
 SAHYADRI,Cement Products,Building Materials
 SAIL,Steel - Large,Metals & Mining
-SAILIFE,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+SAILIFE,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 SAIPARENT,Pharmaceuticals - Indian - Formulations,Healthcare
-SAKAR,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+SAKAR,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 SAKHTISUG,Sugar,Fmcg
 SAKSOFT,Computers - Software - Medium / Small,I.T
 SAKUMA,Trading,Services
@@ -1904,7 +1904,7 @@ SHYAMTEL,Trading,Services
 SICAGEN,Trading,Services
 SICALLOG,Miscellaneous,Transportation
 SIEMENS,Electric Equipment,Industrials
-SIGACHI,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+SIGACHI,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 SIGIND,Trading,Services
 SIGMA,Computers - Software - Medium / Small,I.T
 SIGMAADV,Electronics - Components,Aerospace & Defence
@@ -1943,7 +1943,7 @@ SMSPHARMA,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 SNOWMAN,Miscellaneous,Transportation
 SOBHA,Construction,Realty
 SOFTTECH,Computers - Software - Medium / Small,I.T
-SOLARA,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+SOLARA,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 SOLARINDS,Chemicals,Aerospace & Defence
 SOLARWORLD,Engineering - Turnkey Services,Power & Utilities
 SOLEX,Electric Equipment,Industrials
@@ -1979,7 +1979,7 @@ SSDL,Trading,Textiles
 SSWL,Auto Ancillaries,Auto
 STALLION,Chemicals,Chemicals
 STANLEY,Miscellaneous,Consumer Discretionary
-STAR,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+STAR,Pharmaceuticals - Indian - Formulations,Healthcare
 STARCEMENT,Cement - North India,Building Materials
 STARHEALTH,Finance & Investments,Financials
 STARPAPER,Paper,Building Materials
@@ -2002,7 +2002,7 @@ SUBEXLTD,Computers - Software - Medium / Small,I.T
 SUBROS,Auto Ancillaries,Auto
 SUDARCOLOR,Dyes And Pigments,Chemicals
 SUDARSCHEM,Dyes And Pigments,Chemicals
-SUDEEPPHRM,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+SUDEEPPHRM,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 SUKHJITS,Miscellaneous,Fmcg
 SULA,Breweries & Distilleries,Fmcg
 SUMEETINDS,Textiles - Manmade,Textiles
@@ -2016,7 +2016,7 @@ SUNDRMBRAK,Auto Ancillaries,Auto
 SUNDRMFAST,Auto Ancillaries,Auto
 SUNDROP,Food - Processing - Indian,Fmcg
 SUNFLAG,Steel - Medium / Small,Metals & Mining
-SUNPHARMA,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+SUNPHARMA,Pharmaceuticals - Indian - Formulations,Healthcare
 SUNTECK,Construction,Realty
 SUNTV,Entertainment / Electronic Media Software,Media
 SUPERHOUSE,Leather / Leather Products,Consumer Discretionary
@@ -2026,7 +2026,7 @@ SUPREME,Construction,Industrials
 SUPREMEENG,Steel - Medium / Small,Metals & Mining
 SUPREMEIND,Plastics Products,Plastic Products
 SUPREMEINF,Engineering - Turnkey Services,Industrials
-SUPRIYA,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+SUPRIYA,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 SURAJEST,Construction,Industrials
 SURAJLTD,Steel - Medium / Small,Metals & Mining
 SURAKSHA,Healthcare,Healthcare
@@ -2050,7 +2050,7 @@ SWELECTES,Electric Equipment,Industrials
 SWIGGY,Miscellaneous,I.T
 SWSOLAR,Engineering - Turnkey Services,Industrials
 SYMPHONY,Domestic Appliances,Consumer Discretionary
-SYNCOMF,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+SYNCOMF,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 SYNGENE,Miscellaneous,Healthcare
 SYRMA,Electronics - Components,Consumer Discretionary
 SYSTMTXC,Finance & Investments,Financials
@@ -2110,7 +2110,7 @@ THANGAMAYL,Diamond Cutting / Jewellery,Consumer Discretionary
 THEINVEST,Finance & Investments,Financials
 THEJO,Engineering,Industrials
 THELEELA,Leisure - Restaurants,Leisure Services
-THEMISMED,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+THEMISMED,Pharmaceuticals - Indian - Formulations,Healthcare
 THERMAX,Electric Equipment,Industrials
 THOMASCOOK,Travel Agencies,Miscellaneous
 THOMASCOTT,Textiles - Products,Consumer Discretionary
@@ -2191,7 +2191,7 @@ ULTRAMAR,Dyes And Pigments,Chemicals
 UMAEXPORTS,Trading,Services
 UMESLTD,Computers - Education,I.T
 UMIYA-MRO,Telecommunications - Equipment,Telecom
-UNICHEMLAB,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+UNICHEMLAB,Pharmaceuticals - Indian - Formulations,Healthcare
 UNIDT,Engineering,Industrials
 UNIECOM,Computers - Software - Medium / Small,I.T
 UNIENTER,Trading,Services
@@ -2220,9 +2220,9 @@ UYFINCORP,Finance & Investments,Financials
 V2RETAIL,Textiles - Products,Consumer Discretionary
 VADILALIND,Food - Processing - Indian,Fmcg
 VAIBHAVGBL,Diamond Cutting / Jewellery,Consumer Discretionary
-VAISHALI,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+VAISHALI,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 VAKRANGEE,Computers - Software - Medium / Small,I.T
-VALIANTLAB,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+VALIANTLAB,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 VALIANTORG,Chemicals,Chemicals
 VAML,Aluminium And Aluminium Products,Metals & Mining
 VARDHACRLC,Textiles - Manmade,Textiles
@@ -2260,7 +2260,7 @@ VIMTALABS,Miscellaneous,Healthcare
 VINATIORGA,Chemicals,Chemicals
 VINCOFE,Trading,Consumer Discretionary
 VINDHYATEL,Construction,Industrials
-VINEETLAB,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+VINEETLAB,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 VINNY,Textiles - Processing,Textiles
 VINYLINDIA,Trading,Chemicals
 VIPCLOTHNG,Textiles - Products,Textiles
@@ -2275,8 +2275,8 @@ VISL,Steel - Medium / Small,Metals & Mining
 VITAL,Chemicals,Chemicals
 VIVIANA,Transmisson Line Towers / Equipment,Industrials
 VIVIDHA,Trading,Services
-VIVIMEDLAB,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
-VIYASH,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+VIVIMEDLAB,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
+VIYASH,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 VLEGOV,Computers - Software - Medium / Small,I.T
 VLSFINANCE,Finance & Investments,Financials
 VMART,Trading,Consumer Discretionary
@@ -2299,7 +2299,7 @@ WAAREERTL,Engineering - Turnkey Services,Power & Utilities
 WABAG,Engineering - Turnkey Services,Industrials
 WAKEFIT,Textiles - Jute - Yarn / Products,Textiles
 WALCHANNAG,Engineering,Industrials
-WANBURY,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+WANBURY,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 WCIL,Miscellaneous,Transportation
 WEALTH,Finance & Investments,Financials
 WEBELSOLAR,Electric Equipment,Industrials
@@ -2320,7 +2320,7 @@ WINDMACHIN,Engineering,Industrials
 WINSOME,Textiles - Cotton/Blended,Textiles
 WIPL,Miscellaneous,Building Materials
 WIPRO,Computers - Software - Large,I.T
-WOCKPHARMA,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+WOCKPHARMA,Pharmaceuticals - Indian - Formulations,Healthcare
 WONDERLA,Recreation / Amusement Parks,Media
 WORTHPERI,Packaging,Industrials
 WPIL,Engineering - Turnkey Services,Industrials
@@ -2345,12 +2345,12 @@ ZENSARTECH,Computers - Software - Medium / Small,I.T
 ZENTEC,Miscellaneous,Aerospace & Defence
 ZFCVINDIA,Auto Ancillaries,Auto
 ZFSTEERING,Auto Ancillaries,Auto
-ZIMLAB,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+ZIMLAB,Pharmaceuticals - Indian - Bulk Drugs,Healthcare
 ZODIAC,Engineering - Turnkey Services,Industrials
 ZODIACLOTH,Textiles - Products,Consumer Discretionary
-ZOTA,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+ZOTA,Pharmaceuticals - Indian - Formulations,Healthcare
 ZSARACOM,Finance & Investments,Financials
 ZUARI,Fertilizers,Chemicals
 ZUARIIND,Sugar,Fmcg
-ZYDUSLIFE,Pharmaceuticals - Indian - Bulk Drugs & Formln,Healthcare
+ZYDUSLIFE,Pharmaceuticals - Indian - Formulations,Healthcare
 ZYDUSWELL,Food - Processing - Indian,Fmcg
