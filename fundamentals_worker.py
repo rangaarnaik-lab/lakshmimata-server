@@ -2523,21 +2523,39 @@ async def _announcements_loop(session: aiohttp.ClientSession):
     fetch_nse_announcements's docstring for the caveat about field names
     not being independently verified yet — first several cycles log the
     raw response shape for confirmation."""
-    CHECK_INTERVAL = 5 * 60  # 5 minutes — near-real-time for watchlist alerts, while staying polite to NSE (faster polling risks an IP block, after which the feed goes silent entirely)
+    CHECK_INTERVAL = int(os.getenv('ANNOUNCEMENTS_CHECK_INTERVAL_SECONDS', '60'))
+    # Testing a faster interval (default 60s, was a flat 5 min) per
+    # explicit user request on 2026-08-10, despite the documented risk
+    # noted below - NSE's site can block an IP for polling too
+    # aggressively, after which the feed goes silent (empty/error
+    # responses) entirely. consecutive_empty tracks this: a handful of
+    # empty cycles is normal (no new announcements in that window), but
+    # a long unbroken streak is the actual signal of a block, not
+    # something to squint at manually in the raw logs.
     table_ready = await ensure_announcements_table(session)
     if not table_ready:
         log.error("corporate_announcements table unavailable — announcements loop cannot proceed.")
         return
     cycle = 0
+    consecutive_empty = 0
     while True:
         try:
             cycle += 1
             rows = await fetch_nse_announcements(session, debug=(cycle <= 3))
             if rows:
+                consecutive_empty = 0
                 await enrich_and_save_announcements(session, rows)
                 await _upload_announcements_snapshot(session)
             else:
-                log.info("📢 No announcements fetched this cycle (empty result or fetch failed).")
+                consecutive_empty += 1
+                log.info(f"📢 No announcements fetched this cycle (empty result or fetch failed) "
+                          f"— {consecutive_empty} in a row.")
+                if consecutive_empty in (10, 20, 40):
+                    log.error(f"⚠️ Announcements loop: {consecutive_empty} consecutive empty cycles "
+                                f"at {CHECK_INTERVAL}s interval - possible NSE IP block. Check "
+                                f"_fetch_error_counts (nse_announcements_status_* keys) in the next "
+                                f"periodic breakdown log. If confirmed, raise "
+                                f"ANNOUNCEMENTS_CHECK_INTERVAL_SECONDS back toward 300.")
         except Exception as e:
             import traceback
             log.error(f"Announcements loop cycle failed: {e}\n{traceback.format_exc()}")
