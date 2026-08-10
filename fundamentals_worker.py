@@ -2513,7 +2513,9 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
                                   f"already={len(already)}) — sleeping {idle}s until next check")
                     await asyncio.sleep(max(60, idle))
         else:
-            await asyncio.sleep(120 if todo else 300)
+            idle_wait = int(os.getenv('RESULTS_STEADY_IDLE_SECONDS', '90'))
+            busy_wait = int(os.getenv('RESULTS_STEADY_BUSY_SECONDS', '60'))
+            await asyncio.sleep(busy_wait if todo else idle_wait)
 
 async def _announcements_loop(session: aiohttp.ClientSession):
     """Fetches NSE's corporate announcements feed (all equities in one
