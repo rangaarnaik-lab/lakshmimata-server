@@ -428,13 +428,9 @@ async def backfill_sector_history_30days(session: aiohttp.ClientSession, target_
     isn't "reconstruct from scratch", it's "roll up data that was already
     sitting there the whole time, just never aggregated".
 
-    Deliberately mirrors build_sector_rs()'s exact membership rule (only
-    symbols listed in SECTOR_MAP, ~20 sectors) rather than each stock's
-    broader get_sector()-derived sector field stored in stock_history —
-    matching that was a deliberate choice (see conversation: "leave
-    build_sector_rs as-is, 20 curated sectors only"), so backfilled days
-    and future live-written days show the same sector universe instead of
-    the count changing day to day depending on which code wrote it.
+    Mirrors build_sector_rs() membership: every symbol whose get_sector()
+    name matches (not only the hand-picked SECTOR_MAP lists), so
+    backfilled days match live sector ranks / expand lists.
     """
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
 
@@ -496,12 +492,23 @@ async def backfill_sector_history_30days(session: aiohttp.ClientSession, target_
             continue
         by_date.setdefault(d, {})[row['sym']] = row
 
+    # Precompute symbol → sector once (get_sector hits SECTOR_MAP then lookup).
+    all_syms = {r['sym'] for r in all_rows if r.get('sym')}
+    sym_sector = {sym: get_sector(sym) for sym in all_syms}
+
     sector_history_rows = []
     for d, sym_map in by_date.items():
+        by_sec: dict[str, list] = {}
+        for sym, row in sym_map.items():
+            if row.get('rs_tv') is None:
+                continue
+            sec = (sym_sector.get(sym) or '').strip()
+            if not sec or sec == 'Other':
+                continue
+            by_sec.setdefault(sec, []).append(row)
         sector_agg = {}
-        for sector_name, syms in SECTOR_MAP.items():
-            members = [sym_map[s] for s in syms if s in sym_map and sym_map[s].get('rs_tv') is not None]
-            if not members:
+        for sector_name, members in by_sec.items():
+            if len(members) < 3:
                 continue
             avg_rs = round(sum(m['rs_tv'] for m in members) / len(members))
             pp_count = sum(1 for m in members if m.get('is_pp'))
@@ -530,8 +537,8 @@ async def backfill_sector_history_30days(session: aiohttp.ClientSession, target_
         log.info(f"✅ sector_history backfill complete: {len(by_date)} trading days, "
                  f"{len(sector_history_rows)} sector-day rows saved")
     else:
-        log.error("sector_history backfill: computed zero rows (no SECTOR_MAP symbols found in "
-                   "stock_history?), aborting")
+        log.error("sector_history backfill: computed zero rows (no sector-tagged symbols "
+                   "found in stock_history?), aborting")
 
 async def backfill_stock_history_30days(session: aiohttp.ClientSession, target_days: int = 30):
     """
@@ -829,10 +836,35 @@ async def backfill_stock_history_30days(session: aiohttp.ClientSession, target_d
     gc.collect()
 
 def build_sector_rs(processed: list, sector_map: dict) -> list:
+    """Equal-weight Avg RS per sector.
+
+    Membership = every processed stock whose get_sector() name matches
+    (same universe the UI shows on sector/index expand). Previously only
+    the hand-picked SECTOR_MAP list (~10 Auto names) was averaged while
+    expand showed ~100 Auto-tagged stocks — so Indices / Sectors /
+    Industries could disagree on whether Auto was 'leading'.
+    """
+    by_sector: dict[str, list] = {}
+    for s in processed:
+        sec = (s.get('sector') or '').strip()
+        if not sec or sec == 'Other':
+            continue
+        by_sector.setdefault(sec, []).append(s)
+
+    # Prefer curated SECTOR_MAP names first (stable leaders list), then
+    # any other real sectors that have enough members.
+    preferred = list(sector_map.keys())
+    extras = sorted(k for k in by_sector if k not in preferred)
+    sector_names = preferred + extras
+
     sectors = []
-    for sector, syms in sector_map.items():
-        members = [s for s in processed if s['sym'] in syms]
-        if not members:
+    for sector in sector_names:
+        members = by_sector.get(sector) or []
+        # Fallback for a curated name that somehow has no tagged stocks
+        if not members and sector in sector_map:
+            syms = set(sector_map[sector])
+            members = [s for s in processed if s.get('sym') in syms]
+        if len(members) < 3:
             continue
         avg_rs   = round(sum(s['rs'] for s in members) / len(members))
         pp_count = sum(1 for s in members if s.get('is_pp'))
@@ -840,10 +872,6 @@ def build_sector_rs(processed: list, sector_map: dict) -> list:
         top5     = sorted(members, key=lambda x: x['rs'], reverse=True)[:5]
 
         # Breadth — % of this sector's stocks advancing at each timeframe.
-        # Matches the "Segment Advances %" concept: not just "is the
-        # sector index up", but "how broad is the move across its members"
-        # (a sector up 2% on one large-cap carrying it looks very
-        # different from one up 2% with 80% of members participating).
         def advance_pct(field):
             vals = [s.get(field) for s in members if s.get(field) is not None]
             if not vals:
