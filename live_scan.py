@@ -4840,55 +4840,55 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         # Save to Supabase so frontend can poll and show notifications
         await supabase_upsert(session, 'squeeze_alerts', new_fires, on_conflict='sym,fired_at')
 
-    # Step 5.4b: Detect NEW HY/HT volume-climax fires, same state-transition
-    # pattern as squeeze/VCP above but tracked separately (see
-    # prev_hy_ht_state) — reuses the same squeeze_alerts table + frontend
-    # notification pipeline rather than a new one, since both are just
-    # "tell me the moment this signal turns on" alerts.
+    # Step 5.4b: Detect NEW signal fires (HY/HT/PP/Stage2/Guppy) via
+    # state-transition — reuses squeeze_alerts + frontend notification
+    # pipeline. One row per signal type so users can enable/disable each
+    # type independently. fired_at microsecond offsets avoid (sym,fired_at)
+    # collisions with squeeze/VCP and across multiple signals on one stock.
     global prev_hy_ht_state
-    new_vol_fires = []
-    # fired_at is offset by 1 microsecond from the squeeze/VCP block above —
-    # both use the same fixed now_ist for this scan, and the on_conflict key
-    # is (sym, fired_at). Without this offset, a stock that fires BOTH a
-    # squeeze/VCP signal and an HY/HT signal in the same scan would collide
-    # on that key and the second upsert would silently overwrite the first
-    # alert instead of creating two.
-    hy_ht_fired_at = (now_ist + timedelta(microseconds=1)).isoformat()
+    new_signal_fires = []
+    # Fixed per-type offsets from now_ist (squeeze uses +0).
+    _SIGNAL_SPECS = (
+        ('hy',    'is_hy',                       'HY',       1),
+        ('ht',    'is_ht',                       'HT',       2),
+        ('pp',    'is_pp',                       'PP',       3),
+        ('s2',    'is_s2_new_entry',             'Stage 2',  4),
+        ('guppy', 'is_guppy_bullish_crossover',  'Guppy',    5),
+    )
     for s in processed:
         sym = s['sym']
-        hy_fired = s.get('is_hy', False)
-        ht_fired = s.get('is_ht', False)
-        prev = prev_hy_ht_state.get(sym, {'hy': False, 'ht': False})
-
-        new_hy = hy_fired and not prev['hy']
-        new_ht = ht_fired and not prev['ht']
-
-        if new_hy or new_ht:
-            fire_type = []
-            if new_hy: fire_type.append('HY')
-            if new_ht: fire_type.append('HT')
-            new_vol_fires.append({
-                'sym':        sym,
-                'fire_type':  ', '.join(fire_type),
-                'rs_tv':      s.get('rs_tv'),
-                'rs':         s.get('rs'),
-                'last_price': s.get('last_price'),
-                'chg_pct':    s.get('chg_pct'),
-                'sector':     s.get('sector'),
-                'fired_at':   hy_ht_fired_at,
-            })
+        prev = prev_hy_ht_state.get(sym, {})
+        for key, field, label, us_off in _SIGNAL_SPECS:
+            fired = bool(s.get(field, False))
+            if fired and not prev.get(key, False):
+                new_signal_fires.append({
+                    'sym':        sym,
+                    'fire_type':  label,
+                    'rs_tv':      s.get('rs_tv'),
+                    'rs':         s.get('rs'),
+                    'last_price': s.get('last_price'),
+                    'chg_pct':    s.get('chg_pct'),
+                    'sector':     s.get('sector'),
+                    'fired_at':   (now_ist + timedelta(microseconds=us_off)).isoformat(),
+                })
 
     prev_hy_ht_state = {
         s['sym']: {
-            'hy': s.get('is_hy', False),
-            'ht': s.get('is_ht', False),
+            'hy':    bool(s.get('is_hy', False)),
+            'ht':    bool(s.get('is_ht', False)),
+            'pp':    bool(s.get('is_pp', False)),
+            's2':    bool(s.get('is_s2_new_entry', False)),
+            'guppy': bool(s.get('is_guppy_bullish_crossover', False)),
         }
         for s in processed
     }
 
-    if new_vol_fires:
-        log.info(f"  🔊 {len(new_vol_fires)} NEW HY/HT fires: {[f['sym'] for f in new_vol_fires]}")
-        await supabase_upsert(session, 'squeeze_alerts', new_vol_fires, on_conflict='sym,fired_at')
+    if new_signal_fires:
+        log.info(
+            f"  🔊 {len(new_signal_fires)} NEW signal fires: "
+            f"{[(f['sym'], f['fire_type']) for f in new_signal_fires[:20]]}"
+        )
+        await supabase_upsert(session, 'squeeze_alerts', new_signal_fires, on_conflict='sym,fired_at')
 
     # Step 5.5: Market Breadth metrics
     # These give a pulse on overall market health

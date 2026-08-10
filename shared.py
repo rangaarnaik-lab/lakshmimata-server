@@ -494,13 +494,10 @@ _r2_size_diagnostic_logged = False
 # Format: {sym: {'bb': bool, 'vcp': bool}}
 prev_squeeze_state: dict = {}
 
-# ── HY/HT volume-climax fire state tracking ──────────────────────────
+# ── Signal fire state tracking (HY/HT/PP/Stage2/Guppy) ───────────────
 # Same "only alert on the transition into firing" pattern as squeeze
-# state above, tracked separately so a stock that stays HY/HT for
-# several scans in a row (common — these are daily volume-vs-history
-# ratios, not instantaneous events) only triggers one notification at
-# the moment it turns on, not every single scan while it's true.
-# Format: {sym: {'hy': bool, 'ht': bool}}
+# state above. Format:
+# {sym: {'hy': bool, 'ht': bool, 'pp': bool, 's2': bool, 'guppy': bool}}
 prev_hy_ht_state: dict = {}
 
 
