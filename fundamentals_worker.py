@@ -562,8 +562,18 @@ def _gemini_batch_key_pool() -> tuple[str, ...]:
     for feat in priority_feats:
         if feat == '':
             k = (os.getenv('GEMINI_API_KEY') or '').strip()
+        elif feat == 'ABOUT':
+            # Prefer dedicated About key (Railway Key1 / KEY1) in the shared pool
+            # so PPT/Concall/Results keep working when only Key1 is set.
+            k = _gemini_about_dedicated_key() or (os.getenv('GEMINI_API_KEY_ABOUT') or '').strip()
         else:
             k = (os.getenv(f'GEMINI_API_KEY_{feat}') or '').strip()
+        if k and k not in seen:
+            keys.append(k)
+            seen.add(k)
+    # Always pull Key1 / KEY1 into the pool even if ABOUT wasn't in features.
+    for name in ('Key1', 'KEY1', 'GEMINI_API_KEY_KEY1'):
+        k = (os.getenv(name) or '').strip()
         if k and k not in seen:
             keys.append(k)
             seen.add(k)
@@ -2003,12 +2013,20 @@ async def _fetch_skipped_results_pdfs_for_retry(
     return out
 
 
+def _announcement_or_filter(keywords: list[str]) -> str:
+    """Match keyword on subject OR category (same as UI catch-up list)."""
+    parts = []
+    for kw in keywords:
+        parts.append(f'subject.ilike.*{kw}*')
+        parts.append(f'category.ilike.*{kw}*')
+    return '(' + ','.join(parts) + ')'
+
+
 async def _fetch_results_announcement_candidates(
         session: aiohttp.ClientSession, headers: dict,
         since: str, candidates_limit: int) -> list:
     """Page through results-like announcements (PostgREST caps ~1000/req)."""
-    or_filter = '(' + ','.join(
-        f'subject.ilike.*{kw}*' for kw in _RESULTS_ANN_KEYWORDS) + ')'
+    or_filter = _announcement_or_filter(_RESULTS_ANN_KEYWORDS)
     out, page_size, offset = [], min(1000, candidates_limit), 0
     while len(out) < candidates_limit:
         take = min(page_size, candidates_limit - len(out))
@@ -3227,8 +3245,7 @@ async def _ppt_summary_loop(session: aiohttp.ClientSession):
             _ppt_summary_loop._last_catchup = catchup
         try:
             since = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat()
-            or_filter = '(' + ','.join(
-                f'subject.ilike.*{kw}*' for kw in _PPT_ANN_KEYWORDS) + ')'
+            or_filter = _announcement_or_filter(_PPT_ANN_KEYWORDS)
             async with session.get(
                 f"{SUPABASE_URL}/rest/v1/corporate_announcements", headers=headers,
                 params={'select': 'symbol,category,subject,attachment_url,announced_at',
@@ -3373,8 +3390,7 @@ async def _transcript_summary_loop(session: aiohttp.ClientSession):
             _transcript_summary_loop._last_catchup = catchup
         try:
             since = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat()
-            or_filter = '(' + ','.join(
-                f'subject.ilike.*{kw}*' for kw in _TRANSCRIPT_ANN_KEYWORDS) + ')'
+            or_filter = _announcement_or_filter(_TRANSCRIPT_ANN_KEYWORDS)
             async with session.get(
                 f"{SUPABASE_URL}/rest/v1/corporate_announcements", headers=headers,
                 params={'select': 'symbol,category,subject,attachment_url,announced_at',

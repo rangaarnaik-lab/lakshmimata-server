@@ -75,6 +75,8 @@ __all__ = [
     'UPDATE_INTERVAL',
     '_AI_PICKS_REFRESH_INTERVAL_SEC',
     '_AI_PICKS_TOP_N',
+    '_AI_PICKS_SHORTLIST_N',
+    '_AI_PICKS_AI_KEEP_N',
     '_ANN_NEGATIVE_PATTERNS',
     '_ANN_POSITIVE_PATTERNS',
     '_LAST_AI_PICKS_TS',
@@ -473,6 +475,7 @@ _R2_STOCK_FIELDS = frozenset({
     'mgmt_verdict','mgmt_summary','mgmt_flags','mgmt_flags_at',
     'rs_hist','rs_trend','rs_slope',
     'is_pp','pp_hist','pp_count_10d','pp_vol_ratio','ma10','ma50',
+    'is_bull_snort','bull_snort_vol_ratio',
     'is_hy','hy_pct','volume','hy_hist',
     'is_ht','ht_pct','ht_hist','ibv_hist',
     'near_ema9','ema9','pct_from_ema9',
@@ -598,7 +601,9 @@ _zero_chg_debug_count = 0  # reset each run_scan cycle — caps zero-chg diagnos
 _LAST_FUNDAMENTALS_SYNC_TS = 0.0
 _LAST_RESULTS_DATES_SYNC_TS = 0.0
 _AI_PICKS_REFRESH_INTERVAL_SEC = 3600  # ranking + rationale refresh at most hourly
-_AI_PICKS_TOP_N = 30
+_AI_PICKS_TOP_N = 5                    # final published list size (what UI shows)
+_AI_PICKS_SHORTLIST_N = 10             # scored candidates fed to AI (pass 10)
+_AI_PICKS_AI_KEEP_N = 5                # AI recommends top 5 from that 10
 
 # ── Announcement enrichment + 1-month history backfill ──────────────────
 _ANN_POSITIVE_PATTERNS = [

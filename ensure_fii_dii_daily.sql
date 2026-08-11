@@ -1,5 +1,6 @@
 -- Daily NSE cash-market FII/FPI & DII flows (₹ Crore).
--- Populated by live_scan.fetch_and_store_fii_dii_daily (NSE + history fallback).
+-- Populated by live_scan.fetch_and_store_fii_dii_daily (NSE + ~6mo history-full).
+-- One-shot history: run backfill_fii_dii_6months.sql after this table exists.
 -- Frontend: Market Overview mini card + Smart Money → Daily FII/DII panel.
 
 CREATE TABLE IF NOT EXISTS public.fii_dii_daily (

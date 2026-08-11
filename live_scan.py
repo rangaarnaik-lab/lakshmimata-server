@@ -23,22 +23,28 @@ def _template_pick_reasoning(r: dict) -> str:
     lists whichever strong signals actually fired. Plain and mechanical
     rather than natural language, but still informative."""
     bits = []
-    if r.get('weinstein_stage') == 2:
+    if r.get('is_s2_new_entry'):
+        bits.append('new Stage-2 entry')
+    elif r.get('weinstein_stage') == 2:
         bits.append('Stage-2 uptrend')
+    rs = r.get('rs_tv') or r.get('rs')
+    if isinstance(rs, (int, float)) and rs >= 70:
+        bits.append(f'RS {int(rs)}')
+    flabel = r.get('fundamental_label')
+    fscore = r.get('fundamental_score')
+    if flabel in ('Excellent', 'Good'):
+        bits.append(f'Fund {flabel}' + (f' {int(fscore)}' if isinstance(fscore, (int, float)) else ''))
+    rr = r.get('result_rating')
+    if rr in ('Excellent', 'Good'):
+        bits.append(f'Result {rr}')
     if r.get('vcp_fired'):
         bits.append('VCP breakout')
     if r.get('is_resistance_breakout'):
         bits.append('resistance breakout')
     if r.get('is_cup_handle_breakout'):
         bits.append('cup & handle breakout')
-    rs = r.get('rs_tv') or r.get('rs')
-    if isinstance(rs, (int, float)) and rs >= 80:
-        bits.append(f'RS {int(rs)}')
     if isinstance(r.get('rvol'), (int, float)) and r['rvol'] >= 1.5:
         bits.append(f"{r['rvol']:.1f}x volume")
-    eps_qoq, eps_yoy = r.get('eps_qoq'), r.get('eps_yoy')
-    if isinstance(eps_qoq, (int, float)) and isinstance(eps_yoy, (int, float)) and eps_qoq > 0 and eps_yoy > 0:
-        bits.append('EPS growing QoQ & YoY')
     if r.get('promoter_trend') == 'increasing':
         bits.append('promoter buying')
     if r.get('is_canslim'):
@@ -47,7 +53,7 @@ def _template_pick_reasoning(r: dict) -> str:
         bits.append('PEAD')
     if not bits:
         bits.append('high composite score across signals')
-    return ' + '.join(bits[:3])
+    return ' + '.join(bits[:4])
 
 def atr(highs: list, lows: list, closes: list, n: int = 20) -> Optional[float]:
     if len(closes) < n + 1:
@@ -406,12 +412,48 @@ async def _fetch_fiidii_history_fallback(session: aiohttp.ClientSession) -> list
         })
     return rows
 
+async def _fetch_fiidii_history_full(session: aiohttp.ClientSession, months: int = 6) -> list:
+    """~6+ months of daily cash FII/DII (compact keys from history-full)."""
+    url = "https://fii-diidata.mrchartist.com/api/history-full"
+    try:
+        async with session.get(url, headers={"User-Agent": "Mozilla/5.0"},
+                               timeout=aiohttp.ClientTimeout(total=40)) as r:
+            if r.status != 200:
+                log.warning(f"FII/DII history-full HTTP {r.status}")
+                return []
+            data = await r.json(content_type=None)
+    except Exception as e:
+        log.warning(f"FII/DII history-full failed: {e}")
+        return []
+    if not isinstance(data, list):
+        return []
+    cutoff = (datetime.now(timezone.utc).date() - timedelta(days=int(months * 31))).isoformat()
+    rows = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        # Compact: d/fb/fs/fn/db/ds/dn — also accept long keys if format changes
+        day = _parse_fiidii_date(item.get('d') or item.get('date'))
+        if not day or day < cutoff:
+            continue
+        rows.append({
+            'trade_date': day,
+            'fii_buy': _num_cr(item.get('fb', item.get('fii_buy'))),
+            'fii_sell': _num_cr(item.get('fs', item.get('fii_sell'))),
+            'fii_net': _num_cr(item.get('fn', item.get('fii_net'))),
+            'dii_buy': _num_cr(item.get('db', item.get('dii_buy'))),
+            'dii_sell': _num_cr(item.get('ds', item.get('dii_sell'))),
+            'dii_net': _num_cr(item.get('dn', item.get('dii_net'))),
+        })
+    return rows
+
 async def fetch_and_store_fii_dii_daily(session: aiohttp.ClientSession):
     """Populate fii_dii_daily for Market → FII/DII cards.
 
-    UI already reads this table; until this job existed the card stayed
-    empty ('Daily NSE provisional flows appear after market close…').
+    When the table has fewer than ~100 sessions (~5 months), pulls
+    history-full (~6 months) then overlays today's NSE provisional print.
     Run ensure_fii_dii_daily.sql once in Supabase if the table is missing.
+    Optional one-shot: backfill_fii_dii_6months.sql
     """
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
     existing_count = 0
@@ -434,10 +476,17 @@ async def fetch_and_store_fii_dii_daily(session: aiohttp.ClientSession):
         log.warning(f"fii_dii_daily count check failed: {e}")
 
     rows_by_date: dict[str, dict] = {}
-    if existing_count < 10:
-        for row in await _fetch_fiidii_history_fallback(session):
+    # ~126 trading days ≈ 6 months; refill until we have a solid history.
+    if existing_count < 100:
+        full_rows = await _fetch_fiidii_history_full(session, months=6)
+        for row in full_rows:
             rows_by_date[row['trade_date']] = row
-        log.info(f"  FII/DII history fallback loaded {len(rows_by_date)} day(s)")
+        if rows_by_date:
+            log.info(f"  FII/DII 6-month backfill loaded {len(rows_by_date)} day(s)")
+        else:
+            for row in await _fetch_fiidii_history_fallback(session):
+                rows_by_date[row['trade_date']] = row
+            log.info(f"  FII/DII history fallback loaded {len(rows_by_date)} day(s)")
 
     for row in await _fetch_nse_fiidii_latest(session):
         rows_by_date[row['trade_date']] = {**rows_by_date.get(row['trade_date'], {}), **row}
@@ -1359,72 +1408,120 @@ def calc_weinstein_stage(rs: float, trend: str, pct_from_high: float, hist: list
     return 1
 
 def compute_best_pick_score(row: dict) -> float:
-    """Weighted composite score (0-100) from signals already computed
-    during the scan (technical) plus fundamentals_cache (fundamental) —
-    both already merged into `row`. This is a confluence score to
-    surface candidates for the AI rationale pass to explain in plain
-    English, not a prediction or a recommendation. Weighted toward
-    technical strength (this is a momentum scanner), with fundamentals
-    acting as a confirming or penalizing factor."""
+    """Weighted composite score (0-100) for AI Best Picks.
+
+    Four primary pillars (what the product already surfaces elsewhere):
+      1. Stage 2 / new Stage-2 entry   (~0–20)
+      2. RS rating (rs_tv)             (~0–22)
+      3. Fundamental score/label       (~0–20)
+      4. Latest Result rating          (~0–15)
+    plus a smaller technical-confluence bonus (VCP / breakouts / RVOL)
+    and hard penalties for Stage 4 / weak RS / weak results.
+
+    This is a confluence ranker for the AI rationale pass — not a
+    prediction or a buy recommendation.
+    """
     score = 0.0
 
-    # --- Technical (up to ~64 pts) ---
-    if row.get('weinstein_stage') == 2:
-        score += 15
-    if row.get('vcp_fired'):
-        score += 10
-    if row.get('is_resistance_breakout'):
-        score += 8
-    if row.get('is_cup_handle_breakout'):
-        score += 8
-    if row.get('is_guppy_bullish_crossover'):
-        score += 5
-    if row.get('is_52wh_breakout'):
-        score += 5
+    # --- 1) Stage 2 (~0–20, with Stage 4 / 3 penalties) ---
+    stage = row.get('weinstein_stage')
+    if stage == 2:
+        score += 16
+        if row.get('is_s2_new_entry'):
+            score += 4  # fresh Stage-2 entry gets the full 20
+    elif row.get('is_s2_new_entry'):
+        score += 12  # just crossed in even if stage flag lags
+    elif stage == 3:
+        score -= 4
+    elif stage == 4:
+        score -= 16
+
+    # --- 2) RS rating (~0–22) ---
     rs = row.get('rs_tv') if row.get('rs_tv') is not None else row.get('rs')
     if isinstance(rs, (int, float)):
-        score += min(rs, 99) * 0.15  # up to ~15 pts at RS 99
+        if rs >= 90:
+            score += 22
+        elif rs >= 80:
+            score += 18
+        elif rs >= 70:
+            score += 14
+        elif rs >= 60:
+            score += 8
+        elif rs >= 50:
+            score += 4
+    if row.get('is_weak_rs'):
+        score -= 14
+
+    # --- 3) Fundamental score (~0–20) — use the dedicated 0–100 quality score ---
+    fscore = row.get('fundamental_score')
+    flabel = row.get('fundamental_label')
+    if isinstance(fscore, (int, float)):
+        # Map 0–100 → 0–20 (Fair~50 → ~10, Excellent≥75 → ≥15)
+        score += max(0.0, min(20.0, (float(fscore) / 100.0) * 20.0))
+    elif flabel == 'Excellent':
+        score += 18
+    elif flabel == 'Good':
+        score += 14
+    elif flabel == 'Fair':
+        score += 6
+    elif flabel == 'Poor':
+        score -= 8
+
+    # --- 4) Latest Result rating (~0–15) ---
+    rr = row.get('result_rating')
+    if rr == 'Excellent':
+        score += 15
+    elif rr == 'Good':
+        score += 10
+    elif rr == 'Neutral':
+        score += 3
+    elif rr == 'Weak':
+        score -= 10
+
+    # --- Technical confluence bonus (~0–22) — secondary to the four pillars ---
+    if row.get('vcp_fired'):
+        score += 7
+    if row.get('is_resistance_breakout'):
+        score += 5
+    if row.get('is_cup_handle_breakout'):
+        score += 5
+    if row.get('is_guppy_bullish_crossover'):
+        score += 3
+    if row.get('is_52wh_breakout'):
+        score += 3
     rvol = row.get('rvol')
     if isinstance(rvol, (int, float)):
         if rvol >= 2:
-            score += 6
-        elif rvol >= 1.3:
-            score += 3
-
-    # --- Fundamentals (up to ~35 pts, confirming/penalizing) ---
-    eps_qoq, eps_yoy = row.get('eps_qoq'), row.get('eps_yoy')
-    if isinstance(eps_qoq, (int, float)) and isinstance(eps_yoy, (int, float)) and eps_qoq > 0 and eps_yoy > 0:
-        score += 8
-    streak = row.get('eps_growth_streak')
-    if isinstance(streak, (int, float)) and streak >= 2:
-        score += 4
-    sales_qoq, sales_yoy = row.get('sales_qoq'), row.get('sales_yoy')
-    if isinstance(sales_qoq, (int, float)) and isinstance(sales_yoy, (int, float)) and sales_qoq > 0 and sales_yoy > 0:
-        score += 6
-    roe = row.get('roe')
-    if isinstance(roe, (int, float)) and roe >= 15:
-        score += 5
-    debt_eq = row.get('debt_eq')
-    if isinstance(debt_eq, (int, float)):
-        if debt_eq < 1:
             score += 4
-        elif debt_eq > 2:
-            score -= 5
-    if row.get('promoter_trend') == 'increasing':
-        score += 4
-    elif row.get('promoter_trend') == 'decreasing':
-        score -= 5
-    if row.get('fii_trend') == 'increasing' or row.get('dii_trend') == 'increasing':
-        score += 4
-    peg = row.get('peg_ratio')
-    if isinstance(peg, (int, float)) and 0 < peg <= 1.5:
-        score += 4
+        elif rvol >= 1.3:
+            score += 2
 
-    # --- Penalties ---
-    if row.get('is_weak_rs'):
-        score -= 12
+    # Light ownership confirm (not already fully covered by fund score path)
+    if row.get('promoter_trend') == 'increasing':
+        score += 2
+    elif row.get('promoter_trend') == 'decreasing':
+        score -= 3
 
     return round(max(0.0, min(100.0, score)), 1)
+
+
+def _best_pick_eligible(row: dict) -> bool:
+    """Soft gate before ranking — drop clear laggards so top-N isn't
+    filled with Stage-4 / weak-RS names that somehow scraped points
+    from a single breakout flag."""
+    stage = row.get('weinstein_stage')
+    if stage == 4:
+        return False
+    rs = row.get('rs_tv') if row.get('rs_tv') is not None else row.get('rs')
+    if row.get('is_weak_rs') and (not isinstance(rs, (int, float)) or rs < 55):
+        return False
+    if row.get('result_rating') == 'Weak' and stage != 2:
+        return False
+    if row.get('fundamental_label') == 'Poor' and (
+        not isinstance(rs, (int, float)) or rs < 70
+    ):
+        return False
+    return True
 
 def compute_fundamental_score(row: dict) -> float:
     """Pure fundamentals quality score (0-100) — deliberately separate
@@ -1591,7 +1688,8 @@ def compute_pead_tags(row: dict, results_meta: dict = None) -> dict:
 
 async def load_latest_results_dates(session: aiohttp.ClientSession):
     """Load most recent financial_results row per symbol (filed_at +
-    period_ended) into latest_results_cache for PEAD tagging."""
+    period_ended + result_rating) into latest_results_cache for PEAD
+    tagging and AI Best Picks scoring."""
     global latest_results_cache
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
     by_sym: dict = {}
@@ -1602,7 +1700,7 @@ async def load_latest_results_dates(session: aiohttp.ClientSession):
             page_headers = {**headers, "Range": f"{offset}-{offset + PAGE - 1}"}
             async with session.get(
                 f"{SUPABASE_URL}/rest/v1/financial_results",
-                params={'select': 'symbol,period_ended,filed_at'},
+                params={'select': 'symbol,period_ended,filed_at,result_rating'},
                 headers=page_headers,
                 timeout=aiohttp.ClientTimeout(total=60),
             ) as r:
@@ -2033,6 +2131,45 @@ def detect_ibv_signal(volumes: list, live_vol, live_high, live_low, live_close) 
         return False
     return (live_close - live_low) / day_range * 100 > 50
 
+def detect_bull_snort(opens: list, highs: list, lows: list, closes: list, volumes: list) -> dict:
+    """Bull Snort — bullish volume climax on the latest bar.
+
+    Same rules as the chart overlay (frontend detectBullSnortDays):
+    up close, volume ≥ 2× 20-bar volume SMA, close in upper 30% of range.
+    """
+    n = len(closes) if closes else 0
+    result = {'is_bull_snort': False, 'bull_snort_vol_ratio': 0.0}
+    if n < 21 or not volumes or len(volumes) < n:
+        return result
+    i = n - 1
+    hi = highs[i] if highs and len(highs) == n else closes[i]
+    lo = lows[i] if lows and len(lows) == n else closes[i]
+    cl = closes[i]
+    vol = volumes[i]
+    if hi is None or lo is None or cl is None or vol is None:
+        return result
+    if opens and len(opens) == n and opens[i] is not None:
+        op = opens[i]
+    else:
+        op = closes[i - 1] if i > 0 and closes[i - 1] is not None else cl
+    if cl < op:
+        return result
+    day_range = hi - lo
+    if day_range <= 0:
+        return result
+    if (cl - lo) / day_range < 0.7:
+        return result
+    window = volumes[i - 19:i + 1]
+    if len(window) < 20 or any(v is None for v in window):
+        return result
+    avg = sum(window) / 20
+    if avg <= 0:
+        return result
+    ratio = vol / avg
+    result['bull_snort_vol_ratio'] = round(ratio, 2)
+    result['is_bull_snort'] = ratio >= 2.0
+    return result
+
 def detect_pp(prices: list, volumes: list) -> dict:
     n = len(prices)
     result = {
@@ -2405,6 +2542,23 @@ async def ensure_db_columns(session: aiohttp.ClientSession):
                 log.error("     add column if not exists chart_pattern_fired boolean;")
     except Exception as e:
         log.warning(f"DB column check error (chart patterns): {e}")
+
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/stocks?select=is_bull_snort&limit=1",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ DB columns OK — is_bull_snort column exists")
+            elif r.status == 400:
+                log.error("❌ is_bull_snort column MISSING from stocks — run ensure_bull_snort.sql")
+                log.error("   alter table public.stocks")
+                log.error("     add column if not exists is_bull_snort boolean,")
+                log.error("     add column if not exists bull_snort_vol_ratio numeric;")
+                log.error("   NOTIFY pgrst, 'reload schema';")
+    except Exception as e:
+        log.warning(f"DB column check error (bull snort): {e}")
 
     try:
         async with session.get(
@@ -3226,6 +3380,125 @@ def fundamental_score_label(score) -> str:
     if score >= 40: return 'Fair'
     return 'Poor'
 
+def _best_pick_signal_line(i: int, r: dict) -> str:
+    """Compact one-line signal dump for AI filter / rationale prompts."""
+    return (
+        f"{i+1}. {r['sym']} (sector: {r.get('sector') or '?'}, "
+        f"mcap ₹{int(r['market_cap']) if r.get('market_cap') else '?'} Cr, "
+        f"score {r.get('best_pick_score')}/100) — "
+        f"stage {r.get('weinstein_stage')}"
+        f"{'/NEW' if r.get('is_s2_new_entry') else ''}, "
+        f"RS {r.get('rs_tv') or r.get('rs')}, "
+        f"Fund {r.get('fundamental_label') or '?'}({r.get('fundamental_score') if r.get('fundamental_score') is not None else '?'}), "
+        f"Result {r.get('result_rating') or 'n/a'}, "
+        f"VCP={'Y' if r.get('vcp_fired') else 'N'}, "
+        f"breakout={'Y' if r.get('is_resistance_breakout') or r.get('is_cup_handle_breakout') else 'N'}, "
+        f"RVOL={r.get('rvol')}, EPS QoQ/YoY={r.get('eps_qoq')}/{r.get('eps_yoy')}, "
+        f"Sales QoQ/YoY={r.get('sales_qoq')}/{r.get('sales_yoy')}, ROE={r.get('roe')}, "
+        f"D/E={r.get('debt_eq')}, promoter trend={r.get('promoter_trend')}, "
+        f"FII/DII trend={r.get('fii_trend')}/{r.get('dii_trend')}"
+    )
+
+
+async def ai_filter_best_picks(
+    session: aiohttp.ClientSession,
+    shortlist: list,
+    keep_n: int = None,
+) -> list:
+    """AI pre-filter BEFORE publishing recommendations.
+
+    Input is already score-ranked (Stage-2 / RS / Fund / Result + tech).
+    AI may only KEEP or DROP names from this shortlist — it cannot invent
+    symbols. On missing API key / failure, returns the score-ranked head.
+    """
+    keep_n = keep_n or _AI_PICKS_AI_KEEP_N
+    if not shortlist:
+        return []
+    # No AI → score order
+    api_key = os.getenv('ANTHROPIC_API_KEY', '')
+    if not api_key:
+        return shortlist[:keep_n]
+
+    listing = "\n".join(_best_pick_signal_line(i, r) for i, r in enumerate(shortlist))
+    prompt = (
+        "You are filtering a shortlist for an NSE stock scanner's 'AI Best Picks' page.\n"
+        "These candidates ALREADY passed algorithmic filters (Stage-2 preference, RS, "
+        "fundamental score, result rating, breakout confluence). Your job is ONLY to "
+        "select the strongest subset and order them — NOT invent new symbols.\n\n"
+        f"Rules:\n"
+        f"- You are given exactly 10 scored candidates. Recommend the BEST {keep_n} only.\n"
+        f"- Return exactly {keep_n} symbols from the numbered list ONLY (no more, no fewer).\n"
+        f"- Order them best → 5th (rank 1 first).\n"
+        f"- Prefer Stage-2 / new Stage-2 + RS≥70 + Fund Good/Excellent + Result Good/Excellent.\n"
+        f"- Drop names that look extended/risky despite score (e.g. Stage 3, Weak result, Poor fund) "
+        f"unless the rest of the confluence is exceptional.\n"
+        f"- Diversify sectors when two names are similar quality.\n"
+        f"- This is public-data analysis, NOT investment advice — never say buy/sell/target.\n\n"
+        "Respond ONLY with JSON like:\n"
+        "{\"keep\":[{\"n\":3,\"why\":\"Stage-2 + RS 85 + Excellent fund\"},{\"n\":1,\"why\":\"…\"}]}\n"
+        f"with exactly {keep_n} entries. n is the number from the list below. No other text.\n\n"
+        + listing
+    )
+    try:
+        async with session.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5",
+                "max_tokens": 1200,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=aiohttp.ClientTimeout(total=35),
+        ) as r:
+            if r.status != 200:
+                body = await r.text()
+                log.warning(f"⚠️ AI picks filter failed ({r.status}): {body[:200]} — using score order")
+                return shortlist[:keep_n]
+            data = await r.json()
+        text = "".join(b.get('text', '') for b in data.get('content', []) if b.get('type') == 'text')
+        text = text.replace('```json', '').replace('```', '').strip()
+        parsed = json.loads(text)
+        keep_items = parsed.get('keep') if isinstance(parsed, dict) else parsed
+        if not isinstance(keep_items, list):
+            return shortlist[:keep_n]
+        by_n = {}
+        for item in keep_items:
+            if not isinstance(item, dict):
+                continue
+            n = item.get('n')
+            if isinstance(n, int) and 1 <= n <= len(shortlist) and n not in by_n:
+                by_n[n] = (item.get('why') or '').strip()[:120]
+        if len(by_n) < keep_n:
+            log.warning(f"⚠️ AI filter returned {len(by_n)} names (need {keep_n}) — using score order")
+            return shortlist[:keep_n]
+        ordered = []
+        for n, why in by_n.items():
+            row = dict(shortlist[n - 1])
+            if why:
+                row['_ai_filter_why'] = why
+            ordered.append(row)
+            if len(ordered) >= keep_n:
+                break
+        # If AI returned extras somehow, trim; if short, pad from score order
+        if len(ordered) < keep_n:
+            seen = {r['sym'] for r in ordered}
+            for r in shortlist:
+                if r['sym'] in seen:
+                    continue
+                ordered.append(r)
+                if len(ordered) >= keep_n:
+                    break
+        log.info(f"  🧠 AI recommended top {len(ordered)} from {len(shortlist)} candidates")
+        return ordered[:keep_n]
+    except Exception as e:
+        log.warning(f"⚠️ AI picks filter failed ({type(e).__name__}: {e}) — using score order")
+        return shortlist[:keep_n]
+
+
 async def generate_ai_picks_reasoning(session: aiohttp.ClientSession, top_rows: list) -> dict:
     """One batched Anthropic call (or the free templated fallback) that
     turns each top pick's raw signals into a short plain-English
@@ -3237,31 +3510,29 @@ async def generate_ai_picks_reasoning(session: aiohttp.ClientSession, top_rows: 
     api_key = os.getenv('ANTHROPIC_API_KEY', '')
     if not top_rows:
         return {}
+    # Prefer the AI-filter one-liner when present (already paid for)
+    seeded = {
+        r['sym']: r['_ai_filter_why']
+        for r in top_rows
+        if r.get('_ai_filter_why')
+    }
     if not api_key:
-        return {r['sym']: _template_pick_reasoning(r) for r in top_rows}
+        out = {r['sym']: _template_pick_reasoning(r) for r in top_rows}
+        out.update(seeded)
+        return out
 
-    listing = "\n".join(
-        f"{i+1}. {r['sym']} (sector: {r.get('sector') or '?'}, mcap ₹{int(r['market_cap']) if r.get('market_cap') else '?'} Cr, "
-        f"score {r.get('best_pick_score')}/100) — "
-        f"stage {r.get('weinstein_stage')}, RS {r.get('rs_tv') or r.get('rs')}, "
-        f"VCP={'Y' if r.get('vcp_fired') else 'N'}, "
-        f"breakout={'Y' if r.get('is_resistance_breakout') or r.get('is_cup_handle_breakout') else 'N'}, "
-        f"RVOL={r.get('rvol')}, EPS QoQ/YoY={r.get('eps_qoq')}/{r.get('eps_yoy')}, "
-        f"Sales QoQ/YoY={r.get('sales_qoq')}/{r.get('sales_yoy')}, ROE={r.get('roe')}, "
-        f"D/E={r.get('debt_eq')}, promoter trend={r.get('promoter_trend')}, "
-        f"FII/DII trend={r.get('fii_trend')}/{r.get('dii_trend')}"
-        for i, r in enumerate(top_rows)
-    )
+    listing = "\n".join(_best_pick_signal_line(i, r) for i, r in enumerate(top_rows))
     prompt = (
         "You are a technical+fundamental analyst writing one-line rationales for a stock "
         "scanner's 'Best Picks' list, for Indian retail investors on the NSE. Each numbered "
         "line below gives one stock's confluence of signals that already qualified it for "
-        "this list. Write a crisp reason (max 100 characters) explaining IN YOUR OWN PLAIN "
+        "this list. Prefer citing Stage-2 / RS / Fundamental score / Result rating when strong. "
+        "Write a crisp reason (max 100 characters) explaining IN YOUR OWN PLAIN "
         "WORDS why this stock stands out — reference the 2-3 strongest signals only, don't "
         "just restate every field. This is analysis of already-public scan data, not a buy "
         "recommendation — never use words like 'buy', 'target', or promise returns.\n"
         "Respond ONLY with a JSON array like "
-        "[{\"n\":1,\"reason\":\"Stage-2 breakout on rising RVOL with 3 straight qtrs of EPS growth\"}] "
+        "[{\"n\":1,\"reason\":\"Stage-2 + RS 88 with Excellent fundamentals and Good result\"}] "
         "— no other text.\n\n"
         + listing
     )
@@ -3288,19 +3559,21 @@ async def generate_ai_picks_reasoning(session: aiohttp.ClientSession, top_rows: 
         text = "".join(b.get('text', '') for b in data.get('content', []) if b.get('type') == 'text')
         text = text.replace('```json', '').replace('```', '').strip()
         items = json.loads(text)
-        out = {}
+        out = dict(seeded)
         for item in items:
             idx = item.get('n')
             reason = (item.get('reason') or '').strip()
             if isinstance(idx, int) and 1 <= idx <= len(top_rows) and reason:
                 out[top_rows[idx - 1]['sym']] = reason[:160]
         for r in top_rows:
-            out.setdefault(r['sym'], _template_pick_reasoning(r))
+            out.setdefault(r['sym'], seeded.get(r['sym']) or _template_pick_reasoning(r))
         log.info(f"  🧠 AI-rationaled {len(out)}/{len(top_rows)} best picks")
         return out
     except Exception as e:
         log.warning(f"⚠️ AI picks reasoning failed ({type(e).__name__}: {e}) — using templated fallback")
-        return {r['sym']: _template_pick_reasoning(r) for r in top_rows}
+        out = {r['sym']: _template_pick_reasoning(r) for r in top_rows}
+        out.update(seeded)
+        return out
 
 async def incremental_eod_update(session: aiohttp.ClientSession):
     """
@@ -4678,6 +4951,20 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             rt_prices  = prices + [live_price]
             rt_volumes = volumes + [vol]
         pp = detect_pp(rt_prices, rt_volumes)
+
+        # Bull Snort — same climax rules as the chart overlay; augment with
+        # live OHLC/volume mid-session so the RS filter lights up intraday.
+        highs_arr = s.get('highs') or prices
+        lows_arr = s.get('lows') or prices
+        opens_arr = s.get('opens') or []
+        live_ohlc = live.get('ohlc') if isinstance(live.get('ohlc'), dict) else {}
+        if prices_last_is_today or not (live_price and live_price > 0):
+            rt_highs, rt_lows, rt_opens = highs_arr, lows_arr, opens_arr
+        else:
+            rt_highs = list(highs_arr) + [live_ohlc.get('high') or live_price]
+            rt_lows = list(lows_arr) + [live_ohlc.get('low') or live_price]
+            rt_opens = list(opens_arr) + [live_ohlc.get('open') or (prices[-1] if prices else live_price)]
+        bull_snort = detect_bull_snort(rt_opens, rt_highs, rt_lows, rt_prices, rt_volumes)
         ibv_signal = detect_ibv_signal(
             volumes, vol,
             live.get('ohlc', {}).get('high'), live.get('ohlc', {}).get('low'), last
@@ -4736,8 +5023,8 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         weak = detect_weak_rs(prices, volumes, rs)
 
         # Squeeze (BB + Keltner) and VCP
-        highs_arr = s.get('highs', prices)
-        lows_arr  = s.get('lows', prices)
+        highs_arr = s.get('highs') or prices
+        lows_arr  = s.get('lows') or prices
         squeeze = detect_bb_squeeze(prices, highs_arr, lows_arr)
         vcp     = detect_vcp(prices, volumes, highs_arr, lows_arr)
         cp      = detect_chart_patterns(highs_arr, lows_arr, prices, volumes)
@@ -4818,6 +5105,8 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'rs_slope':       trend_data['slope'],
             'rs_hist':        hist,
             'is_pp':          pp['is_pp'],
+            'is_bull_snort':  bull_snort['is_bull_snort'],
+            'bull_snort_vol_ratio': bull_snort['bull_snort_vol_ratio'],
             'ibv_signal':     ibv_signal,
             'pp_count_10d':   pp['pp_count_10d'],
             'pp_hist':        pp['pp_hist'],
@@ -4964,21 +5253,41 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         except Exception as e:
             log.warning(f"⚠️ Results dates cache sync failed: {e}")
 
-    # Step 5.35: AI Best Picks — composite score + AI rationale for the
-    # top candidates, recomputed at most once per hour (ranking doesn't
-    # need to be fresher than that, and this keeps ANTHROPIC_API_KEY
-    # usage cheap even when it's set). `processed` already has every
-    # technical AND fundamental field merged per stock at this point.
+    # Step 5.35: AI Best Picks pipeline (hourly):
+    #   1) Score all eligible (Stage-2 / RS / Fund / Result + tech)
+    #   2) Take shortlist (~20 by score)
+    #   3) AI FILTER before recommendation (keep/drop/reorder only)
+    #   4) AI one-line rationale on the filtered set
+    #   5) Publish (pad with score-order if AI kept fewer than TOP_N)
     global _LAST_AI_PICKS_TS
     if time.time() - _LAST_AI_PICKS_TS > _AI_PICKS_REFRESH_INTERVAL_SEC:
         try:
             for row in processed:
+                rr_row = latest_results_cache.get((row.get('sym') or '').upper()) or {}
+                row['result_rating'] = rr_row.get('result_rating') or row.get('result_rating')
                 row['best_pick_score'] = compute_best_pick_score(row)
-            top_picks = sorted(processed, key=lambda r: r.get('best_pick_score') or 0, reverse=True)[:_AI_PICKS_TOP_N]
+            pool = [r for r in processed if _best_pick_eligible(r)] or processed
+            scored = sorted(
+                pool,
+                key=lambda r: (
+                    r.get('best_pick_score') or 0,
+                    1 if r.get('weinstein_stage') == 2 or r.get('is_s2_new_entry') else 0,
+                    r.get('rs_tv') or r.get('rs') or 0,
+                ),
+                reverse=True,
+            )
+            # Pass top-10 scored names → AI recommends exactly top-5
+            shortlist = scored[:_AI_PICKS_SHORTLIST_N]
+            top_picks = await ai_filter_best_picks(session, shortlist, keep_n=_AI_PICKS_AI_KEEP_N)
+            top_picks = top_picks[:_AI_PICKS_TOP_N]
             reasoning = await generate_ai_picks_reasoning(session, top_picks)
             await save_best_picks(session, top_picks, reasoning)
             await save_best_picks_history(session, top_picks, reasoning)
             _LAST_AI_PICKS_TS = time.time()
+            log.info(
+                f"  🏆 Best Picks: {len(pool)} eligible → pass {len(shortlist)} to AI "
+                f"→ recommend {len(top_picks)}"
+            )
         except Exception as e:
             log.warning(f"⚠️ Best Picks scan step failed: {e}")
 
@@ -5661,6 +5970,10 @@ async def save_best_picks(session: aiohttp.ClientSession, top_rows: list, reason
             'market_cap': r.get('market_cap'),
             'rs_tv': r.get('rs_tv') or r.get('rs'),
             'weinstein_stage': r.get('weinstein_stage'),
+            'is_s2_new_entry': bool(r.get('is_s2_new_entry')),
+            'fundamental_score': r.get('fundamental_score'),
+            'fundamental_label': r.get('fundamental_label'),
+            'result_rating': r.get('result_rating'),
             'vcp_fired': r.get('vcp_fired'),
             'is_resistance_breakout': r.get('is_resistance_breakout'),
             'is_cup_handle_breakout': r.get('is_cup_handle_breakout'),
@@ -5682,8 +5995,23 @@ async def save_best_picks(session: aiohttp.ClientSession, top_rows: list, reason
                                 timeout=aiohttp.ClientTimeout(total=20)) as r:
             if r.status not in (200, 201):
                 body = await r.text()
-                log.warning(f"⚠️ Best picks upsert failed ({r.status}): {body[:300]}")
-                return
+                # Retry without new columns if schema hasn't been migrated yet
+                if r.status == 400 and ('fundamental_' in body or 'result_rating' in body or 'is_s2_new' in body):
+                    slim = [{k: v for k, v in row.items()
+                             if k not in ('fundamental_score', 'fundamental_label',
+                                          'result_rating', 'is_s2_new_entry')}
+                            for row in payload]
+                    async with session.post(f"{SUPABASE_URL}/rest/v1/best_picks?on_conflict=symbol",
+                                            headers=headers, json=slim,
+                                            timeout=aiohttp.ClientTimeout(total=20)) as r2:
+                        if r2.status not in (200, 201):
+                            body2 = await r2.text()
+                            log.warning(f"⚠️ Best picks upsert failed ({r2.status}): {body2[:300]}")
+                            return
+                    log.warning("⚠️ best_picks missing new columns — ran ensure_best_picks_quality_cols.sql?")
+                else:
+                    log.warning(f"⚠️ Best picks upsert failed ({r.status}): {body[:300]}")
+                    return
         # Remove any symbol no longer in today's top N (full-replace).
         current_syms = {r['sym'] for r in top_rows}
         plain_headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
@@ -5715,9 +6043,15 @@ async def save_best_picks_history(session: aiohttp.ClientSession, top_rows: list
     overwritten), so 'did it go up since being picked' has a stable
     baseline. A new calendar day always creates fresh rows rather than
     touching previous days — that's what makes this a real history
-    instead of another snapshot."""
+    instead of another snapshot.
+
+    History is capped at the AI top-5 (_AI_PICKS_TOP_N) per day — extras
+    from older hourly runs (when TOP_N was larger) are pruned for today.
+    """
     if not top_rows:
         return
+    # Always persist only the published top-5
+    top_rows = list(top_rows)[:_AI_PICKS_TOP_N]
     picked_date = datetime.now(IST).strftime('%Y-%m-%d')
     now_iso = datetime.now(timezone.utc).isoformat()
     payload = [{
@@ -5780,7 +6114,28 @@ async def save_best_picks_history(session: aiohttp.ClientSession, top_rows: list
             ) as pr:
                 if pr.status not in (200, 204):
                     log.warning(f"  Failed to refresh history row for {r['sym']}: {pr.status}")
-        log.info(f"  📜 Saved/updated {len(payload)} best-picks-history rows for {picked_date}")
+        # Keep today's track record at exactly the AI top-5 — drop leftover
+        # rows from when TOP_N used to be larger (or AI swapped names mid-day).
+        keep_syms = {r['sym'] for r in top_rows}
+        plain = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/best_picks_history",
+            headers=plain,
+            params={"select": "symbol", "picked_date": f"eq.{picked_date}"},
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as gr:
+            if gr.status == 200:
+                existing = {row['symbol'] for row in await gr.json()}
+                for sym in existing - keep_syms:
+                    async with session.delete(
+                        f"{SUPABASE_URL}/rest/v1/best_picks_history",
+                        headers=plain,
+                        params={"symbol": f"eq.{sym}", "picked_date": f"eq.{picked_date}"},
+                        timeout=aiohttp.ClientTimeout(total=15),
+                    ) as dr:
+                        if dr.status not in (200, 204):
+                            log.warning(f"  Failed to prune history '{sym}' on {picked_date}: {dr.status}")
+        log.info(f"  📜 Saved/updated {len(payload)} best-picks-history rows for {picked_date} (top {_AI_PICKS_TOP_N})")
     except Exception as e:
         log.warning(f"⚠️ Best picks history save exception: {e}")
 
