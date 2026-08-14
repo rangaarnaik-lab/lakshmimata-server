@@ -18,7 +18,6 @@ log = logging.getLogger('pocketrs')
 
 # Cached stock_history column set for EOD archive filtering (see get_stock_history_columns).
 _stock_history_columns_cache = None
-_stock_history_gap_backfill_started = False
 
 # ══ LIVE-SCAN-ONLY FUNCTIONS ══
 
@@ -5848,19 +5847,6 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
                     archive_ok = True
                     last_eod_archive_ok_date = snapshot_date
                     log.info(f"  ✅ EOD snapshot verified: {saved_count} stocks saved for {snapshot_date}")
-                    # If a recent day is still missing (e.g. Aug 13 after a
-                    # failed EOD), kick a one-shot gap backfill. Startup may
-                    # have already passed before this deploy landed.
-                    global _stock_history_gap_backfill_started
-                    if not _stock_history_gap_backfill_started:
-                        _stock_history_gap_backfill_started = True
-                        async def _gap_bf():
-                            try:
-                                log.info("  📚 Starting stock_history gap backfill for recent missing days…")
-                                await backfill_stock_history_30days(session, target_days=10)
-                            except Exception as e:
-                                log.warning(f"  stock_history gap backfill failed: {e}")
-                        asyncio.create_task(_gap_bf())
                 else:
                     log.error(f"  ❌ EOD snapshot for {snapshot_date} likely FAILED — only {saved_count}/"
                                f"{len(history_rows)} rows found. This usually means stock_history's schema "
@@ -5988,27 +5974,22 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'total': len(processed),
         }], on_conflict='date')
 
-        # Retry the 30-day backfills daily, not just at process startup —
-        # previously these ONLY ran once at startup, meaning any fix to
-        # one of them (a schema change, a relaxed threshold, etc.) needed
-        # someone to manually restart Railway to actually take effect.
-        # Each backfill already self-guards on "do we have enough days
-        # already?", so calling them here every EOD is cheap on a normal
-        # day (a fast row-count check that says "already sufficient,
-        # skip") and self-healing on an abnormal one — no manual restart
-        # ever needed again for this class of issue.
-        try:
-            await asyncio.wait_for(backfill_stock_history_30days(session), timeout=1500)
-        except Exception as e:
-            log.warning(f"Daily stock_history backfill retry error (non-fatal): {e}")
-        try:
-            await asyncio.wait_for(backfill_sector_history_30days(session), timeout=120)
-        except Exception as e:
-            log.warning(f"Daily sector_history backfill retry error (non-fatal): {e}")
-        try:
-            await asyncio.wait_for(backfill_index_history_30days(session), timeout=300)
-        except Exception as e:
-            log.warning(f"Daily index_history backfill retry error (non-fatal): {e}")
+        # Retry the 30-day backfills on EOD only — NOT on live archive
+        # retries. Awaiting these during market hours blocked live scans
+        # for up to ~25 minutes (seen 2026-08-14 after archive fix).
+        if scan_type == 'batch_eod':
+            try:
+                await asyncio.wait_for(backfill_stock_history_30days(session), timeout=1500)
+            except Exception as e:
+                log.warning(f"Daily stock_history backfill retry error (non-fatal): {e}")
+            try:
+                await asyncio.wait_for(backfill_sector_history_30days(session), timeout=120)
+            except Exception as e:
+                log.warning(f"Daily sector_history backfill retry error (non-fatal): {e}")
+            try:
+                await asyncio.wait_for(backfill_index_history_30days(session), timeout=300)
+            except Exception as e:
+                log.warning(f"Daily index_history backfill retry error (non-fatal): {e}")
 
         # Yahoo 2yr chart-history backfill — runs ONLY on Sundays, per
         # user request for a predictable, once-a-week schedule rather
@@ -6033,35 +6014,6 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         # Send daily Telegram digest at EOD
         if breadth:
             await send_daily_digest(session, processed, breadth)
-
-    # Fill recent stock_history gaps even when today's archive already
-    # verified (so a missed day like Aug 13 recovers without waiting
-    # for tomorrow's EOD / a Railway restart).
-    global _stock_history_gap_backfill_started
-    if not _stock_history_gap_backfill_started:
-        try:
-            yday = (now_ist - timedelta(days=1)).strftime('%Y-%m-%d')
-            # Skip weekends for the cheap probe; backfill itself uses the
-            # trading calendar from stock_full_history.
-            if now_ist.weekday() != 0:  # Monday → Fri gap probe is enough
-                hdrs = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
-                async with session.get(
-                    f"{SUPABASE_URL}/rest/v1/stock_history?select=sym&snapshot_date=eq.{yday}&limit=1",
-                    headers=hdrs, timeout=aiohttp.ClientTimeout(total=15)
-                ) as gr:
-                    missing_yday = True
-                    if gr.status in (200, 206):
-                        rows = await gr.json()
-                        missing_yday = not bool(rows)
-                    if missing_yday:
-                        _stock_history_gap_backfill_started = True
-                        log.info(f"  📚 Yesterday {yday} missing from stock_history — "
-                                 f"starting gap backfill (one-shot)…")
-                        asyncio.create_task(backfill_stock_history_30days(session, target_days=10))
-                    else:
-                        _stock_history_gap_backfill_started = True  # no gap; don't re-probe every scan
-        except Exception as e:
-            log.warning(f"  stock_history gap probe failed: {e}")
 
     # Step 8: Update scan metadata
     duration = round(time.time() - start, 1)
