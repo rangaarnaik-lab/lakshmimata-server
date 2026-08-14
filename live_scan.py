@@ -4400,6 +4400,32 @@ async def load_index_cache(session: aiohttp.ClientSession):
             log.warning(f"⚠️ Index {name}: all key formats failed"
                         + (" — MID/SML RS will fall back to Yahoo/DB or synthetic" if name in ("Midcap 150", "Smallcap 250", "Microcap 250") else ""))
     log.info(f"✅ Index cache loaded: {loaded}/{len(INDEX_TRACKER)} indices")
+    # Persist every successfully loaded series so Our Chart (and any
+    # client reading index_price_history) can chart IT/Auto/Pharma/…
+    # — previously only Nifty 50 / Midcap 150 / Smallcap 250 were saved.
+    await persist_all_index_history_to_db(session)
+
+async def persist_all_index_history_to_db(session: aiohttp.ClientSession):
+    """Upsert index_history_cache → index_price_history for all loaded indices."""
+    if not index_history_cache:
+        log.info("  No index_history_cache entries to persist")
+        return
+    saved = 0
+    kept_db = 0
+    for name, data in list(index_history_cache.items()):
+        prices = list((data or {}).get('prices') or [])
+        if len(prices) < 5:
+            continue
+        # Prefer longer DB history when Upstox only returned a shorter window
+        # (e.g. Nifty 50 seed ~1492d vs Upstox ~550d).
+        existing = await load_index_history_from_db(session, name)
+        if existing and len(existing) > len(prices):
+            kept_db += 1
+            continue
+        await save_index_history_to_db(session, name, prices)
+        saved += 1
+    log.info(f"  💾 Persisted {saved} indices to index_price_history"
+             + (f" ({kept_db} kept longer DB series)" if kept_db else ""))
 
 async def load_index_history_from_db(session: aiohttp.ClientSession, name: str) -> list:
     """Load index price history from Supabase."""
@@ -4418,8 +4444,14 @@ async def load_index_history_from_db(session: aiohttp.ClientSession, name: str) 
         ) as r:
             if r.status == 200:
                 data = await r.json()
-                if data and data[0].get("prices"):
-                    return _json.loads(data[0]["prices"])
+                if data and data[0].get("prices") is not None:
+                    raw = data[0]["prices"]
+                    if isinstance(raw, str):
+                        raw = _json.loads(raw)
+                        # Double-encoded legacy rows
+                        if isinstance(raw, str):
+                            raw = _json.loads(raw)
+                    return list(raw) if isinstance(raw, list) else []
             else:
                 body = await r.text()
                 log.warning(f"  Load {name} failed: {r.status} — {body[:100]}")
@@ -6440,19 +6472,20 @@ async def save_full_history_batch_to_db(session: aiohttp.ClientSession, rows: li
 
 async def save_index_history_to_db(session: aiohttp.ClientSession, name: str, prices: list):
     """Save index price history to Supabase for persistence across restarts."""
-    import json as _json
     # Use service role key for writes (anon key blocked by RLS)
     service_key = os.environ.get('SUPABASE_SERVICE_KEY', SUPABASE_KEY)
     headers = {
         "apikey": service_key,
         "Authorization": f"Bearer {service_key}",
         "Content-Type": "application/json",
-        "Prefer": "resolution=merge-duplicates"
+        "Prefer": "resolution=merge-duplicates,return=minimal",
     }
-    row = {"name": name, "prices": _json.dumps(prices), "updated_at": datetime.now(IST).isoformat()}
+    # Store as a JSON array (not a double-encoded string) so jsonb/json
+    # columns and the frontend parseIndexPrices path stay consistent.
+    row = {"name": name, "prices": prices, "updated_at": datetime.now(IST).isoformat()}
     try:
         async with session.post(
-            f"{SUPABASE_URL}/rest/v1/index_price_history",
+            f"{SUPABASE_URL}/rest/v1/index_price_history?on_conflict=name",
             headers=headers,
             json=row,
             timeout=aiohttp.ClientTimeout(total=30)
