@@ -4858,9 +4858,37 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             if exchange_prev_close <= 0:
                 exchange_prev_close = None
 
+        # How old is the last stored daily bar? Used to decide whether
+        # true_prev_close is trustworthy vs exchange net_change.
+        _hist_age_days = None
+        if dates_for_sym:
+            try:
+                _hist_age_days = (datetime.now(IST).date()
+                                  - datetime.strptime(dates_for_sym[-1], '%Y-%m-%d').date()).days
+            except Exception:
+                _hist_age_days = None
+
         if live_price and live_price > 0:
             last = live_price
-            if exchange_prev_close is not None:
+            # Prefer exchange-derived prev when net_change shows a REAL move.
+            # When net_change is ~0, exchange_prev == live_price and chg
+            # collapses to 0.0% for every such quote — confirmed in
+            # production logs (2026-08-14): many names (VAISHALI, ICDSLTD,
+            # MSCIINDIA, MOALPHA50, …) had net_change=0.0 while
+            # true_prev_close differed by 0.2–2%. Upstox often returns a
+            # flat net_change for thin names/ETFs even when LTP has moved
+            # vs yesterday's close. In that case fall back to our stored
+            # true_prev_close when history is fresh (≤3 calendar days).
+            _exch_flat = (
+                exchange_prev_close is not None
+                and abs(live_price - exchange_prev_close) < max(0.005, abs(live_price) * 0.0003)
+            )
+            if exchange_prev_close is not None and not _exch_flat:
+                prev = exchange_prev_close
+            elif (true_prev_close and true_prev_close > 0
+                  and _hist_age_days is not None and _hist_age_days <= 3):
+                prev = true_prev_close
+            elif exchange_prev_close is not None:
                 prev = exchange_prev_close
             else:
                 prev = true_prev_close
@@ -4882,13 +4910,8 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         # revert note above) — using it would silently produce a
         # near-zero chg instead of flagging that we genuinely don't have
         # a trustworthy reference, which is worse than just saying 0.
-        if dates_for_sym:
-            try:
-                _age_days = (datetime.now(IST).date() - datetime.strptime(dates_for_sym[-1], '%Y-%m-%d').date()).days
-                if _age_days > 7:
-                    chg = 0
-            except Exception:
-                pass
+        if _hist_age_days is not None and _hist_age_days > 7:
+            chg = 0
         # Magnitude guard — the date-based guard above only catches STALE
         # (old) reference prices, but confirmed in production logs (2026-08-03)
         # this doesn't cover every case: several symbols (UEL, INDOTHAI,
