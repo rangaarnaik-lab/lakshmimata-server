@@ -5650,8 +5650,22 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         log.info(f"  📊 Index dashboard: {len(index_rows)} indices saved")
 
     # Step 7: Save to Supabase
-    log.info(f"  Saving {len(processed)} stocks to Supabase…")
-    await supabase_upsert(session, 'stocks', processed)
+    # Strip in-memory Best Picks fields that are NOT columns on
+    # public.stocks. Hourly AI picks mutates every row with
+    # result_rating / best_pick_score; PostgREST then rejects the
+    # WHOLE upsert (PGRST204) if either key is unknown — seen
+    # 2026-08-14 right after the first AI-picks cycle of the hour.
+    # These live on financial_results / best_picks, not stocks.
+    _STOCKS_UPSERT_SKIP = frozenset({
+        'result_rating',
+        'best_pick_score',
+    })
+    stocks_rows = [
+        {k: v for k, v in p.items() if k not in _STOCKS_UPSERT_SKIP}
+        for p in processed
+    ]
+    log.info(f"  Saving {len(stocks_rows)} stocks to Supabase…")
+    await supabase_upsert(session, 'stocks', stocks_rows)
 
     # Also publish the same data to R2 for the frontend to read directly —
     # see upload_snapshot_to_r2's docstring. Trimmed to only the fields
