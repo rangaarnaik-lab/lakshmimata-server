@@ -18,6 +18,7 @@ log = logging.getLogger('pocketrs')
 
 # Cached stock_history column set for EOD archive filtering (see get_stock_history_columns).
 _stock_history_columns_cache = None
+_stock_history_cache_gap_fill_done = False
 
 # ══ LIVE-SCAN-ONLY FUNCTIONS ══
 
@@ -775,6 +776,144 @@ async def get_stock_history_columns(session: aiohttp.ClientSession) -> set:
     except Exception as e:
         log.warning(f"get_stock_history_columns failed: {e}")
         return set()
+
+
+async def fill_stock_history_gaps_from_cache(session: aiohttp.ClientSession, lookback: int = 5):
+    """Fill missing recent stock_history days from in-memory historical_cache.
+
+    Used when an EOD archive failed (schema drift) left a hole like Aug 13
+    while live scans continue. Avoids reloading all of stock_full_history
+    (which blocked live scans when awaited during market hours).
+    """
+    global _stock_history_cache_gap_fill_done
+    if _stock_history_cache_gap_fill_done:
+        return
+    if not historical_cache or not history_dates_cache:
+        return
+    nifty_prices = (nifty_cache or {}).get('prices') or []
+    if len(nifty_prices) < 252:
+        log.warning("fill_stock_history_gaps_from_cache: nifty_cache too short, skip")
+        return
+
+    # Candidate dates = last N trading days from the densest symbol calendar
+    ref_dates = []
+    for dates in history_dates_cache.values():
+        if dates and len(dates) > len(ref_dates):
+            ref_dates = dates
+    if not ref_dates:
+        return
+    candidates = ref_dates[-lookback:]
+    today_ist = datetime.now(IST).strftime('%Y-%m-%d')
+    # Today is handled by the live EOD/live archive from `processed`
+    candidates = [d for d in candidates if d != today_ist]
+    if not candidates:
+        _stock_history_cache_gap_fill_done = True
+        return
+
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    missing = []
+    for d in candidates:
+        try:
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/stock_history?select=sym&snapshot_date=eq.{d}&limit=1",
+                headers=headers, timeout=aiohttp.ClientTimeout(total=12)
+            ) as r:
+                rows = await r.json() if r.status in (200, 206) else []
+                if not rows:
+                    missing.append(d)
+        except Exception as e:
+            log.warning(f"  gap probe {d} failed: {e}")
+    if not missing:
+        _stock_history_cache_gap_fill_done = True
+        log.info("  stock_history cache gap fill: no missing recent days")
+        return
+
+    log.info(f"  📚 Filling stock_history from memory for missing day(s): {missing}")
+    stock_data = {}
+    for sym, dates in history_dates_cache.items():
+        hc = historical_cache.get(sym) or {}
+        prices = hc.get('prices') or []
+        volumes = hc.get('volumes') or []
+        highs = hc.get('highs') or prices
+        lows = hc.get('lows') or prices
+        if not dates or len(prices) < 100 or len(dates) != len(prices):
+            continue
+        raw_rs_series = calc_raw_rs_series(prices, nifty_prices)
+        stock_data[sym] = {
+            'dates': dates,
+            'prices': prices,
+            'volumes': volumes,
+            'highs': highs if len(highs) == len(dates) else prices,
+            'lows': lows if len(lows) == len(dates) else prices,
+            'raw_rs_series': raw_rs_series,
+            'date_to_idx': {dt: i for i, dt in enumerate(dates)},
+        }
+    if len(stock_data) < 200:
+        log.warning(f"  cache gap fill: only {len(stock_data)} stocks ready — abort")
+        return
+
+    for snapshot_date in missing:
+        day_rows = []
+        for sym, d in stock_data.items():
+            idx = d['date_to_idx'].get(snapshot_date)
+            if idx is None:
+                continue
+            prices_upto = d['prices'][:idx + 1]
+            volumes_upto = d['volumes'][:idx + 1]
+            highs_upto = d['highs'][:idx + 1]
+            lows_upto = d['lows'][:idx + 1]
+            last = prices_upto[-1]
+            raw_series_upto = d['raw_rs_series'][:idx + 1] if idx < len(d['raw_rs_series']) else d['raw_rs_series']
+            rs = normalize_rs(raw_series_upto) or 0
+            hist15 = tv_history_from_raw(raw_series_upto, days=15) if raw_series_upto else [None] * 15
+            trend_data = rs_slope(hist15)
+            pp = detect_pp(prices_upto, volumes_upto)
+            yr_vols = volumes_upto[-252:] if len(volumes_upto) >= 252 else volumes_upto
+            max_yr = max(yr_vols) if yr_vols else 1
+            max_all = max(volumes_upto) if volumes_upto else 1
+            chg_today = round((last - prices_upto[-2]) / prices_upto[-2] * 100, 2) if len(prices_upto) >= 2 and prices_upto[-2] else 0
+            hy_pct = round(volumes_upto[-1] / max_yr * 100, 1) if max_yr > 0 else 0
+            ht_pct = round(volumes_upto[-1] / max_all * 100, 1) if max_all > 0 else 0
+            is_hy = hy_pct >= 95 and chg_today > 0
+            is_ht = ht_pct >= 95 and chg_today > 0
+            ibv_signal = detect_ibv_signal(
+                volumes_upto[:-1], volumes_upto[-1],
+                highs_upto[-1], lows_upto[-1], last
+            )
+            p252 = prices_upto[-252:] if len(prices_upto) >= 252 else prices_upto
+            h52 = max(p252)
+            l52 = min(p252)
+            pct_from_h52 = round((last - h52) / h52 * 100, 1) if h52 else 0
+            weinstein_stage = calc_weinstein_stage(rs, trend_data['trend'], pct_from_h52, hist15)
+            day_rows.append({
+                'snapshot_date': snapshot_date,
+                'sym': sym,
+                'sector': get_sector(sym),
+                'last_price': round(last, 2),
+                'chg_pct': chg_today,
+                'rs': rs,
+                'rs_tv': rs,
+                'rs_hist': hist15,
+                'rs_trend': trend_data['trend'],
+                'is_pp': pp['is_pp'],
+                'pp_hist': pp['pp_hist'],
+                'pp_count_10d': pp['pp_count_10d'],
+                'is_hy': is_hy,
+                'hy_pct': hy_pct,
+                'is_ht': is_ht,
+                'ht_pct': ht_pct,
+                'ibv_signal': ibv_signal,
+                'weinstein_stage': weinstein_stage,
+                'high_52w': round(h52, 2),
+                'low_52w': round(l52, 2),
+            })
+        if day_rows:
+            await supabase_upsert(session, 'stock_history', day_rows, on_conflict='snapshot_date,sym')
+            log.info(f"  ✅ cache gap fill wrote {len(day_rows)} rows for {snapshot_date}")
+        else:
+            log.warning(f"  cache gap fill: no rows for {snapshot_date}")
+
+    _stock_history_cache_gap_fill_done = True
 
 
 async def backfill_stock_history_30days(session: aiohttp.ClientSession, target_days: int = 30):
@@ -6014,6 +6153,13 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         # Send daily Telegram digest at EOD
         if breadth:
             await send_daily_digest(session, processed, breadth)
+
+    # One-shot: fill holes like Aug 13 from in-memory price cache (fast;
+    # does not reload stock_full_history). Safe during live hours.
+    try:
+        await asyncio.wait_for(fill_stock_history_gaps_from_cache(session), timeout=180)
+    except Exception as e:
+        log.warning(f"stock_history cache gap fill error (non-fatal): {e}")
 
     # Step 8: Update scan metadata
     duration = round(time.time() - start, 1)
