@@ -848,6 +848,29 @@ async def fill_stock_history_gaps_from_cache(session: aiohttp.ClientSession, loo
             'raw_rs_series': raw_rs_series,
             'date_to_idx': {dt: i for i, dt in enumerate(dates)},
         }
+
+    # If memory cache never absorbed the missing day (EOD Yahoo merge
+    # skipped during outage), fall back to the full_history backfill in a
+    # SEPARATE session so we don't block/starve the live scan loop.
+    still_missing = [d for d in missing
+                     if sum(1 for s in stock_data.values() if d in s['date_to_idx']) < 200]
+    if still_missing:
+        _stock_history_cache_gap_fill_done = True
+        log.info(f"  📚 Memory cache lacks {still_missing} — scheduling full_history "
+                 f"gap backfill on a background session…")
+
+        async def _bg_backfill():
+            try:
+                async with aiohttp.ClientSession() as bg:
+                    await asyncio.wait_for(
+                        backfill_stock_history_30days(bg, target_days=10),
+                        timeout=1500)
+            except Exception as e:
+                log.warning(f"  background stock_history gap backfill failed: {e}")
+
+        asyncio.create_task(_bg_backfill())
+        return
+
     if len(stock_data) < 200:
         log.warning(f"  cache gap fill: only {len(stock_data)} stocks ready — abort")
         return
