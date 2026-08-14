@@ -140,6 +140,7 @@ __all__ = [
     'json',
     'last_eod_refresh_date',
     'last_eod_archive_ok_date',
+    'last_eod_archive_attempt_ts',
     'load_fundamentals_batch',
     'latest_results_cache',
     'load_fundamentals_from_supabase',
@@ -516,6 +517,7 @@ last_eod_refresh_date: Optional[str] = None  # IST date string — ensures the
 last_eod_archive_ok_date: Optional[str] = None  # set only after stock_history
 # EOD snapshot verifies — so a failed archive (e.g. schema mismatch) retries
 # on later batch_eod cycles without re-running the heavy Yahoo refresh.
+last_eod_archive_attempt_ts: float = 0.0  # throttle live-scan archive retries
 nifty_cache: dict = {}        # {'prices': [...]} — Nifty index daily closes for TV RS calc
 midcap_cache: dict = {}       # {'prices': [...]} — official Nifty Midcap 150 closes for MID RS
 smallcap_cache: dict = {}     # {'prices': [...]} — official Nifty Smallcap 250 closes for SML RS

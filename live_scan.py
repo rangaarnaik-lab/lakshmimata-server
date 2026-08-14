@@ -16,6 +16,9 @@ from shared import *
 
 log = logging.getLogger('pocketrs')
 
+# Cached stock_history column set for EOD archive filtering (see get_stock_history_columns).
+_stock_history_columns_cache = None
+
 # ══ LIVE-SCAN-ONLY FUNCTIONS ══
 
 def _template_pick_reasoning(r: dict) -> str:
@@ -743,6 +746,36 @@ async def backfill_sector_history_30days(session: aiohttp.ClientSession, target_
     else:
         log.error("sector_history backfill: computed zero rows (no sector-tagged symbols "
                    "found in stock_history?), aborting")
+
+async def get_stock_history_columns(session: aiohttp.ClientSession) -> set:
+    """Column names currently on stock_history (minus id). Cached in-process.
+
+    Used to strip stocks-only fields before EOD archive so a new column on
+    stocks cannot silently zero out an entire trading day's history again.
+    """
+    global _stock_history_columns_cache
+    if _stock_history_columns_cache is not None:
+        return _stock_history_columns_cache
+    try:
+        headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/stock_history?select=*&limit=1",
+            headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+        ) as r:
+            if r.status not in (200, 206):
+                log.warning(f"get_stock_history_columns: status {r.status}")
+                return set()
+            rows = await r.json()
+        if not rows:
+            return set()
+        cols = set(rows[0].keys()) - {'id'}
+        _stock_history_columns_cache = cols
+        log.info(f"  stock_history column allowlist cached ({len(cols)} cols)")
+        return cols
+    except Exception as e:
+        log.warning(f"get_stock_history_columns failed: {e}")
+        return set()
+
 
 async def backfill_stock_history_30days(session: aiohttp.ClientSession, target_days: int = 30):
     """
@@ -5738,15 +5771,19 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
     # this only runs once daily, unlike the main stocks upsert which
     # fails every ~scan and becomes obvious fast). Added an explicit
     # verification step below so a failure here is loud, not silent.
-    # Archive on first EOD of the day, and retry later EOD cycles if
-    # stock_history never verified (schema mismatch used to leave the
-    # day empty until the next calendar day).
-    global last_eod_archive_ok_date
+    # Archive whenever today's stock_history is not yet verified.
+    # Previously only batch_eod could archive — if that upsert failed
+    # (stocks-only columns → PGRST204), the day stayed empty forever
+    # until the next calendar EOD. Live scans now retry (throttled).
+    global last_eod_archive_ok_date, last_eod_archive_attempt_ts
     snapshot_date = now_ist.strftime('%Y-%m-%d')
-    need_eod_archive = (
-        scan_type == 'batch_eod'
-        and (is_first_eod_today or last_eod_archive_ok_date != snapshot_date)
-    )
+    need_eod_archive = (last_eod_archive_ok_date != snapshot_date)
+    if need_eod_archive and scan_type != 'batch_eod':
+        now_ts = time.time()
+        if now_ts - (last_eod_archive_attempt_ts or 0) < 600:
+            need_eod_archive = False
+        else:
+            last_eod_archive_attempt_ts = now_ts
     if need_eod_archive:
         if not is_first_eod_today:
             log.info(f"  📸 Retrying EOD stock_history archive for {snapshot_date} "
@@ -5770,10 +5807,23 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             # PEAD / CANSLIM strategy tags (add_pead_canslim.sql)
             'is_pead', 'days_since_results', 'last_results_date',
             'is_canslim', 'canslim_score', 'canslim_flags',
+            # Live-only / not on stock_history — these killed Aug 13–14 EOD
+            # archives (PGRST204). ensure_bull_snort.sql + ATR target are on
+            # stocks only; one unknown key rejects the entire upsert.
+            'target',
+            'is_bull_snort', 'bull_snort_vol_ratio',
         }
+        # Prefer intersecting with real stock_history columns when we can
+        # sample one row — survives future stocks-only columns without
+        # another silent full-day archive loss.
+        history_cols = await get_stock_history_columns(session)
         history_rows = []
         for p in processed:
-            row = {k: v for k, v in p.items() if k not in _STOCK_HISTORY_SKIP}
+            if history_cols:
+                row = {k: v for k, v in p.items()
+                       if k in history_cols and k not in _STOCK_HISTORY_SKIP}
+            else:
+                row = {k: v for k, v in p.items() if k not in _STOCK_HISTORY_SKIP}
             row['snapshot_date'] = snapshot_date
             history_rows.append(row)
         await supabase_upsert(session, 'stock_history', history_rows, on_conflict='snapshot_date,sym')
@@ -6415,7 +6465,8 @@ async def supabase_upsert(session: aiohttp.ClientSession, table: str, rows: list
                                     timeout=aiohttp.ClientTimeout(total=30)) as r:
                 if r.status not in (200, 201, 204):
                     text = await r.text()
-                    log.warning(f"Supabase upsert {table} failed: {r.status} {text[:100]}")
+                    # Log enough of PGRST204 to see which column killed stock_history.
+                    log.warning(f"Supabase upsert {table} failed: {r.status} {text[:300]}")
         except Exception as e:
             log.error(f"Supabase error ({table}): {e}")
 
