@@ -103,6 +103,7 @@ __all__ = [
     '_fundamentals_debug_count',
     '_fundamentals_fetch_paused',
     '_screener_disabled',
+    '_attachment_looks_like_audio',
     '_is_transcript_announcement',
     '_is_ppt_announcement',
     '_industry_endpoint_path',
