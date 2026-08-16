@@ -2953,6 +2953,22 @@ async def ensure_db_columns(session: aiohttp.ClientSession):
 
     try:
         async with session.get(
+            f"{SUPABASE_URL}/rest/v1/stocks?select=near_ema5,pct_from_ema5&limit=1",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                log.info("✅ DB columns OK — near_ema5 columns exist")
+            elif r.status == 400:
+                log.error("❌ near_ema5 columns MISSING! Run add_near_ema5.sql in Supabase:")
+                log.error("   alter table public.stocks add column if not exists near_ema5 boolean;")
+                log.error("   alter table public.stocks add column if not exists pct_from_ema5 numeric;")
+                log.error("   NOTIFY pgrst, 'reload schema';")
+    except Exception as e:
+        log.warning(f"DB column check error (near_ema5): {e}")
+
+    try:
+        async with session.get(
             f"{SUPABASE_URL}/rest/v1/stocks?select=weinstein_stage&limit=1",
             headers=headers,
             timeout=aiohttp.ClientTimeout(total=10)
@@ -5240,7 +5256,15 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         if ibv_hist['ibv_hist']:
             ibv_hist['ibv_hist'][-1] = ibv_signal
 
-        # EMA9
+        # EMA5 / EMA9 / EMA21 / EMA50 — pullback-to-average setups.
+        # Same rs>=90 gate: only meaningful on already-strong stocks.
+        e5 = ema(prices, 5)
+        near_ema5 = False
+        pct_ema5  = None
+        if e5 and rs >= 90:
+            pct_ema5  = round((last - e5) / e5 * 100, 2)
+            near_ema5 = abs(pct_ema5) <= 3
+
         e9 = ema(prices, 9)
         near_ema9 = False
         pct_ema9  = None
@@ -5248,10 +5272,6 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             pct_ema9  = round((last - e9) / e9 * 100, 2)
             near_ema9 = abs(pct_ema9) <= 3
 
-        # EMA21 / EMA50 — same "pullback to a rising average" idea as
-        # EMA9, just longer-term. Same rs>=90 gate (a pullback to a
-        # longer average is only a meaningful setup on an already-strong
-        # stock, same reasoning as EMA9).
         e21 = ema(prices, 21)
         near_ema21 = False
         pct_ema21  = None
@@ -5378,6 +5398,9 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'is_guppy_bullish_crossover': guppy['is_bullish_crossover'],
             'is_guppy_bearish_crossover': guppy['is_bearish_crossover'],
             'is_guppy_compressed':        guppy['is_compressed'],
+            'ema5':           e5 if e5 is not None else wl['ema5'],
+            'near_ema5':      near_ema5,
+            'pct_from_ema5':  pct_ema5,
             'ema9':           e9,
             'near_ema9':      near_ema9,
             'pct_from_ema9':  pct_ema9,
@@ -5394,7 +5417,6 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'crossed_ema5':   wl['crossed_ema5'],
             'pp_volume_52wl': wl['pp_volume'],
             'is_52wl_signal': wl['is_signal'],
-            'ema5':           wl['ema5'],
             'is_weak_rs':     weak['is_weak_rs'],
             'weak_chg_1d':    weak['chg_1d'],
             'weak_chg_5d':    weak['chg_5d'],
