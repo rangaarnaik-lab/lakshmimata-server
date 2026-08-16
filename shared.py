@@ -685,10 +685,38 @@ _RESULTS_ANN_EXCLUDE = ['newspaper publication', 'newspaper advertisement', 'tra
 # one word) rather than also matching "con. call"/"conference call"
 # generically, since those also cover call-invite/notice filings that
 # aren't the actual post-call transcript document.
-_TRANSCRIPT_ANN_KEYWORDS = ['transcript']
+# PDF transcripts ("Transcript of the … Call") plus rarer audio/recording
+# filings. Deliberately avoid bare "conference call" — that matches invites.
+_TRANSCRIPT_ANN_KEYWORDS = [
+    'transcript',
+    'audio recording',
+    'call recording',
+    'earnings call recording',
+    'conference call recording',
+    'recording of the earnings',
+    'recording of earnings conference',
+]
+_TRANSCRIPT_AUDIO_URL_SUFFIXES = (
+    '.mp3', '.mp4', '.m4a', '.wav', '.aac', '.ogg', '.flac', '.mpeg', '.webm',
+)
+_TRANSCRIPT_CALL_HINTS = (
+    'conference call', 'earnings call', 'analyst call', 'investor call',
+    'con call', 'con. call', 'earnings conference',
+)
+
+def _attachment_looks_like_audio(url: str) -> bool:
+    u = (url or '').lower().split('?', 1)[0]
+    return any(u.endswith(suf) for suf in _TRANSCRIPT_AUDIO_URL_SUFFIXES)
+
 def _is_transcript_announcement(row: dict) -> bool:
     text = ((row.get('category') or '') + ' ' + (row.get('subject') or '')).lower()
-    return any(x in text for x in _TRANSCRIPT_ANN_KEYWORDS)
+    if any(x in text for x in _TRANSCRIPT_ANN_KEYWORDS):
+        return True
+    # Audio attachment + call wording (invite PDFs without audio URL stay out)
+    url = row.get('attachment_url') or ''
+    if _attachment_looks_like_audio(url) and any(h in text for h in _TRANSCRIPT_CALL_HINTS):
+        return True
+    return False
 # Investor presentation filings (slide decks presented alongside or
 # instead of an earnings call) - a third distinct document type,
 # separate from both results PDFs and transcripts. "presentation" is a

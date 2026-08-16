@@ -1162,58 +1162,171 @@ async def extract_ppt_summary(session: aiohttp.ClientSession, symbol: str, attac
         return no_content_result
     return {'summary': summary, 'error': False}
 
+# MIME map for concall attachments Gemini can read (PDF + speech audio).
+_AUDIO_MIME_BY_EXT = {
+    '.mp3': 'audio/mp3', '.mpeg': 'audio/mpeg', '.mpga': 'audio/mpeg',
+    '.mp4': 'audio/mp4', '.m4a': 'audio/mp4',
+    '.wav': 'audio/wav', '.aac': 'audio/aac',
+    '.ogg': 'audio/ogg', '.flac': 'audio/flac', '.webm': 'audio/webm',
+}
+
+def _guess_attachment_mime(url: str, content_type: str | None, data: bytes) -> str:
+    """Best-effort MIME for NSE/BSE attachments (PDF transcript or call audio)."""
+    ct = (content_type or '').split(';', 1)[0].strip().lower()
+    if ct in ('application/pdf', 'audio/mp3', 'audio/mpeg', 'audio/mp4', 'audio/wav',
+              'audio/aac', 'audio/ogg', 'audio/flac', 'audio/webm', 'audio/x-m4a'):
+        if ct == 'audio/x-m4a':
+            return 'audio/mp4'
+        return ct
+    path = (url or '').lower().split('?', 1)[0]
+    if path.endswith('.pdf'):
+        return 'application/pdf'
+    for ext, mime in _AUDIO_MIME_BY_EXT.items():
+        if path.endswith(ext):
+            return mime
+    if data[:4] == b'%PDF':
+        return 'application/pdf'
+    if data[:3] == b'ID3' or (len(data) > 1 and data[0] == 0xFF and (data[1] & 0xE0) == 0xE0):
+        return 'audio/mp3'
+    if data[:4] == b'fLaC':
+        return 'audio/flac'
+    if data[:4] == b'OggS':
+        return 'audio/ogg'
+    if data[:4] == b'RIFF' and data[8:12] == b'WAVE':
+        return 'audio/wav'
+    # Default: treat unknown filings as PDF (historical path).
+    return 'application/pdf'
+
+def _is_audio_mime(mime: str) -> bool:
+    return (mime or '').startswith('audio/')
+
+async def _gemini_upload_file(session: aiohttp.ClientSession, api_key: str,
+                              data: bytes, mime_type: str, display_name: str) -> str | None:
+    """Upload bytes via Gemini Files API (resumable). Returns file.uri or None.
+
+    Required for long concall audio (often >20MB). Files expire ~48h; we only
+    need the URI for the immediate generateContent call."""
+    if not api_key or not data:
+        return None
+    start_url = f"https://generativelanguage.googleapis.com/upload/v1beta/files?key={api_key}"
+    try:
+        async with session.post(
+            start_url,
+            headers={
+                'X-Goog-Upload-Protocol': 'resumable',
+                'X-Goog-Upload-Command': 'start',
+                'X-Goog-Upload-Header-Content-Length': str(len(data)),
+                'X-Goog-Upload-Header-Content-Type': mime_type,
+                'Content-Type': 'application/json',
+            },
+            json={'file': {'display_name': (display_name or 'concall')[:120]}},
+            timeout=aiohttp.ClientTimeout(total=60),
+        ) as r:
+            if r.status not in (200, 201):
+                body = await r.text()
+                log.warning(f"⚠️ Gemini Files start failed ({r.status}): {body[:200]}")
+                return None
+            upload_url = r.headers.get('X-Goog-Upload-URL') or r.headers.get('x-goog-upload-url')
+        if not upload_url:
+            log.warning("⚠️ Gemini Files start: missing X-Goog-Upload-URL")
+            return None
+        async with session.post(
+            upload_url,
+            headers={
+                'Content-Length': str(len(data)),
+                'X-Goog-Upload-Offset': '0',
+                'X-Goog-Upload-Command': 'upload, finalize',
+            },
+            data=data,
+            timeout=aiohttp.ClientTimeout(total=max(120, int(len(data) / 50_000) + 60)),
+        ) as r:
+            text = await r.text()
+            if r.status not in (200, 201):
+                log.warning(f"⚠️ Gemini Files upload failed ({r.status}): {text[:200]}")
+                return None
+            meta = json.loads(text) if text else {}
+            file_obj = meta.get('file') if isinstance(meta.get('file'), dict) else meta
+            uri = (file_obj or {}).get('uri')
+            if not uri:
+                log.warning(f"⚠️ Gemini Files upload: no uri in response: {text[:200]}")
+                return None
+            return uri
+    except Exception as e:
+        log.warning(f"⚠️ Gemini Files upload error: {type(e).__name__}: {e}")
+        return None
+
 async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str, attachment_url: str):
-    """Downloads an earnings-call TRANSCRIPT PDF (a different filing type
-    from results PDFs - filed separately under 'Transcript of the
-    Earnings/Analyst/Investor Call', identified by _is_transcript_announcement)
-    and asks Gemini to produce a structured summary covering what a
-    results PDF alone can't: management's own explanation of the
-    quarter, cost/margin commentary, forward guidance, and the specific
-    concerns analysts raised in Q&A. Same graceful-degradation contract
-    as extract_results_from_pdf: 'error'=True means transient failure,
-    don't mark processed, retry next cycle; 'error'=False with
-    summary=None means Gemini genuinely found nothing worth
-    summarizing (e.g. a garbled/corrupted PDF), safe to mark done.
-    Separate function (not a generalized version of
-    extract_results_from_pdf) specifically so the already-stabilized
-    results pipeline can't be affected by changes here."""
+    """Downloads an earnings-call TRANSCRIPT (PDF) or call AUDIO filing and
+    asks Gemini for a structured concall summary (management narrative,
+    guidance, analyst Q&A). Audio uses Gemini Files API + native speech
+    understanding; PDFs keep the existing inline path.
+
+    Same graceful-degradation contract as extract_results_from_pdf:
+    'error'=True → transient, retry next cycle; 'error'=False with
+    summary=None → nothing to save (safe to mark done)."""
     error_result = {'summary': None, 'error': True}
     no_content_result = {'summary': None, 'error': False}
     api_key = _gemini_api_key_next('TRANSCRIPT')
     if not api_key or not attachment_url:
         return error_result
+    download_timeout = int(os.getenv('TRANSCRIPT_DOWNLOAD_TIMEOUT_SECONDS', '120'))
     try:
         async with session.get(attachment_url,
             headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.nseindia.com"},
-            timeout=aiohttp.ClientTimeout(total=30)) as r:
+            timeout=aiohttp.ClientTimeout(total=download_timeout)) as r:
             if r.status != 200:
-                log.warning(f"⚠️ Transcript PDF fetch failed for {symbol} ({r.status})")
+                log.warning(f"⚠️ Transcript fetch failed for {symbol} ({r.status})")
                 return error_result
-            pdf_bytes = await r.read()
+            content_type = r.headers.get('Content-Type')
+            file_bytes = await r.read()
     except asyncio.TimeoutError:
-        log.warning(f"⚠️ Transcript PDF download timed out for {symbol} (30s limit)")
+        log.warning(f"⚠️ Transcript download timed out for {symbol} ({download_timeout}s limit)")
         return error_result
     except Exception as e:
-        log.warning(f"⚠️ Transcript PDF download failed for {symbol}: {type(e).__name__}: {e}")
+        log.warning(f"⚠️ Transcript download failed for {symbol}: {type(e).__name__}: {e}")
         return error_result
-    # Transcripts run much longer than results PDFs (NALCO's Q1 FY27
-    # call transcript was 20 pages) - same 15MB sanity cap as results,
-    # but a separate, more generous timeout below since Gemini needs
-    # more time to process a longer document.
-    if len(pdf_bytes) > 15_000_000:
-        log.warning(f"⚠️ Transcript PDF too large for {symbol} ({len(pdf_bytes)} bytes) - skipping")
+
+    mime = _guess_attachment_mime(attachment_url, content_type, file_bytes)
+    is_audio = _is_audio_mime(mime)
+    max_pdf = int(os.getenv('TRANSCRIPT_PDF_MAX_BYTES', str(15_000_000)))
+    max_audio = int(os.getenv('TRANSCRIPT_AUDIO_MAX_BYTES', str(100_000_000)))
+    if is_audio and len(file_bytes) > max_audio:
+        log.warning(f"⚠️ Transcript audio too large for {symbol} ({len(file_bytes)} bytes, "
+                     f"cap={max_audio}) - skipping")
         return no_content_result
-    pdf_b64 = base64.b64encode(pdf_bytes).decode('ascii')
+    if (not is_audio) and len(file_bytes) > max_pdf:
+        log.warning(f"⚠️ Transcript PDF too large for {symbol} ({len(file_bytes)} bytes) - skipping")
+        return no_content_result
+
+    if is_audio:
+        media_intro = (
+            "This is an AUDIO RECORDING of an earnings/analyst/investor conference call for an "
+            "Indian listed company (NSE/BSE filing or IR webcast). Listen to the FULL call — "
+            "prepared management remarks AND the analyst Q&A — then produce a structured summary "
+            "in your own words. Never quote verbatim; always paraphrase. Base every field ONLY "
+            "on what is said in the audio — never invent outside facts.\n\n"
+            "DOCUMENT CHECK: if this is not a real earnings-call recording (silence, music-only, "
+            "unrelated content, or no spoken dialogue with moderator / named speakers / Q&A), "
+            "set has_content to false and leave every other field null. If in doubt, set "
+            "has_content false.\n\n"
+        )
+        log.info(f"🎙️ {symbol}: concall audio detected ({mime}, {len(file_bytes)} bytes) — "
+                 f"uploading to Gemini Files API")
+    else:
+        media_intro = (
+            "This is a transcript of an earnings/analyst/investor conference call for an Indian "
+            "listed company, filed with NSE/BSE. Read the FULL transcript — prepared management "
+            "remarks AND the analyst Q&A — then produce a structured summary in your own words. "
+            "Never quote verbatim; always paraphrase. Base every field ONLY on what is said in "
+            "the transcript — never invent outside facts.\n\n"
+            "DOCUMENT CHECK: some filings labeled 'transcript' are only a cover letter, invite, "
+            "or slide deck with no spoken dialogue. If there is no real dialogue (moderator / "
+            "named speakers / Q&A), set has_content to false and leave every other field null. "
+            "If in doubt, set has_content false.\n\n"
+        )
+
     prompt = (
-        "This is a transcript of an earnings/analyst/investor conference call for an Indian "
-        "listed company, filed with NSE/BSE. Read the FULL transcript — prepared management "
-        "remarks AND the analyst Q&A — then produce a structured summary in your own words. "
-        "Never quote verbatim; always paraphrase. Base every field ONLY on what is said in "
-        "the transcript — never invent outside facts.\n\n"
-        "DOCUMENT CHECK: some filings labeled 'transcript' are only a cover letter, invite, "
-        "or slide deck with no spoken dialogue. If there is no real dialogue (moderator / "
-        "named speakers / Q&A), set has_content to false and leave every other field null. "
-        "If in doubt, set has_content false.\n\n"
+        media_intro +
         "When has_content is true, you MUST fill these three fields — they power the main "
         "Concall Report UI and must not be left null for a real call:\n"
         "1) overall_summary  2) guidance_direction  3) key_concerns (unless there is literally no Q&A)\n\n"
@@ -1294,18 +1407,38 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
         "required": ["has_content", "overall_summary", "guidance_direction"],
     }
     model = os.getenv('GEMINI_CONCALL_MODEL', 'gemini-3.1-flash-lite')
-    # Separate, more generous default timeout than results PDFs
-    # (GEMINI_TIMEOUT_SECONDS) since transcripts run much longer -
-    # Gemini needs more time to read and synthesize a 20-page document
-    # than a results table.
-    gemini_timeout = int(os.getenv('GEMINI_TRANSCRIPT_TIMEOUT_SECONDS', '180'))
+    # Audio needs more time than PDF (full speech understanding).
+    if is_audio:
+        gemini_timeout = int(os.getenv('GEMINI_AUDIO_TIMEOUT_SECONDS',
+                                       os.getenv('GEMINI_TRANSCRIPT_TIMEOUT_SECONDS', '300')))
+    else:
+        gemini_timeout = int(os.getenv('GEMINI_TRANSCRIPT_TIMEOUT_SECONDS', '180'))
+
+    # Build media part: Files API for audio (and oversized PDFs); inline PDF otherwise.
+    inline_pdf_cap = int(os.getenv('GEMINI_INLINE_PDF_MAX_BYTES', str(18_000_000)))
+    media_part = None
+    if is_audio or len(file_bytes) > inline_pdf_cap:
+        file_uri = await _gemini_upload_file(
+            session, api_key, file_bytes, mime,
+            display_name=f"{symbol}-concall{'.mp3' if is_audio else '.pdf'}")
+        if not file_uri:
+            return error_result
+        media_part = {"file_data": {"mime_type": mime, "file_uri": file_uri}}
+    else:
+        media_part = {
+            "inline_data": {
+                "mime_type": mime or "application/pdf",
+                "data": base64.b64encode(file_bytes).decode('ascii'),
+            }
+        }
+
     try:
         status, data, body = await _gemini_generate(
             session,
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
             {
                 "contents": [{"parts": [
-                    {"inline_data": {"mime_type": "application/pdf", "data": pdf_b64}},
+                    media_part,
                     {"text": prompt},
                 ]}],
                 "generationConfig": {"responseMimeType": "application/json", "responseSchema": schema},
@@ -1321,8 +1454,10 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
                 log.warning(f"⚠️ Gemini transcript extraction failed for {symbol} ({status}): {body[:200]}")
             return error_result
     except asyncio.TimeoutError:
+        kind = 'audio' if is_audio else 'PDF'
         log.warning(f"⚠️ Gemini call timed out for {symbol} transcript ({gemini_timeout}s limit, "
-                     f"PDF was {len(pdf_bytes)} bytes) - consider raising GEMINI_TRANSCRIPT_TIMEOUT_SECONDS")
+                     f"{kind} was {len(file_bytes)} bytes) - consider raising "
+                     f"{'GEMINI_AUDIO_TIMEOUT_SECONDS' if is_audio else 'GEMINI_TRANSCRIPT_TIMEOUT_SECONDS'}")
         return error_result
     except Exception as e:
         log.warning(f"⚠️ Gemini call failed for {symbol} transcript: {type(e).__name__}: {e}")
