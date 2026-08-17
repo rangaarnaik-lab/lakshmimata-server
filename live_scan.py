@@ -1550,29 +1550,41 @@ def calc_live_raw_rs_today(prices: list, bench_prices: list,
     historical_cache's last element is still YESTERDAY's close — this
     function treats live_price/live_bench_price as an implicit "today"
     point one step past the end of the arrays, using the same 63/126/189/
-    252-day-back weighting as calc_raw_rs_series. The lookback anchors
+    252-day-back weighting as calc_raw_rs_series (renormalized when the
+    stock has less than a full year of history). The lookback anchors
     (prices[-63] etc) are measured from yesterday rather than today, which
     is off by one trading day out of a 63-252 day window — negligible.
     """
     if live_price is None or live_bench_price is None:
         return None
     n = min(len(prices), len(bench_prices))
-    if n < 252:
+    if n < 63:
         return None
     prices = prices[-n:]
     bench_prices = bench_prices[-n:]
 
     def pct(last_val, arr, length):
+        if length > len(arr):
+            return None
         prev = arr[-length]
         return (last_val - prev) / prev * 100 if prev else None
 
-    r3,  br3  = pct(live_price, prices, 63),  pct(live_bench_price, bench_prices, 63)
-    r6,  br6  = pct(live_price, prices, 126), pct(live_bench_price, bench_prices, 126)
-    r9,  br9  = pct(live_price, prices, 189), pct(live_bench_price, bench_prices, 189)
-    r12, br12 = pct(live_price, prices, 252), pct(live_bench_price, bench_prices, 252)
-    if None in (r3, br3, r6, br6, r9, br9, r12, br12):
+    periods = ((63, 0.4), (126, 0.2), (189, 0.2), (252, 0.2))
+    parts = []
+    for length, weight in periods:
+        if n < length:
+            continue
+        r = pct(live_price, prices, length)
+        b = pct(live_bench_price, bench_prices, length)
+        if r is None or b is None:
+            continue
+        parts.append(((r - b), weight))
+    if not parts:
         return None
-    return (r3-br3)*0.4 + (r6-br6)*0.2 + (r9-br9)*0.2 + (r12-br12)*0.2
+    wsum = sum(w for _, w in parts)
+    if wsum <= 0:
+        return None
+    return sum(diff * (w / wsum) for diff, w in parts)
 
 def calc_raw_rs_series(prices: list, bench_prices: list) -> list:
     """
@@ -1587,26 +1599,46 @@ def calc_raw_rs_series(prices: list, bench_prices: list) -> list:
     index — left-aligning (as a naive `arr[i]` for i in range(min(len...)))
     would compare the stock's recent prices against the benchmark's oldest
     prices, from a completely different calendar period.
+
+    Full IBD/TV weights need 252 trading days. Stocks with shorter history
+    (new listings, thin ETFs) still get a provisional rawRS from whichever
+    of the 63/126/189/252 lookbacks fit, with weights renormalized so
+    rs_tv / rs_midcap / rs_smallcap populate for the whole universe instead
+    of staying null until a full year of bars exists.
     """
     n = min(len(prices), len(bench_prices))
     prices = prices[-n:]
     bench_prices = bench_prices[-n:]
+    # (lookback, weight) — same mix as Pine / full formula when all fit.
+    periods = ((63, 0.4), (126, 0.2), (189, 0.2), (252, 0.2))
+    min_lookback = periods[0][0]
     result = []
     for i in range(n):
-        if i < 252:
+        if i < min_lookback:
             result.append(None)
             continue
+
         def pct(arr, length):
             prev = arr[i - length]
             return (arr[i] - prev) / prev * 100 if prev else None
-        r3  = pct(prices, 63);  br3  = pct(bench_prices, 63)
-        r6  = pct(prices, 126); br6  = pct(bench_prices, 126)
-        r9  = pct(prices, 189); br9  = pct(bench_prices, 189)
-        r12 = pct(prices, 252); br12 = pct(bench_prices, 252)
-        if None in (r3,br3,r6,br6,r9,br9,r12,br12):
+
+        parts = []
+        for length, weight in periods:
+            if i < length:
+                continue
+            r = pct(prices, length)
+            b = pct(bench_prices, length)
+            if r is None or b is None:
+                continue
+            parts.append(((r - b), weight))
+        if not parts:
             result.append(None)
-        else:
-            result.append((r3-br3)*0.4 + (r6-br6)*0.2 + (r9-br9)*0.2 + (r12-br12)*0.2)
+            continue
+        wsum = sum(w for _, w in parts)
+        if wsum <= 0:
+            result.append(None)
+            continue
+        result.append(sum(diff * (w / wsum) for diff, w in parts))
     return result
 
 def calc_rs_line(prices: list, bench_prices: list) -> dict:
@@ -5040,6 +5072,20 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         log.warning("⚠️ No stocks with historical data yet — skipping scan, will retry next cycle")
         return 0
 
+    # Ensure Mid/Small/Nifty benchmarks are loaded before RS so every stock
+    # gets rs_tv / rs_midcap / rs_smallcap against the multi-year seeds.
+    nifty_n = len(nifty_cache.get('prices') or [])
+    mid_n = len(midcap_cache.get('prices') or [])
+    sml_n = len(smallcap_cache.get('prices') or [])
+    if mid_n < 252 or sml_n < 252:
+        log.warning(f"  ⚠️ Mid/Small benchmarks short (mid={mid_n}d sml={sml_n}d) — "
+                    "refreshing from DB/Upstox before RS calc")
+        await refresh_mid_smallcap_benchmarks(session)
+        mid_n = len(midcap_cache.get('prices') or [])
+        sml_n = len(smallcap_cache.get('prices') or [])
+    log.info(f"  RS benchmarks ready: Nifty={nifty_n}d Midcap={mid_n}d Smallcap={sml_n}d | "
+             f"stocks with ≥60d history={len(stocks_with_hist)}")
+
     # Build one synthetic price index per sector (average of that sector's
     # member stocks' own price histories) so sector-relative RS can use the
     # SAME TV-style, self-normalized-vs-benchmark method as Nifty/Midcap/
@@ -5647,6 +5693,18 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         row['fundamental_label'] = fundamental_score_label(row['fundamental_score'])
         row.update(compute_canslim(row))
         row.update(compute_pead_tags(row, latest_results_cache.get(row['sym'])))
+
+    n_tv = sum(1 for s in processed if s.get('rs_tv') is not None)
+    n_mid = sum(1 for s in processed if s.get('rs_midcap') is not None)
+    n_sml = sum(1 for s in processed if s.get('rs_smallcap') is not None)
+    n_full = sum(
+        1 for s in processed
+        if len((historical_cache.get(s['sym']) or {}).get('prices') or []) >= 252
+        and s.get('rs_tv') is not None
+    )
+    log.info(f"  📊 RS populated: rs_tv={n_tv}/{len(processed)} "
+             f"rs_midcap={n_mid}/{len(processed)} rs_smallcap={n_sml}/{len(processed)} "
+             f"(full-year history≥252d with RS: {n_full})")
 
     # Step 5.3: Periodic fundamentals-cache sync from Supabase — NOT a
     # rescrape, just a cheap read. This live-scan process only ever
