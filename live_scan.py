@@ -16,8 +16,10 @@ from shared import *
 
 log = logging.getLogger('pocketrs')
 
-# Cached stock_history column set for EOD archive filtering (see get_stock_history_columns).
+# Cached stock_history / stocks column sets for upsert filtering
+# (see get_stock_history_columns / get_stocks_columns).
 _stock_history_columns_cache = None
+_stocks_columns_cache = None
 _stock_history_cache_gap_fill_done = False
 
 # ══ LIVE-SCAN-ONLY FUNCTIONS ══
@@ -775,6 +777,39 @@ async def get_stock_history_columns(session: aiohttp.ClientSession) -> set:
         return cols
     except Exception as e:
         log.warning(f"get_stock_history_columns failed: {e}")
+        return set()
+
+
+async def get_stocks_columns(session: aiohttp.ClientSession) -> set:
+    """Column names currently on public.stocks. Cached in-process.
+
+    Live scan used to POST every key on `processed` into stocks. One unknown
+    column (PGRST204) rejects the WHOLE chunk — confirmed 2026-08-14→17:
+    near_ema5/pct_from_ema5 were written every cycle but never migrated, so
+    stocks.last_updated froze on Aug 14 while scan_meta/sectors kept updating
+    and % change looked "stuck" for every name. Allowlist = schema-safe upsert.
+    """
+    global _stocks_columns_cache
+    if _stocks_columns_cache is not None:
+        return _stocks_columns_cache
+    try:
+        headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/stocks?select=*&limit=1",
+            headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+        ) as r:
+            if r.status not in (200, 206):
+                log.warning(f"get_stocks_columns: status {r.status}")
+                return set()
+            rows = await r.json()
+        if not rows:
+            return set()
+        cols = set(rows[0].keys()) - {'id'}
+        _stocks_columns_cache = cols
+        log.info(f"  stocks column allowlist cached ({len(cols)} cols)")
+        return cols
+    except Exception as e:
+        log.warning(f"get_stocks_columns failed: {e}")
         return set()
 
 
@@ -5899,22 +5934,47 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         log.info(f"  📊 Index dashboard: {len(index_rows)} indices saved")
 
     # Step 7: Save to Supabase
-    # Strip in-memory Best Picks fields that are NOT columns on
-    # public.stocks. Hourly AI picks mutates every row with
-    # result_rating / best_pick_score; PostgREST then rejects the
-    # WHOLE upsert (PGRST204) if either key is unknown — seen
-    # 2026-08-14 right after the first AI-picks cycle of the hour.
-    # These live on financial_results / best_picks, not stocks.
+    # Strip keys that are not columns on public.stocks. PostgREST rejects
+    # the WHOLE chunk (PGRST204) on one unknown key — seen 2026-08-14 when
+    # near_ema5/pct_from_ema5 shipped in code before add_near_ema5.sql ran,
+    # freezing stocks (and % change) while scan_meta still reported success.
+    # Prefer intersecting with live schema columns; always drop ephemeral
+    # AI / in-memory-only keys.
     _STOCKS_UPSERT_SKIP = frozenset({
-        'result_rating',
-        'best_pick_score',
+        'result_rating',   # lives on financial_results / best_picks, not stocks
+        '_ai_filter_why',  # ephemeral AI shortlist annotation
     })
-    stocks_rows = [
-        {k: v for k, v in p.items() if k not in _STOCKS_UPSERT_SKIP}
-        for p in processed
-    ]
+    # If schema sample fails, still drop these so a missing migration cannot
+    # freeze the whole table (PGRST204). When allowlist works, unknown keys
+    # are stripped automatically — including these until add_near_ema5.sql runs.
+    _STOCKS_UPSERT_FALLBACK_SKIP = _STOCKS_UPSERT_SKIP | frozenset({
+        'near_ema5',
+        'pct_from_ema5',
+    })
+    stocks_cols = await get_stocks_columns(session)
+    stocks_rows = []
+    dropped_keys = set()
+    for p in processed:
+        if stocks_cols:
+            row = {}
+            for k, v in p.items():
+                if k in _STOCKS_UPSERT_SKIP:
+                    continue
+                if k in stocks_cols:
+                    row[k] = v
+                else:
+                    dropped_keys.add(k)
+            stocks_rows.append(row)
+        else:
+            stocks_rows.append(
+                {k: v for k, v in p.items() if k not in _STOCKS_UPSERT_FALLBACK_SKIP}
+            )
+            dropped_keys |= (set(p.keys()) & _STOCKS_UPSERT_FALLBACK_SKIP)
+    if dropped_keys:
+        log.warning(f"  ⚠️ Stripping {len(dropped_keys)} non-column key(s) from stocks "
+                    f"upsert (run matching ALTER / NOTIFY pgrst): {sorted(dropped_keys)}")
     log.info(f"  Saving {len(stocks_rows)} stocks to Supabase…")
-    await supabase_upsert(session, 'stocks', stocks_rows)
+    stocks_upsert_ok = await supabase_upsert(session, 'stocks', stocks_rows)
 
     # Also publish the same data to R2 for the frontend to read directly —
     # see upload_snapshot_to_r2's docstring. Trimmed to only the fields
@@ -6241,17 +6301,28 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
     # Step 8: Update scan metadata
     duration = round(time.time() - start, 1)
     next_scan = (now_ist + timedelta(seconds=UPDATE_INTERVAL)).isoformat()
+    # Don't report success if the stocks table write failed — that is
+    # exactly how % change stayed frozen for days while the UI still
+    # looked "healthy" via a fresh last_scan timestamp.
+    meta_status = 'success' if stocks_upsert_ok else 'partial'
+    meta_err = None if stocks_upsert_ok else (
+        'stocks upsert failed (schema drift / PGRST204?) — prices & chg_pct not refreshed'
+    )
     await supabase_update_meta(session, {
         'last_scan':    now_ist.isoformat(),
         'scan_type':    scan_type,
         'stocks_count': len(processed),
         'duration_sec': duration,
-        'status':       'success',
-        'error_msg':    None,
+        'status':       meta_status,
+        'error_msg':    meta_err,
         'next_scan':    next_scan,
     })
 
-    log.info(f"✅ {scan_type} scan done: {len(processed)} stocks in {duration}s")
+    if stocks_upsert_ok:
+        log.info(f"✅ {scan_type} scan done: {len(processed)} stocks in {duration}s")
+    else:
+        log.error(f"❌ {scan_type} scan computed {len(processed)} stocks in {duration}s "
+                  f"but stocks table upsert FAILED — chg_pct will stay stuck until fixed")
     return len(processed)
 
 async def save_best_picks(session: aiohttp.ClientSession, top_rows: list, reasoning: dict):
@@ -6665,10 +6736,14 @@ async def supabase_update_meta(session: aiohttp.ClientSession, meta: dict):
     except Exception as e:
         log.error(f"Meta update error: {e}")
 
-async def supabase_upsert(session: aiohttp.ClientSession, table: str, rows: list, on_conflict: str = None):
-    """Upsert rows into Supabase table in parallel chunks for speed."""
+async def supabase_upsert(session: aiohttp.ClientSession, table: str, rows: list, on_conflict: str = None) -> bool:
+    """Upsert rows into Supabase table in parallel chunks for speed.
+
+    Returns True if every chunk succeeded (2xx). Callers that must not
+    silently freeze display data (stocks) should treat False as failure.
+    """
     if not rows:
-        return
+        return True
     url = f"{SUPABASE_URL}/rest/v1/{table}"
     if on_conflict:
         url += f"?on_conflict={on_conflict}"
@@ -6679,6 +6754,7 @@ async def supabase_upsert(session: aiohttp.ClientSession, table: str, rows: list
         "Prefer":        "resolution=merge-duplicates",
     }
     CHUNK = 500  # larger chunks = fewer round trips
+    failures = {'n': 0}
 
     async def upsert_chunk(chunk):
         try:
@@ -6686,9 +6762,11 @@ async def supabase_upsert(session: aiohttp.ClientSession, table: str, rows: list
                                     timeout=aiohttp.ClientTimeout(total=30)) as r:
                 if r.status not in (200, 201, 204):
                     text = await r.text()
-                    # Log enough of PGRST204 to see which column killed stock_history.
+                    failures['n'] += 1
+                    # Log enough of PGRST204 to see which column killed the write.
                     log.warning(f"Supabase upsert {table} failed: {r.status} {text[:300]}")
         except Exception as e:
+            failures['n'] += 1
             log.error(f"Supabase error ({table}): {e}")
 
     # Fire all chunks concurrently (max 4 at a time)
@@ -6698,6 +6776,7 @@ async def supabase_upsert(session: aiohttp.ClientSession, table: str, rows: list
         async with sem:
             await upsert_chunk(chunk)
     await asyncio.gather(*[upsert_with_sem(c) for c in chunks])
+    return failures['n'] == 0
 
 def trim_for_r2(stocks: list) -> list:
     """Filters each stock dict down to only _R2_STOCK_FIELDS before
