@@ -3,7 +3,7 @@ Intraday 1-minute OHLCV store for Our Chart (client rolls up to 3/5/15).
 
 Kill switch (no code delete needed):
   Railway env  ENABLE_INTRADAY_1M=0   → stop writing + publish features.intraday_1m=false
-  Railway env  ENABLE_INTRADAY_1M=1   → write bars + publish features.intraday_1m=true
+  Railway env  ENABLE_INTRADAY_1M=1   → write bars (also the default if unset)
 
 Frontend hides 1/3/5/15 when scan_meta.features.intraday_1m is false
 (or VITE_ENABLE_INTRADAY_CHART=0). Existing daily charts are unaffected.
@@ -21,13 +21,13 @@ from shared import IST, SUPABASE_KEY, SUPABASE_URL, is_market_open
 log = logging.getLogger('pocketrs')
 
 # ── Feature flag ──────────────────────────────────────────────────────
-def _env_truthy(name: str, default: str = '0') -> bool:
+def _env_truthy(name: str, default: str = '1') -> bool:
     return os.environ.get(name, default).strip().lower() in ('1', 'true', 'yes', 'on')
 
 
 def is_intraday_1m_enabled() -> bool:
-    """Master kill switch. Default OFF until explicitly enabled on Railway."""
-    return _env_truthy('ENABLE_INTRADAY_1M', '0')
+    """Master kill switch. Default ON; set ENABLE_INTRADAY_1M=0 on Railway to stop writes."""
+    return _env_truthy('ENABLE_INTRADAY_1M', '1')
 
 
 def feature_flags_payload() -> dict:
