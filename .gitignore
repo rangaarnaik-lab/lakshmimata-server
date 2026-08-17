@@ -2,6 +2,9 @@
 __pycache__/
 *.pyc
 
+# Regenerable index history downloads (scripts/fetch_index_history_csv.py)
+data/indices/
+
 # Cloud Agent clones frontend beside/inside the server workspace
 Lakshmimata/
 
