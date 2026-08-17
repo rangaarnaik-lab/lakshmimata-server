@@ -4792,6 +4792,13 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
     for r in results:
         live_data.update(r)
 
+    # Persist 1-minute OHLCV when ENABLE_INTRADAY_1M=1 (no-op if off).
+    try:
+        from intraday_1m import persist_bars as persist_intraday_1m_bars
+        await persist_intraday_1m_bars(session, live_data)
+    except Exception as e:
+        log.warning(f"intraday 1m persist skipped: {e}")
+
     # Live Nifty 50 price — needed so RS-TV can react intraday instead of
     # only updating at EOD (historical_cache's Nifty series only refreshes
     # once at startup + once daily, same as every stock's own history).
@@ -6308,6 +6315,11 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
     meta_err = None if stocks_upsert_ok else (
         'stocks upsert failed (schema drift / PGRST204?) — prices & chg_pct not refreshed'
     )
+    try:
+        from intraday_1m import feature_flags_payload
+        features = feature_flags_payload()
+    except Exception:
+        features = {'intraday_1m': False, 'intraday_intervals': []}
     await supabase_update_meta(session, {
         'last_scan':    now_ist.isoformat(),
         'scan_type':    scan_type,
@@ -6316,6 +6328,8 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         'status':       meta_status,
         'error_msg':    meta_err,
         'next_scan':    next_scan,
+        # Feature flags for the UI (stripped automatically if column missing)
+        'features':     features,
     })
 
     if stocks_upsert_ok:
@@ -6721,7 +6735,7 @@ def std_dev(prices: list, n: int) -> Optional[float]:
     return variance ** 0.5
 
 async def supabase_update_meta(session: aiohttp.ClientSession, meta: dict):
-    """Update scan metadata."""
+    """Update scan metadata. Drops unknown columns (e.g. features) on PGRST204."""
     url = f"{SUPABASE_URL}/rest/v1/scan_meta"
     headers = {
         "apikey":        SUPABASE_KEY,
@@ -6729,12 +6743,29 @@ async def supabase_update_meta(session: aiohttp.ClientSession, meta: dict):
         "Content-Type":  "application/json",
         "Prefer":        "resolution=merge-duplicates",
     }
+    payload = [{"id": "latest", **meta}]
     try:
-        async with session.post(url, headers=headers, json=[{"id": "latest", **meta}],
+        async with session.post(url, headers=headers, json=payload,
                                 timeout=aiohttp.ClientTimeout(total=10)) as r:
-            pass
+            if r.status in (200, 201, 204):
+                return
+            text = await r.text()
+            # features jsonb may not exist until 013 SQL is run — retry without it
+            if r.status == 400 and 'features' in meta and (
+                'features' in text or 'PGRST204' in text or 'column' in text.lower()
+            ):
+                slim = {k: v for k, v in meta.items() if k != 'features'}
+                async with session.post(url, headers=headers,
+                                        json=[{"id": "latest", **slim}],
+                                        timeout=aiohttp.ClientTimeout(total=10)) as r2:
+                    if r2.status not in (200, 201, 204):
+                        t2 = await r2.text()
+                        log.warning(f"Meta update failed (no features): {r2.status} {t2[:200]}")
+                return
+            log.warning(f"Meta update failed: {r.status} {text[:200]}")
     except Exception as e:
         log.error(f"Meta update error: {e}")
+
 
 async def supabase_upsert(session: aiohttp.ClientSession, table: str, rows: list, on_conflict: str = None) -> bool:
     """Upsert rows into Supabase table in parallel chunks for speed.
@@ -6980,6 +7011,11 @@ async def run_live_scan_service():
         # merged here).
         await ensure_best_picks_table(session)
         await ensure_best_picks_history_table(session)
+        try:
+            from intraday_1m import on_startup as intraday_on_startup
+            await intraday_on_startup(session)
+        except Exception as e:
+            log.warning(f"intraday_1m startup: {e}")
         # Step 2b: Load Nifty 50 + all index histories
         await load_nifty_cache(session)
         await load_index_cache(session)
