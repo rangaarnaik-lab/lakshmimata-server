@@ -1391,6 +1391,90 @@ def _index_levels_compatible(older: list, newer: list, tol: float = 0.25) -> boo
         return False
     return abs(a - b) / max(a, b) <= tol
 
+def merge_index_seed_with_fresh(db: list, fresh: list) -> tuple:
+    """
+    Keep a multi-year DB seed and splice a shorter Upstox/Yahoo fresh window
+    onto the tail (daily EOD append for Nifty / Midcap / Smallcap).
+
+    Returns (merged_prices, note) where note is a short log tag.
+    Never shortens a longer clean DB series just because Upstox only has ~370d.
+    """
+    db = list(db or [])
+    fresh = list(fresh or [])
+    if not fresh and not db:
+        return [], "empty"
+    if not fresh:
+        return db, f"db-only:{len(db)}d"
+    if not db:
+        if _index_series_has_corrupt_jumps(fresh):
+            return [], "fresh-corrupt"
+        return fresh, f"fresh-only:{len(fresh)}d"
+    if len(db) > len(fresh):
+        overlap_old = db[-len(fresh):]
+        merged = db[:-len(fresh)] + fresh
+        if (_index_levels_compatible(overlap_old, fresh)
+                and not _index_series_has_corrupt_jumps(merged)):
+            return merged, f"seed:{len(db)-len(fresh)}d+fresh:{len(fresh)}d={len(merged)}d"
+        # Fresh window incompatible — keep long seed rather than clobbering it.
+        return db, f"kept-db:{len(db)}d (fresh incompatible)"
+    # Fresh is longer or equal — prefer it when clean.
+    if _index_series_has_corrupt_jumps(fresh):
+        return db, f"kept-db:{len(db)}d (fresh corrupt)"
+    return fresh, f"fresh:{len(fresh)}d"
+
+# Benchmark indexes that carry multi-year seeds in index_price_history and
+# must be lengthened daily (not replaced by the ~370d Upstox window).
+BENCHMARK_INDEX_NAMES = ("Nifty 50", "Midcap 150", "Smallcap 250")
+last_benchmark_append_date: Optional[str] = None
+
+async def daily_append_benchmark_indexes(session: aiohttp.ClientSession) -> None:
+    """
+    Once-per-day EOD job: for Nifty 50 / Midcap 150 / Smallcap 250, take the
+    long series already in Supabase and splice today's Upstox (or in-memory)
+    closes onto the tail, then write back. Replaces the old
+    "keep longer DB, skip write" path that left seeds frozen after the
+    one-time SQL backfill.
+    """
+    global nifty_cache, midcap_cache, smallcap_cache, last_benchmark_append_date
+    today = datetime.now(IST).strftime('%Y-%m-%d')
+    if last_benchmark_append_date == today:
+        log.info(f"  Benchmark index append already done today ({today}) — skipping")
+        return
+
+    log.info("📈 Daily append: Nifty 50 / Midcap 150 / Smallcap 250 → index_price_history")
+    for name in BENCHMARK_INDEX_NAMES:
+        db = await load_index_history_from_db(session, name)
+        fresh = list(index_history_cache.get(name, {}).get('prices') or [])
+        if name == "Nifty 50" and nifty_cache.get('prices'):
+            # load_nifty_cache may already hold a merged series — use the longer.
+            n = list(nifty_cache.get('prices') or [])
+            if len(n) > len(fresh):
+                fresh = n
+        if name == "Midcap 150" and midcap_cache.get('prices') and len(midcap_cache['prices']) > len(fresh):
+            fresh = list(midcap_cache['prices'])
+        if name == "Smallcap 250" and smallcap_cache.get('prices') and len(smallcap_cache['prices']) > len(fresh):
+            fresh = list(smallcap_cache['prices'])
+
+        if db and _index_series_has_corrupt_jumps(db):
+            log.warning(f"  ⚠️ {name}: discarding corrupt DB seed ({len(db)}d)")
+            db = []
+
+        merged, note = merge_index_seed_with_fresh(db, fresh)
+        if not merged:
+            log.warning(f"  ⚠️ {name}: nothing to save ({note})")
+            continue
+
+        await save_index_history_to_db(session, name, merged)
+        if name == "Nifty 50":
+            nifty_cache = {'prices': merged, 'volumes': nifty_cache.get('volumes', [])}
+        elif name == "Midcap 150":
+            midcap_cache = {'prices': merged}
+        elif name == "Smallcap 250":
+            smallcap_cache = {'prices': merged}
+        log.info(f"  ✅ {name}: {note}")
+
+    last_benchmark_append_date = today
+
 async def refresh_mid_smallcap_benchmarks(session: aiohttp.ClientSession) -> None:
     """
     Populate midcap_cache / smallcap_cache from the OFFICIAL Nifty Midcap 150
@@ -1432,29 +1516,19 @@ async def refresh_mid_smallcap_benchmarks(session: aiohttp.ClientSession) -> Non
                     fresh = list(y)
                     log.info(f"  ✅ {name}: rebuilt from Yahoo after discarding corrupt DB ({len(fresh)}d)")
 
-        merged: list = []
+        merged, note = merge_index_seed_with_fresh(db, fresh)
         used_synth = False
-        if db and fresh and len(db) > len(fresh):
-            overlap_old = db[-len(fresh):]
-            if _index_levels_compatible(overlap_old, fresh) and not _index_series_has_corrupt_jumps(db[:-len(fresh)] + fresh):
-                merged = db[:-len(fresh)] + fresh
-                log.info(f"  ✅ {name}: {len(merged)}d (DB seed {len(db)-len(fresh)}d + fresh {len(fresh)}d)")
-            else:
-                merged = fresh
-                log.warning(f"  ⚠️ {name}: DB scale incompatible with fresh — using Upstox/Yahoo only ({len(fresh)}d)")
-        elif fresh:
-            merged = fresh
-            log.info(f"  ✅ {name}: {len(merged)}d from Upstox/Yahoo")
-        elif db:
-            merged = db
-            log.info(f"  ✅ {name}: {len(merged)}d from DB only")
-        else:
+        if not merged:
             synth = build_synthetic_index(list(synth_symbols), historical_cache, min_stocks=min_stocks)
             merged = synth.get('prices') or []
             used_synth = bool(merged)
             if merged:
                 log.warning(f"  ⚠️ {name}: official index unavailable — "
                             f"temporary equal-weight synthetic fallback ({len(merged)}d)")
+            else:
+                log.warning(f"  ⚠️ {name}: no series ({note})")
+        else:
+            log.info(f"  ✅ {name}: {note}")
 
         # Persist clean official series so the next restart doesn't re-use
         # the corrupted stitch. Never write synthetic under the official name.
@@ -4187,16 +4261,21 @@ async def load_full_history_once(session: aiohttp.ClientSession):
         if db_mid: midcap_cache = {'prices': db_mid}
         if db_sml: smallcap_cache = {'prices': db_sml}
         if not db_mid or not db_sml:
-            # Fetch Midcap/Smallcap from Yahoo
+            # Fetch Midcap/Smallcap from Yahoo — only fill gaps; never
+            # overwrite a longer multi-year seed already in the DB.
             results = await fetch_full_nifty_history(session)
             if "Midcap 150" in results:
-                midcap_cache = {"prices": results["Midcap 150"]}
-                await save_index_history_to_db(session, "Midcap 150", results["Midcap 150"])
-                log.info(f"  💾 Saved Midcap 150: {len(results['Midcap 150'])} days")
+                mid_merged, mid_note = merge_index_seed_with_fresh(db_mid, results["Midcap 150"])
+                if mid_merged:
+                    midcap_cache = {"prices": mid_merged}
+                    await save_index_history_to_db(session, "Midcap 150", mid_merged)
+                    log.info(f"  💾 Midcap 150: {mid_note}")
             if "Smallcap 250" in results:
-                smallcap_cache = {"prices": results["Smallcap 250"]}
-                await save_index_history_to_db(session, "Smallcap 250", results["Smallcap 250"])
-                log.info(f"  💾 Saved Smallcap 250: {len(results['Smallcap 250'])} days")
+                sml_merged, sml_note = merge_index_seed_with_fresh(db_sml, results["Smallcap 250"])
+                if sml_merged:
+                    smallcap_cache = {"prices": sml_merged}
+                    await save_index_history_to_db(session, "Smallcap 250", sml_merged)
+                    log.info(f"  💾 Smallcap 250: {sml_note}")
         return
 
     log.info(f"📥 DB has only {len(nifty_cache.get('prices', []))}d — fetching full history from external sources…")
@@ -4208,18 +4287,31 @@ async def load_full_history_once(session: aiohttp.ClientSession):
 
     for name, prices in results.items():
         existing = await load_index_history_from_db(session, name)
-        if existing and len(existing) >= len(prices):
-            log.info(f"  Keeping DB {len(existing)}d for {name} (longer than external {len(prices)}d)")
+        merged, note = merge_index_seed_with_fresh(existing, prices)
+        if not merged:
+            log.info(f"  Skipping {name}: {note}")
             continue
-        await save_index_history_to_db(session, name, prices)
-        log.info(f"  💾 Saved {name}: {len(prices)} days to DB")
+        if existing and len(existing) >= len(merged) and merged == existing:
+            log.info(f"  Keeping DB {len(existing)}d for {name} ({note})")
+            continue
+        await save_index_history_to_db(session, name, merged)
+        log.info(f"  💾 Saved {name}: {note}")
 
-    if "Nifty 50" in results and len(results["Nifty 50"]) > len(nifty_cache.get('prices', [])):
-        nifty_cache = {"prices": results["Nifty 50"]}
+    if "Nifty 50" in results:
+        existing = await load_index_history_from_db(session, "Nifty 50")
+        merged, _ = merge_index_seed_with_fresh(existing, results["Nifty 50"])
+        if merged and len(merged) > len(nifty_cache.get('prices', [])):
+            nifty_cache = {"prices": merged}
     if "Midcap 150" in results:
-        midcap_cache = {"prices": results["Midcap 150"]}
+        existing = await load_index_history_from_db(session, "Midcap 150")
+        merged, _ = merge_index_seed_with_fresh(existing, results["Midcap 150"])
+        if merged:
+            midcap_cache = {"prices": merged}
     if "Smallcap 250" in results:
-        smallcap_cache = {"prices": results["Smallcap 250"]}
+        existing = await load_index_history_from_db(session, "Smallcap 250")
+        merged, _ = merge_index_seed_with_fresh(existing, results["Smallcap 250"])
+        if merged:
+            smallcap_cache = {"prices": merged}
     log.info("✅ Full history loaded!")
 
 async def load_fundamentals_at_startup(session: aiohttp.ClientSession):
@@ -4457,26 +4549,44 @@ async def load_index_cache(session: aiohttp.ClientSession):
     await persist_all_index_history_to_db(session)
 
 async def persist_all_index_history_to_db(session: aiohttp.ClientSession):
-    """Upsert index_history_cache → index_price_history for all loaded indices."""
+    """Upsert index_history_cache → index_price_history for all loaded indices.
+
+    For multi-year seeded benchmarks (Nifty / Mid / Small), splice the shorter
+    Upstox window onto the DB seed — never leave the seed frozen, and never
+    overwrite a longer clean seed with ~370 Upstox days.
+    """
     if not index_history_cache:
         log.info("  No index_history_cache entries to persist")
         return
     saved = 0
-    kept_db = 0
+    merged_n = 0
     for name, data in list(index_history_cache.items()):
         prices = list((data or {}).get('prices') or [])
         if len(prices) < 5:
             continue
-        # Prefer longer DB history when Upstox only returned a shorter window
-        # (e.g. Nifty 50 seed ~1492d vs Upstox ~550d).
         existing = await load_index_history_from_db(session, name)
-        if existing and len(existing) > len(prices):
-            kept_db += 1
+        if existing and _index_series_has_corrupt_jumps(existing):
+            existing = []
+        if name in BENCHMARK_INDEX_NAMES or (existing and len(existing) > len(prices)):
+            out, note = merge_index_seed_with_fresh(existing, prices)
+            if not out:
+                continue
+            if existing and len(out) >= len(existing) and out != existing:
+                merged_n += 1
+            await save_index_history_to_db(session, name, out)
+            # Keep in-memory cache aligned when we lengthened a seed.
+            index_history_cache[name] = {
+                **(data or {}),
+                'prices': out,
+            }
+            saved += 1
+            if name in BENCHMARK_INDEX_NAMES:
+                log.info(f"  💾 {name}: {note}")
             continue
         await save_index_history_to_db(session, name, prices)
         saved += 1
     log.info(f"  💾 Persisted {saved} indices to index_price_history"
-             + (f" ({kept_db} kept longer DB series)" if kept_db else ""))
+             + (f" ({merged_n} spliced onto longer DB seed)" if merged_n else ""))
 
 async def load_index_history_from_db(session: aiohttp.ClientSession, name: str) -> list:
     """Load index price history from Supabase."""
@@ -4560,22 +4670,19 @@ async def load_nifty_cache(session: aiohttp.ClientSession):
             candles = list(reversed(data.get('data', {}).get('candles', [])))
             fresh_prices = [c[4] for c in candles]
 
-            # Merge with DB seed (2020-2025) — no overlap
-            # DB seed ends Dec 2025, Upstox starts ~Jul 2025 (371 days back)
-            # Overlap ~125 days. Solution: take DB base + Upstox tail only
+            # Merge with multi-year DB seed — Upstox only covers ~550 trading days.
             db_prices = await load_index_history_from_db(session, "Nifty 50")
-            if db_prices and len(db_prices) > len(fresh_prices):
-                # DB has more history (seed). Replace last N days with fresh.
-                # This avoids overlap: base = everything before Upstox window
-                base = db_prices[:-len(fresh_prices)]
-                merged = base + fresh_prices
-                log.info(f"✅ Nifty 50: {len(merged)}d total (seed:{len(base)}d + fresh:{len(fresh_prices)}d, no overlap)")
-            else:
+            if db_prices and _index_series_has_corrupt_jumps(db_prices):
+                log.warning("  ⚠️ Discarding corrupt Nifty 50 DB seed")
+                db_prices = []
+            merged, note = merge_index_seed_with_fresh(db_prices, fresh_prices)
+            if not merged:
                 merged = fresh_prices
-                log.info(f"✅ Nifty 50: {len(merged)}d from Upstox only")
+                note = f"fresh-fallback:{len(merged)}d"
+            log.info(f"✅ Nifty 50: {note}")
 
             nifty_cache = {'prices': merged, 'volumes': [c[5] for c in candles]}
-            # Save back to DB for next restart
+            # Save back to DB for next restart / daily append
             await save_index_history_to_db(session, "Nifty 50", merged)
     except Exception as e:
         log.warning(f"Nifty cache load failed: {e}")
@@ -4913,6 +5020,9 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             # Refresh official Midcap 150 / Smallcap 250 benchmarks (not
             # synthetic constituent averages — those were corrupting MID/SML RS).
             await refresh_mid_smallcap_benchmarks(session)
+            # Explicit daily append for the three multi-year seeds so
+            # index_price_history keeps growing after the one-time SQL load.
+            await daily_append_benchmark_indexes(session)
 
     # Step 3: DO NOT mutate historical_cache prices in place (was causing chg% drift).
     # Instead, keep historical close as the immutable baseline and use live price
@@ -7035,6 +7145,9 @@ async def run_live_scan_service():
         # index_history_cache; load_full_history_once may have Yahoo/DB.
         # refresh_* merges those cleanly and discards any previously
         # corrupted synthetic-stitched series in Supabase.
+        # Daily append of today's close onto the multi-year seeds runs once
+        # at EOD via daily_append_benchmark_indexes (not here — startup
+        # would consume the once-per-day guard before the final close lands).
         await refresh_mid_smallcap_benchmarks(session)
 
         # Step 3c: Load full 2yr history at startup — from Supabase first
