@@ -2478,23 +2478,42 @@ def detect_bull_snort(opens: list, highs: list, lows: list, closes: list, volume
     if n < 21 or not volumes or len(volumes) < n:
         return result
     i = n - 1
-    hi = highs[i] if highs and len(highs) == n else closes[i]
-    lo = lows[i] if lows and len(lows) == n else closes[i]
+
+    def _at(arr, idx, fallback):
+        """Prefer last-n aligned series even when lengths drifted after trim."""
+        if not arr:
+            return fallback
+        if len(arr) == n:
+            v = arr[idx]
+            return fallback if v is None else v
+        if len(arr) > n:
+            v = arr[len(arr) - n + idx]
+            return fallback if v is None else v
+        # shorter than closes — use last available if this is the final bar
+        if idx == n - 1 and arr:
+            v = arr[-1]
+            return fallback if v is None else v
+        return fallback
+
     cl = closes[i]
     vol = volumes[i]
-    if hi is None or lo is None or cl is None or vol is None:
+    if cl is None or vol is None:
         return result
-    if opens and len(opens) == n and opens[i] is not None:
-        op = opens[i]
+    hi = _at(highs, i, cl)
+    lo = _at(lows, i, cl)
+    if opens and len(opens) >= 1:
+        op = _at(opens, i, None)
+        if op is None:
+            op = closes[i - 1] if i > 0 and closes[i - 1] is not None else cl
     else:
         op = closes[i - 1] if i > 0 and closes[i - 1] is not None else cl
     if cl < op:
         return result
     day_range = hi - lo
-    if day_range <= 0:
-        return result
-    if (cl - lo) / day_range < 0.7:
-        return result
+    if day_range > 0:
+        if (cl - lo) / day_range < 0.7:
+            return result
+    # else: live quotes often set H=L=last mid-session — skip range gate
     window = volumes[i - 19:i + 1]
     if len(window) < 20 or any(v is None for v in window):
         return result
@@ -5418,9 +5437,26 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
 
         # Bull Snort — same climax rules as the chart overlay; augment with
         # live OHLC/volume mid-session so the RS filter lights up intraday.
-        highs_arr = s.get('highs') or prices
-        lows_arr = s.get('lows') or prices
-        opens_arr = s.get('opens') or []
+        # highs/lows live on historical_cache; opens live on opens_cache
+        # (NOT on s). Always align to len(prices) after the volumes trim above.
+        _n = len(prices)
+        _raw_h = s.get('highs') or []
+        _raw_l = s.get('lows') or []
+        _raw_o = opens_cache.get(sym) or []
+        highs_arr = list(_raw_h[-_n:]) if len(_raw_h) >= _n else (
+            list(_raw_h) + [prices[j] for j in range(len(_raw_h), _n)] if _raw_h
+            else list(prices)
+        )
+        lows_arr = list(_raw_l[-_n:]) if len(_raw_l) >= _n else (
+            list(_raw_l) + [prices[j] for j in range(len(_raw_l), _n)] if _raw_l
+            else list(prices)
+        )
+        if len(_raw_o) >= _n:
+            opens_arr = list(_raw_o[-_n:])
+        elif _raw_o:
+            opens_arr = list(_raw_o) + [prices[j] for j in range(len(_raw_o), _n)]
+        else:
+            opens_arr = []
         live_ohlc = live.get('ohlc') if isinstance(live.get('ohlc'), dict) else {}
         if prices_last_is_today or not (live_price and live_price > 0):
             rt_highs, rt_lows, rt_opens = highs_arr, lows_arr, opens_arr
