@@ -501,6 +501,8 @@ _R2_STOCK_FIELDS = frozenset({
     'is_52wl_signal',
     'is_weak_rs','weak_chg_1d','weak_chg_5d','weak_vol_spike',
     'in_squeeze','squeeze_fired','bb_width_pct','squeeze_days',
+    'sqz_level','sqz_days','sqz_high_days','sqz_mom','sqz_mom_slope',
+    'sqz_bias','sqz_fired_dir',
     'is_vcp','vcp_stage','vcp_fired','vcp_contractions',
     'last_updated','scan_type',
 })

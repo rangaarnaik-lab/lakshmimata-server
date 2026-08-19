@@ -17,6 +17,7 @@ from bull_snort import (
     BULL_SNORT_AVG_LEN, BULL_SNORT_MIN_DCR, BULL_SNORT_MIN_REL_VOL,
     detect_bull_snort,
 )
+from squeeze_pro import compute_squeeze_pro
 
 log = logging.getLogger('pocketrs')
 
@@ -2165,76 +2166,24 @@ def detect_52wl(prices: list, volumes: list) -> dict:
 
 def detect_bb_squeeze(prices: list, highs: list, lows: list, n: int = 20) -> dict:
     """
-    Bollinger Band Squeeze: BB width at multi-month low, BB inside Keltner Channel.
-    Classic TTM Squeeze indicator logic.
+    Squeeze state for one stock — John Carter's Squeeze Pro.
+
+    Delegates to squeeze_pro.compute_squeeze_pro so the tier the chart draws,
+    the tier the scanner sorts on and the tier the alert fires on are one
+    calculation. It returns both the classic columns (in_squeeze /
+    squeeze_fired / squeeze_days / bb_width_pct, where "in squeeze" is still
+    the 1.5-ATR Keltner test) and the Squeeze Pro columns:
+
+        sqz_level      none | low | mid | high  — how hard price is coiled
+        sqz_days       bars in any compression  — how long the coil has held
+        sqz_high_days  bars at high compression
+        sqz_mom        TTM momentum, sign = long/short side of the break
+        sqz_mom_slope  momentum change vs the prior bar
+        sqz_bias       long | short
+        sqz_fired      left every Keltner on this bar
+        sqz_fired_dir  which way it released
     """
-    empty = {'in_squeeze': False, 'squeeze_fired': False, 'bb_width_pct': None, 'squeeze_days': 0}
-    if len(prices) < n + 60:
-        return empty
-
-    closes = prices
-    ma20 = sma(closes, n)
-    sd20 = std_dev(closes, n)
-    if not ma20 or not sd20:
-        return empty
-
-    upper_bb = ma20 + 2 * sd20
-    lower_bb = ma20 - 2 * sd20
-    bb_width = upper_bb - lower_bb
-    bb_width_pct = round((bb_width / ma20) * 100, 2) if ma20 else None
-
-    # Keltner Channel using ATR
-    atr_val = atr(highs, lows, closes, n)
-    if not atr_val:
-        return empty
-    upper_kc = ma20 + 1.5 * atr_val
-    lower_kc = ma20 - 1.5 * atr_val
-
-    # Squeeze ON when BB is inside KC
-    in_squeeze = (upper_bb < upper_kc) and (lower_bb > lower_kc)
-
-    # Check how many consecutive days squeeze has been on.
-    # PERFORMANCE: avoid re-slicing/re-scanning the full price history on every
-    # iteration (was O(n) work x 20 iterations x 3 functions x 2400 stocks,
-    # which froze the event loop for minutes). Instead, precompute a short
-    # window of closes/highs/lows once and reuse it.
-    squeeze_days = 0
-    max_lookback = min(20, len(closes) - n - 20)
-    if max_lookback > 0:
-        # Only need the last (n + max_lookback + 20) closes for this whole check
-        window_size = n + max_lookback + 21
-        wc = closes[-window_size:] if len(closes) > window_size else closes
-        wh = highs[-window_size:]  if len(highs)  > window_size else highs
-        wl = lows[-window_size:]   if len(lows)   > window_size else lows
-
-        for d in range(0, max_lookback):
-            end = len(wc) - 1 - d
-            if end < n + 20:
-                break
-            sub_closes = wc[:end+1]
-            sub_highs  = wh[:end+1]
-            sub_lows   = wl[:end+1]
-            m = sma(sub_closes, n)
-            s = std_dev(sub_closes, n)
-            a = atr(sub_highs, sub_lows, sub_closes, n)
-            if not m or not s or not a:
-                break
-            ub, lb = m + 2*s, m - 2*s
-            uk, lk = m + 1.5*a, m - 1.5*a
-            if ub < uk and lb > lk:
-                squeeze_days += 1
-            else:
-                break
-
-    # Squeeze fired = was in squeeze yesterday, not in squeeze today (breakout)
-    squeeze_fired = squeeze_days == 0 and was_in_squeeze_yesterday(closes, highs, lows, n)
-
-    return {
-        'in_squeeze': in_squeeze,
-        'squeeze_fired': squeeze_fired,
-        'bb_width_pct': bb_width_pct,
-        'squeeze_days': squeeze_days,
-    }
+    return compute_squeeze_pro(highs, lows, prices, length=n)
 
 def detect_chart_patterns(highs: list, lows: list, prices: list, volumes: list) -> dict:
     """
@@ -5605,6 +5554,14 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'squeeze_fired':  squeeze['squeeze_fired'],
             'bb_width_pct':   squeeze['bb_width_pct'],
             'squeeze_days':   squeeze['squeeze_days'],
+            # Squeeze Pro — compression tier, coil length and momentum side
+            'sqz_level':      squeeze['sqz_level'],
+            'sqz_days':       squeeze['sqz_days'],
+            'sqz_high_days':  squeeze['sqz_high_days'],
+            'sqz_mom':        squeeze['sqz_mom'],
+            'sqz_mom_slope':  squeeze['sqz_mom_slope'],
+            'sqz_bias':       squeeze['sqz_bias'],
+            'sqz_fired_dir':  squeeze['sqz_fired_dir'],
             'is_vcp':         vcp['is_vcp'],
             'vcp_stage':      vcp['vcp_stage'],
             'vcp_fired':      vcp['vcp_fired'],
@@ -5769,7 +5726,11 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
 
         if new_bb or new_vcp:
             fire_type = []
-            if new_bb:  fire_type.append('BB Squeeze')
+            if new_bb:
+                # Momentum side of the release, so the alert says whether the
+                # coil broke long or short instead of just "fired".
+                direction = {'long': ' ↑ Long', 'short': ' ↓ Short'}.get(s.get('sqz_bias'), '')
+                fire_type.append(f"BB Squeeze{direction}")
             if new_vcp: fire_type.append('VCP')
             new_fires.append({
                 'sym':        sym,
@@ -7060,21 +7021,6 @@ def validate_hardcoded_symbol_lists():
     else:
         log.error(f"  ❌ {total_bad} bad symbol(s) found across hardcoded lists — see warnings above. "
                   f"These stocks are silently invisible in the app until the symbol is corrected.")
-
-def was_in_squeeze_yesterday(closes, highs, lows, n=20) -> bool:
-    if len(closes) < n + 21:
-        return False
-    sub_closes = closes[:-1]
-    sub_highs  = highs[:-1]
-    sub_lows   = lows[:-1]
-    m = sma(sub_closes, n)
-    s = std_dev(sub_closes, n)
-    a = atr(sub_highs, sub_lows, sub_closes, n)
-    if not m or not s or not a:
-        return False
-    ub, lb = m + 2*s, m - 2*s
-    uk, lk = m + 1.5*a, m - 1.5*a
-    return ub < uk and lb > lk
 
 
 # ══ SERVICE ENTRY POINT ══
