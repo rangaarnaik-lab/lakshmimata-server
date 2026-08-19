@@ -5850,7 +5850,8 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         # Save to Supabase so frontend can poll and show notifications
         await supabase_upsert(session, 'squeeze_alerts', new_fires, on_conflict='sym,fired_at')
 
-    # Step 5.4b: Detect NEW signal fires (HY/HT/PP/Stage2/Guppy/RS>70) via
+    # Step 5.4b: Detect NEW signal fires
+    # (HY/HT/PP/Bull Snort/Stage2/Guppy/RS>70) via
     # state-transition — reuses squeeze_alerts + frontend notification
     # pipeline. One row per signal type so users can enable/disable each
     # type independently. fired_at microsecond offsets avoid (sym,fired_at)
@@ -5859,11 +5860,12 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
     new_signal_fires = []
     # Fixed per-type offsets from now_ist (squeeze uses +0).
     _SIGNAL_SPECS = (
-        ('hy',    'is_hy',                       'HY',       1),
-        ('ht',    'is_ht',                       'HT',       2),
-        ('pp',    'is_pp',                       'PP',       3),
-        ('s2',    'is_s2_new_entry',             'Stage 2',  4),
-        ('guppy', 'is_guppy_bullish_crossover',  'Guppy',    5),
+        ('hy',        'is_hy',                       'HY',         1),
+        ('ht',        'is_ht',                       'HT',         2),
+        ('pp',        'is_pp',                       'PP',         3),
+        ('bullsnort', 'is_bull_snort',               'Bull Snort', 4),
+        ('s2',        'is_s2_new_entry',             'Stage 2',    5),
+        ('guppy',     'is_guppy_bullish_crossover',  'Guppy',      6),
     )
     for s in processed:
         sym = s['sym']
@@ -5897,7 +5899,7 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
                 'last_price': s.get('last_price'),
                 'chg_pct':    s.get('chg_pct'),
                 'sector':     s.get('sector'),
-                'fired_at':   (now_ist + timedelta(microseconds=6)).isoformat(),
+                'fired_at':   (now_ist + timedelta(microseconds=7)).isoformat(),
             })
 
     def _rs70_flag(row):
@@ -5912,6 +5914,7 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'hy':    bool(s.get('is_hy', False)),
             'ht':    bool(s.get('is_ht', False)),
             'pp':    bool(s.get('is_pp', False)),
+            'bullsnort': bool(s.get('is_bull_snort', False)),
             's2':    bool(s.get('is_s2_new_entry', False)),
             'guppy': bool(s.get('is_guppy_bullish_crossover', False)),
             'rs70':  _rs70_flag(s),
