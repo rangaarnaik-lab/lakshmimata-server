@@ -13,6 +13,10 @@ import logging
 from datetime import datetime, timezone, timedelta
 
 from shared import *
+from bull_snort import (
+    BULL_SNORT_AVG_LEN, BULL_SNORT_MIN_DCR, BULL_SNORT_MIN_REL_VOL,
+    detect_bull_snort,
+)
 
 log = logging.getLogger('pocketrs')
 
@@ -2466,64 +2470,6 @@ def detect_ibv_signal(volumes: list, live_vol, live_high, live_low, live_close) 
     if day_range <= 0:
         return False
     return (live_close - live_low) / day_range * 100 > 50
-
-def detect_bull_snort(opens: list, highs: list, lows: list, closes: list, volumes: list) -> dict:
-    """Bull Snort — bullish volume climax on the latest bar.
-
-    Same rules as the chart overlay (frontend detectBullSnortDays):
-    up close, volume ≥ 2× 20-bar volume SMA, close in upper 30% of range.
-    """
-    n = len(closes) if closes else 0
-    result = {'is_bull_snort': False, 'bull_snort_vol_ratio': 0.0}
-    if n < 21 or not volumes or len(volumes) < n:
-        return result
-    i = n - 1
-
-    def _at(arr, idx, fallback):
-        """Prefer last-n aligned series even when lengths drifted after trim."""
-        if not arr:
-            return fallback
-        if len(arr) == n:
-            v = arr[idx]
-            return fallback if v is None else v
-        if len(arr) > n:
-            v = arr[len(arr) - n + idx]
-            return fallback if v is None else v
-        # shorter than closes — use last available if this is the final bar
-        if idx == n - 1 and arr:
-            v = arr[-1]
-            return fallback if v is None else v
-        return fallback
-
-    cl = closes[i]
-    vol = volumes[i]
-    if cl is None or vol is None:
-        return result
-    hi = _at(highs, i, cl)
-    lo = _at(lows, i, cl)
-    if opens and len(opens) >= 1:
-        op = _at(opens, i, None)
-        if op is None:
-            op = closes[i - 1] if i > 0 and closes[i - 1] is not None else cl
-    else:
-        op = closes[i - 1] if i > 0 and closes[i - 1] is not None else cl
-    if cl < op:
-        return result
-    day_range = hi - lo
-    if day_range > 0:
-        if (cl - lo) / day_range < 0.7:
-            return result
-    # else: live quotes often set H=L=last mid-session — skip range gate
-    window = volumes[i - 19:i + 1]
-    if len(window) < 20 or any(v is None for v in window):
-        return result
-    avg = sum(window) / 20
-    if avg <= 0:
-        return result
-    ratio = vol / avg
-    result['bull_snort_vol_ratio'] = round(ratio, 2)
-    result['is_bull_snort'] = ratio >= 2.0
-    return result
 
 def detect_pp(prices: list, volumes: list) -> dict:
     n = len(prices)
