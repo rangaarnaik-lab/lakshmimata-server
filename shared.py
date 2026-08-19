@@ -256,22 +256,35 @@ def _load_sector_industry_lookup() -> dict:
     """
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'sector_industry_lookup.csv')
     lookup = {}
+    headers = None
     try:
-        with open(path, newline='', encoding='utf-8') as f:
-            for row in csv.DictReader(f):
-                sym = (row.get('symbol') or '').strip()
+        # utf-8-sig, not utf-8: this CSV ships with a UTF-8 BOM, which made
+        # DictReader name the first column '\ufeffsymbol'. row['symbol'] then
+        # returned None for all 2,355 rows, the lookup loaded empty, and every
+        # stock outside SECTOR_MAP silently got sector='Other' / industry=NULL
+        # — which dropped them from the sector and industry rankings.
+        with open(path, newline='', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
+            headers = reader.fieldnames
+            for row in reader:
+                # Defensive: a future refresh of this file could re-introduce a
+                # BOM or padded headers, and that must never fail silently.
+                row = {(k or '').strip().lstrip('\ufeff'): v for k, v in row.items()}
+                sym = (row.get('symbol') or '').strip().upper()
                 if sym:
                     lookup[sym] = {
                         'industry': (row.get('industry') or '').strip() or None,
                         'sector':   (row.get('sector') or '').strip() or None,
                     }
-        log.info(f"✅ Loaded sector/industry lookup: {len(lookup)} symbols from {path}")
+        if lookup:
+            log.info(f"✅ Loaded sector/industry lookup: {len(lookup)} symbols from {path}")
+        else:
+            log.error(f"❌ Sector/industry lookup loaded 0 symbols from {path} (headers={headers!r}) — "
+                      f"expected a 'symbol' column. Every stock outside SECTOR_MAP will fall back to "
+                      f"sector 'Other' / industry NULL and disappear from sector/industry rankings.")
     except Exception as e:
         log.warning(f"Sector/industry lookup load failed ({path}): {e} — falling back to SECTOR_MAP + live fetch only")
     return lookup
-
-SECTOR_INDUSTRY_LOOKUP = _load_sector_industry_lookup()
-
 
 SECTOR_INDUSTRY_LOOKUP = _load_sector_industry_lookup()
 
@@ -786,16 +799,32 @@ def _load_sector_industry_lookup() -> dict:
     """
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'sector_industry_lookup.csv')
     lookup = {}
+    headers = None
     try:
-        with open(path, newline='', encoding='utf-8') as f:
-            for row in csv.DictReader(f):
-                sym = (row.get('symbol') or '').strip()
+        # utf-8-sig, not utf-8: this CSV ships with a UTF-8 BOM, which made
+        # DictReader name the first column '\ufeffsymbol'. row['symbol'] then
+        # returned None for all 2,355 rows, the lookup loaded empty, and every
+        # stock outside SECTOR_MAP silently got sector='Other' / industry=NULL
+        # — which dropped them from the sector and industry rankings.
+        with open(path, newline='', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
+            headers = reader.fieldnames
+            for row in reader:
+                # Defensive: a future refresh of this file could re-introduce a
+                # BOM or padded headers, and that must never fail silently.
+                row = {(k or '').strip().lstrip('\ufeff'): v for k, v in row.items()}
+                sym = (row.get('symbol') or '').strip().upper()
                 if sym:
                     lookup[sym] = {
                         'industry': (row.get('industry') or '').strip() or None,
                         'sector':   (row.get('sector') or '').strip() or None,
                     }
-        log.info(f"✅ Loaded sector/industry lookup: {len(lookup)} symbols from {path}")
+        if lookup:
+            log.info(f"✅ Loaded sector/industry lookup: {len(lookup)} symbols from {path}")
+        else:
+            log.error(f"❌ Sector/industry lookup loaded 0 symbols from {path} (headers={headers!r}) — "
+                      f"expected a 'symbol' column. Every stock outside SECTOR_MAP will fall back to "
+                      f"sector 'Other' / industry NULL and disappear from sector/industry rankings.")
     except Exception as e:
         log.warning(f"Sector/industry lookup load failed ({path}): {e} — falling back to SECTOR_MAP + live fetch only")
     return lookup
@@ -1447,6 +1476,28 @@ PHARMA_BULK_API_SYMS = {
     'VIVIMEDLAB','VIYASH','WANBURY','ZIMLAB',
 }
 
+# The static CSV and SECTOR_MAP were built independently, so they label the
+# same sector differently ('Fmcg' vs 'FMCG', 'I.T' vs 'IT'). Left alone, the
+# sectors table gets two rows per pair — the handful of curated names under one
+# label and the hundreds of lookup names under the other — which splits Avg RS
+# and breadth. 'Miscellaneous' is folded into 'Other' so it's excluded from the
+# rankings, matching how the UI already treats that catch-all.
+_SECTOR_ALIASES = {
+    'fmcg':                'FMCG',
+    'i.t':                 'IT',
+    'it':                  'IT',
+    'metals & mining':     'Metals',
+    'aerospace & defence': 'Defence',
+    'telecom-service':     'Telecom',
+    'textiles':            'Textile',
+    'miscellaneous':       'Other',
+}
+
+def _canon_sector(name: Optional[str]) -> Optional[str]:
+    if not name:
+        return name
+    return _SECTOR_ALIASES.get(name.strip().lower(), name.strip())
+
 def _normalize_pharma_industry(sym: str, industry: Optional[str]) -> Optional[str]:
     key = (sym or '').strip().upper()
     if key in PHARMA_FORMULATION_SYMS:
@@ -1467,7 +1518,7 @@ def get_industry(sym: str) -> Optional[str]:
     if key in QSR_INDUSTRY_OVERRIDES:
         return QSR_INDUSTRY_OVERRIDES[key]
     live = fundamentals_cache.get(sym, {}).get('industry')
-    raw = live or SECTOR_INDUSTRY_LOOKUP.get(sym, {}).get('industry')
+    raw = live or SECTOR_INDUSTRY_LOOKUP.get(key, {}).get('industry')
     return _normalize_pharma_industry(key, raw)
 
 def get_sector(sym: str) -> str:
@@ -1485,12 +1536,12 @@ def get_sector(sym: str) -> str:
     # see _load_sector_industry_lookup() for why. Still fall back to
     # fundamentals_cache as a last resort for any symbol not in either
     # static source, since it costs nothing to check.
-    static = SECTOR_INDUSTRY_LOOKUP.get(sym, {}).get('sector')
+    static = SECTOR_INDUSTRY_LOOKUP.get(key, {}).get('sector')
     if static:
-        return static
+        return _canon_sector(static)
     auto = fundamentals_cache.get(sym, {}).get('industry')
     if auto:
-        return auto
+        return _canon_sector(auto)
     return "Other"
 
 def is_market_open() -> bool:
