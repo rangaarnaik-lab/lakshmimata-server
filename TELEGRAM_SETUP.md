@@ -48,7 +48,31 @@ Each digest is built per user: the signal-type toggles and **Watchlist only** ar
 
 One Telegram chat maps to exactly one account. Linking a chat that already belongs to another account moves it, so the previous account stops receiving alerts instead of both getting them.
 
-## 5. Message labels
+## 5. What is allowed to alert
+
+A state transition alone let too much noise through, so three gates run before anything reaches a digest:
+
+| Gate | Rule | Why |
+|------|------|-----|
+| ETFs | Symbols the Upstox master marks `ETF` never alert (`shared.etf_syms`) | They stay in the scanner, but "Bull Snort" on a silver or index fund is not a tradable signal |
+| Re-fire cooldown | Same `sym` + `fire_type` at most once per `ALERT_REFIRE_COOLDOWN_MIN` (120 min) | A borderline flag flickering false→true between one-minute scans was re-alerting the same name all session |
+| RS band | Fires at RS ≥ `RS_ALERT_FIRE_ABOVE` (72), re-arms only below `RS_ALERT_RESET_BELOW` (68) | A bare `> 70` test re-fired every time a stock wobbled between 70 and 71 |
+| RS floor | Nothing below `ALERT_MIN_RS` (50) alerts, except a short-biased squeeze | A valid pattern on a weak stock is still a stock nobody wants buzzed about; weakness is the whole premise of a short squeeze, so that one is exempt |
+
+`RS > 70` also requires a previous scan for that symbol now, so a scanner restart no longer replays an alert for every stock already above the line.
+
+## 6. Delivery cadence and the 2-signal limit
+
+Both live in `user_alert_prefs.prefs`, so there is no migration to run.
+
+| Pref | Values | Effect |
+|------|--------|--------|
+| `telegramCadence` | `live` (default), `5m`, `1h`, `eod` | `live` sends one digest per scan, as before. The rest batch the same fires and send on a timer, sorted strongest RS first, with a bigger line cap (12 / 20 / 30) |
+| `telegramTypes` | up to 2 pref keys, e.g. `['bullsnort','pp']` | Narrows **Telegram only** to those signals. Empty (every existing user) means Telegram keeps following the 🔔 types |
+
+Batched cadences are flushed by `flush_due_telegram_digests`, called from the idle loop rather than from `run_scan`, because the end-of-day digest has to go out after 15:35 IST when scans have already stopped. Fires are buffered once per day process-wide (not per user), so memory tracks market activity rather than user count — a restart mid-session drops whatever had not been flushed yet.
+
+## 7. Message labels
 
 Example:
 
@@ -64,7 +88,7 @@ Research alert — not advice
 - Users **must** tap Start. You cannot message a Telegram account that never opened the bot.
 - Each user gets **one digest per scan** (up to 10 lines, rest in the app), not 10 separate DMs.
 - Sends are paced at **25/sec** (Telegram cap ~30/sec). 1,000 users ≈ 40 seconds, off the scan loop.
-- Scans run every 60s, so a user receives **at most one DM per minute** — both detectors (squeeze and signals) are merged into that single digest. Quiet scans send nothing, since alerts only fire on a state transition.
+- Scans run every 60s, so a user on the default `live` cadence receives **at most one DM per minute** — both detectors (squeeze and signals) are merged into that single digest. Quiet scans send nothing, since alerts only fire on a state transition. A user on `5m` / `1h` / `eod` receives proportionally fewer.
 - Throughput headroom at one digest per user per scan: 100 users ≈ 1.7/sec, 500 ≈ 8/sec, 1,000 ≈ 17/sec. The ~30/sec ceiling is reached around 1,800 users.
 - 429 (too many requests) waits `retry_after` and retries a few times; leftover DMs stay queued.
 - Do not run a second `getUpdates` poller (only one process can poll). Keep it on live_scan.

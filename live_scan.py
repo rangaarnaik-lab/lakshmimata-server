@@ -18,7 +18,9 @@ from bull_snort import (
     detect_bull_snort,
 )
 from squeeze_pro import compute_squeeze_pro
-from telegram_alerts import fanout_telegram_alerts, poll_telegram_links
+from telegram_alerts import (
+    fanout_telegram_alerts, flush_due_telegram_digests, poll_telegram_links,
+)
 
 log = logging.getLogger('pocketrs')
 
@@ -5786,6 +5788,36 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         except Exception as e:
             log.warning(f"⚠️ Best Picks scan step failed: {e}")
 
+    # Alert quality gate, shared by every detector below. Digests were
+    # dominated by two kinds of noise: ETFs and index funds firing stock
+    # patterns (a Bull Snort on a silver ETF says nothing about a
+    # breakout), and the same stock+signal repeating within minutes
+    # because a borderline flag flickered off and back on.
+    _refire_gap = timedelta(minutes=ALERT_REFIRE_COOLDOWN_MIN)
+    for _key in [k for k, t in alert_cooldown.items() if now_ist - t > _refire_gap]:
+        alert_cooldown.pop(_key, None)
+
+    def alert_rs(row):
+        v = row.get('rs_tv') if row.get('rs_tv') is not None else row.get('rs')
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def alert_allowed(sym, fire_type, rs=None):
+        """Claims the alert slot for sym+fire_type, so only call when firing."""
+        if sym in etf_syms:
+            return False
+        # A short-biased squeeze is the one signal where weakness is the
+        # point, so it keeps alerting below the floor.
+        if rs is not None and rs < ALERT_MIN_RS and 'Short' not in fire_type:
+            return False
+        last = alert_cooldown.get((sym, fire_type))
+        if last is not None and now_ist - last < _refire_gap:
+            return False
+        alert_cooldown[(sym, fire_type)] = now_ist
+        return True
+
     # Step 5.4: Detect NEW squeeze/VCP fires (state change from last scan)
     global prev_squeeze_state
     new_fires = []
@@ -5806,16 +5838,18 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
                 direction = {'long': ' ↑ Long', 'short': ' ↓ Short'}.get(s.get('sqz_bias'), '')
                 fire_type.append(f"BB Squeeze{direction}")
             if new_vcp: fire_type.append('VCP')
-            new_fires.append({
-                'sym':        sym,
-                'fire_type':  ', '.join(fire_type),
-                'rs_tv':      s.get('rs_tv'),
-                'rs':         s.get('rs'),
-                'last_price': s.get('last_price'),
-                'chg_pct':    s.get('chg_pct'),
-                'sector':     s.get('sector'),
-                'fired_at':   now_ist.isoformat(),
-            })
+            label = ', '.join(fire_type)
+            if alert_allowed(sym, label, alert_rs(s)):
+                new_fires.append({
+                    'sym':        sym,
+                    'fire_type':  label,
+                    'rs_tv':      s.get('rs_tv'),
+                    'rs':         s.get('rs'),
+                    'last_price': s.get('last_price'),
+                    'chg_pct':    s.get('chg_pct'),
+                    'sector':     s.get('sector'),
+                    'fired_at':   now_ist.isoformat(),
+                })
 
     # Update state for next scan
     prev_squeeze_state = {
@@ -5854,6 +5888,16 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         ('s2',        'is_s2_new_entry',             'Stage 2',    5),
         ('guppy',     'is_guppy_bullish_crossover',  'Guppy',      6),
     )
+
+    def _rs_band_state(rs, was_above):
+        """Hysteresis around the RS 70 line — see RS_ALERT_* in shared."""
+        if rs is None:
+            return was_above
+        if was_above:
+            return rs >= RS_ALERT_RESET_BELOW
+        return rs >= RS_ALERT_FIRE_ABOVE
+
+    rs_band_now = {}
     for s in processed:
         sym = s['sym']
         had_previous_scan = sym in prev_hy_ht_state
@@ -5863,7 +5907,8 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             # A real alert requires an observed false -> true transition.
             # On process startup the previous-state map is empty; seed it
             # from this scan instead of replaying every already-active signal.
-            if had_previous_scan and fired and not prev.get(key, False):
+            if (had_previous_scan and fired and not prev.get(key, False)
+                    and alert_allowed(sym, label, alert_rs(s))):
                 new_signal_fires.append({
                     'sym':        sym,
                     'fire_type':  label,
@@ -5880,8 +5925,12 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             rs_num = float(rs_val) if rs_val is not None else None
         except (TypeError, ValueError):
             rs_num = None
-        rs70_now = rs_num is not None and rs_num > 70
-        if rs70_now and not prev.get('rs70', False):
+        rs70_now = _rs_band_state(rs_num, prev.get('rs70', False))
+        rs_band_now[sym] = rs70_now
+        # had_previous_scan matters here too: without it a scanner restart
+        # replayed an "RS > 70" alert for every stock already above the line.
+        if (had_previous_scan and rs70_now and not prev.get('rs70', False)
+                and alert_allowed(sym, 'RS > 70')):
             new_signal_fires.append({
                 'sym':        sym,
                 'fire_type':  'RS > 70',
@@ -5893,13 +5942,6 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
                 'fired_at':   (now_ist + timedelta(microseconds=7)).isoformat(),
             })
 
-    def _rs70_flag(row):
-        v = row.get('rs_tv') if row.get('rs_tv') is not None else row.get('rs')
-        try:
-            return v is not None and float(v) > 70
-        except (TypeError, ValueError):
-            return False
-
     prev_hy_ht_state = {
         s['sym']: {
             'hy':    bool(s.get('is_hy', False)),
@@ -5908,7 +5950,7 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'bullsnort': bool(s.get('is_bull_snort', False)),
             's2':    bool(s.get('is_s2_new_entry', False)),
             'guppy': bool(s.get('is_guppy_bullish_crossover', False)),
-            'rs70':  _rs70_flag(s),
+            'rs70':  rs_band_now.get(s['sym'], False),
         }
         for s in processed
     }
@@ -7406,6 +7448,13 @@ async def run_live_scan_service():
                     await poll_telegram_links(session)
                 except Exception as e:
                     log.warning(f"Telegram poll failed: {e}")
+                # Batched cadences (5m / hourly / end of day) are sent from
+                # here, not from run_scan: the end-of-day digest has to go
+                # out after the close, once scans have stopped for the day.
+                try:
+                    await flush_due_telegram_digests(session)
+                except Exception as e:
+                    log.warning(f"Telegram cadence flush failed: {e}")
                 await asyncio.sleep(5 if should_scan_now else 20)
 
             except KeyboardInterrupt:

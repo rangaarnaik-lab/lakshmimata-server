@@ -137,6 +137,7 @@ __all__ = [
     'history_dates_cache',
     'index_history_cache',
     'index_key_map',
+    'etf_syms',
     'instrument_key_map',
     'is_market_open',
     'json',
@@ -154,6 +155,11 @@ __all__ = [
     'nifty_cache',
     'opens_cache',
     'os',
+    'alert_cooldown',
+    'ALERT_MIN_RS',
+    'ALERT_REFIRE_COOLDOWN_MIN',
+    'RS_ALERT_FIRE_ABOVE',
+    'RS_ALERT_RESET_BELOW',
     'prev_hy_ht_state',
     'prev_squeeze_state',
     'random',
@@ -523,6 +529,25 @@ prev_squeeze_state: dict = {}
 # {sym: {'hy','ht','pp','s2','guppy','rs70': bool}}
 prev_hy_ht_state: dict = {}
 
+# ── Alert re-fire suppression ────────────────────────────────────────
+# State-transition detection alone is not enough: a borderline flag can
+# flicker off and back on between one-minute scans, so the same stock
+# and signal was alerting several times an hour. Format:
+# {(sym, fire_type): datetime of last alert}
+alert_cooldown: dict = {}
+ALERT_REFIRE_COOLDOWN_MIN = 120
+
+# RS Rating alerts use a band instead of a bare "> 70" test, so a stock
+# oscillating between 70 and 71 cannot re-alert on every crossing. The
+# signal arms above the upper edge and only disarms below the lower one.
+RS_ALERT_FIRE_ABOVE = 72
+RS_ALERT_RESET_BELOW = 68
+
+# Quality floor: a technically valid pattern on a weak stock is still a
+# stock nobody wants to be alerted about. Short-biased squeeze releases
+# are exempt, since weakness is the whole premise of that signal.
+ALERT_MIN_RS = 50
+
 
 historical_cache: dict = {}   # sym -> {prices, volumes, highs, lows}
 history_dates_cache: dict = {}  # sym -> [dates] — parallel to historical_cache,
@@ -604,6 +629,10 @@ NIFTY50_SEED_PRICES = [12182.5, 12282.2, 12226.65, 11993.05, 12052.95, 12025.35,
 
 # ── Full 2yr history → Supabase (all stocks, at startup) ──────────────
 instrument_key_map: dict = {} # sym -> full instrument key (e.g. NSE_EQ|INE002A01018)
+etf_syms: set = set()        # ETF / index-fund symbols. They are scanned like any
+                             # other instrument, but signal alerts are meaningless
+                             # for them (a "Bull Snort" on a silver ETF is noise),
+                             # so live_scan excludes them when firing alerts.
 index_key_map: dict = {}     # normalized index name -> instrument key (e.g. NSE_INDEX|...) —
                               # built alongside instrument_key_map in load_instrument_master,
                               # replaces guessing text variants for thematic sector indices
@@ -1843,8 +1872,13 @@ async def load_instrument_master(session: aiohttp.ClientSession):
                     key = item.get('instrument_key', '')
                     if exch == 'NSE' and itype in ('EQ', 'ETF') and sym and key:
                         instrument_key_map[sym] = key
+                        if itype == 'ETF':
+                            etf_syms.add(sym)
 
-                log.info(f"✅ Instrument master loaded: {len(instrument_key_map)} EQ+ETF instruments")
+                log.info(
+                    f"✅ Instrument master loaded: {len(instrument_key_map)} "
+                    f"EQ+ETF instruments ({len(etf_syms)} ETFs, excluded from alerts)"
+                )
                 # Diagnostic for tracking down specific missing-stock
                 # reports (e.g. COFORGE silently dropping out of the
                 # live scan for days with no error) — logs whether a
@@ -1916,6 +1950,8 @@ async def load_instrument_master(session: aiohttp.ClientSession):
                         key = row.get('instrument_key', '')
                         if sym and key:
                             instrument_key_map[sym] = key
+                            if row.get('instrument_type') == 'ETF':
+                                etf_syms.add(sym)
                 log.info(f"✅ CSV master loaded: {len(instrument_key_map)} EQ+ETF instruments")
                 if len(instrument_key_map) > 100:
                     ALL_STOCKS[:] = list(instrument_key_map.keys())  # in-place: from-import-* copies in live_scan.py/fundamentals_worker.py only see mutations, not reassignments

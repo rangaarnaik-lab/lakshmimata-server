@@ -12,7 +12,7 @@ from typing import Optional
 
 import aiohttp
 
-from shared import SUPABASE_KEY, SUPABASE_URL, TELEGRAM_BOT_TOKEN
+from shared import IST, SUPABASE_KEY, SUPABASE_URL, TELEGRAM_BOT_TOKEN
 
 log = logging.getLogger('pocketrs')
 
@@ -52,6 +52,22 @@ def fire_type_enabled(fire_type: str, prefs: dict) -> bool:
     if not keys:
         return True
     return any(prefs.get(k) is not False for k in keys)
+
+
+TELEGRAM_MAX_TYPES = 2
+
+
+def telegram_type_allowed(fire_type: str, prefs: dict) -> bool:
+    """Telegram can be narrowed to at most TELEGRAM_MAX_TYPES signals.
+
+    An empty selection means "whatever the in-app 🔔 menu says", which is
+    what every existing user has, so nobody goes quiet after this ships.
+    """
+    picks = prefs.get('telegramTypes')
+    if isinstance(picks, list) and picks:
+        wanted = {str(p) for p in picks[:TELEGRAM_MAX_TYPES]}
+        return bool(set(pref_keys_for_fire_type(fire_type)) & wanted)
+    return fire_type_enabled(fire_type, prefs)
 
 
 def _headers():
@@ -159,10 +175,12 @@ async def send_telegram_chat(session: aiohttp.ClientSession, chat_id, text: str)
     return False
 
 
-def format_digest_html(fires: list[dict], extra: int = 0) -> str:
+def format_digest_html(fires: list[dict], extra: int = 0, window: str = '') -> str:
     """One message: up to _TG_DIGEST_LINES stocks, rest pointed to the app."""
     total = len(fires) + extra
     head = f"<b>Lakshmimata</b> · {total} alert{'s' if total != 1 else ''}"
+    if window:
+        head += f" · {_esc(window)}"
     rows = [head]
     for fire in fires:
         kind = fire.get('fire_type') or 'Alert'
@@ -404,46 +422,124 @@ async def poll_telegram_links(session: aiohttp.ClientSession):
             )
 
 
-async def fanout_telegram_alerts(session: aiohttp.ClientSession, fires: list[dict]):
-    """Queue one digest per linked user; drain at 25/s off the scan loop.
+# Delivery cadence, picked per user in Account → Telegram alerts. 'live'
+# is the original behaviour: one digest per scan, so at most one a minute.
+# The others batch the very same fires and send on a timer. Fires are
+# buffered once for the whole day rather than per user, so memory tracks
+# market activity instead of user count.
+_CADENCE_SEC = {'live': 0, '5m': 300, '1h': 3600}
+_CADENCE_LINES = {'live': _TG_DIGEST_LINES, '5m': 12, '1h': 20, 'eod': 30}
+_CADENCE_WINDOW = {'5m': 'last 5 min', '1h': 'last hour', 'eod': 'today'}
+_EOD_FLUSH_AFTER = (15, 35)   # IST — a few minutes past the close
+_DAY_BUFFER_MAX = 5000
 
-    1,000 users × 10 alerts → 1,000 messages (~40s), not 10,000.
+_day_buffer: list[tuple[float, dict]] = []
+_buffer_day = ''
+_last_flush: dict[str, float] = {}
+_eod_flushed_on: dict[str, str] = {}
+_recipients_cache: tuple[float, list, dict] = (0.0, [], {})
+_last_flush_check = 0.0
+
+
+def _cadence(prefs: dict) -> str:
+    c = str(prefs.get('telegramCadence') or 'live').lower()
+    return c if c in ('live', '5m', '1h', 'eod') else 'live'
+
+
+def _rs_of(fire: dict):
+    v = fire.get('rs_tv') if fire.get('rs_tv') is not None else fire.get('rs')
+    try:
+        return float(v) if v is not None else -1.0
+    except (TypeError, ValueError):
+        return -1.0
+
+
+def _buffer_fires(fires: list[dict]):
+    global _buffer_day, _day_buffer
+    today = datetime.now(IST).strftime('%Y-%m-%d')
+    if today != _buffer_day:
+        # Yesterday's fires must never appear in today's digest.
+        _buffer_day = today
+        _day_buffer = []
+        _last_flush.clear()
+    now = time.time()
+    _day_buffer.extend((now, f) for f in fires)
+    if len(_day_buffer) > _DAY_BUFFER_MAX:
+        del _day_buffer[:len(_day_buffer) - _DAY_BUFFER_MAX]
+
+
+async def _recipients(session: aiohttp.ClientSession) -> tuple[list, dict]:
+    """Linked chats + their prefs, cached briefly.
+
+    Both the per-scan fan-out and the cadence flush need this, and the
+    flush runs from the idle loop every few seconds, so without a cache
+    this would hammer Supabase with the same two reads.
     """
-    if not TELEGRAM_BOT_TOKEN or not fires:
-        return
+    global _recipients_cache
+    ts, links, prefs_by = _recipients_cache
+    if time.time() - ts < 45:
+        return links, prefs_by
     links = await _sb_get(
         session,
         'user_telegram?select=user_id,chat_id,enabled&enabled=eq.true&chat_id=not.is.null',
-    )
-    if not links:
-        return
+    ) or []
     prefs_rows = await _sb_get(session, 'user_alert_prefs?select=user_id,prefs') or []
     prefs_by = {str(r['user_id']): (r.get('prefs') or {}) for r in prefs_rows}
+    _recipients_cache = (time.time(), links, prefs_by)
+    return links, prefs_by
 
-    queued = 0
-    seen_chats: set[str] = set()
+
+def _iter_chats(links: list, prefs_by: dict):
+    """Yields (uid, chat_id, prefs) once per chat, skipping paused users."""
+    seen: set[str] = set()
     for link in links:
-        uid = str(link.get('user_id') or '')
         chat_id = link.get('chat_id')
-        # chat_id is uniquely indexed, but guard anyway: one Telegram chat must
-        # never receive two digests because it maps to two accounts.
-        chat_key = str(chat_id)
-        if chat_key in seen_chats:
-            log.warning(f"Telegram chat {chat_key} linked to more than one account — sending once")
+        if not chat_id:
             continue
-        seen_chats.add(chat_key)
-        prefs = prefs_by.get(uid) or {}
+        # chat_id is uniquely indexed, but guard anyway: one Telegram chat
+        # must never receive two digests because it maps to two accounts.
+        key = str(chat_id)
+        if key in seen:
+            log.warning(f"Telegram chat {key} linked to more than one account — sending once")
+            continue
+        seen.add(key)
+        prefs = prefs_by.get(str(link.get('user_id') or '')) or {}
         if prefs.get('telegramEnabled') is False:
             continue
-        matched = [f for f in fires if fire_type_enabled(f.get('fire_type') or '', prefs)]
-        # "Watchlist only" has to be applied here, since the scanner sends these
-        # messages and cannot see the browser's watchlist. A missing key means an
-        # older client that never published one, so filtering is skipped rather
-        # than silently muting the user.
-        watchlist = prefs.get('watchlistSyms')
-        if prefs.get('watchlistOnly') is True and watchlist is not None:
-            wanted = {str(s).upper() for s in watchlist}
-            matched = [f for f in matched if str(f.get('sym') or '').upper() in wanted]
+        yield str(link.get('user_id') or ''), chat_id, prefs
+
+
+def _matched_for(fires: list[dict], prefs: dict) -> list[dict]:
+    out = [f for f in fires if telegram_type_allowed(f.get('fire_type') or '', prefs)]
+    # "Watchlist only" has to be applied here, since the scanner sends these
+    # messages and cannot see the browser's watchlist. A missing key means an
+    # older client that never published one, so filtering is skipped rather
+    # than silently muting the user.
+    watchlist = prefs.get('watchlistSyms')
+    if prefs.get('watchlistOnly') is True and watchlist is not None:
+        wanted = {str(s).upper() for s in watchlist}
+        out = [f for f in out if str(f.get('sym') or '').upper() in wanted]
+    return out
+
+
+async def fanout_telegram_alerts(session: aiohttp.ClientSession, fires: list[dict]):
+    """Queue one digest per 'live' user; drain at 25/s off the scan loop.
+
+    1,000 users × 10 alerts → 1,000 messages (~40s), not 10,000. Users on a
+    batched cadence are served by flush_due_telegram_digests instead.
+    """
+    if not TELEGRAM_BOT_TOKEN or not fires:
+        return
+    _buffer_fires(fires)
+    links, prefs_by = await _recipients(session)
+    if not links:
+        return
+
+    queued = 0
+    for _uid, chat_id, prefs in _iter_chats(links, prefs_by):
+        if _cadence(prefs) != 'live':
+            continue
+        matched = _matched_for(fires, prefs)
         if not matched:
             continue
         shown = matched[:_TG_DIGEST_LINES]
@@ -452,4 +548,62 @@ async def fanout_telegram_alerts(session: aiohttp.ClientSession, fires: list[dic
         queued += 1
     if queued:
         log.info(f"  📬 Telegram: queued {queued} digest(s) for {len(links)} linked chat(s)")
+        await _kick_telegram_drain(session)
+
+
+async def flush_due_telegram_digests(session: aiohttp.ClientSession):
+    """Send the batched cadences (5m / 1h / end of day) from the idle loop.
+
+    Driven from the loop rather than from run_scan because the end-of-day
+    digest has to go out after the close, when scans have already stopped.
+    """
+    global _last_flush_check
+    if not TELEGRAM_BOT_TOKEN or not _day_buffer:
+        return
+    now = time.time()
+    if now - _last_flush_check < 30:
+        return
+    _last_flush_check = now
+    links, prefs_by = await _recipients(session)
+    if not links:
+        return
+
+    ist = datetime.now(IST)
+    after_close = (ist.hour, ist.minute) >= _EOD_FLUSH_AFTER
+    today = ist.strftime('%Y-%m-%d')
+    queued = 0
+    for uid, chat_id, prefs in _iter_chats(links, prefs_by):
+        cad = _cadence(prefs)
+        if cad == 'live':
+            continue
+        if cad == 'eod':
+            if not after_close or _eod_flushed_on.get(uid) == today:
+                continue
+            since = 0.0
+        else:
+            last = _last_flush.get(uid)
+            if last is not None and now - last < _CADENCE_SEC[cad]:
+                continue
+            since = last or 0.0
+        matched = _matched_for([f for ts, f in _day_buffer if ts > since], prefs)
+        if not matched:
+            # Nothing to say. Still move the clock, so the next window is
+            # measured from now instead of replaying old fires later.
+            _last_flush[uid] = now
+            continue
+        # A batched digest is a shortlist, so lead with the strongest names
+        # rather than whichever fired first.
+        matched.sort(key=_rs_of, reverse=True)
+        cap = _CADENCE_LINES.get(cad, _TG_DIGEST_LINES)
+        shown = matched[:cap]
+        await _send_q.put((
+            chat_id,
+            format_digest_html(shown, len(matched) - len(shown), _CADENCE_WINDOW.get(cad, '')),
+        ))
+        _last_flush[uid] = now
+        if cad == 'eod':
+            _eod_flushed_on[uid] = today
+        queued += 1
+    if queued:
+        log.info(f"  📬 Telegram: queued {queued} batched digest(s)")
         await _kick_telegram_drain(session)
