@@ -21,6 +21,7 @@ _TG_API = 'https://api.telegram.org/bot{token}/{method}'
 _update_offset = 0
 _last_poll = 0.0
 _last_publish_settings = 0.0
+_last_conflict_log = 0.0
 
 
 def pref_keys_for_fire_type(fire_type: str) -> list[str]:
@@ -119,6 +120,20 @@ async def telegram_api(session: aiohttp.ClientSession, method: str, payload=None
             retry_after = (data.get('parameters') or {}).get('retry_after')
             if data.get('error_code') == 429 and retry_after:
                 return {'_retry_after': float(retry_after)}
+            # 409 on getUpdates means a webhook owns this bot's updates, so
+            # polling can never succeed. Silent-ish warnings made this look
+            # like "the bot is just quiet" for a long time.
+            if data.get('error_code') == 409:
+                global _last_conflict_log
+                if time.time() - _last_conflict_log > 300:
+                    _last_conflict_log = time.time()
+                    log.error(
+                        f"Telegram {method} conflict (409): {data.get('description')}. "
+                        "A webhook or a second poller owns this bot. Clear it with "
+                        "https://api.telegram.org/bot<TOKEN>/deleteWebhook — /start "
+                        "linking cannot work until then."
+                    )
+                return None
             log.warning(f"Telegram {method} failed: {data}")
             return None
         return data.get('result')
@@ -239,12 +254,32 @@ async def _sb_get(session, path: str):
         return await r.json()
 
 
-async def _sb_patch(session, table: str, match: str, body: dict):
+async def _sb_patch(session, table: str, match: str, body: dict) -> int:
+    """Returns the number of rows actually written, or -1 on error.
+
+    Deliberately asks for the updated rows back: with Prefer=return=minimal
+    PostgREST answers 204 even when the filter matched nothing, so a link that
+    silently wrote zero rows still looked like a success.
+    """
     url = f"{SUPABASE_URL}/rest/v1/{table}?{match}"
     async with session.patch(
         url,
-        headers={**_headers(), 'Prefer': 'return=minimal'},
+        headers={**_headers(), 'Prefer': 'return=representation'},
         json=body,
+        timeout=aiohttp.ClientTimeout(total=10),
+    ) as r:
+        if r.status not in (200, 201):
+            log.warning(f"Supabase patch {table} failed: {r.status} {(await r.text())[:200]}")
+            return -1
+        rows = await r.json(content_type=None)
+        return len(rows) if isinstance(rows, list) else 0
+
+
+async def _sb_delete(session, table: str, match: str) -> bool:
+    url = f"{SUPABASE_URL}/rest/v1/{table}?{match}"
+    async with session.delete(
+        url,
+        headers={**_headers(), 'Prefer': 'return=minimal'},
         timeout=aiohttp.ClientTimeout(total=10),
     ) as r:
         return r.status in (200, 204)
@@ -259,7 +294,15 @@ async def complete_link(session, code: str, chat_id: str, username: Optional[str
         "user_telegram?select=user_id,link_code,link_code_expires_at"
         f"&link_code=eq.{code}",
     )
+    if rows is None:
+        log.error(
+            "Telegram link lookup failed — the scanner could not read "
+            "user_telegram. Check SUPABASE_SERVICE_KEY is the service-role key "
+            "and that add_user_telegram.sql has been run."
+        )
+        return False
     if not rows:
+        log.info(f"Telegram link code not found: {code}")
         return False
     row = rows[0]
     exp = row.get('link_code_expires_at')
@@ -267,11 +310,29 @@ async def complete_link(session, code: str, chat_id: str, username: Optional[str
         try:
             exp_dt = datetime.fromisoformat(exp.replace('Z', '+00:00'))
             if exp_dt < datetime.now(timezone.utc):
+                log.info(f"Telegram link code expired: {code}")
                 return False
         except Exception:
             pass
     uid = row['user_id']
-    return await _sb_patch(session, 'user_telegram', f'user_id=eq.{uid}', {
+
+    # chat_id is uniquely indexed, so a chat still bound to a different account
+    # (common while testing, or when a user re-registers) would make the write
+    # below fail. Release the stale binding first.
+    existing = await _sb_get(
+        session,
+        f"user_telegram?select=user_id&chat_id=eq.{chat_id}&user_id=neq.{uid}",
+    )
+    if existing:
+        for other in existing:
+            await _sb_patch(session, 'user_telegram', f"user_id=eq.{other['user_id']}", {
+                'chat_id': None,
+                'telegram_username': None,
+                'linked_at': None,
+            })
+        log.info(f"Telegram chat {chat_id} moved from {len(existing)} previous account(s)")
+
+    written = await _sb_patch(session, 'user_telegram', f'user_id=eq.{uid}', {
         'chat_id': str(chat_id),
         'telegram_username': (username or '')[:64] or None,
         'enabled': True,
@@ -279,6 +340,13 @@ async def complete_link(session, code: str, chat_id: str, username: Optional[str
         'link_code_expires_at': None,
         'linked_at': datetime.now(timezone.utc).isoformat(),
     })
+    if written <= 0:
+        log.error(
+            f"Telegram link for user {uid} wrote {written} rows — the bot must not "
+            "report success. If this persists, a trigger or RLS is stripping chat_id."
+        )
+        return False
+    return True
 
 
 async def poll_telegram_links(session: aiohttp.ClientSession):

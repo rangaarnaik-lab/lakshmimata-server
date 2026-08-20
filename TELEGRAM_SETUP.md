@@ -62,3 +62,14 @@ Research alert — not advice
 - Sends are paced at **25/sec** (Telegram cap ~30/sec). 1,000 users ≈ 40 seconds, off the scan loop.
 - 429 (too many requests) waits `retry_after` and retries a few times; leftover DMs stay queued.
 - Do not run a second `getUpdates` poller (only one process can poll). Keep it on live_scan.
+
+## Troubleshooting: Account says “Not linked” after Start
+
+Check in this order — each step rules out one cause.
+
+1. **A webhook owns the bot.** Open `https://api.telegram.org/bot<TOKEN>/getWebhookInfo`. Anything other than `"url":""` means Telegram delivers updates there and never to the scanner, so `getUpdates` returns 409 forever. Clear it with `/deleteWebhook`. Third-party bot services (Livegram and similar) set this silently when you connect a bot to them.
+2. **The scanner is not polling.** Run `select * from public.app_settings where key = 'telegram_bot_username';`. The scanner writes that row from inside the polling routine, so a missing row means `TELEGRAM_BOT_TOKEN` is unset on the live-scan service, or the deploy is stale.
+3. **Wrong Supabase key.** `SUPABASE_SERVICE_KEY` must be the service-role key. With the anon key, RLS hides `user_telegram` from the link lookup and the scanner logs "could not read user_telegram".
+4. **Expired code.** Codes last 15 minutes. Generate a fresh one from Account.
+
+If a bot token ever sat in a third-party service, treat it as compromised: `/revoke` in BotFather, update `TELEGRAM_BOT_TOKEN`, redeploy. Whoever holds the token can read every message to the bot and message every user who started it.

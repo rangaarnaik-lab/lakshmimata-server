@@ -5934,7 +5934,9 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             'rs_above_50':        sum(1 for s in processed if (s.get('rs_tv') or s.get('rs',0)) >= 50),
             'rs_improving':       sum(1 for s in processed if s.get('rs_trend') == 'improving'),
             'rs_declining':       sum(1 for s in processed if s.get('rs_trend') == 'declining'),
+            'stage1_count':       sum(1 for s in processed if s.get('weinstein_stage') == 1),
             'stage2_count':       sum(1 for s in processed if s.get('weinstein_stage') == 2),
+            'stage3_count':       sum(1 for s in processed if s.get('weinstein_stage') == 3),
             'stage4_count':       sum(1 for s in processed if s.get('weinstein_stage') == 4),
             'new_52w_high':       sum(1 for s in processed if s.get('pct_from_52wh', -100) >= -2),
             'new_52w_low':        sum(1 for s in processed if s.get('pct_from_52wl', 100) <= 2),
@@ -6467,13 +6469,26 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         above9  = sum(1 for s in processed if s.get('last_price') and s.get('ema9')  and s['last_price'] > s['ema9'])
         above21 = sum(1 for s in processed if s.get('last_price') and s.get('ema21') and s['last_price'] > s['ema21'])
         above50 = sum(1 for s in processed if s.get('last_price') and s.get('ema50') and s['last_price'] > s['ema50'])
-        stage2_count = sum(1 for s in processed if s.get('weinstein_stage') == 2)
-        await supabase_upsert(session, 'ema_breadth_history', [{
+        stage_counts = {
+            1: sum(1 for s in processed if s.get('weinstein_stage') == 1),
+            2: sum(1 for s in processed if s.get('weinstein_stage') == 2),
+            3: sum(1 for s in processed if s.get('weinstein_stage') == 3),
+            4: sum(1 for s in processed if s.get('weinstein_stage') == 4),
+        }
+        ema_row = {
             'date': snapshot_date,
             'above_ema9': above9, 'above_ema21': above21, 'above_ema50': above50,
-            'stage2_count': stage2_count,
+            'stage1_count': stage_counts[1],
+            'stage2_count': stage_counts[2],
+            'stage3_count': stage_counts[3],
+            'stage4_count': stage_counts[4],
             'total': len(processed),
-        }], on_conflict='date')
+        }
+        ema_ok = await supabase_upsert(session, 'ema_breadth_history', [ema_row], on_conflict='date')
+        if not ema_ok:
+            slim = {k: v for k, v in ema_row.items()
+                    if k not in ('stage1_count', 'stage3_count', 'stage4_count')}
+            await supabase_upsert(session, 'ema_breadth_history', [slim], on_conflict='date')
 
         # Retry the 30-day backfills on EOD only — NOT on live archive
         # retries. Awaiting these during market hours blocked live scans
