@@ -2380,19 +2380,37 @@ async def _concall_summary_loop(session: aiohttp.ClientSession):
                 # Keep Results priority until the numbers gap is small.
                 # Numbers come from Results PDFs only (BSE snapshot off).
                 max_lb = int(os.getenv('RESULTS_PDF_CATCHUP_MAX_LOOKBACK_DAYS', '1095'))
-                if missing_fr_total > idle_missing_ok:
-                    if lookback_days < max_lb:
-                        nxt = min(max_lb, max(lookback_days * 2, 730))
-                        _concall_summary_loop._catchup_lookback = nxt
-                        log.info(f"🎙️ Results catchup: still missing_fr≈{missing_fr_total} "
-                                 f"— widening lookback {lookback_days}d → {nxt}d "
-                                 f"(Results keeps Gemini priority)")
-                    else:
-                        log.info(f"🎙️ Results PDF queue empty (lookback={lookback_days}d) but "
-                                  f"missing_fr≈{missing_fr_total} — holding Gemini on Results "
-                                  f"(retry skipped PDFs; Concall/PPT wait)")
+                # …but a gap is not the same as work. Part of the universe
+                # (ETFs, trusts, newly listed and suspended names) simply
+                # has no results filing to read, so missing_fr can never
+                # reach zero. Holding the Gemini key for it starved PPT
+                # and concall indefinitely — the queue was empty, the
+                # lookback was already maxed, and the loop still claimed
+                # priority every 90s. After a few empty cycles at max
+                # lookback, declare idle and let the other readers in.
+                # Results still re-scans on its normal cadence and takes
+                # priority again the moment a real filing shows up.
+                yield_after = int(os.getenv('RESULTS_CATCHUP_YIELD_CYCLES', '3'))
+                widening = missing_fr_total > idle_missing_ok and lookback_days < max_lb
+                if widening:
+                    nxt = min(max_lb, max(lookback_days * 2, 730))
+                    _concall_summary_loop._catchup_lookback = nxt
+                    log.info(f"🎙️ Results catchup: still missing_fr≈{missing_fr_total} "
+                             f"— widening lookback {lookback_days}d → {nxt}d "
+                             f"(Results keeps Gemini priority)")
+                    _set_results_catchup_idle(False)
+                elif missing_fr_total > idle_missing_ok and idle_streak < yield_after:
+                    log.info(f"🎙️ Results PDF queue empty (lookback={lookback_days}d) but "
+                              f"missing_fr≈{missing_fr_total} — retrying skipped PDFs "
+                              f"({idle_streak}/{yield_after} before yielding Gemini)")
                     _set_results_catchup_idle(False)
                 else:
+                    if missing_fr_total > idle_missing_ok and idle_streak == yield_after:
+                        log.info(f"🎙️ Results catchup: queue empty at max lookback "
+                                  f"{lookback_days}d with missing_fr≈{missing_fr_total} "
+                                  f"unfilable — yielding Gemini to Concall/PPT/About "
+                                  f"(Results re-checks every cycle and takes priority "
+                                  f"again on any new filing)")
                     _set_results_catchup_idle(
                         True, lookback_days=lookback_days,
                         matched=len(concall_rows), already=len(already))
@@ -5529,7 +5547,8 @@ async def extract_management_flags(session: aiohttp.ClientSession, symbol: str, 
 
 
 async def answer_stock_ai_ask(session: aiohttp.ClientSession, symbol: str, question: str,
-                              context: str, industry=None, sector=None, use_web: bool = False):
+                              context: str, industry=None, sector=None, use_web: bool = False,
+                              chart_image=None, chart_image_mime=None):
     """Answer a diligence question via free Gemini (flash-lite).
     use_web=False → local context (filings/about/fundamentals); if thin, still
     answers with free Gemini + clear uncertainty (does not refuse).
@@ -5541,6 +5560,29 @@ async def answer_stock_ai_ask(session: aiohttp.ClientSession, symbol: str, quest
         return None
     has_context = bool(context and len(context.strip()) >= 80)
     sector_bit = ' / '.join(x for x in [industry, sector] if x) or 'NSE-listed company'
+    img_b64 = (chart_image or '').strip()
+    img_mime = (chart_image_mime or 'image/jpeg').strip().lower()
+    if img_mime not in ('image/jpeg', 'image/png', 'image/webp'):
+        img_mime = 'image/jpeg'
+    if img_b64.startswith('data:'):
+        try:
+            header, img_b64 = img_b64.split(',', 1)
+            if 'image/png' in header:
+                img_mime = 'image/png'
+            elif 'image/webp' in header:
+                img_mime = 'image/webp'
+            else:
+                img_mime = 'image/jpeg'
+        except ValueError:
+            img_b64 = ''
+    has_chart = len(img_b64) >= 800
+    chart_rules = (
+        "A CHART SCREENSHOT is attached. Read it carefully: trend, stage if visible, "
+        "volume character, squeeze/dots, EMAs, buy/sell markers, RS or Super Cycle if shown. "
+        "Say what you can actually see; do not invent RSI/RS/price figures you cannot read. "
+        "If it is not a price chart, say what the image is instead. "
+        "This is research commentary, not a buy/sell call.\n"
+    )
     if use_web:
         prompt = (
             f"Answer this investor diligence question about Indian NSE stock {symbol} ({sector_bit}).\n"
@@ -5548,7 +5590,8 @@ async def answer_stock_ai_ask(session: aiohttp.ClientSession, symbol: str, quest
             "Use Google Search across annual reports, concalls, filings, company site, and "
             "reputable news. Also use LOCAL CONTEXT below when present (PPT/concall/about on file).\n"
             "Compare management promises vs execution when relevant. No buy/sell recommendation.\n"
-            "If evidence is weak, say so explicitly.\n\n"
+            "If evidence is weak, say so explicitly.\n"
+            f"{chart_rules if has_chart else ''}\n"
             "Return ONLY JSON:\n"
             '- "answer": 120-220 words, clear and specific\n'
             '- "verdict": trustworthy | mixed | caution | unknown | n/a\n'
@@ -5562,7 +5605,8 @@ async def answer_stock_ai_ask(session: aiohttp.ClientSession, symbol: str, quest
             f"QUESTION: {question.strip()}\n\n"
             "Prefer the LOCAL CONTEXT below (PPT/concall/about/fundamentals on file). "
             "If context is thin, say what is known vs unknown — still give a useful answer. "
-            "Do not invent precise figures not in context. No buy/sell recommendation.\n\n"
+            "Do not invent precise figures not in context. No buy/sell recommendation.\n"
+            f"{chart_rules if has_chart else ''}\n"
             "Return ONLY JSON:\n"
             '- "answer": 80-200 words\n'
             '- "verdict": trustworthy | mixed | caution | unknown | n/a\n'
@@ -5576,7 +5620,8 @@ async def answer_stock_ai_ask(session: aiohttp.ClientSession, symbol: str, quest
             f"QUESTION: {question.strip()}\n\n"
             "No PPT/concall excerpts are on file. Use well-known public facts about this company "
             "only; clearly label uncertainty; do not invent precise quarterly figures. "
-            "No buy/sell recommendation.\n\n"
+            "No buy/sell recommendation.\n"
+            f"{chart_rules if has_chart else ''}\n"
             "Return ONLY JSON:\n"
             '- "answer": 80-180 words\n'
             '- "verdict": unknown | n/a | mixed\n'
@@ -5586,6 +5631,16 @@ async def answer_stock_ai_ask(session: aiohttp.ClientSession, symbol: str, quest
     # Web search is slow on free tier — short timeout, then fast no-tools fallback.
     web_timeout = int(os.getenv('GEMINI_ASK_WEB_TIMEOUT_SECONDS', '40'))
     fast_timeout = int(os.getenv('GEMINI_ASK_TIMEOUT_SECONDS', '35'))
+    if has_chart:
+        fast_timeout = max(fast_timeout, 50)
+        web_timeout = max(web_timeout, 55)
+
+    def _contents(text: str):
+        parts = []
+        if has_chart:
+            parts.append({"inline_data": {"mime_type": img_mime, "data": img_b64}})
+        parts.append({"text": text})
+        return [{"parts": parts}]
 
     async def _parse_answer(data, with_sources: bool):
         parts = (data.get('candidates') or [{}])[0].get('content', {}).get('parts', [])
@@ -5610,7 +5665,7 @@ async def answer_stock_ai_ask(session: aiohttp.ClientSession, symbol: str, quest
         try:
             if use_web:
                 body_web = {
-                    "contents": [{"parts": [{"text": prompt}]}],
+                    "contents": _contents(prompt),
                     "generationConfig": {"temperature": 0.25},
                     "tools": [{"google_search": {}}],
                 }
@@ -5627,16 +5682,16 @@ async def answer_stock_ai_ask(session: aiohttp.ClientSession, symbol: str, quest
                         return out
                 # Fast path: same prompt, no Google Search tool.
                 body_fast = {
-                    "contents": [{"parts": [{"text": prompt +
+                    "contents": _contents(prompt +
                         "\n(Answer quickly from LOCAL CONTEXT and well-known public facts; "
-                        "no live browsing.)\n"}]}],
+                        "no live browsing.)\n"),
                     "generationConfig": {"temperature": 0.2},
                 }
                 status, data, txt = await _gemini_generate(
                     session, url, body_fast, fast_timeout, api_key=api_key, priority=True)
             else:
                 body = {
-                    "contents": [{"parts": [{"text": prompt}]}],
+                    "contents": _contents(prompt),
                     "generationConfig": {"temperature": 0.2},
                 }
                 status, data, txt = await _gemini_generate(
@@ -5836,7 +5891,7 @@ async def _stock_ai_asks_loop(session: aiohttp.ClientSession):
             async with session.get(
                 f"{SUPABASE_URL}/rest/v1/stock_ai_asks", headers=headers,
                 params={
-                    'select': 'id,symbol,question,ask_mode,created_at',
+                    'select': 'id,symbol,question,ask_mode,chart_image,chart_image_mime,created_at',
                     'status': 'eq.pending',
                     'order': 'created_at.asc',
                     'limit': '3',
@@ -5845,19 +5900,37 @@ async def _stock_ai_asks_loop(session: aiohttp.ClientSession):
             ) as r:
                 if r.status != 200:
                     body = await r.text()
-                    if r.status == 404 or (r.status == 400 and 'stock_ai_asks' in body):
-                        log.warning("💬 Ask-AI: run add_stock_ai_asks.sql")
-                        await asyncio.sleep(600)
-                        continue
-                    # Older DB without ask_mode — retry without it
-                    if r.status == 400 and 'ask_mode' in body:
+                    # Column checks come FIRST: PostgREST reports a missing
+                    # column as "column stock_ai_asks.chart_image does not
+                    # exist", which also matches the table-missing test below.
+                    # With the old ordering that made this degrade path dead
+                    # code, so a DB missing only the newer image columns
+                    # parked Ask-AI for 10 minutes a time instead of
+                    # answering questions without the screenshot.
+                    if r.status == 400 and ('ask_mode' in body or 'chart_image' in body):
+                        sel = 'id,symbol,question,created_at'
+                        if 'ask_mode' not in body:
+                            sel = 'id,symbol,question,ask_mode,created_at'
                         async with session.get(
                             f"{SUPABASE_URL}/rest/v1/stock_ai_asks", headers=headers,
-                            params={'select': 'id,symbol,question,created_at', 'status': 'eq.pending',
+                            params={'select': sel, 'status': 'eq.pending',
                                     'order': 'created_at.asc', 'limit': '3'},
                             timeout=aiohttp.ClientTimeout(total=20),
                         ) as r2:
                             pending = await r2.json() if r2.status == 200 else []
+                        if r2.status == 200:
+                            _missing = ('chart images' if 'chart_image' in body
+                                        else 'web-search mode')
+                            if not getattr(_stock_ai_asks_loop, '_degraded_logged', False):
+                                log.warning(f"💬 Ask-AI: running without {_missing} — "
+                                            f"run add_ask_ai_chart_image.sql / "
+                                            f"add_stock_ai_ask_mode.sql to enable")
+                                _stock_ai_asks_loop._degraded_logged = True
+                    elif r.status == 404 or (r.status == 400 and 'stock_ai_asks' in body):
+                        log.warning(f"💬 Ask-AI: table missing — run "
+                                    f"add_stock_ai_asks.sql ({body[:120]})")
+                        await asyncio.sleep(600)
+                        continue
                     else:
                         log.warning(f"💬 Ask-AI poll failed ({r.status}): {body[:160]}")
                         await asyncio.sleep(30)
@@ -5873,17 +5946,23 @@ async def _stock_ai_asks_loop(session: aiohttp.ClientSession):
                 question = (row.get('question') or '').strip()
                 ask_mode = (row.get('ask_mode') or 'filings').strip().lower()
                 use_web = ask_mode in ('web', 'web_search', 'search')
+                chart_image = row.get('chart_image')
+                chart_mime = row.get('chart_image_mime')
+                has_img = bool(chart_image and len(str(chart_image)) >= 800)
                 if not ask_id or not sym or len(question) < 8:
                     continue
                 t0 = time.monotonic()
-                log.info(f"💬 Ask-AI answering {sym} [{ask_mode}]: {question[:80]}")
+                log.info(f"💬 Ask-AI answering {sym} [{ask_mode}"
+                         f"{'+chart' if has_img else ''}]: {question[:80]}")
                 context, fund, ppt, tx, _about = await _gather_stock_ask_context(session, headers, sym)
                 # Keep about + fundamentals + filings — free Gemini can answer
                 # even when PPT/concall are not on file yet.
                 result = await answer_stock_ai_ask(
                     session, sym, question, context or '',
                     industry=fund.get('industry'), sector=fund.get('sector'),
-                    use_web=use_web)
+                    use_web=use_web,
+                    chart_image=chart_image if has_img else None,
+                    chart_image_mime=chart_mime if has_img else None)
                 elapsed = time.monotonic() - t0
                 if result:
                     patch = {
@@ -5894,6 +5973,9 @@ async def _stock_ai_asks_loop(session: aiohttp.ClientSession):
                         'sources': result.get('sources') if use_web else None,
                         'answered_at': datetime.now(timezone.utc).isoformat(),
                         'error': None,
+                        # Drop the screenshot after answering so the row stays small.
+                        'chart_image': None,
+                        'chart_image_mime': None,
                     }
                 else:
                     patch = {
@@ -5908,7 +5990,24 @@ async def _stock_ai_asks_loop(session: aiohttp.ClientSession):
                     timeout=aiohttp.ClientTimeout(total=20),
                 ) as pr:
                     if pr.status not in (200, 204):
-                        log.warning(f"⚠️ Ask-AI patch {pr.status} for {ask_id}: {(await pr.text())[:160]}")
+                        err_body = await pr.text()
+                        if 'chart_image' in err_body:
+                            slim = {k: v for k, v in patch.items()
+                                    if k not in ('chart_image', 'chart_image_mime')}
+                            async with session.patch(
+                                f"{SUPABASE_URL}/rest/v1/stock_ai_asks?id=eq.{ask_id}",
+                                headers={**headers, 'Prefer': 'return=minimal'},
+                                json=slim,
+                                timeout=aiohttp.ClientTimeout(total=20),
+                            ) as pr2:
+                                if pr2.status not in (200, 204):
+                                    log.warning(f"⚠️ Ask-AI patch {pr2.status} for {ask_id}: "
+                                                f"{(await pr2.text())[:160]}")
+                                else:
+                                    log.info(f"  💬 {sym}: ask {ask_id[:8]}… → {patch['status']} "
+                                             f"in {elapsed:.1f}s")
+                        else:
+                            log.warning(f"⚠️ Ask-AI patch {pr.status} for {ask_id}: {err_body[:160]}")
                     else:
                         log.info(f"  💬 {sym}: ask {ask_id[:8]}… → {patch['status']} "
                                  f"in {elapsed:.1f}s")
@@ -6857,7 +6956,18 @@ def _gemini_focus_allows(feature: str) -> bool:
             return True
         if _filing_catchup_parallel() and feature in ('transcript', 'ppt'):
             return _filing_catchup_enabled() and _gemini_focus_allowed_by_env(feature)
-    return _gemini_focus_allowed_by_env(feature)
+    if _gemini_focus_allowed_by_env(feature):
+        return True
+    # GEMINI_FOCUS is a priority order, not a permanent veto. Once the
+    # named focus has genuinely run out of work, hand the key to the
+    # loops it was starving instead of idling a paid-for key forever.
+    if feature in ('transcript', 'ppt', 'about'):
+        focus = {x.strip() for x in (os.getenv('GEMINI_FOCUS') or '').lower().split(',')}
+        if 'results' in focus and _results_catchup_over():
+            if feature == 'about':
+                return not _about_company_manually_paused()
+            return _filing_catchup_enabled()
+    return False
 
 
 async def _idle_if_gemini_paused(feature: str, label: str):

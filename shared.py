@@ -138,6 +138,7 @@ __all__ = [
     'index_history_cache',
     'index_key_map',
     'etf_syms',
+    'is_etf_like',
     'instrument_key_map',
     'is_market_open',
     'json',
@@ -633,6 +634,38 @@ etf_syms: set = set()        # ETF / index-fund symbols. They are scanned like a
                              # other instrument, but signal alerts are meaningless
                              # for them (a "Bull Snort" on a silver ETF is noise),
                              # so live_scan excludes them when firing alerts.
+
+# Upstox's instrument feed labels almost every NSE cash-segment line as
+# 'EQ', including ETFs — so instrument_type alone identified zero ETFs
+# and index/commodity funds (LICMFGOLD, SILVERBETA, TATSILV, GROWWSC250…)
+# kept firing signal alerts. These markers are matched against the
+# instrument name first, since fund names are explicit, and against the
+# symbol only for unambiguous tokens. EXTRA_ETF_SYMS is the manual escape
+# hatch for anything that still slips through.
+_ETF_NAME_MARKERS = (
+    'ETF', 'EXCHANGE TRADED', 'BEES', 'INDEX FUND', 'MUTUAL FUND',
+    'AMC ', ' AMC', 'ASSET MANAGEMENT', 'GOLD FUND', 'SILVER FUND',
+    'LIQUID FUND', 'GILT FUND',
+)
+_ETF_SYM_MARKERS = ('BEES', 'IETF', 'ETF', 'LICMF', 'GSEC', 'SDL')
+_EXTRA_ETF_SYMS = {
+    x.strip().upper()
+    for x in (os.getenv('EXTRA_ETF_SYMS') or '').split(',')
+    if x.strip()
+}
+
+
+def is_etf_like(sym: str, name: str = None) -> bool:
+    """ETF / listed-fund detection that does not trust instrument_type."""
+    s = (sym or '').upper()
+    if not s:
+        return False
+    if s in _EXTRA_ETF_SYMS:
+        return True
+    n = (name or '').upper()
+    if n and any(m in n for m in _ETF_NAME_MARKERS):
+        return True
+    return any(m in s for m in _ETF_SYM_MARKERS)
 index_key_map: dict = {}     # normalized index name -> instrument key (e.g. NSE_INDEX|...) —
                               # built alongside instrument_key_map in load_instrument_master,
                               # replaces guessing text variants for thematic sector indices
@@ -1872,13 +1905,20 @@ async def load_instrument_master(session: aiohttp.ClientSession):
                     key = item.get('instrument_key', '')
                     if exch == 'NSE' and itype in ('EQ', 'ETF') and sym and key:
                         instrument_key_map[sym] = key
-                        if itype == 'ETF':
+                        if itype == 'ETF' or is_etf_like(sym, item.get('name')):
                             etf_syms.add(sym)
 
                 log.info(
                     f"✅ Instrument master loaded: {len(instrument_key_map)} "
                     f"EQ+ETF instruments ({len(etf_syms)} ETFs, excluded from alerts)"
                 )
+                if etf_syms:
+                    log.info(f"  🚫 ETF sample (no signal alerts): "
+                             f"{sorted(etf_syms)[:15]}")
+                else:
+                    log.warning("  ⚠️ No ETFs identified — ETF alert filtering is "
+                                "inactive, so index/commodity funds can still fire "
+                                "signal alerts. Set EXTRA_ETF_SYMS to patch manually.")
                 # Diagnostic for tracking down specific missing-stock
                 # reports (e.g. COFORGE silently dropping out of the
                 # live scan for days with no error) — logs whether a
@@ -1950,7 +1990,8 @@ async def load_instrument_master(session: aiohttp.ClientSession):
                         key = row.get('instrument_key', '')
                         if sym and key:
                             instrument_key_map[sym] = key
-                            if row.get('instrument_type') == 'ETF':
+                            if (row.get('instrument_type') == 'ETF'
+                                    or is_etf_like(sym, row.get('name'))):
                                 etf_syms.add(sym)
                 log.info(f"✅ CSV master loaded: {len(instrument_key_map)} EQ+ETF instruments")
                 if len(instrument_key_map) > 100:
