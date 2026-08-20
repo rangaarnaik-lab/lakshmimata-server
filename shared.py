@@ -199,8 +199,9 @@ if R2_ACCOUNT_ID and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_BUCKET_NAM
     )
 
 # ── Telegram Bot ─────────────────────────────────────────────────────
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
-TELEGRAM_CHAT_ID   = os.getenv('TELEGRAM_CHAT_ID', '')
+TELEGRAM_BOT_TOKEN    = os.getenv('TELEGRAM_BOT_TOKEN', '')
+TELEGRAM_BOT_USERNAME = os.getenv('TELEGRAM_BOT_USERNAME', '').lstrip('@').strip()
+TELEGRAM_CHAT_ID      = os.getenv('TELEGRAM_CHAT_ID', '')
 
 # Market hours IST
 MARKET_OPEN_H, MARKET_OPEN_M   = 9, 15
