@@ -18,6 +18,7 @@ from bull_snort import (
     detect_bull_snort,
 )
 from squeeze_pro import compute_squeeze_pro
+from telegram_alerts import fanout_telegram_alerts, poll_telegram_links
 
 log = logging.getLogger('pocketrs')
 
@@ -5756,6 +5757,10 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         log.info(f"  🔥 {len(new_fires)} NEW squeeze fires: {[f['sym'] for f in new_fires]}")
         # Save to Supabase so frontend can poll and show notifications
         await supabase_upsert(session, 'squeeze_alerts', new_fires, on_conflict='sym,fired_at')
+        try:
+            await fanout_telegram_alerts(session, new_fires)
+        except Exception as e:
+            log.warning(f"Telegram squeeze fan-out failed: {e}")
 
     # Step 5.4b: Detect NEW signal fires
     # (HY/HT/PP/Bull Snort/Stage2/Guppy/RS>70) via
@@ -5835,6 +5840,10 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             f"{[(f['sym'], f['fire_type']) for f in new_signal_fires[:20]]}"
         )
         await supabase_upsert(session, 'squeeze_alerts', new_signal_fires, on_conflict='sym,fired_at')
+        try:
+            await fanout_telegram_alerts(session, new_signal_fires)
+        except Exception as e:
+            log.warning(f"Telegram signal fan-out failed: {e}")
 
     # Step 5.5: Market Breadth metrics
     # These give a pulse on overall market health
@@ -7276,7 +7285,13 @@ async def run_live_scan_service():
                 # Outside market hours with today's EOD already done: sleep
                 # long instead of polling every 5s. Still short enough to
                 # wake up promptly for tomorrow's pre-market window.
-                await asyncio.sleep(5 if should_scan_now else 1800)
+                # Keep Telegram /start linking alive after hours (20s) instead of
+                # a 30-minute sleep that would stall Account → Connect Telegram.
+                try:
+                    await poll_telegram_links(session)
+                except Exception as e:
+                    log.warning(f"Telegram poll failed: {e}")
+                await asyncio.sleep(5 if should_scan_now else 20)
 
             except KeyboardInterrupt:
                 log.info("Shutting down…")
