@@ -4343,14 +4343,21 @@ async def load_fundamentals_at_startup(session: aiohttp.ClientSession):
         log.info(f"📊 Starting background fundamentals fetch for {len(stale_or_missing)} stocks…")
         asyncio.create_task(load_fundamentals_batch(session, stale_or_missing))
 
-async def load_historical_cache(session: aiohttp.ClientSession):
-    """Load historical data for all stocks at startup."""
-    log.info(f"Loading historical data for {len(ALL_STOCKS)} stocks…")
+async def load_historical_cache(session: aiohttp.ClientSession, syms: list = None):
+    """Fill historical_cache from Upstox candles — one API call per stock.
+
+    Pass `syms` to cover only the symbols Supabase could not supply. The
+    default (whole universe) is the cold-start path; running it up front
+    unconditionally meant ~2,600 calls whose results the Supabase load
+    immediately overwrote.
+    """
+    targets = list(syms) if syms is not None else list(ALL_STOCKS)
+    log.info(f"Loading historical data for {len(targets)} stocks…")
     BATCH = 10
     loaded = 0
     failed_syms = []
-    for i in range(0, len(ALL_STOCKS), BATCH):
-        batch = ALL_STOCKS[i:i+BATCH]
+    for i in range(0, len(targets), BATCH):
+        batch = targets[i:i+BATCH]
         results = await asyncio.gather(*[
             fetch_historical(session, sym, instrument_key_map.get(sym, f"NSE_EQ|{sym}"))
             for sym in batch
@@ -4363,7 +4370,7 @@ async def load_historical_cache(session: aiohttp.ClientSession):
                 failed_syms.append(sym)
         await asyncio.sleep(0.5)
         if (i // BATCH) % 10 == 0:
-            log.info(f"  Loaded {loaded}/{len(ALL_STOCKS)} stocks…")
+            log.info(f"  Loaded {loaded}/{len(targets)} stocks…")
 
     # Retry failed stocks with BSE exchange key
     if failed_syms:
@@ -7291,9 +7298,29 @@ async def run_live_scan_service():
         # Step 2d: Try external sources for Midcap/Smallcap only
         await load_full_history_once(session)
 
-        # Step 3: Load historical data cache at startup
+        # Step 3: Rehydrate the in-memory price cache (RS / patterns /
+        # volume averages all read it, and a fresh container starts empty).
+        # Supabase first, because stock_full_history already holds these
+        # series for free and its load OVERWRITES whatever is cached. This
+        # used to run after a full-universe Upstox pass, so ~2,600
+        # historical-candle calls and two-plus minutes of every startup
+        # produced arrays that were then thrown away. Upstox now only
+        # covers what Supabase (and its Yahoo backfill) could not.
         log.info("Loading historical data cache at startup…")
-        await load_historical_cache(session)
+        FULL_HISTORY_TIMEOUT = 1800  # 30 min ceiling if a large backfill is needed
+        try:
+            await asyncio.wait_for(load_history_at_startup(session), timeout=FULL_HISTORY_TIMEOUT)
+        except asyncio.TimeoutError:
+            log.error(f"⏱ Startup history load exceeded {FULL_HISTORY_TIMEOUT}s — continuing with partial data")
+        except Exception as e:
+            import traceback
+            log.error(f"Startup history load error: {e}\n{traceback.format_exc()}")
+
+        cache_gaps = [s for s in ALL_STOCKS if not historical_cache.get(s, {}).get('prices')]
+        log.info(f"📦 Price cache: {len(historical_cache)} stocks in memory, "
+                 f"{len(cache_gaps)} still need Upstox candles")
+        if cache_gaps:
+            await load_historical_cache(session, cache_gaps)
 
         # Step 3b: Official Midcap 150 / Smallcap 250 benchmarks for MID/SML RS.
         # load_index_cache (above) already pulled Upstox history into
@@ -7304,20 +7331,6 @@ async def run_live_scan_service():
         # at EOD via daily_append_benchmark_indexes (not here — startup
         # would consume the once-per-day guard before the final close lands).
         await refresh_mid_smallcap_benchmarks(session)
-
-        # Step 3c: Load full 2yr history at startup — from Supabase first
-        # (fast, zero Yahoo calls), falling back to Yahoo only for symbols
-        # that are missing or stale. Previously this always re-fetched all
-        # ~2385 stocks from Yahoo on every single restart, which was slow
-        # and the main source of Yahoo rate-limit failures.
-        FULL_HISTORY_TIMEOUT = 1800  # 30 min ceiling if a large backfill is needed
-        try:
-            await asyncio.wait_for(load_history_at_startup(session), timeout=FULL_HISTORY_TIMEOUT)
-        except asyncio.TimeoutError:
-            log.error(f"⏱ Startup history load exceeded {FULL_HISTORY_TIMEOUT}s — continuing with partial data")
-        except Exception as e:
-            import traceback
-            log.error(f"Startup history load error: {e}\n{traceback.format_exc()}")
 
         # One-time backfill of the historical advance/decline line, using
         # the price history just loaded above — self-guards to skip if
