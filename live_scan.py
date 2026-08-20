@@ -5826,14 +5826,16 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         for s in processed
     }
 
+    # Telegram goes out once per scan, after both detectors below have run.
+    # Fanning out per detector meant a user could get two separate DMs in the
+    # same minute for the same scan.
+    telegram_fires: list = []
+
     if new_fires:
         log.info(f"  🔥 {len(new_fires)} NEW squeeze fires: {[f['sym'] for f in new_fires]}")
         # Save to Supabase so frontend can poll and show notifications
         await supabase_upsert(session, 'squeeze_alerts', new_fires, on_conflict='sym,fired_at')
-        try:
-            await fanout_telegram_alerts(session, new_fires)
-        except Exception as e:
-            log.warning(f"Telegram squeeze fan-out failed: {e}")
+        telegram_fires.extend(new_fires)
 
     # Step 5.4b: Detect NEW signal fires
     # (HY/HT/PP/Bull Snort/Stage2/Guppy/RS>70) via
@@ -5917,10 +5919,13 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             f"{[(f['sym'], f['fire_type']) for f in new_signal_fires[:20]]}"
         )
         await supabase_upsert(session, 'squeeze_alerts', new_signal_fires, on_conflict='sym,fired_at')
+        telegram_fires.extend(new_signal_fires)
+
+    if telegram_fires:
         try:
-            await fanout_telegram_alerts(session, new_signal_fires)
+            await fanout_telegram_alerts(session, telegram_fires)
         except Exception as e:
-            log.warning(f"Telegram signal fan-out failed: {e}")
+            log.warning(f"Telegram fan-out failed: {e}")
 
     # Step 5.5: Market Breadth metrics
     # These give a pulse on overall market health

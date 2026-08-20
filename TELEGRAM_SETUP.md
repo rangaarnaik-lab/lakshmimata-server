@@ -64,6 +64,8 @@ Research alert — not advice
 - Users **must** tap Start. You cannot message a Telegram account that never opened the bot.
 - Each user gets **one digest per scan** (up to 10 lines, rest in the app), not 10 separate DMs.
 - Sends are paced at **25/sec** (Telegram cap ~30/sec). 1,000 users ≈ 40 seconds, off the scan loop.
+- Scans run every 60s, so a user receives **at most one DM per minute** — both detectors (squeeze and signals) are merged into that single digest. Quiet scans send nothing, since alerts only fire on a state transition.
+- Throughput headroom at one digest per user per scan: 100 users ≈ 1.7/sec, 500 ≈ 8/sec, 1,000 ≈ 17/sec. The ~30/sec ceiling is reached around 1,800 users.
 - 429 (too many requests) waits `retry_after` and retries a few times; leftover DMs stay queued.
 - Do not run a second `getUpdates` poller (only one process can poll). Keep it on live_scan.
 
