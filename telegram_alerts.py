@@ -94,6 +94,15 @@ def format_alert_html(fire: dict) -> str:
     )
 
 
+# One digest per user (10 lines in 1 DM), paced at ~25/sec so 1,000 users
+# finish in ~40s instead of 10,000 individual sends (~167/sec, Telegram 429).
+_TG_SEND_PER_SEC = 25
+_TG_DIGEST_LINES = 10
+_send_q: asyncio.Queue = asyncio.Queue()
+_drain_lock = asyncio.Lock()
+_drain_running = False
+
+
 async def telegram_api(session: aiohttp.ClientSession, method: str, payload=None, params=None):
     if not TELEGRAM_BOT_TOKEN:
         return None
@@ -107,6 +116,9 @@ async def telegram_api(session: aiohttp.ClientSession, method: str, payload=None
             async with session.get(url, params=params, timeout=timeout) as r:
                 data = await r.json(content_type=None)
         if not data.get('ok'):
+            retry_after = (data.get('parameters') or {}).get('retry_after')
+            if data.get('error_code') == 429 and retry_after:
+                return {'_retry_after': float(retry_after)}
             log.warning(f"Telegram {method} failed: {data}")
             return None
         return data.get('result')
@@ -118,13 +130,82 @@ async def telegram_api(session: aiohttp.ClientSession, method: str, payload=None
 async def send_telegram_chat(session: aiohttp.ClientSession, chat_id, text: str) -> bool:
     if not chat_id or not text:
         return False
-    result = await telegram_api(session, 'sendMessage', payload={
-        'chat_id': chat_id,
-        'text': text,
-        'parse_mode': 'HTML',
-        'disable_web_page_preview': True,
-    })
-    return result is not None
+    for attempt in range(4):
+        result = await telegram_api(session, 'sendMessage', payload={
+            'chat_id': chat_id,
+            'text': text[:4090],
+            'parse_mode': 'HTML',
+            'disable_web_page_preview': True,
+        })
+        if isinstance(result, dict) and '_retry_after' in result:
+            await asyncio.sleep(min(30.0, result['_retry_after']))
+            continue
+        return result is not None
+    return False
+
+
+def format_digest_html(fires: list[dict], extra: int = 0) -> str:
+    """One message: up to _TG_DIGEST_LINES stocks, rest pointed to the app."""
+    total = len(fires) + extra
+    head = f"<b>Lakshmimata</b> · {total} alert{'s' if total != 1 else ''}"
+    rows = [head]
+    for fire in fires:
+        kind = fire.get('fire_type') or 'Alert'
+        sym = (fire.get('sym') or '').upper()
+        rs = fire.get('rs_tv') if fire.get('rs_tv') is not None else fire.get('rs')
+        chg = fire.get('chg_pct')
+        bits = []
+        if rs is not None:
+            bits.append(f"RS {rs}")
+        if isinstance(chg, (int, float)):
+            bits.append(f"{chg:+.1f}%")
+        meta = '  '.join(bits)
+        line = f"• <b>{_esc(sym)}</b> · {_esc(kind)}"
+        if meta:
+            line += f"  {_esc(meta)}"
+        rows.append(line)
+    if extra > 0:
+        rows.append(f"<i>+{extra} more in the app</i>")
+    rows.append("<i>Research alert — not advice</i>")
+    return '\n'.join(rows)
+
+
+async def _drain_telegram_queue(session: aiohttp.ClientSession):
+    """Pace outbound DMs at _TG_SEND_PER_SEC. Scan loop does not wait."""
+    global _drain_running
+    interval = 1.0 / _TG_SEND_PER_SEC
+    last = 0.0
+    sent = 0
+    try:
+        while True:
+            try:
+                chat_id, text = _send_q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            wait = interval - (time.time() - last)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            if await send_telegram_chat(session, chat_id, text):
+                sent += 1
+            last = time.time()
+            _send_q.task_done()
+        if sent:
+            log.info(f"  📬 Telegram: {sent} digest(s) delivered (paced {_TG_SEND_PER_SEC}/s)")
+    finally:
+        async with _drain_lock:
+            _drain_running = False
+            leftover = not _send_q.empty()
+        if leftover:
+            asyncio.create_task(_kick_telegram_drain(session))
+
+
+async def _kick_telegram_drain(session: aiohttp.ClientSession):
+    global _drain_running
+    async with _drain_lock:
+        if _drain_running:
+            return
+        _drain_running = True
+    asyncio.create_task(_drain_telegram_queue(session))
 
 
 async def publish_bot_username(session: aiohttp.ClientSession):
@@ -214,7 +295,7 @@ async def poll_telegram_links(session: aiohttp.ClientSession):
     if _update_offset:
         params['offset'] = _update_offset
     result = await telegram_api(session, 'getUpdates', params=params)
-    if result is None:
+    if not isinstance(result, list):
         return
     for upd in result:
         uid = upd.get('update_id')
@@ -256,6 +337,10 @@ async def poll_telegram_links(session: aiohttp.ClientSession):
 
 
 async def fanout_telegram_alerts(session: aiohttp.ClientSession, fires: list[dict]):
+    """Queue one digest per linked user; drain at 25/s off the scan loop.
+
+    1,000 users × 10 alerts → 1,000 messages (~40s), not 10,000.
+    """
     if not TELEGRAM_BOT_TOKEN or not fires:
         return
     links = await _sb_get(
@@ -267,7 +352,7 @@ async def fanout_telegram_alerts(session: aiohttp.ClientSession, fires: list[dic
     prefs_rows = await _sb_get(session, 'user_alert_prefs?select=user_id,prefs') or []
     prefs_by = {str(r['user_id']): (r.get('prefs') or {}) for r in prefs_rows}
 
-    sent = 0
+    queued = 0
     for link in links:
         uid = str(link.get('user_id') or '')
         chat_id = link.get('chat_id')
@@ -277,16 +362,10 @@ async def fanout_telegram_alerts(session: aiohttp.ClientSession, fires: list[dic
         matched = [f for f in fires if fire_type_enabled(f.get('fire_type') or '', prefs)]
         if not matched:
             continue
-        cap = 8
-        for fire in matched[:cap]:
-            if await send_telegram_chat(session, chat_id, format_alert_html(fire)):
-                sent += 1
-            await asyncio.sleep(0.04)
-        extra = len(matched) - cap
-        if extra > 0:
-            await send_telegram_chat(
-                session, chat_id,
-                f"…and <b>{extra}</b> more matching alerts this scan. Open Lakshmimata for the full list.",
-            )
-    if sent:
-        log.info(f"  📬 Telegram: {sent} personal alert(s) across {len(links)} linked chat(s)")
+        shown = matched[:_TG_DIGEST_LINES]
+        extra = len(matched) - len(shown)
+        await _send_q.put((chat_id, format_digest_html(shown, extra)))
+        queued += 1
+    if queued:
+        log.info(f"  📬 Telegram: queued {queued} digest(s) for {len(links)} linked chat(s)")
+        await _kick_telegram_drain(session)

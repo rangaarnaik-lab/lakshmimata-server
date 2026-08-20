@@ -1334,6 +1334,53 @@ def build_sector_rs(processed: list, sector_map: dict) -> list:
         s['rank'] = i + 1
     return sectors
 
+
+def build_industry_rs(processed: list) -> list:
+    """Equal-weight industry groups used by Market → Industries.
+
+    The frontend still joins the live member rows for drill-down and thrust
+    details. Persisting this compact group snapshot gives industries the same
+    stable weekly rank history sectors already have.
+    """
+    by_industry: dict[str, list] = {}
+    for stock in processed:
+        industry = (stock.get('industry') or '').strip()
+        if not industry or industry.lower() in ('other', 'unknown', 'n/a'):
+            continue
+        by_industry.setdefault(industry, []).append(stock)
+
+    rows = []
+    for industry, members in by_industry.items():
+        if len(members) < 3:
+            continue
+        sector_counts = {}
+        for member in members:
+            sector = (member.get('sector') or '').strip()
+            if sector:
+                sector_counts[sector] = sector_counts.get(sector, 0) + 1
+        parent_sector = max(sector_counts, key=sector_counts.get) if sector_counts else None
+
+        def advance_pct(field):
+            values = [s.get(field) for s in members if s.get(field) is not None]
+            return round(sum(1 for v in values if v > 0) / len(values) * 100, 2) if values else None
+
+        rows.append({
+            'industry': industry,
+            'parent_sector': parent_sector,
+            'avg_rs': round(sum(s.get('rs') or 0 for s in members) / len(members)),
+            'count': len(members),
+            'pp_count': sum(1 for s in members if s.get('is_pp')),
+            'improving': sum(1 for s in members if s.get('rs_trend') == 'improving'),
+            'advances_d': advance_pct('chg_pct'),
+            'advances_w': advance_pct('chg_w_pct'),
+            'advances_m': advance_pct('chg_m_pct'),
+        })
+    rows.sort(key=lambda row: row['avg_rs'], reverse=True)
+    for i, row in enumerate(rows, start=1):
+        row['rank'] = i
+    return rows
+
+
 def build_synthetic_index(symbols: list, cache: dict, min_stocks: int = 20) -> dict:
     """
     Build synthetic index from constituent stocks.
@@ -4708,6 +4755,32 @@ async def load_sector_rank_history(session: aiohttp.ClientSession) -> dict:
         log.warning(f"  Load sector rank history error: {e}")
     return result
 
+
+async def load_industry_rank_history(session: aiohttp.ClientSession) -> dict:
+    """Load persisted weekly industry ranks; empty until migration is run."""
+    import json as _json
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    result: dict = {}
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/industries?select=industry,rank_history",
+            headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+        ) as r:
+            if r.status == 200:
+                for row in await r.json():
+                    raw = row.get('rank_history')
+                    if raw:
+                        try:
+                            result[row['industry']] = _json.loads(raw) if isinstance(raw, str) else raw
+                        except Exception:
+                            pass
+            elif r.status != 404:
+                log.warning(f"  Load industry rank history failed: {r.status}")
+    except Exception as e:
+        log.warning(f"  Load industry rank history error: {e}")
+    return result
+
+
 def merge_incremental_days(existing_dates: list, existing_prices: list, existing_volumes: list,
                             existing_highs: list, existing_lows: list, existing_opens: list = None,
                             fresh: dict = None, max_days: int = 504) -> dict:
@@ -5781,10 +5854,14 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
     )
     for s in processed:
         sym = s['sym']
+        had_previous_scan = sym in prev_hy_ht_state
         prev = prev_hy_ht_state.get(sym, {})
         for key, field, label, us_off in _SIGNAL_SPECS:
             fired = bool(s.get(field, False))
-            if fired and not prev.get(key, False):
+            # A real alert requires an observed false -> true transition.
+            # On process startup the previous-state map is empty; seed it
+            # from this scan instead of replaying every already-active signal.
+            if had_previous_scan and fired and not prev.get(key, False):
                 new_signal_fires.append({
                     'sym':        sym,
                     'fire_type':  label,
@@ -5877,6 +5954,7 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
 
     # Step 6: Build sector RS
     sector_rows = build_sector_rs(processed, SECTOR_MAP)
+    industry_rows = build_industry_rs(processed)
 
     # Step 6.5: Build index dashboard data
     # For each tracked index: live price + daily/weekly/monthly chg + RS-TV + Stage
@@ -6132,6 +6210,23 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         {**s, 'last_updated': now_ist.isoformat(), 'top_stocks': json.dumps(s['top_stocks'])}
         for s in sector_rows
     ])
+
+    # Industries use the same once-per-day 8-session rank history as sectors.
+    # The upsert is deliberately independent: before add_market_group_scores.sql
+    # is deployed it may fail, but stocks/sectors/indexes continue normally.
+    prev_industry_history = await load_industry_rank_history(session)
+    for row in industry_rows:
+        hist = list(prev_industry_history.get(row['industry'], []))
+        if is_first_eod_today:
+            hist.append(row['rank'])
+            hist = hist[-8:]
+        elif not hist:
+            hist = [row['rank']]
+        row['rank_history'] = hist
+        row['rank_change'] = (hist[0] - hist[-1]) if len(hist) >= 2 else None
+        row['last_updated'] = now_ist.isoformat()
+    if industry_rows:
+        await supabase_upsert(session, 'industries', industry_rows, on_conflict='industry')
 
     # Clean up stale sector rows — upsert only adds/updates CURRENT
     # sectors. Keep every name we just wrote (SECTOR_MAP + extras from

@@ -58,5 +58,7 @@ Research alert — not advice
 ## Limits
 
 - Users **must** tap Start. You cannot message a Telegram account that never opened the bot.
-- ~30 messages/second. 1,000 filtered alerts is fine.
+- Each user gets **one digest per scan** (up to 10 lines, rest in the app), not 10 separate DMs.
+- Sends are paced at **25/sec** (Telegram cap ~30/sec). 1,000 users ≈ 40 seconds, off the scan loop.
+- 429 (too many requests) waits `retry_after` and retries a few times; leftover DMs stay queued.
 - Do not run a second `getUpdates` poller (only one process can poll). Keep it on live_scan.
