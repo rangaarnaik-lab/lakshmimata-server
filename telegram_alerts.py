@@ -421,13 +421,29 @@ async def fanout_telegram_alerts(session: aiohttp.ClientSession, fires: list[dic
     prefs_by = {str(r['user_id']): (r.get('prefs') or {}) for r in prefs_rows}
 
     queued = 0
+    seen_chats: set[str] = set()
     for link in links:
         uid = str(link.get('user_id') or '')
         chat_id = link.get('chat_id')
+        # chat_id is uniquely indexed, but guard anyway: one Telegram chat must
+        # never receive two digests because it maps to two accounts.
+        chat_key = str(chat_id)
+        if chat_key in seen_chats:
+            log.warning(f"Telegram chat {chat_key} linked to more than one account — sending once")
+            continue
+        seen_chats.add(chat_key)
         prefs = prefs_by.get(uid) or {}
         if prefs.get('telegramEnabled') is False:
             continue
         matched = [f for f in fires if fire_type_enabled(f.get('fire_type') or '', prefs)]
+        # "Watchlist only" has to be applied here, since the scanner sends these
+        # messages and cannot see the browser's watchlist. A missing key means an
+        # older client that never published one, so filtering is skipped rather
+        # than silently muting the user.
+        watchlist = prefs.get('watchlistSyms')
+        if prefs.get('watchlistOnly') is True and watchlist is not None:
+            wanted = {str(s).upper() for s in watchlist}
+            matched = [f for f in matched if str(f.get('sym') or '').upper() in wanted]
         if not matched:
             continue
         shown = matched[:_TG_DIGEST_LINES]

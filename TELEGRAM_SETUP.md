@@ -44,6 +44,10 @@ Account → **Telegram alerts** → **Connect Telegram** → Start in the app �
 
 Prefs already chosen under the header 🔔 apply to Telegram (same HY / Squeeze / watchlist-only flags). Toggle **Send these alerts to Telegram** on that card.
 
+Each digest is built per user: the signal-type toggles and **Watchlist only** are both applied before sending, so two users rarely get the same message. Watchlists live in the browser, so the app publishes just the symbol list with the user's alert prefs for the scanner to filter on. A user whose client has never published one keeps receiving unfiltered alerts rather than being silently muted.
+
+One Telegram chat maps to exactly one account. Linking a chat that already belongs to another account moves it, so the previous account stops receiving alerts instead of both getting them.
+
 ## 5. Message labels
 
 Example:
