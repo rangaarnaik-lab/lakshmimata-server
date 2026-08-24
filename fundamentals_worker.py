@@ -711,11 +711,54 @@ def _gemini_api_key_results() -> str:
 
 
 def _gemini_ask_model() -> str:
-    """Prefer free/lite models for interactive Ask AI."""
+    """Prefer free/lite models for interactive Ask AI.
+    Default matches the rest of the worker — gemini-2.0-* was shut down by
+    Google on 2026-06-01 and 404s on every call."""
     return (os.getenv('GEMINI_ASK_MODEL')
             or os.getenv('GEMINI_ABOUT_MODEL')
             or os.getenv('GEMINI_CONCALL_MODEL')
-            or 'gemini-2.0-flash-lite')
+            or 'gemini-3.1-flash-lite')
+
+
+def _gemini_ask_model_chain() -> list[str]:
+    """Ask AI must keep working when Google retires a model name.
+    Try the configured model first, then current vision-capable fallbacks,
+    de-duplicated and in order. Retired ids are dropped so a stale
+    GEMINI_ASK_MODEL env var cannot park the feature."""
+    extra = [m.strip() for m in (os.getenv('GEMINI_ASK_MODEL_FALLBACKS') or '').split(',')]
+    chain = [_gemini_ask_model()] + [m for m in extra if m] + [
+        'gemini-3.1-flash-lite',
+        'gemini-3.5-flash-lite',
+        'gemini-flash-lite-latest',
+        'gemini-flash-latest',
+    ]
+    chain = [m for m in chain if not m.startswith(('gemini-1.', 'gemini-2.0'))] or [
+        'gemini-3.1-flash-lite']
+    out: list[str] = []
+    for m in chain:
+        if m and m not in out:
+            out.append(m)
+    return out
+
+
+def _gemini_error_detail(data: dict, txt: str) -> str:
+    """Short human-readable reason out of a Gemini error payload."""
+    try:
+        msg = ((data or {}).get('error') or {}).get('message') or ''
+    except Exception:
+        msg = ''
+    return (msg or (txt or '')).strip()[:160] or 'no detail'
+
+
+def _gemini_model_unusable(status: int, txt: str) -> bool:
+    """True when the model name itself is the problem (retired / not granted /
+    no vision), so retrying the same model on other keys is pointless."""
+    if status == 404:
+        return True
+    low = (txt or '').lower()
+    return status in (400, 403) and any(s in low for s in (
+        'not found', 'not supported', 'is not available', 'does not support',
+        'unsupported', 'permission'))
 
 
 def _gemini_key_fingerprint(api_key: str) -> str:
@@ -5553,11 +5596,15 @@ async def answer_stock_ai_ask(session: aiohttp.ClientSession, symbol: str, quest
     use_web=False → local context (filings/about/fundamentals); if thin, still
     answers with free Gemini + clear uncertainty (does not refuse).
     use_web=True  → Gemini Google Search + local context.
-    Always exempt from batch hard-stops — interactive Q&A must keep working."""
+    Always exempt from batch hard-stops — interactive Q&A must keep working.
+
+    Returns (result, error_reason). error_reason is a short diagnostic string
+    ('429 quota', '404 model not found', …) so the UI can show WHY instead of
+    a generic 'could not answer'."""
     # Prefer ASKS key, else any free-tier Gemini key on the box.
     keys = _gemini_pool_rotated()
     if not keys:
-        return None
+        return None, 'no GEMINI_API_KEY* configured on the worker'
     has_context = bool(context and len(context.strip()) >= 80)
     sector_bit = ' / '.join(x for x in [industry, sector] if x) or 'NSE-listed company'
     img_b64 = (chart_image or '').strip()
@@ -5627,7 +5674,7 @@ async def answer_stock_ai_ask(session: aiohttp.ClientSession, symbol: str, quest
             '- "verdict": unknown | n/a | mixed\n'
             '- "flags": []\n'
         )
-    model = _gemini_ask_model()
+    models = _gemini_ask_model_chain()
     # Web search is slow on free tier — short timeout, then fast no-tools fallback.
     web_timeout = int(os.getenv('GEMINI_ASK_WEB_TIMEOUT_SECONDS', '40'))
     fast_timeout = int(os.getenv('GEMINI_ASK_TIMEOUT_SECONDS', '35'))
@@ -5659,7 +5706,10 @@ async def answer_stock_ai_ask(session: aiohttp.ClientSession, symbol: str, quest
         }
 
     last_err = None
-    for api_key in keys:
+    dead_models: set[str] = set()
+    for model, api_key in [(m, k) for m in models for k in keys]:
+        if model in dead_models:
+            continue
         url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
                f"{model}:generateContent?key={api_key}")
         try:
@@ -5679,7 +5729,7 @@ async def answer_stock_ai_ask(session: aiohttp.ClientSession, symbol: str, quest
                     if out:
                         log.info(f"💬 Ask-AI answered {symbol} via web+Gemini "
                                  f"model={model} key={_gemini_key_fingerprint(api_key)}")
-                        return out
+                        return out, None
                 # Fast path: same prompt, no Google Search tool.
                 body_fast = {
                     "contents": _contents(prompt +
@@ -5698,30 +5748,40 @@ async def answer_stock_ai_ask(session: aiohttp.ClientSession, symbol: str, quest
                     session, url, body, fast_timeout, api_key=api_key, priority=True)
 
             if status == 429:
-                last_err = f"429 on {_gemini_key_fingerprint(api_key)}"
+                last_err = (f"Gemini free-tier quota/rate limit (429) on model {model}")
                 log.warning(f"⚠️ Ask-AI 429 for {symbol} key={_gemini_key_fingerprint(api_key)} "
-                            f"— trying next free key if any")
+                            f"model={model} — trying next free key if any")
                 await asyncio.sleep(1)
                 continue
+            if status == 408:
+                last_err = f"Gemini timed out on model {model}"
+                log.warning(f"⚠️ Ask-AI timeout for {symbol} model={model}")
+                continue
             if status != 200:
-                last_err = f"{status}: {(txt or '')[:120]}"
-                log.warning(f"⚠️ Ask-AI failed for {symbol} ({status}): {(txt or '')[:160]}")
+                detail = _gemini_error_detail(data, txt)
+                last_err = f"Gemini {status} on model {model}: {detail}"
+                log.warning(f"⚠️ Ask-AI failed for {symbol} model={model} ({status}): "
+                            f"{(txt or '')[:200]}")
+                if _gemini_model_unusable(status, txt):
+                    dead_models.add(model)
+                    log.warning(f"⚠️ Ask-AI dropping model {model} for this run "
+                                f"— set GEMINI_ASK_MODEL to a model your key can call")
                 continue
             out = await _parse_answer(data, False)
             if not out:
-                last_err = 'bad/short answer'
+                last_err = f"model {model} returned no usable JSON answer"
                 continue
             log.info(f"💬 Ask-AI answered {symbol} via free Gemini "
                      f"model={model} key={_gemini_key_fingerprint(api_key)}"
                      f"{' (web fallback)' if use_web else ''}")
-            return out
+            return out, None
         except Exception as e:
             last_err = f"{type(e).__name__}: {e}"
             log.warning(f"⚠️ Ask-AI error for {symbol}: {last_err}")
             continue
     if last_err:
-        log.warning(f"⚠️ Ask-AI exhausted keys for {symbol}: {last_err}")
-    return None
+        log.warning(f"⚠️ Ask-AI exhausted models/keys for {symbol}: {last_err}")
+    return None, (last_err or 'no answer from any Gemini model')
 
 
 async def _mgmt_flags_loop(session: aiohttp.ClientSession):
@@ -5863,6 +5923,26 @@ async def _mgmt_flags_loop(session: aiohttp.ClientSession):
         await asyncio.sleep(CHECK_INTERVAL)
 
 
+def _ask_error_message(reason: str | None) -> str:
+    """Turn the worker's diagnostic string into something a user can act on,
+    keeping the raw detail so the cause is visible without Railway logs."""
+    r = (reason or '').strip()
+    if not r:
+        return 'AI could not produce an answer — try again shortly'
+    low = r.lower()
+    if 'no gemini_api_key' in low:
+        head = 'Ask AI is not configured — no Gemini key on the server'
+    elif '429' in low or 'quota' in low:
+        head = 'Free Gemini quota is used up for now — try again later'
+    elif 'timed out' in low:
+        head = 'Gemini took too long — try again'
+    elif 'model' in low and ('404' in low or 'not found' in low or 'unusable' in low):
+        head = 'The configured Gemini model is unavailable — set GEMINI_ASK_MODEL'
+    else:
+        head = 'AI could not produce an answer'
+    return f"{head} ({r})"[:400]
+
+
 async def _stock_ai_asks_loop(session: aiohttp.ClientSession):
     """Answer pending free-form Ask AI questions from the UI.
     Always on — uses free Gemini (any configured key). Not paused by
@@ -5957,7 +6037,7 @@ async def _stock_ai_asks_loop(session: aiohttp.ClientSession):
                 context, fund, ppt, tx, _about = await _gather_stock_ask_context(session, headers, sym)
                 # Keep about + fundamentals + filings — free Gemini can answer
                 # even when PPT/concall are not on file yet.
-                result = await answer_stock_ai_ask(
+                result, ask_err = await answer_stock_ai_ask(
                     session, sym, question, context or '',
                     industry=fund.get('industry'), sector=fund.get('sector'),
                     use_web=use_web,
@@ -5980,8 +6060,10 @@ async def _stock_ai_asks_loop(session: aiohttp.ClientSession):
                 else:
                     patch = {
                         'status': 'error',
-                        'error': 'AI could not produce an answer — try again shortly',
+                        'error': _ask_error_message(ask_err),
                         'answered_at': datetime.now(timezone.utc).isoformat(),
+                        'chart_image': None,
+                        'chart_image_mime': None,
                     }
                 async with session.patch(
                     f"{SUPABASE_URL}/rest/v1/stock_ai_asks?id=eq.{ask_id}",
