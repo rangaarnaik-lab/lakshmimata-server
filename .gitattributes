@@ -1,0 +1,20 @@
+# Normalise line endings so a Windows checkout stops reporting unchanged
+# files as modified. Without this, core.autocrlf=true left ~20 files
+# permanently " M " with an empty diff, which is how a broken live_scan.py
+# hid in "push all changes".
+* text=auto eol=lf
+
+# Windows shells need CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.webp binary
+*.ico  binary
+*.pdf  binary
+*.xlsx binary
+*.zip  binary
