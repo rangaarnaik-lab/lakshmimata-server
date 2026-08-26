@@ -5553,7 +5553,48 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         _stop_loss = round(last - 2 * _atr_val, 2) if _atr_val and last else None
         _target = round(last + 4 * _atr_val, 2) if _atr_val and last else None
 
+        # ── Delayed view we are allowed to publish ─────────────────────────
+        # `last` above is the live tick off OUR Upstox token. It stays internal
+        # for signal detection (our own account computing our own analytics),
+        # but shipping it to every user is market-data redistribution. What
+        # leaves this process is the last COMPLETED session's close; clients
+        # overlay live prices from each user's own broker connection.
+        # Only step back off today's bar while the session is still running —
+        # once the close is final it is published EOD data and fine to serve.
+        _eod_i = n - 2 if (prices_last_is_today and is_market_open() and n >= 2) else n - 1
+        _eod_close = prices[_eod_i] if 0 <= _eod_i < n else None
+        _eod_prev = prices[_eod_i - 1] if _eod_i >= 1 else None
+
+        def _eod_pct(sessions_back):
+            j = _eod_i - sessions_back
+            base = prices[j] if 0 <= j < n else None
+            if not (_eod_close and base):
+                return None
+            return round((_eod_close - base) / base * 100, 2)
+
+        # Index only into arrays that line up with prices; a mismatched
+        # highs/lows array would otherwise read another session's bar.
+        _h_arr = s.get('highs') if len(s.get('highs') or []) == n else None
+        _l_arr = s.get('lows') if len(s.get('lows') or []) == n else None
+        _eod_atr = atr(_h_arr or prices, _l_arr or prices, prices[:_eod_i + 1], 20)
+        _published_price = {
+            'last_price':  round(_eod_close, 2) if _eod_close else None,
+            'close':       round(_eod_close, 2) if _eod_close else None,
+            'prev_close':  round(_eod_prev, 2) if _eod_prev else None,
+            'chg_pct':     _eod_pct(1),
+            'chg_w_pct':   _eod_pct(5),
+            'chg_m_pct':   _eod_pct(21),
+            'volume':      int(volumes[_eod_i]) if 0 <= _eod_i < len(volumes) and volumes[_eod_i] else 0,
+            'high':        round(_h_arr[_eod_i], 2) if _h_arr and _h_arr[_eod_i] else None,
+            'low':         round(_l_arr[_eod_i], 2) if _l_arr and _l_arr[_eod_i] else None,
+            # Gap % is a today-only intraday concept — no delayed equivalent.
+            'open':        None,
+            'stop_loss':   round(_eod_close - 2 * _eod_atr, 2) if (_eod_atr and _eod_close) else None,
+            'target':      round(_eod_close + 4 * _eod_atr, 2) if (_eod_atr and _eod_close) else None,
+        }
+
         processed.append({
+            '_published_price': _published_price,
             'sym':            sym,
             'weinstein_stage': weinstein_stage,
             'is_52wh_breakout': is_52wh_breakout,
@@ -5847,13 +5888,15 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
             if new_vcp: fire_type.append('VCP')
             label = ', '.join(fire_type)
             if alert_allowed(sym, label, alert_rs(s)):
+                # No last_price / chg_pct: those are raw quotes off our own
+                # Upstox token, and publishing them to every user is market-data
+                # redistribution. The signal and RS are our own computation, so
+                # they stay; the client overlays live price from the user's broker.
                 new_fires.append({
                     'sym':        sym,
                     'fire_type':  label,
                     'rs_tv':      s.get('rs_tv'),
                     'rs':         s.get('rs'),
-                    'last_price': s.get('last_price'),
-                    'chg_pct':    s.get('chg_pct'),
                     'sector':     s.get('sector'),
                     'fired_at':   now_ist.isoformat(),
                 })
@@ -5921,8 +5964,6 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
                     'fire_type':  label,
                     'rs_tv':      s.get('rs_tv'),
                     'rs':         s.get('rs'),
-                    'last_price': s.get('last_price'),
-                    'chg_pct':    s.get('chg_pct'),
                     'sector':     s.get('sector'),
                     'fired_at':   (now_ist + timedelta(microseconds=us_off)).isoformat(),
                 })
@@ -5943,8 +5984,6 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
                 'fire_type':  'RS > 70',
                 'rs_tv':      s.get('rs_tv'),
                 'rs':         s.get('rs'),
-                'last_price': s.get('last_price'),
-                'chg_pct':    s.get('chg_pct'),
                 'sector':     s.get('sector'),
                 'fired_at':   (now_ist + timedelta(microseconds=7)).isoformat(),
             })
@@ -6207,6 +6246,7 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
     _STOCKS_UPSERT_SKIP = frozenset({
         'result_rating',   # lives on financial_results / best_picks, not stocks
         '_ai_filter_why',  # ephemeral AI shortlist annotation
+        '_published_price',  # folded into the row by publish_price_view
     })
     # If schema sample fails, still drop these so a missing migration cannot
     # freeze the whole table (PGRST204). When allowlist works, unknown keys
@@ -6218,7 +6258,9 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
     stocks_cols = await get_stocks_columns(session)
     stocks_rows = []
     dropped_keys = set()
-    for p in processed:
+    # Delayed prices from here on — see publish_price_view.
+    publishable = [publish_price_view(p) for p in processed]
+    for p in publishable:
         if stocks_cols:
             row = {}
             for k, v in p.items():
@@ -6245,7 +6287,7 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
     # transformStockRow() actually reads (trim_for_r2, defined above) —
     # unlike the Supabase write, this doesn't need the full processed
     # dict, just what the frontend displays.
-    await upload_snapshot_to_r2('stocks-snapshot.json', trim_for_r2(processed))
+    await upload_snapshot_to_r2('stocks-snapshot.json', trim_for_r2(publishable))
 
     # Week-over-week rank movement for sectors — same approach as the
     # Index Dashboard's rank_w_change: append today's rank once per day,
@@ -6633,6 +6675,8 @@ async def save_best_picks(session: aiohttp.ClientSession, top_rows: list, reason
     if not top_rows:
         return
     now_iso = datetime.now(timezone.utc).isoformat()
+    # Client-readable table, so publish the delayed price view, not our live tick.
+    top_rows = [publish_price_view(r) for r in top_rows]
     payload = []
     for i, r in enumerate(top_rows):
         payload.append({
@@ -6729,8 +6773,8 @@ async def save_best_picks_history(session: aiohttp.ClientSession, top_rows: list
     """
     if not top_rows:
         return
-    # Always persist only the published top-5
-    top_rows = list(top_rows)[:_AI_PICKS_TOP_N]
+    # Always persist only the published top-5, at the delayed price.
+    top_rows = [publish_price_view(r) for r in list(top_rows)[:_AI_PICKS_TOP_N]]
     picked_date = datetime.now(IST).strftime('%Y-%m-%d')
     now_iso = datetime.now(timezone.utc).isoformat()
     payload = [{
@@ -7095,6 +7139,16 @@ async def supabase_upsert(session: aiohttp.ClientSession, table: str, rows: list
             await upsert_chunk(chunk)
     await asyncio.gather(*[upsert_with_sem(c) for c in chunks])
     return failures['n'] == 0
+
+def publish_price_view(s: dict) -> dict:
+    """Copy of a processed stock with live quote fields swapped for the last
+    completed session's values. Every path that leaves this process (Supabase
+    `stocks`, R2 snapshot) goes through here, so the live tick from our own
+    broker token is never redistributed to users."""
+    out = {k: v for k, v in s.items() if k != '_published_price'}
+    out.update(s.get('_published_price') or {})
+    return out
+
 
 def trim_for_r2(stocks: list) -> list:
     """Filters each stock dict down to only _R2_STOCK_FIELDS before

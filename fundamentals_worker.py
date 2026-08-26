@@ -721,6 +721,11 @@ def _gemini_ask_model() -> str:
             or 'gemini-3.1-flash-lite')
 
 
+# Research-note answers run long; the default token budget truncates them
+# mid-JSON, which then fails the parse and looks like "could not answer".
+_ASK_MAX_OUTPUT_TOKENS = int(os.getenv('GEMINI_ASK_MAX_OUTPUT_TOKENS', '4096'))
+
+
 def _gemini_ask_model_chain() -> list[str]:
     """Ask AI must keep working when Google retires a model name.
     Try the configured model first, then current vision-capable fallbacks,
@@ -5462,7 +5467,10 @@ def _ask_num(value, digits=1):
         return None
     if not math.isfinite(n):
         return None
-    return f"{n:.{digits}f}".rstrip('0').rstrip('.')
+    text = f"{n:.{digits}f}"
+    # Only trim the fractional tail — rstrip on a digits=0 result turned
+    # RS 90 into "9" and a 45000cr market cap into "45".
+    return text.rstrip('0').rstrip('.') if '.' in text else text
 
 
 def _fmt_scan_strategy_context(scan: dict) -> str:
@@ -5532,9 +5540,73 @@ def _fmt_scan_strategy_context(scan: dict) -> str:
     return '\n'.join(lines)
 
 
+def _fmt_results_history_context(rows) -> str:
+    """Last few quarters as a compact table so answers can cite real trends."""
+    if not rows:
+        return ''
+    lines = ['QUARTERLY RESULTS ON FILE (most recent first; INR crore unless noted):',
+             'quarter | sales | PAT | EPS | OPM% | rating']
+    for row in rows[:6]:
+        lines.append(' | '.join([
+            str(row.get('period_ended') or '?'),
+            _ask_num(row.get('sales'), 2) or '-',
+            _ask_num(row.get('pat'), 2) or '-',
+            _ask_num(row.get('eps'), 2) or '-',
+            _ask_num(row.get('opm_pct'), 2) or '-',
+            str(row.get('result_rating') or '-'),
+        ]))
+    lines.append('Derive QoQ/YoY from these rows rather than guessing.')
+    return '\n'.join(lines)
+
+
+def _fmt_peer_context(symbol: str, industry: str, peers) -> str:
+    """Same-industry valuation table — lets the answer say cheap/expensive vs peers."""
+    rows = [p for p in (peers or []) if (p.get('sym') or '').upper() != symbol.upper()]
+    if not rows:
+        return ''
+    def _sort_key(p):
+        rs = p.get('rs_tv') if p.get('rs_tv') is not None else p.get('rs')
+        try:
+            return -float(rs)
+        except (TypeError, ValueError):
+            return 0.0
+    rows.sort(key=_sort_key)
+    lines = [f'PEER SET — {industry or "same industry"} (for relative valuation only):',
+             'symbol | PE | PB | ROE% | RS | mcap(cr)']
+    for peer in rows[:10]:
+        rs = peer.get('rs_tv') if peer.get('rs_tv') is not None else peer.get('rs')
+        lines.append(' | '.join([
+            str(peer.get('sym') or '?'),
+            _ask_num(peer.get('pe'), 1) or '-',
+            _ask_num(peer.get('pb'), 1) or '-',
+            _ask_num(peer.get('roe'), 1) or '-',
+            _ask_num(rs, 0) or '-',
+            _ask_num(peer.get('market_cap'), 0) or '-',
+        ]))
+    return '\n'.join(lines)
+
+
+def _fmt_announcement_context(rows) -> str:
+    """Recent exchange filings — the primary-source trail behind any news claim."""
+    if not rows:
+        return ''
+    lines = ['RECENT EXCHANGE FILINGS (NSE/BSE announcements on file):']
+    for row in rows[:10]:
+        when = str(row.get('announced_at') or row.get('created_at') or '')[:10]
+        subject = str(row.get('subject') or row.get('category') or '').strip()
+        if not subject:
+            continue
+        lines.append(f"- {when}: {subject[:220]}")
+    return '\n'.join(lines) if len(lines) > 1 else ''
+
+
 async def _gather_stock_ask_context(session, headers, symbol: str):
     """Collect PPT/concall/about snippets for Ask AI / management flags."""
     ppt = tx = about = None
+    fund = {}
+    scan = {}
+    peers = []
+    industry = None
     try:
         async with session.get(
             f"{SUPABASE_URL}/rest/v1/ppt_summaries", headers=headers,
@@ -5569,7 +5641,7 @@ async def _gather_stock_ask_context(session, headers, symbol: str):
         async with session.get(
             f"{SUPABASE_URL}/rest/v1/stock_fundamentals", headers=headers,
             # No sector / fundamental_label — missing on some prod schemas.
-            params={'select': 'industry,pe,roe,roce,debt_eq,promoter,promoter_trend,'
+            params={'select': 'industry,pe,roe,roce,debt_eq,promoter,promoter_trend,fetched_at,'
                     'cfo,fcf,cfo_pat,eps_yoy,sales_yoy,emerging_themes',
                     'sym': f'eq.{symbol}', 'limit': '1'},
             timeout=aiohttp.ClientTimeout(total=15),
@@ -5593,13 +5665,60 @@ async def _gather_stock_ask_context(session, headers, symbol: str):
         log.warning(f"⚠️ Ask-context fetch failed for {symbol}: {type(e).__name__}: {e}")
         fund = {}
         scan = {}
+
+    # Each extra block is fetched on its own so one bad column or table on a
+    # given schema degrades that one section instead of the whole answer.
+    async def _fetch(label, table, params):
+        try:
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/{table}", headers=headers, params=params,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as r:
+                if r.status != 200:
+                    log.warning(f"⚠️ Ask-context {label} for {symbol} returned {r.status}")
+                    return []
+                out = await r.json()
+                return out if isinstance(out, list) else []
+        except Exception as e:
+            log.warning(f"⚠️ Ask-context {label} failed for {symbol}: {type(e).__name__}: {e}")
+            return []
+
+    valuation_rows = await _fetch('valuation', 'stocks', {
+        'select': 'sym,industry,sector,market_cap,pe,pb,peg_ratio,industry_pe,div_yield,'
+                  'roe,roce,debt_eq,promoter,opm_pct,opm_trend,cfo,fcf,cfo_pat,'
+                  'eps,sales_qoq,sales_yoy,fii_pct,dii_pct,'
+                  'nim,gnpa,nnpa,car,casa,fundamental_score,fundamental_label',
+        'sym': f'eq.{symbol}', 'limit': '1'})
+    valuation = valuation_rows[0] if valuation_rows else {}
+    results_rows = await _fetch('results', 'financial_results', {
+        'select': 'period_ended,sales,pat,eps,opm_pct,result_rating',
+        'symbol': f'eq.{symbol}', 'order': 'period_ended.desc', 'limit': '6'})
+    announcements = await _fetch('announcements', 'corporate_announcements', {
+        'select': 'announced_at,subject,category',
+        'symbol': f'eq.{symbol}', 'order': 'announced_at.desc', 'limit': '10'})
+    industry = valuation.get('industry') or (fund or {}).get('industry')
+    if industry:
+        peers = await _fetch('peers', 'stocks', {
+            'select': 'sym,pe,pb,roe,rs,rs_tv,market_cap',
+            'industry': f'eq.{industry}', 'limit': '14'})
+
     parts = []
     strategy = _fmt_scan_strategy_context(scan)
     if strategy:
         parts.append(strategy)
-    if fund:
+    merged = {**(valuation or {}), **{k: v for k, v in (fund or {}).items() if v is not None}}
+    if merged:
         parts.append('FUNDAMENTALS SNAPSHOT:\n' + json.dumps(
-            {k: v for k, v in fund.items() if v is not None}, default=str)[:2500])
+            {k: v for k, v in merged.items() if v is not None}, default=str)[:3500])
+    history = _fmt_results_history_context(results_rows)
+    if history:
+        parts.append(history)
+    peer_table = _fmt_peer_context(symbol, industry, peers)
+    if peer_table:
+        parts.append(peer_table)
+    filings = _fmt_announcement_context(announcements)
+    if filings:
+        parts.append(filings)
     if about:
         about_bits = []
         for k in ('overall_brief', 'what_they_do'):
@@ -5723,6 +5842,44 @@ async def answer_stock_ai_ask(session: aiohttp.ClientSession, symbol: str, quest
     wants_strategy = bool(re.search(
         r'\b(canslim|can slim|pead|weinstein|stage\s*[1-4]|relative strength|\brs\b)\b',
         q_low))
+    wants_analyst = bool(re.search(
+        r'\b(analyst|brokerage|buy call|sell call|hold call|target price|price target|'
+        r'rating|upgrade|downgrade|accumulate|outperform)\b',
+        q_low))
+    if wants_analyst:
+        use_web = True
+    # Depth is what makes these answers worth reading: force an evidence-first
+    # structure instead of a generic paragraph, while staying inside the SEBI
+    # line (no own call, no own target price).
+    analyst_persona = (
+        "You are a senior sell-side equity research analyst covering Indian listed equities, "
+        "writing an initiation-quality note for an informed retail investor. "
+        "Be specific, quantitative and opinionated about the EVIDENCE — never vague.\n"
+        "HARD RULES:\n"
+        "1. Every claim carries a number, a date, or a named source. No filler adjectives.\n"
+        "2. Use the figures in LOCAL CONTEXT (results table, peer table, scan tags) rather than "
+        "inventing any. If a figure is absent, write 'not on file' — never estimate silently.\n"
+        "3. Quantify comparisons: say 'PE 34x vs peer median 21x', not 'expensive'.\n"
+        "4. Separate fact from interpretation. Facts get a number; interpretation is labelled as a view.\n"
+        "5. Give the bear case real weight — at least as specific as the bull case.\n"
+        "6. You may report third-party brokerage calls and targets with attribution, but issue NO "
+        "recommendation and NO price target of your own, and never say buy/sell/hold as your advice.\n"
+        "7. Plain English. Expand a term the first time (RS, OPM, PEAD). No hype, no emoji.\n"
+    )
+    structure_rules = (
+        "STRUCTURE the answer with these titled sections, each on its own line ending in ':', "
+        "followed by '- ' bullet lines. Skip a section only when there is genuinely nothing to say:\n"
+        "Snapshot: 2 bullets — what the company does and the single most important thing right now.\n"
+        "Latest quarter: sales/PAT/EPS/OPM with the quarter label and QoQ or YoY change.\n"
+        "Growth and margins: multi-quarter trend from the results table, with direction.\n"
+        "Balance sheet and cash: debt/equity, CFO vs PAT, promoter and FII/DII trend.\n"
+        "Valuation: PE/PB/PEG vs the peer table and industry PE, stated as a multiple comparison.\n"
+        "Technical read: RS, Weinstein stage, CANSLIM score, PEAD status, volume character.\n"
+        "Bull case: 2-3 specific, falsifiable points.\n"
+        "Bear case: 2-3 specific risks with the number or filing behind each.\n"
+        "What to watch: 2-3 dated or measurable triggers.\n"
+        "Bottom line: 2 bullets balancing the evidence, no recommendation.\n"
+    )
     strategy_rules = (
         "If LOCAL CONTEXT includes SCAN STRATEGY TAGS, use those numbers. "
         "When the question is about CANSLIM, PEAD, RS, or Weinstein stage — or those tags are relevant — "
@@ -5731,10 +5888,23 @@ async def answer_stock_ai_ask(session: aiohttp.ClientSession, symbol: str, quest
         "Say clearly this is a screen, not a buy or sell call. Do not invent letters that are not in the tags. "
         "Do not append a legal disclaimer; the app shows a SEBI / AI-generated notice after every answer.\n"
     )
+    analyst_section = (
+        'an "Analyst calls" section with one bullet per house (house name, '
+        'Buy/Accumulate/Hold/Reduce/Sell, INR target price, date), or the line '
+        '"No recent published brokerage call found in search." if none, '
+    ) if (use_web or wants_analyst) else ''
     answer_len = (
-        '- "answer": 220-420 words, walk through CANSLIM letters and PEAD with this stock\'s numbers\n'
+        '- "answer": 400-650 words of dense, evidence-led research. Use the section structure above, '
+        'and include exactly: "CANSLIM score: X/7", "Letters that fired: C, ...", one bullet per '
+        'letter with this stock\'s figure and pass/fail, then a "PEAD" section, '
+        + analyst_section
+        + 'and a "Bottom line" section. Third-party brokerage views are not our recommendation\n'
         if wants_strategy else
-        '- "answer": 120-280 words, clear and specific; if scan tags are present, mention CANSLIM score and PEAD in 2-4 sentences\n'
+        '- "answer": 350-600 words of dense, evidence-led research following the section structure '
+        'above. Numbers in every section. If scan tags are present, give the CANSLIM score and PEAD '
+        'status under "Technical read". Include '
+        + (analyst_section or 'a "Bottom line" section ')
+        + 'and never a wall of undifferentiated text\n'
     )
     conversation_bit = ''
     if conversation_context and conversation_context.strip():
@@ -5752,11 +5922,19 @@ async def answer_stock_ai_ask(session: aiohttp.ClientSession, symbol: str, quest
     )
     if use_web:
         prompt = (
+            f"{analyst_persona}\n"
             f"Answer this investor diligence question about Indian NSE stock {symbol} ({sector_bit}).\n"
             f"QUESTION: {question.strip()}\n\n"
+            f"{structure_rules}\n"
             "Use Google Search across annual reports, concalls, filings, company site, and "
             "reputable news. Search specifically for material news from the last 30 days and "
             "include a short 'Recent news' section with dates; if none is reliable, say so. "
+            "Also search brokerage / analyst reports from the last 90 days for this NSE stock: "
+            "house name, rating (Buy, Accumulate, Hold, Reduce, Sell, Overweight, Underweight), "
+            "target price in INR, and date. Put that under a titled 'Analyst calls' section as "
+            "one bullet per house. If nothing reliable is found, write 'No recent published "
+            "brokerage call found in search.' Do not invent houses, ratings, or targets. "
+            "Those calls are third-party views, not Lakshmimata advice.\n"
             "Also use LOCAL CONTEXT below when present (PPT/concall/about on file).\n"
             "Compare management promises vs execution when relevant. No buy/sell recommendation.\n"
             "If evidence is weak, say so explicitly.\n"
@@ -5769,11 +5947,13 @@ async def answer_stock_ai_ask(session: aiohttp.ClientSession, symbol: str, quest
             f"{conversation_bit}"
         )
         if has_context:
-            prompt += f"LOCAL CONTEXT:\n{context[:15000]}\n"
+            prompt += f"LOCAL CONTEXT:\n{context[:22000]}\n"
     elif has_context:
         prompt = (
+            f"{analyst_persona}\n"
             f"Answer this investor diligence question about Indian NSE stock {symbol} ({sector_bit}).\n"
             f"QUESTION: {question.strip()}\n\n"
+            f"{structure_rules}\n"
             "Prefer the LOCAL CONTEXT below (PPT/concall/about/fundamentals/scan tags on file). "
             "If context is thin, say what is known vs unknown — still give a useful answer. "
             "Do not invent precise figures not in context. No buy/sell recommendation.\n"
@@ -5784,13 +5964,15 @@ async def answer_stock_ai_ask(session: aiohttp.ClientSession, symbol: str, quest
             '- "verdict": trustworthy | mixed | caution | unknown | n/a\n'
             '- "flags": 0-6 objects {tone: green|red|watch, title, detail}\n\n'
             f"{conversation_bit}"
-            f"LOCAL CONTEXT:\n{context[:16000]}\n"
+            f"LOCAL CONTEXT:\n{context[:22000]}\n"
         )
     else:
         # No filings yet — still answer with free Gemini (general public knowledge).
         prompt = (
+            f"{analyst_persona}\n"
             f"Answer this investor diligence question about Indian NSE stock {symbol} ({sector_bit}).\n"
             f"QUESTION: {question.strip()}\n\n"
+            f"{structure_rules}\n"
             "No PPT/concall excerpts are on file. Use well-known public facts about this company "
             "only; clearly label uncertainty; do not invent precise quarterly figures. "
             "If asked about CANSLIM or PEAD, explain the method and say this stock's live screen "
@@ -5806,8 +5988,8 @@ async def answer_stock_ai_ask(session: aiohttp.ClientSession, symbol: str, quest
         )
     models = _gemini_ask_model_chain()
     # Web search is slow on free tier — short timeout, then fast no-tools fallback.
-    web_timeout = int(os.getenv('GEMINI_ASK_WEB_TIMEOUT_SECONDS', '40'))
-    fast_timeout = int(os.getenv('GEMINI_ASK_TIMEOUT_SECONDS', '35'))
+    web_timeout = int(os.getenv('GEMINI_ASK_WEB_TIMEOUT_SECONDS', '75'))
+    fast_timeout = int(os.getenv('GEMINI_ASK_TIMEOUT_SECONDS', '55'))
     if has_chart:
         fast_timeout = max(fast_timeout, 50)
         web_timeout = max(web_timeout, 55)
@@ -5829,7 +6011,7 @@ async def answer_stock_ai_ask(session: aiohttp.ClientSession, symbol: str, quest
         if len(answer) < 40:
             return None
         return {
-            'answer': answer[:4000] if wants_strategy else answer[:2800],
+            'answer': answer[:9000],
             'verdict': str(parsed.get('verdict') or 'n/a')[:40],
             'flags': _clean_mgmt_flags(parsed.get('flags')),
             'sources': (_grounding_source_urls(data, limit=6) if with_sources else None),
@@ -5846,7 +6028,8 @@ async def answer_stock_ai_ask(session: aiohttp.ClientSession, symbol: str, quest
             if use_web:
                 body_web = {
                     "contents": _contents(prompt),
-                    "generationConfig": {"temperature": 0.25},
+                    "generationConfig": {"temperature": 0.25,
+                                         "maxOutputTokens": _ASK_MAX_OUTPUT_TOKENS},
                     "tools": [{"google_search": {}}],
                 }
                 status, data, txt = await _gemini_generate(
@@ -5865,14 +6048,16 @@ async def answer_stock_ai_ask(session: aiohttp.ClientSession, symbol: str, quest
                     "contents": _contents(prompt +
                         "\n(Answer quickly from LOCAL CONTEXT and well-known public facts; "
                         "no live browsing.)\n"),
-                    "generationConfig": {"temperature": 0.2},
+                    "generationConfig": {"temperature": 0.2,
+                                         "maxOutputTokens": _ASK_MAX_OUTPUT_TOKENS},
                 }
                 status, data, txt = await _gemini_generate(
                     session, url, body_fast, fast_timeout, api_key=api_key, priority=True)
             else:
                 body = {
                     "contents": _contents(prompt),
-                    "generationConfig": {"temperature": 0.2},
+                    "generationConfig": {"temperature": 0.2,
+                                         "maxOutputTokens": _ASK_MAX_OUTPUT_TOKENS},
                 }
                 status, data, txt = await _gemini_generate(
                     session, url, body, fast_timeout, api_key=api_key, priority=True)
@@ -6107,6 +6292,136 @@ async def _ask_conversation_context(session: aiohttp.ClientSession, headers: dic
     return '\n\n'.join(turns)[-8000:]
 
 
+_ASK_HEAL_FUND_IN_FLIGHT: set[str] = set()
+_ASK_HEAL_RESULTS_IN_FLIGHT: set[str] = set()
+_ASK_HEAL_TASKS: set[asyncio.Task] = set()
+_ASK_HEAL_FUND_LAST: dict[str, float] = {}
+_ASK_HEAL_RESULTS_LAST: dict[str, float] = {}
+_ASK_HEAL_COOLDOWN_SECONDS = int(os.getenv('ASK_HEAL_COOLDOWN_SECONDS', '21600'))
+
+
+def _ask_fundamentals_need_heal(fund: dict) -> bool:
+    """True when the ratio snapshot is absent, thin, or stale.
+
+    The Ask answer is never used as a data source. A True result only permits
+    the existing Upstox fundamentals loader to refresh this symbol.
+    """
+    if not fund:
+        return True
+    core = ('pe', 'roe', 'roce', 'debt_eq', 'promoter', 'eps_yoy', 'sales_yoy')
+    # One missing core field is enough to retry. Some sources legitimately do
+    # not publish every ratio, so the cooldown prevents repeated hammering.
+    if any(fund.get(k) is None for k in core):
+        return True
+    fetched_at = fund.get('fetched_at')
+    if fetched_at:
+        try:
+            fetched = datetime.fromisoformat(str(fetched_at).replace('Z', '+00:00'))
+            return fetched < datetime.now(timezone.utc) - timedelta(days=30)
+        except (TypeError, ValueError):
+            return True
+    return False
+
+
+async def _heal_ask_fundamentals(session: aiohttp.ClientSession,
+                                 symbol: str, fund: dict) -> bool:
+    """Refresh one symbol from Upstox before answering; deduped and bounded."""
+    if not _ask_fundamentals_need_heal(fund):
+        return False
+    now = time.monotonic()
+    if symbol in _ASK_HEAL_FUND_IN_FLIGHT:
+        return False
+    if now - _ASK_HEAL_FUND_LAST.get(symbol, 0) < _ASK_HEAL_COOLDOWN_SECONDS:
+        return False
+    _ASK_HEAL_FUND_IN_FLIGHT.add(symbol)
+    _ASK_HEAL_FUND_LAST[symbol] = now
+    try:
+        # A blank DB row may have a blank in-memory row inside its 30-day TTL.
+        # Remove only this symbol so load_fundamentals_batch really retries it.
+        fundamentals_cache.pop(symbol, None)
+        log.info(f"🩹 Ask auto-heal: refreshing fundamentals for {symbol}")
+        await asyncio.wait_for(
+            load_fundamentals_batch(session, [symbol]),
+            timeout=float(os.getenv('ASK_HEAL_FUND_TIMEOUT_SECONDS', '20')),
+        )
+        healed = fundamentals_cache.get(symbol) or {}
+        useful = any(healed.get(k) is not None for k in (
+            'pe', 'roe', 'eps', 'market_cap', 'debt_eq', 'promoter'))
+        log.info(f"🩹 Ask auto-heal: {symbol} fundamentals "
+                 f"{'repaired' if useful else 'still unavailable from source'}")
+        return useful
+    except asyncio.TimeoutError:
+        log.warning(f"⚠️ Ask auto-heal: fundamentals timed out for {symbol}")
+        return False
+    except Exception as e:
+        log.warning(f"⚠️ Ask auto-heal: fundamentals failed for {symbol}: "
+                    f"{type(e).__name__}: {e}")
+        return False
+    finally:
+        _ASK_HEAL_FUND_IN_FLIGHT.discard(symbol)
+
+
+async def _heal_ask_results(session: aiohttp.ClientSession,
+                            headers: dict, symbol: str):
+    """Backfill recent quarterly numbers from exchange XBRL in the background.
+
+    No Gemini answer text is parsed or persisted. This calls the same
+    deterministic XBRL path used by the scheduled results worker.
+    """
+    now = time.monotonic()
+    if symbol in _ASK_HEAL_RESULTS_IN_FLIGHT:
+        return
+    if now - _ASK_HEAL_RESULTS_LAST.get(symbol, 0) < _ASK_HEAL_COOLDOWN_SECONDS:
+        return
+    _ASK_HEAL_RESULTS_IN_FLIGHT.add(symbol)
+    _ASK_HEAL_RESULTS_LAST[symbol] = now
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/corporate_announcements",
+            headers=headers,
+            params={
+                'select': 'symbol,subject,category,announced_at,attachment_url',
+                'symbol': f'eq.{symbol}',
+                'order': 'announced_at.desc',
+                'limit': '12',
+            },
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as r:
+            rows = await r.json() if r.status == 200 else []
+        candidates = [
+            row for row in (rows if isinstance(rows, list) else [])
+            if _is_results_announcement(row)
+        ]
+        if not candidates:
+            log.info(f"🩹 Ask auto-heal: no results filing found for {symbol}")
+            return
+        log.info(f"🩹 Ask auto-heal: trying exchange XBRL for {symbol}")
+        for row in candidates[:3]:
+            try:
+                if await fetch_and_save_result_for_announcement(
+                        session, headers, row, debug=False):
+                    log.info(f"🩹 Ask auto-heal: quarterly results repaired for {symbol}")
+                    return
+            except Exception as e:
+                log.warning(f"⚠️ Ask auto-heal: XBRL candidate failed for {symbol}: "
+                            f"{type(e).__name__}: {e}")
+        log.info(f"🩹 Ask auto-heal: XBRL unavailable for {symbol}; "
+                 f"scheduled filing extraction will retry")
+    except Exception as e:
+        log.warning(f"⚠️ Ask auto-heal: results failed for {symbol}: "
+                    f"{type(e).__name__}: {e}")
+    finally:
+        _ASK_HEAL_RESULTS_IN_FLIGHT.discard(symbol)
+
+
+def _schedule_ask_results_heal(session: aiohttp.ClientSession,
+                               headers: dict, symbol: str):
+    """Keep a strong reference to background heals until they finish."""
+    task = asyncio.create_task(_heal_ask_results(session, headers, symbol))
+    _ASK_HEAL_TASKS.add(task)
+    task.add_done_callback(_ASK_HEAL_TASKS.discard)
+
+
 async def _stock_ai_asks_loop(session: aiohttp.ClientSession):
     """Answer pending free-form Ask AI questions from the UI.
     Always on — uses free Gemini (any configured key). Not paused by
@@ -6200,6 +6515,11 @@ async def _stock_ai_asks_loop(session: aiohttp.ClientSession):
                 question = (row.get('question') or '').strip()
                 ask_mode = (row.get('ask_mode') or 'filings').strip().lower()
                 use_web = ask_mode in ('web', 'web_search', 'search')
+                if re.search(
+                    r'\b(analyst|brokerage|buy call|sell call|hold call|target price|price target|'
+                    r'rating|upgrade|downgrade)\b',
+                    question, re.I):
+                    use_web = True
                 chart_image = row.get('chart_image')
                 chart_mime = row.get('chart_image_mime')
                 has_img = bool(chart_image and len(str(chart_image)) >= 800)
@@ -6209,7 +6529,20 @@ async def _stock_ai_asks_loop(session: aiohttp.ClientSession):
                 t0 = time.monotonic()
                 log.info(f"💬 Ask-AI answering {sym} [{ask_mode}"
                          f"{'+chart' if has_img else ''}]: {question[:80]}")
-                context, fund, ppt, tx, _about = await _gather_stock_ask_context(session, headers, sym)
+                context, fund, ppt, tx, _about = await _gather_stock_ask_context(
+                    session, headers, sym)
+                # Repair a missing ratio snapshot before generating the reply.
+                # This is a single-symbol Upstox call (usually a few seconds),
+                # then context is re-read so this very answer benefits.
+                if await _heal_ask_fundamentals(session, sym, fund):
+                    context, fund, ppt, tx, _about = await _gather_stock_ask_context(
+                        session, headers, sym)
+
+                # Quarterly XBRL can be slower and NSE may throttle it. Do not
+                # hold the interactive answer; repair the DB for the follow-up
+                # and every later user instead.
+                if 'QUARTERLY RESULTS ON FILE' not in (context or ''):
+                    _schedule_ask_results_heal(session, headers, sym)
                 conversation_context = await _ask_conversation_context(
                     session, headers, conversation_id, ask_id)
                 # Keep about + fundamentals + filings — free Gemini can answer

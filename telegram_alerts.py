@@ -86,22 +86,15 @@ def format_alert_html(fire: dict) -> str:
     kind = fire.get('fire_type') or 'Alert'
     sym = (fire.get('sym') or '').upper()
     rs = fire.get('rs_tv') if fire.get('rs_tv') is not None else fire.get('rs')
-    chg = fire.get('chg_pct')
-    price = fire.get('last_price')
     sector = fire.get('sector') or ''
-    chg_s = ''
-    if isinstance(chg, (int, float)):
-        chg_s = f"{chg:+.1f}%"
-    price_s = ''
-    if isinstance(price, (int, float)) and price > 0:
-        price_s = f"₹{price:,.0f}" if price >= 100 else f"₹{price:g}"
+    # Deliberately no LTP or % change. Telegram leaves the app entirely, so
+    # there is no user broker session to source a quote from — sending ours
+    # would be redistributing our licensed feed. Signal + RS are our own work.
     bits = []
     if rs is not None:
         bits.append(f"RS {_esc(rs)}")
-    if chg_s:
-        bits.append(_esc(chg_s))
     meta = '   '.join(bits)
-    loc = ' · '.join(x for x in (sector, price_s) if x)
+    loc = sector
     return (
         f"<b>Lakshmimata</b> · {_esc(kind)}\n"
         f"<b>{_esc(sym)}</b>"
@@ -186,12 +179,9 @@ def format_digest_html(fires: list[dict], extra: int = 0, window: str = '') -> s
         kind = fire.get('fire_type') or 'Alert'
         sym = (fire.get('sym') or '').upper()
         rs = fire.get('rs_tv') if fire.get('rs_tv') is not None else fire.get('rs')
-        chg = fire.get('chg_pct')
         bits = []
         if rs is not None:
             bits.append(f"RS {rs}")
-        if isinstance(chg, (int, float)):
-            bits.append(f"{chg:+.1f}%")
         meta = '  '.join(bits)
         line = f"• <b>{_esc(sym)}</b> · {_esc(kind)}"
         if meta:
