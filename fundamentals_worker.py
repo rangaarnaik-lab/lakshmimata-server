@@ -6,6 +6,7 @@ import os
 import gc
 import re
 import sys
+import math
 import time
 import json
 import base64
@@ -5454,6 +5455,83 @@ def _clean_mgmt_verdict(v):
     return aliases.get(t, t if t in allowed else 'unknown')
 
 
+def _ask_num(value, digits=1):
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(n):
+        return None
+    return f"{n:.{digits}f}".rstrip('0').rstrip('.')
+
+
+def _fmt_scan_strategy_context(scan: dict) -> str:
+    """Turn this stock's CANSLIM / PEAD / stage tags into readable Ask-AI context."""
+    if not scan:
+        return ''
+    rs = scan.get('rs_tv') if scan.get('rs_tv') is not None else scan.get('rs')
+    flags = {p.strip().upper() for p in str(scan.get('canslim_flags') or '').split(',') if p.strip()}
+    score = scan.get('canslim_score')
+    letters = [
+        ('C', 'Current quarterly earnings',
+         'EPS QoQ ≥15% or YoY ≥20%',
+         f"EPS QoQ={_ask_num(scan.get('eps_qoq')) or 'n/a'}%, "
+         f"YoY={_ask_num(scan.get('eps_yoy')) or 'n/a'}%"),
+        ('A', 'Annual earnings consistency',
+         'EPS YoY ≥20% and growth streak ≥2 quarters',
+         f"streak={scan.get('eps_growth_streak') if scan.get('eps_growth_streak') is not None else 'n/a'}"),
+        ('N', 'New high / Stage 2 entry',
+         '52-week breakout, Stage-2 new entry, or within 10% of 52-week high',
+         f"52w high={_ask_num(scan.get('high_52w'), 2) or 'n/a'}, "
+         f"last={_ask_num(scan.get('last_price'), 2) or 'n/a'}, "
+         f"52w BO={bool(scan.get('is_52wh_breakout'))}, "
+         f"S2 entry={bool(scan.get('is_s2_new_entry'))}"),
+        ('S', 'Supply / demand (volume)',
+         'RVOL ≥1.3, IBV, High Yield, or High Turnover',
+         f"RVOL={_ask_num(scan.get('rvol'), 2) or 'n/a'}, "
+         f"IBV={bool(scan.get('ibv_signal'))}, HY={bool(scan.get('is_hy'))}, HT={bool(scan.get('is_ht'))}"),
+        ('L', 'Leader (relative strength)',
+         'RS rating ≥80 (1–99 vs NSE universe)',
+         f"RS={_ask_num(rs, 0) or 'n/a'}, trend={scan.get('rs_trend') or 'n/a'}"),
+        ('I', 'Institutional sponsorship (India proxy)',
+         'FII, DII, or promoter holding trend = increasing',
+         f"FII={scan.get('fii_trend') or 'n/a'}, DII={scan.get('dii_trend') or 'n/a'}, "
+         f"promoter={scan.get('promoter_trend') or 'n/a'}"),
+        ('M', 'Market direction / Stage 2',
+         'Weinstein Stage 2 and RS trend not deteriorating',
+         f"stage={scan.get('weinstein_stage') if scan.get('weinstein_stage') is not None else 'n/a'}, "
+         f"RS trend={scan.get('rs_trend') or 'n/a'}"),
+    ]
+    lines = [
+        'SCAN STRATEGY TAGS (Lakshmimata screen — research overlay, not a buy/sell call):',
+        '',
+        'CANSLIM is William O\'Neil\'s growth checklist, adapted here for NSE data. '
+        'A pass is 5 or more of 7 letters. Letters: C current earnings, A annual earnings, '
+        'N new high, S supply/demand volume, L RS leader, I institutional (FII/DII/promoter), '
+        'M market/Stage 2.',
+        f"This stock: score {score if score is not None else 'n/a'}/7, "
+        f"{'PASSES the 5+ screen' if scan.get('is_canslim') else 'does not pass the 5+ screen'}. "
+        f"Letters that fired: {', '.join(sorted(flags)) or 'none'}.",
+    ]
+    for letter, title, rule, numbers in letters:
+        hit = 'PASS' if letter in flags else 'fail'
+        lines.append(f"- {letter} {title} [{hit}]: {rule}. This stock: {numbers}.")
+    days = scan.get('days_since_results')
+    lines.extend([
+        '',
+        'PEAD is Post-Earnings Announcement Drift: results filed 3–60 days ago, EPS grew QoQ or YoY, '
+        'and price/RS still drifting up (positive week or month change, RS ≥70, or RS improving).',
+        f"This stock: {'ON the PEAD screen' if scan.get('is_pead') else 'not on the PEAD screen'}. "
+        f"Days since results={days if days is not None else 'n/a'}, "
+        f"filed/period={scan.get('last_results_date') or 'n/a'}, "
+        f"week %={_ask_num(scan.get('chg_w_pct')) or 'n/a'}, "
+        f"month %={_ask_num(scan.get('chg_m_pct')) or 'n/a'}.",
+        f"Weinstein stage={scan.get('weinstein_stage') if scan.get('weinstein_stage') is not None else 'n/a'} "
+        '(1 base, 2 uptrend, 3 topping, 4 downtrend).',
+    ])
+    return '\n'.join(lines)
+
+
 async def _gather_stock_ask_context(session, headers, symbol: str):
     """Collect PPT/concall/about snippets for Ask AI / management flags."""
     ppt = tx = about = None
@@ -5498,10 +5576,27 @@ async def _gather_stock_ask_context(session, headers, symbol: str):
         ) as r:
             rows = await r.json() if r.status == 200 else []
             fund = rows[0] if isinstance(rows, list) and rows else {}
+        scan = {}
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/stocks", headers=headers,
+            params={'select': 'rs,rs_tv,rs_trend,last_price,high_52w,rvol,chg_w_pct,chg_m_pct,'
+                    'eps_qoq,eps_yoy,eps_growth_streak,fii_trend,dii_trend,promoter_trend,'
+                    'is_52wh_breakout,is_s2_new_entry,ibv_signal,is_hy,is_ht,weinstein_stage,'
+                    'is_pead,days_since_results,last_results_date,'
+                    'is_canslim,canslim_score,canslim_flags',
+                    'sym': f'eq.{symbol}', 'limit': '1'},
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as r:
+            rows = await r.json() if r.status == 200 else []
+            scan = rows[0] if isinstance(rows, list) and rows else {}
     except Exception as e:
         log.warning(f"⚠️ Ask-context fetch failed for {symbol}: {type(e).__name__}: {e}")
         fund = {}
+        scan = {}
     parts = []
+    strategy = _fmt_scan_strategy_context(scan)
+    if strategy:
+        parts.append(strategy)
     if fund:
         parts.append('FUNDAMENTALS SNAPSHOT:\n' + json.dumps(
             {k: v for k, v in fund.items() if v is not None}, default=str)[:2500])
@@ -5591,7 +5686,8 @@ async def extract_management_flags(session: aiohttp.ClientSession, symbol: str, 
 
 async def answer_stock_ai_ask(session: aiohttp.ClientSession, symbol: str, question: str,
                               context: str, industry=None, sector=None, use_web: bool = False,
-                              chart_image=None, chart_image_mime=None):
+                              chart_image=None, chart_image_mime=None,
+                              conversation_context: str = ''):
     """Answer a diligence question via free Gemini (flash-lite).
     use_web=False → local context (filings/about/fundamentals); if thin, still
     answers with free Gemini + clear uncertainty (does not refuse).
@@ -5623,6 +5719,30 @@ async def answer_stock_ai_ask(session: aiohttp.ClientSession, symbol: str, quest
         except ValueError:
             img_b64 = ''
     has_chart = len(img_b64) >= 800
+    q_low = question.strip().lower()
+    wants_strategy = bool(re.search(
+        r'\b(canslim|can slim|pead|weinstein|stage\s*[1-4]|relative strength|\brs\b)\b',
+        q_low))
+    strategy_rules = (
+        "If LOCAL CONTEXT includes SCAN STRATEGY TAGS, use those numbers. "
+        "When the question is about CANSLIM, PEAD, RS, or Weinstein stage — or those tags are relevant — "
+        "explain each CANSLIM letter (C A N S L I M): what it means, this stock's figure, and pass/fail. "
+        "Then explain PEAD (3–60 day window, EPS growth, price/RS drift) with this stock's dates and %. "
+        "Say clearly this is a screen, not a buy or sell call. Do not invent letters that are not in the tags. "
+        "Do not append a legal disclaimer; the app shows a SEBI / AI-generated notice after every answer.\n"
+    )
+    answer_len = (
+        '- "answer": 220-420 words, walk through CANSLIM letters and PEAD with this stock\'s numbers\n'
+        if wants_strategy else
+        '- "answer": 120-280 words, clear and specific; if scan tags are present, mention CANSLIM score and PEAD in 2-4 sentences\n'
+    )
+    conversation_bit = ''
+    if conversation_context and conversation_context.strip():
+        conversation_bit = (
+            "\nEARLIER MESSAGES IN THIS CHAT:\n"
+            f"{conversation_context.strip()[:8000]}\n"
+            "Treat the new question as a follow-up. Do not repeat the earlier answer unless needed.\n"
+        )
     chart_rules = (
         "A CHART SCREENSHOT is attached. Read it carefully: trend, stage if visible, "
         "volume character, squeeze/dots, EMAs, buy/sell markers, RS or Super Cycle if shown. "
@@ -5635,30 +5755,36 @@ async def answer_stock_ai_ask(session: aiohttp.ClientSession, symbol: str, quest
             f"Answer this investor diligence question about Indian NSE stock {symbol} ({sector_bit}).\n"
             f"QUESTION: {question.strip()}\n\n"
             "Use Google Search across annual reports, concalls, filings, company site, and "
-            "reputable news. Also use LOCAL CONTEXT below when present (PPT/concall/about on file).\n"
+            "reputable news. Search specifically for material news from the last 30 days and "
+            "include a short 'Recent news' section with dates; if none is reliable, say so. "
+            "Also use LOCAL CONTEXT below when present (PPT/concall/about on file).\n"
             "Compare management promises vs execution when relevant. No buy/sell recommendation.\n"
             "If evidence is weak, say so explicitly.\n"
-            f"{chart_rules if has_chart else ''}\n"
+            f"{chart_rules if has_chart else ''}"
+            f"{strategy_rules}"
             "Return ONLY JSON:\n"
-            '- "answer": 120-220 words, clear and specific\n'
+            f"{answer_len}"
             '- "verdict": trustworthy | mixed | caution | unknown | n/a\n'
             '- "flags": 0-6 objects {tone: green|red|watch, title, detail}\n\n'
+            f"{conversation_bit}"
         )
         if has_context:
-            prompt += f"LOCAL CONTEXT:\n{context[:12000]}\n"
+            prompt += f"LOCAL CONTEXT:\n{context[:15000]}\n"
     elif has_context:
         prompt = (
             f"Answer this investor diligence question about Indian NSE stock {symbol} ({sector_bit}).\n"
             f"QUESTION: {question.strip()}\n\n"
-            "Prefer the LOCAL CONTEXT below (PPT/concall/about/fundamentals on file). "
+            "Prefer the LOCAL CONTEXT below (PPT/concall/about/fundamentals/scan tags on file). "
             "If context is thin, say what is known vs unknown — still give a useful answer. "
             "Do not invent precise figures not in context. No buy/sell recommendation.\n"
-            f"{chart_rules if has_chart else ''}\n"
+            f"{chart_rules if has_chart else ''}"
+            f"{strategy_rules}"
             "Return ONLY JSON:\n"
-            '- "answer": 80-200 words\n'
+            f"{answer_len}"
             '- "verdict": trustworthy | mixed | caution | unknown | n/a\n'
             '- "flags": 0-6 objects {tone: green|red|watch, title, detail}\n\n'
-            f"LOCAL CONTEXT:\n{context[:14000]}\n"
+            f"{conversation_bit}"
+            f"LOCAL CONTEXT:\n{context[:16000]}\n"
         )
     else:
         # No filings yet — still answer with free Gemini (general public knowledge).
@@ -5667,12 +5793,16 @@ async def answer_stock_ai_ask(session: aiohttp.ClientSession, symbol: str, quest
             f"QUESTION: {question.strip()}\n\n"
             "No PPT/concall excerpts are on file. Use well-known public facts about this company "
             "only; clearly label uncertainty; do not invent precise quarterly figures. "
-            "No buy/sell recommendation.\n"
-            f"{chart_rules if has_chart else ''}\n"
+            "If asked about CANSLIM or PEAD, explain the method and say this stock's live screen "
+            "numbers are not in context.\n"
+            "Do not append a legal disclaimer; the app shows a SEBI / AI-generated notice after every answer.\n"
+            f"{chart_rules if has_chart else ''}"
+            f"{strategy_rules}"
             "Return ONLY JSON:\n"
-            '- "answer": 80-180 words\n'
+            f"{answer_len}"
             '- "verdict": unknown | n/a | mixed\n'
             '- "flags": []\n'
+            f"{conversation_bit}"
         )
     models = _gemini_ask_model_chain()
     # Web search is slow on free tier — short timeout, then fast no-tools fallback.
@@ -5699,7 +5829,7 @@ async def answer_stock_ai_ask(session: aiohttp.ClientSession, symbol: str, quest
         if len(answer) < 40:
             return None
         return {
-            'answer': answer[:2500],
+            'answer': answer[:4000] if wants_strategy else answer[:2800],
             'verdict': str(parsed.get('verdict') or 'n/a')[:40],
             'flags': _clean_mgmt_flags(parsed.get('flags')),
             'sources': (_grounding_source_urls(data, limit=6) if with_sources else None),
@@ -5943,6 +6073,40 @@ def _ask_error_message(reason: str | None) -> str:
     return f"{head} ({r})"[:400]
 
 
+async def _ask_conversation_context(session: aiohttp.ClientSession, headers: dict,
+                                    conversation_id: str | None, current_id: str) -> str:
+    """Load a compact transcript so follow-up questions retain chat context."""
+    if not conversation_id:
+        return ''
+    try:
+        async with session.get(
+            f"{SUPABASE_URL}/rest/v1/stock_ai_asks",
+            headers=headers,
+            params={
+                'select': 'id,question,answer',
+                'conversation_id': f'eq.{conversation_id}',
+                'status': 'eq.done',
+                'order': 'created_at.asc',
+                'limit': '8',
+            },
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as response:
+            if response.status != 200:
+                return ''
+            rows = await response.json()
+    except Exception:
+        return ''
+    turns = []
+    for row in rows or []:
+        if row.get('id') == current_id:
+            continue
+        question = str(row.get('question') or '').strip()
+        answer = str(row.get('answer') or '').strip()
+        if question and answer:
+            turns.append(f"USER: {question[:500]}\nASSISTANT: {answer[:1800]}")
+    return '\n\n'.join(turns)[-8000:]
+
+
 async def _stock_ai_asks_loop(session: aiohttp.ClientSession):
     """Answer pending free-form Ask AI questions from the UI.
     Always on — uses free Gemini (any configured key). Not paused by
@@ -5971,7 +6135,8 @@ async def _stock_ai_asks_loop(session: aiohttp.ClientSession):
             async with session.get(
                 f"{SUPABASE_URL}/rest/v1/stock_ai_asks", headers=headers,
                 params={
-                    'select': 'id,symbol,question,ask_mode,chart_image,chart_image_mime,created_at',
+                    'select': ('id,symbol,question,ask_mode,chart_image,chart_image_mime,'
+                               'conversation_id,parent_ask_id,created_at'),
                     'status': 'eq.pending',
                     'order': 'created_at.asc',
                     'limit': '3',
@@ -5987,10 +6152,17 @@ async def _stock_ai_asks_loop(session: aiohttp.ClientSession):
                     # code, so a DB missing only the newer image columns
                     # parked Ask-AI for 10 minutes a time instead of
                     # answering questions without the screenshot.
-                    if r.status == 400 and ('ask_mode' in body or 'chart_image' in body):
-                        sel = 'id,symbol,question,created_at'
-                        if 'ask_mode' not in body:
-                            sel = 'id,symbol,question,ask_mode,created_at'
+                    if r.status == 400 and (
+                            'ask_mode' in body or 'chart_image' in body
+                            or 'conversation_id' in body or 'parent_ask_id' in body):
+                        optional = [
+                            name for name in (
+                                'ask_mode', 'chart_image', 'chart_image_mime',
+                                'conversation_id', 'parent_ask_id')
+                            if name not in body
+                        ]
+                        sel = ','.join(
+                            ['id', 'symbol', 'question', *optional, 'created_at'])
                         async with session.get(
                             f"{SUPABASE_URL}/rest/v1/stock_ai_asks", headers=headers,
                             params={'select': sel, 'status': 'eq.pending',
@@ -5999,8 +6171,10 @@ async def _stock_ai_asks_loop(session: aiohttp.ClientSession):
                         ) as r2:
                             pending = await r2.json() if r2.status == 200 else []
                         if r2.status == 200:
-                            _missing = ('chart images' if 'chart_image' in body
-                                        else 'web-search mode')
+                            _missing = ('conversation support'
+                                        if 'conversation_id' in body or 'parent_ask_id' in body
+                                        else ('chart images' if 'chart_image' in body
+                                              else 'web-search mode'))
                             if not getattr(_stock_ai_asks_loop, '_degraded_logged', False):
                                 log.warning(f"💬 Ask-AI: running without {_missing} — "
                                             f"run add_ask_ai_chart_image.sql / "
@@ -6029,12 +6203,15 @@ async def _stock_ai_asks_loop(session: aiohttp.ClientSession):
                 chart_image = row.get('chart_image')
                 chart_mime = row.get('chart_image_mime')
                 has_img = bool(chart_image and len(str(chart_image)) >= 800)
+                conversation_id = row.get('conversation_id')
                 if not ask_id or not sym or len(question) < 8:
                     continue
                 t0 = time.monotonic()
                 log.info(f"💬 Ask-AI answering {sym} [{ask_mode}"
                          f"{'+chart' if has_img else ''}]: {question[:80]}")
                 context, fund, ppt, tx, _about = await _gather_stock_ask_context(session, headers, sym)
+                conversation_context = await _ask_conversation_context(
+                    session, headers, conversation_id, ask_id)
                 # Keep about + fundamentals + filings — free Gemini can answer
                 # even when PPT/concall are not on file yet.
                 result, ask_err = await answer_stock_ai_ask(
@@ -6042,7 +6219,8 @@ async def _stock_ai_asks_loop(session: aiohttp.ClientSession):
                     industry=fund.get('industry'), sector=fund.get('sector'),
                     use_web=use_web,
                     chart_image=chart_image if has_img else None,
-                    chart_image_mime=chart_mime if has_img else None)
+                    chart_image_mime=chart_mime if has_img else None,
+                    conversation_context=conversation_context)
                 elapsed = time.monotonic() - t0
                 if result:
                     patch = {
