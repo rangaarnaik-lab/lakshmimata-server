@@ -3929,6 +3929,9 @@ async def enrich_and_save_announcements(session: aiohttp.ClientSession, rows: li
             r.setdefault(k, None)
     enriched = _dedupe_by_key(enriched, ('symbol', 'subject', 'announced_at'))
     await save_announcements_to_db(session, enriched)
+    # Do not block the feed save or R2 snapshot while Gemini checks themes.
+    # Only material growth announcements pass the cheap keyword/routine gate.
+    _schedule_announcement_theme_checks(session, enriched)
 
     # Results numbers are triggered directly off results-type
     # announcements landing here, rather than a separate scheduled poll
@@ -5086,7 +5089,8 @@ _fund_highlight_select_fields = list(_FUND_HIGHLIGHT_CORE_FIELDS)
 
 async def extract_stock_themes_ai(session: aiohttp.ClientSession, symbol: str,
                                   industry: str = None, sector: str = None,
-                                  about: dict = None, ppt_row=None, tx_row=None):
+                                  about: dict = None, ppt_row=None, tx_row=None,
+                                  announcement_rows: list | None = None):
     """Tag allowlisted emerging themes for ANY stock via Gemini + Google Search,
     optionally grounded with About/PPT/concall already on file. Returns
     {emerging_themes, theme_evidence, theme_intensity} or None on failure."""
@@ -5098,6 +5102,12 @@ async def extract_stock_themes_ai(session: aiohttp.ClientSession, symbol: str,
         _fmt_filing_context('INVESTOR PRESENTATION', ppt_row),
         _fmt_filing_context('EARNINGS CALL / TRANSCRIPT', tx_row),
     ] if x)
+    news_ctx = '\n'.join(
+        f"- {row.get('announced_at') or 'recent'} | "
+        f"{row.get('category') or 'Corporate announcement'} | "
+        f"{row.get('subject') or ''} | {row.get('ai_summary') or ''}"
+        for row in (announcement_rows or [])[:5]
+    )
     about_bits = []
     if about:
         for k in ('overall_brief', 'what_they_do'):
@@ -5124,6 +5134,14 @@ async def extract_stock_themes_ai(session: aiohttp.ClientSession, symbol: str,
         "- Prefer themes with multi-source support. No buy/sell advice.\n\n"
         "Return ONLY JSON with keys emerging_themes, theme_evidence, theme_intensity.\n"
     )
+    if news_ctx:
+        prompt += (
+            "\nA NEW CORPORATE ANNOUNCEMENT triggered this check. Promote a theme only when "
+            "the announcement itself provides concrete evidence linking the company to that "
+            "controlled theme. A generic contract, board meeting, compliance filing, or an "
+            "industry label is not enough. Return an empty array when the link is uncertain.\n"
+            "NEW CORPORATE ANNOUNCEMENT(S):\n" + news_ctx[:5000] + "\n\n"
+        )
     if about_bits:
         prompt += "COMPANY BRIEF ALREADY ON FILE:\n" + '\n'.join(about_bits)[:6000] + "\n\n"
     if filing_ctx:
@@ -5176,6 +5194,149 @@ async def extract_stock_themes_ai(session: aiohttp.ClientSession, symbol: str,
         'theme_evidence': evidence,
         'theme_intensity': intensity or 'medium',
     }
+
+
+_ANNOUNCEMENT_THEME_SEEN: set[str] = set()
+_ANNOUNCEMENT_THEME_IN_FLIGHT: set[str] = set()
+_ANNOUNCEMENT_THEME_TASKS: set[asyncio.Task] = set()
+_ANNOUNCEMENT_THEME_MATERIAL_RE = re.compile(
+    r'\b(order|contract|award(?:ed)?|tender|capex|capacity|expansion|new plant|'
+    r'new facility|commercial production|commission(?:ed|ing)|product launch|'
+    r'partnership|collaboration|joint venture|\bmou\b|acquisition|investment|'
+    r'patent|regulatory approval|drug approval|technology agreement)\b',
+    re.IGNORECASE,
+)
+_ANNOUNCEMENT_THEME_ROUTINE_RE = re.compile(
+    r'\b(trading window|newspaper publication|certificate under|shareholding pattern|'
+    r'investor grievance|postal ballot|annual general meeting|board meeting|'
+    r'loss of share certificate|reconciliation of share capital)\b',
+    re.IGNORECASE,
+)
+
+
+def _announcement_can_change_themes(row: dict) -> bool:
+    """Cheap gate before spending an AI call on corporate news."""
+    text = ' '.join(str(row.get(k) or '') for k in (
+        'category', 'subject', 'ai_summary'))
+    if not text or _is_results_announcement(row):
+        return False
+    if _ANNOUNCEMENT_THEME_ROUTINE_RE.search(text):
+        return False
+    return bool(_ANNOUNCEMENT_THEME_MATERIAL_RE.search(text))
+
+
+async def _promote_announcement_themes(session: aiohttp.ClientSession,
+                                       rows: list):
+    """Re-check Emerging Themes for symbols with new, material filings.
+
+    The controlled theme vocabulary and evidence requirement remain the
+    authority. A filing can add a supported theme, but an uncertain or empty
+    AI result never removes themes already backed by PPT/concall research.
+    """
+    headers = {
+        'apikey': SUPABASE_KEY,
+        'Authorization': f'Bearer {SUPABASE_KEY}',
+        'Content-Type': 'application/json',
+    }
+    by_symbol = {}
+    for row in rows or []:
+        if not _announcement_can_change_themes(row):
+            continue
+        sym = str(row.get('symbol') or '').strip().upper()
+        key = '|'.join(str(row.get(k) or '') for k in (
+            'symbol', 'subject', 'announced_at'))
+        if not sym or key in _ANNOUNCEMENT_THEME_SEEN:
+            continue
+        _ANNOUNCEMENT_THEME_SEEN.add(key)
+        by_symbol.setdefault(sym, []).append(row)
+    # Bound process memory while retaining enough history to suppress the
+    # repeatedly-polled NSE recent-announcements window.
+    if len(_ANNOUNCEMENT_THEME_SEEN) > 5000:
+        keep = list(_ANNOUNCEMENT_THEME_SEEN)[-2500:]
+        _ANNOUNCEMENT_THEME_SEEN.clear()
+        _ANNOUNCEMENT_THEME_SEEN.update(keep)
+
+    cap = max(1, int(os.getenv('ANNOUNCEMENT_THEME_MAX_PER_CYCLE', '3')))
+    for sym, news_rows in list(by_symbol.items())[:cap]:
+        if sym in _ANNOUNCEMENT_THEME_IN_FLIGHT:
+            continue
+        _ANNOUNCEMENT_THEME_IN_FLIGHT.add(sym)
+        try:
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/stock_fundamentals",
+                headers=headers,
+                params={
+                    'select': 'sym,industry,sector,emerging_themes,theme_evidence,'
+                              'theme_intensity,themes_source,themes_at',
+                    'sym': f'eq.{sym}',
+                    'limit': '1',
+                },
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as r:
+                current_rows = await r.json() if r.status == 200 else []
+            current = (
+                current_rows[0]
+                if isinstance(current_rows, list) and current_rows else {}
+            )
+            result = await extract_stock_themes_ai(
+                session, sym,
+                industry=current.get('industry'),
+                sector=current.get('sector'),
+                announcement_rows=news_rows,
+            )
+            new_themes = _clean_themes((result or {}).get('emerging_themes'))
+            if not new_themes:
+                log.info(f"🌱 Corporate-news theme check: {sym} no supported theme")
+                continue
+            old_themes = _clean_themes(current.get('emerging_themes')) or []
+            merged_themes = list(dict.fromkeys(new_themes + old_themes))[:5]
+            new_evidence = _clean_bullets((result or {}).get('theme_evidence')) or []
+            old_evidence = _clean_bullets(current.get('theme_evidence')) or []
+            merged_evidence = list(dict.fromkeys(new_evidence + old_evidence))[:6]
+            intensity_rank = {'none': 0, 'low': 1, 'medium': 2, 'high': 3}
+            new_intensity = _clean_theme_intensity(
+                (result or {}).get('theme_intensity'), new_themes)
+            old_intensity = _clean_theme_intensity(
+                current.get('theme_intensity'), old_themes)
+            intensity = max(
+                (new_intensity, old_intensity),
+                key=lambda value: intensity_rank.get(value, 0),
+            )
+            newest_at = max(
+                (str(row.get('announced_at') or '') for row in news_rows),
+                default='',
+            )
+            await save_fundamentals_batch_to_db(session, [{
+                'sym': sym,
+                'emerging_themes': merged_themes,
+                'theme_evidence': merged_evidence or None,
+                'theme_intensity': intensity,
+                'themes_source': 'corporate_news',
+                'themes_at': datetime.now(timezone.utc).isoformat(),
+                'themes_announced_at': newest_at or None,
+            }])
+            log.info(
+                f"🌱 Corporate-news theme check: {sym} promoted "
+                f"{','.join(new_themes)}"
+            )
+        except Exception as e:
+            log.warning(
+                f"⚠️ Corporate-news theme check failed for {sym}: "
+                f"{type(e).__name__}: {e}"
+            )
+        finally:
+            _ANNOUNCEMENT_THEME_IN_FLIGHT.discard(sym)
+
+
+def _schedule_announcement_theme_checks(session: aiohttp.ClientSession,
+                                        rows: list):
+    material = [dict(row) for row in (rows or [])
+                if _announcement_can_change_themes(row)]
+    if not material:
+        return
+    task = asyncio.create_task(_promote_announcement_themes(session, material))
+    _ANNOUNCEMENT_THEME_TASKS.add(task)
+    task.add_done_callback(_ANNOUNCEMENT_THEME_TASKS.discard)
 
 
 async def _stock_themes_loop(session: aiohttp.ClientSession):
@@ -6324,14 +6485,28 @@ def _ask_fundamentals_need_heal(fund: dict) -> bool:
 
 
 async def _heal_ask_fundamentals(session: aiohttp.ClientSession,
-                                 symbol: str, fund: dict) -> bool:
+                                 symbol: str, fund: dict,
+                                 force: bool = False) -> bool:
     """Refresh one symbol from Upstox before answering; deduped and bounded."""
-    if not _ask_fundamentals_need_heal(fund):
+    if not force and not _ask_fundamentals_need_heal(fund):
         return False
     now = time.monotonic()
     if symbol in _ASK_HEAL_FUND_IN_FLIGHT:
-        return False
-    if now - _ASK_HEAL_FUND_LAST.get(symbol, 0) < _ASK_HEAL_COOLDOWN_SECONDS:
+        if force:
+            for _ in range(12):
+                await asyncio.sleep(2)
+                if symbol not in _ASK_HEAL_FUND_IN_FLIGHT:
+                    break
+            healed = fundamentals_cache.get(symbol) or {}
+            if any(healed.get(k) is not None for k in (
+                    'pe', 'roe', 'eps', 'market_cap', 'debt_eq', 'promoter',
+                    'pb', 'roce', 'cfo')):
+                return True
+            if symbol in _ASK_HEAL_FUND_IN_FLIGHT:
+                return False
+        else:
+            return False
+    if not force and now - _ASK_HEAL_FUND_LAST.get(symbol, 0) < _ASK_HEAL_COOLDOWN_SECONDS:
         return False
     _ASK_HEAL_FUND_IN_FLIGHT.add(symbol)
     _ASK_HEAL_FUND_LAST[symbol] = now
@@ -6339,22 +6514,24 @@ async def _heal_ask_fundamentals(session: aiohttp.ClientSession,
         # A blank DB row may have a blank in-memory row inside its 30-day TTL.
         # Remove only this symbol so load_fundamentals_batch really retries it.
         fundamentals_cache.pop(symbol, None)
-        log.info(f"🩹 Ask auto-heal: refreshing fundamentals for {symbol}")
+        log.info(f"🩹 auto-heal: refreshing fundamentals for {symbol}"
+                 f"{' (forced)' if force else ''}")
         await asyncio.wait_for(
             load_fundamentals_batch(session, [symbol]),
             timeout=float(os.getenv('ASK_HEAL_FUND_TIMEOUT_SECONDS', '20')),
         )
         healed = fundamentals_cache.get(symbol) or {}
         useful = any(healed.get(k) is not None for k in (
-            'pe', 'roe', 'eps', 'market_cap', 'debt_eq', 'promoter'))
-        log.info(f"🩹 Ask auto-heal: {symbol} fundamentals "
+            'pe', 'roe', 'eps', 'market_cap', 'debt_eq', 'promoter',
+            'pb', 'roce', 'cfo'))
+        log.info(f"🩹 auto-heal: {symbol} fundamentals "
                  f"{'repaired' if useful else 'still unavailable from source'}")
         return useful
     except asyncio.TimeoutError:
-        log.warning(f"⚠️ Ask auto-heal: fundamentals timed out for {symbol}")
+        log.warning(f"⚠️ auto-heal: fundamentals timed out for {symbol}")
         return False
     except Exception as e:
-        log.warning(f"⚠️ Ask auto-heal: fundamentals failed for {symbol}: "
+        log.warning(f"⚠️ auto-heal: fundamentals failed for {symbol}: "
                     f"{type(e).__name__}: {e}")
         return False
     finally:
@@ -6362,17 +6539,27 @@ async def _heal_ask_fundamentals(session: aiohttp.ClientSession,
 
 
 async def _heal_ask_results(session: aiohttp.ClientSession,
-                            headers: dict, symbol: str):
-    """Backfill recent quarterly numbers from exchange XBRL in the background.
+                            headers: dict, symbol: str,
+                            force: bool = False) -> bool:
+    """Backfill recent quarterly numbers from exchange XBRL.
 
     No Gemini answer text is parsed or persisted. This calls the same
     deterministic XBRL path used by the scheduled results worker.
+    Returns True when at least one period with sales/PAT/EPS was saved.
     """
     now = time.monotonic()
     if symbol in _ASK_HEAL_RESULTS_IN_FLIGHT:
-        return
-    if now - _ASK_HEAL_RESULTS_LAST.get(symbol, 0) < _ASK_HEAL_COOLDOWN_SECONDS:
-        return
+        if force:
+            for _ in range(20):
+                await asyncio.sleep(2)
+                if symbol not in _ASK_HEAL_RESULTS_IN_FLIGHT:
+                    break
+            if symbol in _ASK_HEAL_RESULTS_IN_FLIGHT:
+                return False
+        else:
+            return False
+    if not force and now - _ASK_HEAL_RESULTS_LAST.get(symbol, 0) < _ASK_HEAL_COOLDOWN_SECONDS:
+        return False
     _ASK_HEAL_RESULTS_IN_FLIGHT.add(symbol)
     _ASK_HEAL_RESULTS_LAST[symbol] = now
     try:
@@ -6393,23 +6580,29 @@ async def _heal_ask_results(session: aiohttp.ClientSession,
             if _is_results_announcement(row)
         ]
         if not candidates:
-            log.info(f"🩹 Ask auto-heal: no results filing found for {symbol}")
-            return
-        log.info(f"🩹 Ask auto-heal: trying exchange XBRL for {symbol}")
-        for row in candidates[:3]:
+            log.info(f"🩹 results auto-heal: no results filing found for {symbol}")
+            return False
+        log.info(f"🩹 results auto-heal: trying exchange XBRL for {symbol}"
+                 f"{' (forced)' if force else ''}")
+        saved = False
+        for row in candidates[:6 if force else 3]:
             try:
                 if await fetch_and_save_result_for_announcement(
                         session, headers, row, debug=False):
-                    log.info(f"🩹 Ask auto-heal: quarterly results repaired for {symbol}")
-                    return
+                    saved = True
+                    log.info(f"🩹 results auto-heal: quarterly results repaired for {symbol}")
+                    break
             except Exception as e:
-                log.warning(f"⚠️ Ask auto-heal: XBRL candidate failed for {symbol}: "
+                log.warning(f"⚠️ results auto-heal: XBRL candidate failed for {symbol}: "
                             f"{type(e).__name__}: {e}")
-        log.info(f"🩹 Ask auto-heal: XBRL unavailable for {symbol}; "
-                 f"scheduled filing extraction will retry")
+        if not saved:
+            log.info(f"🩹 results auto-heal: XBRL unavailable for {symbol}; "
+                     f"scheduled filing extraction will retry")
+        return saved
     except Exception as e:
-        log.warning(f"⚠️ Ask auto-heal: results failed for {symbol}: "
+        log.warning(f"⚠️ results auto-heal: results failed for {symbol}: "
                     f"{type(e).__name__}: {e}")
+        return False
     finally:
         _ASK_HEAL_RESULTS_IN_FLIGHT.discard(symbol)
 
@@ -6420,6 +6613,420 @@ def _schedule_ask_results_heal(session: aiohttp.ClientSession,
     task = asyncio.create_task(_heal_ask_results(session, headers, symbol))
     _ASK_HEAL_TASKS.add(task)
     task.add_done_callback(_ASK_HEAL_TASKS.discard)
+
+
+def _ist_now():
+    return datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+
+
+def _dislike_batch_window_open() -> bool:
+    """Hold genuine dislikes during cash hours; drain them after the close.
+
+    Default: queue all day, run from 16:00 IST through 08:59 IST the next
+    morning so one night's batch can finish. Override with
+    HEAL_DISLIKE_AFTER_IST_HOUR / HEAL_DISLIKE_UNTIL_IST_HOUR.
+    """
+    after = int(os.getenv('HEAL_DISLIKE_AFTER_IST_HOUR', '16'))
+    until = int(os.getenv('HEAL_DISLIKE_UNTIL_IST_HOUR', '9'))
+    hour = _ist_now().hour
+    if after >= until:
+        return hour >= after or hour < until
+    return after <= hour < until
+
+
+def _filter_heal_rows_for_window(rows: list) -> list:
+    """Missing-on-open stays immediate; dislike waits for the evening job."""
+    if not isinstance(rows, list):
+        return []
+    batch_open = _dislike_batch_window_open()
+    out = []
+    for row in rows:
+        reason = str(row.get('reason') or 'missing')
+        if reason == 'dislike' and not batch_open:
+            continue
+        out.append(row)
+    return out
+
+
+_DISLIKE_HARVEST_DATE = None
+
+
+async def _harvest_dislikes_into_heal_queues(session: aiohttp.ClientSession,
+                                             headers: dict):
+    """Safety net: unique down-votes from today also land on the EOD queues."""
+    global _DISLIKE_HARVEST_DATE
+    if not _dislike_batch_window_open():
+        return
+    today = _ist_now().date().isoformat()
+    if _DISLIKE_HARVEST_DATE == today:
+        return
+    start_ist = datetime.combine(_ist_now().date(), datetime.min.time())
+    start_utc = (start_ist - timedelta(hours=5, minutes=30)).replace(
+        tzinfo=timezone.utc).isoformat()
+    async with session.get(
+        f"{SUPABASE_URL}/rest/v1/content_feedback",
+        headers=headers,
+        params={
+            'select': 'symbol,content_type,section_key,comment,user_id,visitor_id,created_at',
+            'vote': 'eq.down',
+            'created_at': f'gte.{start_utc}',
+            'order': 'created_at.asc',
+            'limit': '500',
+        },
+        timeout=aiohttp.ClientTimeout(total=30),
+    ) as r:
+        if r.status != 200:
+            return
+        rows = await r.json()
+    if not isinstance(rows, list) or not rows:
+        _DISLIKE_HARVEST_DATE = today
+        return
+    per_user_cap = max(1, int(os.getenv('DISLIKE_PER_USER_PER_DAY', '5')))
+    used_by_person: dict[str, int] = {}
+    fund_syms, result_syms = {}, {}
+    skipped_over_cap = 0
+    for row in rows:
+        person = str(row.get('user_id') or row.get('visitor_id') or '').strip()
+        if not person:
+            continue
+        taken = used_by_person.get(person, 0)
+        if taken >= per_user_cap:
+            skipped_over_cap += 1
+            continue
+        used_by_person[person] = taken + 1
+        sym = str(row.get('symbol') or '').strip().upper()
+        if not sym:
+            continue
+        note = str(row.get('comment') or '')
+        ctype = str(row.get('content_type') or '').lower()
+        low = note.lower()
+        wants_fund = (
+            'fundamental' in low or ctype in ('fundamentals', 'themes', 'flags'))
+        wants_res = 'result' in low or ctype in ('results', 'results_summary')
+        if 'both' in low:
+            wants_fund = wants_res = True
+        if not wants_fund and not wants_res:
+            continue
+        payload = {
+            'symbol': sym,
+            'reason': 'dislike',
+            'section_key': (row.get('section_key') or '')[:60] or None,
+            'comment': (note or '')[:1000] or None,
+            'force': True,
+            'status': 'pending',
+            'requested_at': datetime.now(timezone.utc).isoformat(),
+            'processed_at': None,
+            'last_error': None,
+        }
+        if wants_fund:
+            fund_syms[sym] = payload
+        if wants_res:
+            result_syms[sym] = payload
+    for table, by_sym in (
+        ('fundamentals_heal_requests', fund_syms),
+        ('results_heal_requests', result_syms),
+    ):
+        for payload in by_sym.values():
+            async with session.post(
+                f"{SUPABASE_URL}/rest/v1/{table}?on_conflict=symbol",
+                headers={**headers, 'Prefer': 'resolution=merge-duplicates'},
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as wr:
+                if wr.status >= 400:
+                    body = await wr.text()
+                    log.warning(f"🩹 dislike harvest {table} {payload['symbol']} "
+                                f"{wr.status}: {body[:160]}")
+    log.info(f"🩹 dislike harvest: {len(fund_syms)} fund / {len(result_syms)} "
+             f"results symbol(s) from today's down-votes"
+             f"{f', skipped {skipped_over_cap} over the {per_user_cap}/user cap' if skipped_over_cap else ''}")
+    _DISLIKE_HARVEST_DATE = today
+
+
+async def _patch_heal_request(session: aiohttp.ClientSession, headers: dict,
+                              table: str, symbol: str, payload: dict):
+    async with session.patch(
+        f"{SUPABASE_URL}/rest/v1/{table}",
+        headers={**headers, 'Prefer': 'return=minimal'},
+        params={'symbol': f'eq.{symbol}'},
+        json=payload,
+        timeout=aiohttp.ClientTimeout(total=20),
+    ) as r:
+        if r.status >= 400:
+            body = await r.text()
+            log.warning(f"🩹 heal queue patch {table} {symbol} {r.status}: {body[:180]}")
+
+
+# Down-votes on these sections are the ones a refill could possibly fix, so a
+# wrong report is only cleared from these content types.
+_DISLIKE_VOTE_CONTENT_TYPES = {
+    'fundamentals': ('fundamentals', 'themes', 'flags'),
+    'results': ('results', 'results_summary'),
+}
+
+
+async def _fetch_fundamentals_row(session: aiohttp.ClientSession, headers: dict,
+                                  symbol: str) -> dict:
+    async with session.get(
+        f"{SUPABASE_URL}/rest/v1/stock_fundamentals",
+        headers=headers,
+        params={'select': '*', 'sym': f'eq.{symbol}', 'limit': '1'},
+        timeout=aiohttp.ClientTimeout(total=20),
+    ) as r:
+        rows = await r.json() if r.status == 200 else []
+    return (rows[0] if isinstance(rows, list) and rows else {}) or {}
+
+
+def _fundamentals_dislike_verdict(fund: dict) -> tuple[bool, str]:
+    """Is a fundamentals down-vote worth a refill, or was it a mis-click?
+
+    Genuine when the stored snapshot is absent, missing a core ratio, or older
+    than the refresh window — exactly what the tab would render as blank. When
+    every core ratio is present and fresh there is nothing to refill, so the
+    report is treated as wrong rather than queued again every night.
+    """
+    if _ask_fundamentals_need_heal(fund):
+        return True, ''
+    return False, 'core ratios already present and fresh'
+
+
+async def _results_dislike_verdict(session: aiohttp.ClientSession, headers: dict,
+                                   symbol: str) -> tuple[bool, str]:
+    """Same check for quarterly results, against what is stored on file."""
+    async with session.get(
+        f"{SUPABASE_URL}/rest/v1/financial_results",
+        headers=headers,
+        params={
+            'select': 'period_ended,sales,pat,eps,filed_at',
+            'symbol': f'eq.{symbol}',
+            'order': 'period_ended.desc',
+            'limit': '4',
+        },
+        timeout=aiohttp.ClientTimeout(total=20),
+    ) as r:
+        rows = await r.json() if r.status == 200 else []
+    rows = rows if isinstance(rows, list) else []
+    if not rows:
+        return True, ''
+    filled = [row for row in rows
+              if any(row.get(k) is not None for k in ('sales', 'pat', 'eps'))]
+    if not filled:
+        return True, ''
+    # A complete but old latest quarter means a newer filing is genuinely
+    # absent, so that down-vote still deserves a fetch.
+    stale_days = int(os.getenv('RESULTS_DISLIKE_STALE_DAYS', '140'))
+    newest = str(filled[0].get('period_ended') or '')
+    try:
+        period = datetime.fromisoformat(newest.replace('Z', '+00:00'))
+        if period.tzinfo is None:
+            period = period.replace(tzinfo=timezone.utc)
+        if period < datetime.now(timezone.utc) - timedelta(days=stale_days):
+            return True, ''
+    except (TypeError, ValueError):
+        return True, ''
+    return False, f'latest quarter {newest} already has sales/PAT/EPS'
+
+
+async def _discard_wrong_dislike(session: aiohttp.ClientSession, headers: dict,
+                                 table: str, symbol: str, kind: str, why: str):
+    """Reject the queue row and delete the down-votes it came from.
+
+    Leaving a disproved down-vote in content_feedback would keep the nightly
+    harvest re-queueing the same symbol, and would drag the section's score
+    down for everyone else.
+    """
+    await _patch_heal_request(session, headers, table, symbol, {
+        'status': 'rejected',
+        'processed_at': datetime.now(timezone.utc).isoformat(),
+        'last_error': f'dislike not genuine: {why}',
+    })
+    types = _DISLIKE_VOTE_CONTENT_TYPES.get(kind, ())
+    if not types:
+        return
+    try:
+        async with session.delete(
+            f"{SUPABASE_URL}/rest/v1/content_feedback",
+            headers={**headers, 'Prefer': 'return=representation'},
+            params={
+                'symbol': f'eq.{symbol}',
+                'vote': 'eq.down',
+                'content_type': f"in.({','.join(types)})",
+            },
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as r:
+            body = await r.json() if r.status in (200, 201) else []
+            removed = len(body) if isinstance(body, list) else 0
+        log.info(f"🩹 dislike check: {symbol} {kind} report dropped "
+                 f"({why}); {removed} down-vote(s) removed")
+    except Exception as e:
+        log.warning(f"🩹 dislike check: could not clear {symbol} {kind} "
+                    f"down-votes: {type(e).__name__}: {e}")
+
+
+async def _fundamentals_heal_queue_loop(session: aiohttp.ClientSession):
+    """Refill stock_fundamentals when the tab is empty or a dislike is genuine.
+
+    Numbers come only from load_fundamentals_batch (Upstox). Gemini is used
+    afterwards to rewrite AI takeaways, never as a numeric source.
+    """
+    headers = {
+        'apikey': SUPABASE_KEY,
+        'Authorization': f'Bearer {SUPABASE_KEY}',
+        'Content-Type': 'application/json',
+    }
+    missing_table_logged = False
+    poll = int(os.getenv('FUND_HEAL_POLL_SECONDS', '12'))
+    while True:
+        try:
+            await _harvest_dislikes_into_heal_queues(session, headers)
+            batch_open = _dislike_batch_window_open()
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/fundamentals_heal_requests",
+                headers=headers,
+                params={
+                    'select': 'symbol,reason,section_key,comment,force,status,requested_at',
+                    'status': 'eq.pending',
+                    'order': 'requested_at.asc',
+                    'limit': '24' if batch_open else '8',
+                },
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as r:
+                if r.status in (404, 400):
+                    if not missing_table_logged:
+                        log.warning("🩹 Heal queue: run 020_fundamentals_heal_requests.sql")
+                        missing_table_logged = True
+                    await asyncio.sleep(120)
+                    continue
+                rows = await r.json() if r.status == 200 else []
+            rows = _filter_heal_rows_for_window(rows)
+            if not rows:
+                await asyncio.sleep(300 if not batch_open else poll)
+                continue
+            for row in rows:
+                sym = str(row.get('symbol') or '').strip().upper()
+                if not sym:
+                    continue
+                reason = str(row.get('reason') or 'missing')
+                force = bool(row.get('force')) or reason == 'dislike'
+                await _patch_heal_request(session, headers, 'fundamentals_heal_requests', sym, {
+                    'status': 'working',
+                    'last_error': None,
+                })
+                fund = await _fetch_fundamentals_row(session, headers, sym)
+                if reason == 'dislike':
+                    genuine, why = _fundamentals_dislike_verdict(fund)
+                    if not genuine:
+                        await _discard_wrong_dislike(
+                            session, headers, 'fundamentals_heal_requests', sym,
+                            'fundamentals', why)
+                        continue
+                useful = await _heal_ask_fundamentals(session, sym, fund, force=force)
+                highlight_err = None
+                section = str(row.get('section_key') or '')
+                want_ai = force or section in (
+                    'ai_highlights', 'important_metrics', 'all_metrics', '')
+                if want_ai:
+                    async with session.get(
+                        f"{SUPABASE_URL}/rest/v1/stock_fundamentals",
+                        headers=headers,
+                        params={'select': '*', 'sym': f'eq.{sym}', 'limit': '1'},
+                        timeout=aiohttp.ClientTimeout(total=20),
+                    ) as fr2:
+                        fresh_rows = await fr2.json() if fr2.status == 200 else []
+                    fresh = (fresh_rows[0] if isinstance(fresh_rows, list) and fresh_rows
+                             else {}) or {}
+                    try:
+                        result = await extract_fundamentals_highlights(session, fresh)
+                        if result:
+                            await save_fundamentals_batch_to_db(session, [{
+                                'sym': sym,
+                                'ai_highlights': result['ai_highlights'],
+                                'ai_key_metrics': result['ai_key_metrics'],
+                                'ai_highlights_at': datetime.now(timezone.utc).isoformat(),
+                            }])
+                    except Exception as e:
+                        highlight_err = f'{type(e).__name__}: {e}'
+                        log.warning(f"🩹 heal queue: highlights failed for {sym}: {highlight_err}")
+                status = 'done' if useful else 'failed'
+                err = None if useful else (
+                    highlight_err or 'source still has no core ratios')
+                await _patch_heal_request(session, headers, 'fundamentals_heal_requests', sym, {
+                    'status': status,
+                    'processed_at': datetime.now(timezone.utc).isoformat(),
+                    'last_error': err,
+                })
+                log.info(f"🩹 heal queue: {sym} {status} reason={row.get('reason')}")
+        except Exception as e:
+            log.warning(f"🩹 heal queue loop: {type(e).__name__}: {e}")
+        await asyncio.sleep(poll)
+
+
+async def _results_heal_queue_loop(session: aiohttp.ClientSession):
+    """Refill financial_results when the Results tab is empty or disliked.
+
+    Numbers come only from exchange XBRL via fetch_and_save_result_for_announcement.
+    """
+    headers = {
+        'apikey': SUPABASE_KEY,
+        'Authorization': f'Bearer {SUPABASE_KEY}',
+        'Content-Type': 'application/json',
+    }
+    missing_table_logged = False
+    poll = int(os.getenv('RESULTS_HEAL_POLL_SECONDS', '12'))
+    while True:
+        try:
+            await _harvest_dislikes_into_heal_queues(session, headers)
+            batch_open = _dislike_batch_window_open()
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/results_heal_requests",
+                headers=headers,
+                params={
+                    'select': 'symbol,reason,section_key,comment,force,status,requested_at',
+                    'status': 'eq.pending',
+                    'order': 'requested_at.asc',
+                    'limit': '20' if batch_open else '6',
+                },
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as r:
+                if r.status in (404, 400):
+                    if not missing_table_logged:
+                        log.warning("🩹 Results heal queue: run 021_results_heal_requests.sql")
+                        missing_table_logged = True
+                    await asyncio.sleep(120)
+                    continue
+                rows = await r.json() if r.status == 200 else []
+            rows = _filter_heal_rows_for_window(rows)
+            if not rows:
+                await asyncio.sleep(300 if not batch_open else poll)
+                continue
+            for row in rows:
+                sym = str(row.get('symbol') or '').strip().upper()
+                if not sym:
+                    continue
+                reason = str(row.get('reason') or 'missing')
+                force = bool(row.get('force')) or reason == 'dislike'
+                await _patch_heal_request(session, headers, 'results_heal_requests', sym, {
+                    'status': 'working',
+                    'last_error': None,
+                })
+                if reason == 'dislike':
+                    genuine, why = await _results_dislike_verdict(session, headers, sym)
+                    if not genuine:
+                        await _discard_wrong_dislike(
+                            session, headers, 'results_heal_requests', sym,
+                            'results', why)
+                        continue
+                useful = await _heal_ask_results(session, headers, sym, force=force)
+                await _patch_heal_request(session, headers, 'results_heal_requests', sym, {
+                    'status': 'done' if useful else 'failed',
+                    'processed_at': datetime.now(timezone.utc).isoformat(),
+                    'last_error': None if useful else 'no XBRL numbers on recent results filings',
+                })
+                log.info(f"🩹 results heal queue: {sym} "
+                         f"{'done' if useful else 'failed'} reason={row.get('reason')}")
+        except Exception as e:
+            log.warning(f"🩹 results heal queue loop: {type(e).__name__}: {e}")
+        await asyncio.sleep(poll)
 
 
 async def _stock_ai_asks_loop(session: aiohttp.ClientSession):
@@ -7477,6 +8084,8 @@ async def fundamentals_worker_main():
             _delayed(100, _mgmt_flags_loop(session)),
             # Ask AI starts immediately — interactive, not staggered with batch jobs.
             _delayed(0, _stock_ai_asks_loop(session)),
+            _delayed(5, _fundamentals_heal_queue_loop(session)),
+            _delayed(8, _results_heal_queue_loop(session)),
             # Periodic plain-text pending counts for Results / PPT / Concall.
             _filings_backlog_status_loop(session),
         )
