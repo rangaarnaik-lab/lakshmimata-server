@@ -6073,20 +6073,31 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         mkt_open_now = is_market_open()
         if mkt_open_now and live_idx_price:
             last = live_idx_price
-            prev = prices[-1]  # yesterday's close (correct baseline while market is open)
         else:
             last = prices[-1]
-            prev = prices[-2] if n >= 2 else last
         week    = prices[-6]  if n >= 6   else prices[0]
         month   = prices[-22] if n >= 22  else prices[0]
         qtr     = prices[-66] if n >= 66  else prices[0]
         yr      = prices[-252] if n >= 252 else prices[0]
 
-        chg_d = round((last - prev) / prev * 100, 2) if prev else 0
-        chg_w = round((last - week) / week * 100, 2) if week else 0
-        chg_m = round((last - month) / month * 100, 2) if month else 0
-        chg_q = round((last - qtr)  / qtr  * 100, 2) if qtr  else 0
-        chg_y = round((last - yr)   / yr   * 100, 2) if yr   else 0
+        # index_dashboard is world-readable, so anything published here reaches
+        # every client. `last` is the owner's live tick during market hours, and
+        # deriving the published changes from it would make even the 1W..1Y
+        # lookbacks live-derived. Keep `last` for RS-TV and stage below — those
+        # are ordinals with no recoverable price — and publish a
+        # last-completed-session view. Clients overlay live levels from their
+        # own broker.
+        pub_last = prices[-1]
+        pub_prev = prices[-2] if n >= 2 else pub_last
+
+        def _pub_chg(base):
+            return round((pub_last - base) / base * 100, 2) if base else 0
+
+        pub_chg_d = _pub_chg(pub_prev)
+        pub_chg_w = _pub_chg(week)
+        pub_chg_m = _pub_chg(month)
+        pub_chg_q = _pub_chg(qtr)
+        pub_chg_y = _pub_chg(yr)
 
         # RS-TV using Nifty as benchmark — meaningless for Nifty 50 itself
         # (comparing an index against itself trivially gives 0 relative
@@ -6119,7 +6130,12 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         ma10  = sma(prices, min(10, n))
         h52   = max(prices[-252:]) if n >= 252 else max(prices)
         l52   = min(prices[-252:]) if n >= 252 else min(prices)
-        pct_from_high = round((last - h52) / h52 * 100, 1) if h52 else 0
+        # Two versions on purpose. The stage signal below keeps the live tick so
+        # its behaviour is unchanged; the published one is anchored on the close
+        # because high_52w ships alongside it, and a live-tick percentage would
+        # let any client multiply the two back into the owner's live level.
+        pct_from_high_live = round((last - h52) / h52 * 100, 1) if h52 else 0
+        pct_from_high = round((pub_last - h52) / h52 * 100, 1) if h52 else 0
 
         # Stage logic for index — uses MA10-vs-MA30 (a stable, multi-day
         # trend-confirmation signal, same as the up/down arrows already
@@ -6131,7 +6147,7 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
         # genuinely-uptrending indices were all showing "Base" together
         # on an ordinary red day for the broader market.
         if ma30 and last > ma30 and ma10 and ma10 >= ma30:
-            if pct_from_high >= -5:
+            if pct_from_high_live >= -5:
                 stage = 3
             else:
                 stage = 2
@@ -6178,12 +6194,12 @@ async def run_scan(session: aiohttp.ClientSession, scan_type: str = 'live') -> i
 
         index_rows.append({
             'name':          idx_name,
-            'last_price':    round(last, 2),
-            'chg_d':         chg_d,
-            'chg_w':         chg_w,
-            'chg_m':         chg_m,
-            'chg_q':         chg_q,
-            'chg_y':         chg_y,
+            'last_price':    round(pub_last, 2),
+            'chg_d':         pub_chg_d,
+            'chg_w':         pub_chg_w,
+            'chg_m':         pub_chg_m,
+            'chg_q':         pub_chg_q,
+            'chg_y':         pub_chg_y,
             'rs_tv':         rs_tv_idx,
             'stage':         stage,
             'stage_label':   stage_label,
