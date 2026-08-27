@@ -4,6 +4,7 @@ __pycache__/
 
 # Regenerable index history downloads (scripts/fetch_index_history_csv.py)
 data/indices/
+data/ohlcv/
 
 # Cloud Agent clones frontend beside/inside the server workspace
 Lakshmimata/

@@ -21,6 +21,14 @@ from squeeze_pro import compute_squeeze_pro
 from telegram_alerts import (
     fanout_telegram_alerts, flush_due_telegram_digests, poll_telegram_links,
 )
+from local_ohlcv import (
+    load_all_ohlcv_from_disk,
+    persist_cache_symbols,
+    persist_db_rows,
+    persist_ohlcv_to_supabase,
+    seed_ohlcv_from_supabase,
+    symbols_needing_fetch,
+)
 
 log = logging.getLogger('pocketrs')
 
@@ -3253,19 +3261,11 @@ async def fetch_full_history_for_symbols(session: aiohttp.ClientSession, symbols
                                           label: str = "full") -> int:
     """
     Fetch the full 2-year daily OHLCV history from Yahoo Finance for the
-    given list of symbols and persist it into Supabase `stock_full_history`
-    + historical_cache/history_dates_cache. This is the expensive full
-    fetch — used only for symbols that are missing or stale in Supabase,
-    NOT for every stock on every restart (see load_history_at_startup).
+    given list of symbols and persist it to the worker disk (and RAM).
+    Used only for symbols that are missing or stale locally.
     Returns the count of symbols successfully fetched.
     """
     if not symbols:
-        return 0
-
-    table_ready = await ensure_full_history_table(session)
-    if not table_ready:
-        log.error("⏭️  Skipping Yahoo history fetch this run — table still unavailable "
-                   "(will try again on next restart).")
         return 0
 
     total = len(symbols)
@@ -3901,11 +3901,6 @@ async def incremental_eod_update(session: aiohttp.ClientSession):
     Stocks with no existing history yet (new IPOs, or ones that never
     successfully backfilled) fall back to a full fetch instead.
     """
-    table_ready = await ensure_full_history_table(session)
-    if not table_ready:
-        log.error("⏭️  Skipping EOD history update — table still unavailable.")
-        return
-
     has_history  = [s for s in ALL_STOCKS if s in historical_cache and s in history_dates_cache
                     and len(historical_cache[s].get('prices', [])) >= 100]
     needs_full   = [s for s in ALL_STOCKS if s not in has_history]
@@ -4083,6 +4078,8 @@ async def load_all_history_from_supabase(session: aiohttp.ClientSession) -> list
             if not sym:
                 continue
             found_syms.add(sym)
+            if sym in historical_cache and len(historical_cache[sym].get('prices') or []) >= 100:
+                continue
             try:
                 dates   = parse(row.get('dates'))
                 prices  = parse(row.get('prices'))
@@ -4393,22 +4390,25 @@ async def load_historical_cache(session: aiohttp.ClientSession, syms: list = Non
     log.info(f"✅ Historical cache loaded: {loaded} stocks")
 
 async def load_history_at_startup(session: aiohttp.ClientSession):
-    """
-    Startup replacement for the old 'always re-fetch all ~2385 stocks from
-    Yahoo' behavior. Loads everything already stored in Supabase first
-    (fast, free), then only hits Yahoo for symbols that are missing or
-    whose stored data is stale — normally a small fraction of the universe
-    (new IPOs, or symbols that failed every fetch attempt for several
-    days running), rather than the whole thing every single restart.
-    """
-    table_ready = await ensure_full_history_table(session)
-    if not table_ready:
-        log.error("⏭️  stock_full_history table unavailable — falling back to full "
-                   "Yahoo fetch for all stocks this run.")
-        await fetch_full_history_for_symbols(session, list(ALL_STOCKS), label="startup-fallback-all")
-        return
+    """Load private OHLCV from the worker disk, compute RS from RAM.
 
-    stale_or_missing = await load_all_history_from_supabase(session)
+    Optional one-time seed from stock_full_history, then Yahoo only for
+    gaps. Prices are not written back to Supabase unless
+    STORE_OHLCV_IN_SUPABASE=1.
+    """
+    stale_or_missing = load_all_ohlcv_from_disk(list(ALL_STOCKS))
+    if stale_or_missing and seed_ohlcv_from_supabase():
+        table_ready = await ensure_full_history_table(session)
+        if table_ready:
+            before = set(historical_cache)
+            await load_all_history_from_supabase(session)
+            seeded = [s for s in historical_cache if s not in before]
+            if seeded:
+                persist_cache_symbols(seeded)
+                log.info(f"💾 Seeded {len(seeded)} symbols from Supabase onto local disk")
+        else:
+            log.warning("SEED_OHLCV_FROM_SUPABASE is on but stock_full_history is unavailable")
+    stale_or_missing = symbols_needing_fetch(list(ALL_STOCKS))
     if stale_or_missing:
         await fetch_full_history_for_symbols(session, stale_or_missing, label="startup-backfill")
 
@@ -6878,10 +6878,8 @@ async def save_best_picks_history(session: aiohttp.ClientSession, top_rows: list
     except Exception as e:
         log.warning(f"⚠️ Best picks history save exception: {e}")
 
-async def save_full_history_batch_to_db(session: aiohttp.ClientSession, rows: list):
-    """Upsert full-history rows into Supabase in small chunks (payload per
-    row is large — full 2yr OHLCV — so chunks are kept smaller than the
-    generic supabase_upsert default)."""
+async def _upload_full_history_to_supabase(session: aiohttp.ClientSession, rows: list):
+    """Opt-in: upsert OHLCV into stock_full_history. Off unless STORE_OHLCV_IN_SUPABASE=1."""
     if not rows:
         return
     url = f"{SUPABASE_URL}/rest/v1/stock_full_history?on_conflict=sym"
@@ -6923,6 +6921,18 @@ async def save_full_history_batch_to_db(session: aiohttp.ClientSession, rows: li
 
     await asyncio.gather(*[upload(c) for c in chunks])
     log.info(f"  💾 Uploaded {uploaded}/{len(rows)} full-history rows to Supabase")
+
+
+async def save_full_history_batch_to_db(session: aiohttp.ClientSession, rows: list):
+    """Persist OHLCV to the worker disk. Supabase is opt-in and off by default."""
+    if not rows:
+        return
+    n = persist_db_rows(rows)
+    log.info(f"  💾 Wrote {n} OHLCV files to local disk (RS input only)")
+    if persist_ohlcv_to_supabase():
+        await _upload_full_history_to_supabase(session, rows)
+    elif n:
+        log.info("  ⏭️  Not writing OHLCV to Supabase (STORE_OHLCV_IN_SUPABASE=0)")
 
 async def save_index_history_to_db(session: aiohttp.ClientSession, name: str, prices: list):
     """Save index price history to Supabase for persistence across restarts."""
