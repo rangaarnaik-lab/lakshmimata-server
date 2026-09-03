@@ -1335,13 +1335,21 @@ async def fetch_upstox_fundamentals(session: aiohttp.ClientSession, sym: str, is
         except Exception:
             return None
 
+    _upstox_401_count = 0  # module-level within function for early-stop
+
     async def get_with_retry(url):
         """GET with one retry + backoff specifically for 429 (rate-limit)
         responses — Upstox's fundamentals endpoints do have a real rate
         limit (confirmed: hundreds of 429s once concurrency went up),
         unlike Screener.in this is a normal, well-behaved API limit, not
         adversarial blocking, so a short backoff and retry is the
-        appropriate fix rather than treating it as a hard failure."""
+        appropriate fix rather than treating it as a hard failure.
+
+        Returns (status, data, early_stop). early_stop=True when the
+        analytics token is invalid (401) — the caller should bail out
+        immediately instead of pointlessly retrying every remaining
+        symbol in the batch."""
+        nonlocal _upstox_401_count
         for attempt in (1, 2):
             async with session.get(url, headers=headers,
                                    timeout=aiohttp.ClientTimeout(total=10)) as r:
@@ -1349,12 +1357,21 @@ async def fetch_upstox_fundamentals(session: aiohttp.ClientSession, sym: str, is
                     await asyncio.sleep(1.5 + random.uniform(0, 1.5))
                     continue
                 if r.status == 200:
-                    return r.status, await r.json()
-                return r.status, None
-        return 429, None
+                    return r.status, await r.json(), False
+                if r.status == 401:
+                    _upstox_401_count += 1
+                    # 3+ 401s in one batch means the token is expired — stop
+                    if _upstox_401_count >= 3:
+                        return r.status, None, True
+                    return r.status, None, False
+                return r.status, None, False
+        return 429, None, False
 
     try:
-        status, data = await get_with_retry(f"https://api.upstox.com/v2/fundamentals/{isin}/key-ratios")
+        status, data, early_stop = await get_with_retry(f"https://api.upstox.com/v2/fundamentals/{isin}/key-ratios")
+        if early_stop:
+            # Upstox token expired (3+ 401s) — bail out instead of pointlessly retrying every endpoint
+            return None
         if debug:
             log.info(f"  🔍 {sym} ({isin}) Upstox key-ratios: status={status}")
         if status == 200:
@@ -1390,7 +1407,9 @@ async def fetch_upstox_fundamentals(session: aiohttp.ClientSession, sym: str, is
             log.info(f"  🔍 {sym} Upstox key-ratios exception: {type(e).__name__}: {e}")
 
     try:
-        status, data = await get_with_retry(f"https://api.upstox.com/v2/fundamentals/{isin}/share-holdings")
+        status, data, early_stop = await get_with_retry(f"https://api.upstox.com/v2/fundamentals/{isin}/share-holdings")
+        if early_stop:
+            return None
         if debug:
             log.info(f"  🔍 {sym} ({isin}) Upstox share-holdings: status={status}")
         if status == 200:
@@ -1487,7 +1506,9 @@ async def fetch_upstox_fundamentals(session: aiohttp.ClientSession, sym: str, is
             # Fallback: competitors endpoint carries the company's peers'
             # sector — the FIRST competitor's sector is the same industry
             # bucket as the company itself (peers share it by definition).
-            status, data = await get_with_retry(f"https://api.upstox.com/v2/fundamentals/{isin}/competitors")
+            status, data, early_stop = await get_with_retry(f"https://api.upstox.com/v2/fundamentals/{isin}/competitors")
+            if early_stop:
+                return None
             if status == 200 and data:
                 items = data.get('data', [])
                 if isinstance(items, list) and items and isinstance(items[0], dict):

@@ -416,10 +416,10 @@ def _gemini_jobs_hard_paused() -> bool:
 
 
 def _gemini_jobs_hard_pause_seconds() -> int:
-    # Billing/hard quota only — default 2h (was 24h; overnight catchup stalled).
-    return max(900, int(os.getenv(
+    # Billing/hard quota only — default 30min (was 2h; shorter so catchup resumes faster).
+    return max(600, int(os.getenv(
         'GEMINI_JOBS_HARD_PAUSE_SECONDS',
-        os.getenv('RESULTS_HARD_QUOTA_COOLDOWN_SECONDS', '7200'))))  # 2h
+        os.getenv('RESULTS_HARD_QUOTA_COOLDOWN_SECONDS', '1800'))))  # 30min
 
 
 def _gemini_jobs_soft_pause_seconds() -> int:
@@ -2944,15 +2944,14 @@ async def _announcements_loop(session: aiohttp.ClientSession):
     fetch_nse_announcements's docstring for the caveat about field names
     not being independently verified yet — first several cycles log the
     raw response shape for confirmation."""
-    CHECK_INTERVAL = int(os.getenv('ANNOUNCEMENTS_CHECK_INTERVAL_SECONDS', '60'))
-    # Testing a faster interval (default 60s, was a flat 5 min) per
-    # explicit user request on 2026-08-10, despite the documented risk
-    # noted below - NSE's site can block an IP for polling too
-    # aggressively, after which the feed goes silent (empty/error
-    # responses) entirely. consecutive_empty tracks this: a handful of
-    # empty cycles is normal (no new announcements in that window), but
-    # a long unbroken streak is the actual signal of a block, not
-    # something to squint at manually in the raw logs.
+    CHECK_INTERVAL = int(os.getenv('ANNOUNCEMENTS_CHECK_INTERVAL_SECONDS', '300'))
+    # Testing a faster interval (default 300s/5min, was 60s) — NSE's site
+    # can block an IP for polling too aggressively, after which the feed
+    # goes silent (empty/error responses) entirely. consecutive_empty
+    # tracks this: a handful of empty cycles is normal (no new
+    # announcements in that window), but a long unbroken streak is the
+    # actual signal of a block, not something to squint at manually in
+    # the raw logs.
     table_ready = await ensure_announcements_table(session)
     if not table_ready:
         log.error("corporate_announcements table unavailable — announcements loop cannot proceed.")
@@ -2982,6 +2981,8 @@ async def _announcements_loop(session: aiohttp.ClientSession):
             log.error(f"Announcements loop cycle failed: {e}\n{traceback.format_exc()}")
         await asyncio.sleep(CHECK_INTERVAL)
 
+_announcements_last_snapshot_upload = [0.0]
+
 async def _upload_announcements_snapshot(session: aiohttp.ClientSession):
     """Uploads the default/unfiltered announcements view (most recent
     100, no category/sector/mcap filters) to R2, same pattern as
@@ -2994,6 +2995,11 @@ async def _upload_announcements_snapshot(session: aiohttp.ClientSession):
     single most common case (first page, no filters) while anything
     filtered/paginated still queries Supabase directly, same tradeoff
     already accepted for the stocks R2 cache."""
+    # Debounce: skip if we uploaded less than 60s ago (avoid redundant Supabase reads + R2 writes)
+    now = time.time()
+    if now - _announcements_last_snapshot_upload[0] < 60:
+        return
+    _announcements_last_snapshot_upload[0] = now
     headers = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
     try:
         async with session.get(
@@ -8645,17 +8651,29 @@ async def save_announcements_to_db(session: aiohttp.ClientSession, rows: list):
         "Content-Type": "application/json",
         "Prefer": "resolution=merge-duplicates",
     }
-    try:
-        async with session.post(f"{url}?on_conflict=symbol,subject,announced_at",
-                                headers=headers, json=rows,
-                                timeout=aiohttp.ClientTimeout(total=20)) as r:
-            if r.status not in (200, 201):
+    # Retry on 522 (Cloudflare connection timed out) — transient, worth one retry
+    for attempt in (1, 2):
+        try:
+            async with session.post(f"{url}?on_conflict=symbol,subject,announced_at",
+                                    headers=headers, json=rows,
+                                    timeout=aiohttp.ClientTimeout(total=20)) as r:
+                if r.status in (200, 201):
+                    log.info(f"  📢 Upserted {len(rows)} announcements to Supabase")
+                    return
+                if r.status == 522 and attempt == 1:
+                    log.warning(f"⚠️ Announcements upsert 522 (Cloudflare) — retrying")
+                    await asyncio.sleep(2)
+                    continue
                 body = await r.text()
                 log.warning(f"⚠️ Announcements upsert failed ({r.status}): {body[:300]}")
-            else:
-                log.info(f"  📢 Upserted {len(rows)} announcements to Supabase")
-    except Exception as e:
-        log.warning(f"⚠️ Announcements upsert exception: {e}")
+                return
+        except Exception as e:
+            if attempt == 1:
+                log.warning(f"⚠️ Announcements upsert exception (retrying): {e}")
+                await asyncio.sleep(2)
+                continue
+            log.warning(f"⚠️ Announcements upsert exception: {e}")
+            return
 
 def _pct_change(new, old):
     """Standard % change, guarding the usual edge cases (zero/None/
