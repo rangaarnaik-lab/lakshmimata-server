@@ -659,6 +659,32 @@ def _gemini_pool_rotated() -> list[str]:
     return pool[start:] + pool[:start]
 
 
+# ── Per-key hard-quota penalty ─────────────────────────────────────────
+# When a GEMINI_API_KEY* returns 429 "quota exceeded", it is penalized for a
+# cooldown window instead of being retried every call. With several separate
+# tokens, this keeps the loops from hammering a dead key and lets the healthy
+# keys carry the load. The key is skipped while `time.time() < _GEMINI_KEY_BAD_UNTIL[key]`.
+_GEMINI_KEY_BAD_UNTIL: dict[str, float] = {}
+_GEMINI_KEY_PENALTY_SEC = float(os.getenv('GEMINI_KEY_PENALTY_SECONDS', '300'))  # 5m
+
+def _gemini_key_usable(api_key: str) -> bool:
+    return time.time() >= _GEMINI_KEY_BAD_UNTIL.get(api_key, 0.0)
+
+def _gemini_key_penalize(api_key: str, reason: str):
+    until = time.time() + _GEMINI_KEY_PENALTY_SEC
+    _GEMINI_KEY_BAD_UNTIL[api_key] = until
+    log.warning(f"⏸️ Key {_gemini_key_fingerprint(api_key)} skipped for "
+                f"{int(_GEMINI_KEY_PENALTY_SEC)}s after: {reason}")
+
+def _gemini_key_cooldown_summary() -> str:
+    now = time.time()
+    bad = [f"{_gemini_key_fingerprint(k)}:{int(v-now)}s"
+           for k, v in _GEMINI_KEY_BAD_UNTIL.items() if v > now]
+    if not bad:
+        return 'none'
+    return ', '.join(bad[:5]) + (f' (+{len(bad)-5})' if len(bad) > 5 else '')
+
+
 def _gemini_env_key_var_names() -> list[str]:
     """Railway env var names that hold a Gemini key (for startup logs)."""
     return sorted(
@@ -676,6 +702,11 @@ async def _gemini_generate_rotating(session: aiohttp.ClientSession, *,
         return 0, {}, '', False, None
     last_status, last_data, last_body = 0, {}, ''
     all_hard_quota = True
+    usable = [k for k in keys if _gemini_key_usable(k)]
+    if len(usable) < len(keys):
+        log.info(f"  🔁 pool: skipping {len(keys)-len(usable)} penalized key(s) "
+                 f"({_gemini_key_cooldown_summary()})")
+    keys = usable or keys  # if all penalized, fall back to trying anyway
     for i, api_key in enumerate(keys):
         url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
                f"{model}:generateContent?key={api_key}")
@@ -686,6 +717,7 @@ async def _gemini_generate_rotating(session: aiohttp.ClientSession, *,
         last_status, last_data, last_body = status, data, body_txt
         hard_quota = status == 429 and _gemini_quota_exhausted(body_txt)
         if hard_quota:
+            _gemini_key_penalize(api_key, f'{label} {symbol} 429 hard quota')
             log.warning(
                 f"⚠️ Gemini {label} for {symbol} ({status}) — HARD QUOTA on "
                 f"{_gemini_key_fingerprint(api_key)}"
@@ -7985,6 +8017,13 @@ async def _about_company_loop(session: aiohttp.ClientSession):
         )
         if hit_hard_quota:
             _ABOUT_GEMINI_HARD_QUOTA = True
+        # Full long pause only when NOTHING at all succeeded. With several
+        # separate tokens, if SOME calls succeeded the pool still has working
+        # keys — pausing everything for an hour then wastes that capacity
+        # (2026-09: ok=2, errors=2/8 still triggered the full pause; the
+        # per-key penalty in _gemini_generate_rotating already removes the
+        # exhausted keys, so the healthy ones should keep going).
+        total_hard_fail = (hit_hard_quota or _ABOUT_GEMINI_HARD_QUOTA) and gemini_ok == 0
         if need_cooldown or all_failed:
             retry_window = int(os.getenv('ABOUT_COMPANY_ERROR_RETRY_SECONDS', '600'))  # 10m
             retry_gap = int(os.getenv('ABOUT_COMPANY_ERROR_RETRY_GAP_SECONDS', '45'))
@@ -7993,7 +8032,7 @@ async def _about_company_loop(session: aiohttp.ClientSession):
             hard_cool = _about_hard_pause_seconds()
             # Billing/plan quota won't recover soon — skip retry window, pause 24h,
             # and hand the Gemini slot to Results PDF backfill.
-            if hit_hard_quota or _ABOUT_GEMINI_HARD_QUOTA:
+            if total_hard_fail:
                 _ABOUT_GEMINI_UNHEALTHY_SINCE = None
                 _ABOUT_GEMINI_HARD_QUOTA = False
                 _begin_about_yield_to_results(
