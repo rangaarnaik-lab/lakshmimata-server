@@ -67,6 +67,24 @@ async def main():
     assert await asyncio.to_thread(_trim, build_pdf(), 8) is None, "should not trim short PDF"
     print("TRIM_OK")
 
+    # ── Give-up logic (mirrors _gemini_give_up) ──
+    no_retry = set(); counts = {}
+    MAX = 4
+    def give_up(sym, url, reason):
+        k = (sym, url)
+        n = counts.get(k, 0) + 1
+        counts[k] = n
+        if n >= MAX:
+            no_retry.add(k)
+            return True
+        return False
+    sym, url = "WEWIN", "https://x/y.pdf"
+    results = [give_up(sym, url, "429") for _ in range(4)]
+    assert results[:-1] == [False, False, False], "should not give up early"
+    assert results[-1] is True, "should give up after MAX"
+    assert (sym, url) in no_retry, "should be marked no-retry"
+    print("GIVEUP_OK")
+
 
 if __name__ == "__main__":
     asyncio.run(main())

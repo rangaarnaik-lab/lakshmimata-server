@@ -19,6 +19,10 @@ from datetime import datetime, timezone, timedelta
 from shared import *
 
 log = logging.getLogger('pocketrs')
+# pypdf spam ("invalid pdf header", "EOF marker not found") on corrupt
+# filings we now parse/trim locally — these are handled (file is dropped
+# after GEMINI_MAX_FILE_FAILS), they don't need to flood every cycle.
+logging.getLogger('pypdf').setLevel(logging.ERROR)
 
 # Local fallbacks — shared.__all__ omitted these once and crash-looped Railway.
 # Prefer shared definitions when present; never NameError on boot.
@@ -82,6 +86,33 @@ _RESULTS_PDF_NO_RETRY: set[tuple[str, str]] = set()
 # egress for zero chance of success (WEWIN/AARTIPHARM/MODIS/... 2026-09).
 # In-memory: cleared on restart, so each gets exactly one retry per deploy.
 _GEMINI_400_NO_RETRY: set[tuple[str, str]] = set()
+# Per-file consecutive-failure counters so ANY repeated failure (400,
+# 429 hard-quota, timeout, 5xx) eventually makes the file give up instead
+# of looping forever. After GEMINI_MAX_CONSECUTIVE_FAILS failures the item
+# is moved into _GEMINI_400_NO_RETRY and left alone — otherwise a poisoned
+# filing keeps getting downloaded and re-uploaded to Gemini every cycle
+# even when it's now failing with 429 (quota) rather than 400.
+# 2026-09: WEWIN/HMAAGRO/AARTIPHARM/MODIS/SHARDAMOTR/SURAKSHA shifted from
+# 400 to 429 once all free-tier keys hit hard quota, so the 400-only guard
+# no longer caught them. Reset on restart → each file gets a few attempts
+# per deploy, then is dropped.
+_GEMINI_RETRY_COUNTS: dict[tuple[str, str], int] = {}
+_GEMINI_MAX_FILE_FAILS = int(os.getenv('GEMINI_MAX_FILE_FAILS', '4'))
+
+
+def _gemini_give_up(symbol: str, url: str, reason: str) -> bool:
+    """Count a failure for (symbol, url). Returns True once the item has
+    failed GEMINI_MAX_FILE_FAILS times, marking it permanently no-retry for
+    this process. Prevents any single file from looping in retry forever."""
+    key = (symbol, url)
+    n = _GEMINI_RETRY_COUNTS.get(key, 0) + 1
+    _GEMINI_RETRY_COUNTS[key] = n
+    if n >= _GEMINI_MAX_FILE_FAILS:
+        _GEMINI_400_NO_RETRY.add(key)
+        log.warning(f"🚫 {symbol}: giving up on this file after {n} failures "
+                    f"({reason}) — no more re-uploads this process")
+        return True
+    return False
 # When Gemini starts failing: retry for ~10 min, then long-pause.
 _ABOUT_GEMINI_UNHEALTHY_SINCE: float | None = None
 # Hard quota / billing 429 — skip short retry, go straight to long cooldown.
@@ -1194,6 +1225,8 @@ async def extract_ppt_summary(session: aiohttp.ClientSession, symbol: str, attac
         )
         if status != 200:
             if status == 429:
+                if _gemini_give_up(symbol, attachment_url, '429'):
+                    return no_content_result
                 log.warning(f"⚠️ Gemini rate-limit hit for {symbol} presentation (429) - backing off")
                 await asyncio.sleep(int(os.getenv('GEMINI_429_BACKOFF_SECONDS', '45')))
             elif status == 400:
@@ -1206,13 +1239,19 @@ async def extract_ppt_summary(session: aiohttp.ClientSession, symbol: str, attac
                 return no_content_result
             else:
                 log.warning(f"⚠️ Gemini presentation extraction failed for {symbol} ({status}): {body[:200]}")
+                if _gemini_give_up(symbol, attachment_url, f'http {status}'):
+                    return no_content_result
             return error_result
     except asyncio.TimeoutError:
+        if _gemini_give_up(symbol, attachment_url, 'timeout'):
+            return no_content_result
         log.warning(f"⚠️ Gemini call timed out for {symbol} presentation ({gemini_timeout}s limit, "
                      f"PDF was {len(pdf_bytes)} bytes) - consider raising GEMINI_PPT_TIMEOUT_SECONDS")
         return error_result
     except Exception as e:
         log.warning(f"⚠️ Gemini call failed for {symbol} presentation: {type(e).__name__}: {e}")
+        if _gemini_give_up(symbol, attachment_url, f'{type(e).__name__}'):
+            return no_content_result
         return error_result
     try:
         candidates = data.get('candidates', [])
@@ -1562,6 +1601,10 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
         )
         if status != 200:
             if status == 429:
+                # Count toward per-file give-up — with all keys at hard quota,
+                # re-uploading the same file every cycle just burns egress.
+                if _gemini_give_up(symbol, attachment_url, '429'):
+                    return no_content_result
                 log.warning(f"⚠️ Gemini rate-limit hit for {symbol} transcript (429) - backing off")
                 await asyncio.sleep(int(os.getenv('GEMINI_429_BACKOFF_SECONDS', '45')))
             elif status == 400:
@@ -1576,15 +1619,21 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
                 return no_content_result
             else:
                 log.warning(f"⚠️ Gemini transcript extraction failed for {symbol} ({status}): {body[:200]}")
+                if _gemini_give_up(symbol, attachment_url, f'http {status}'):
+                    return no_content_result
             return error_result
     except asyncio.TimeoutError:
         kind = 'audio' if is_audio else 'PDF'
+        if _gemini_give_up(symbol, attachment_url, 'timeout'):
+            return no_content_result
         log.warning(f"⚠️ Gemini call timed out for {symbol} transcript ({gemini_timeout}s limit, "
                      f"{kind} was {len(file_bytes)} bytes) - consider raising "
                      f"{'GEMINI_AUDIO_TIMEOUT_SECONDS' if is_audio else 'GEMINI_TRANSCRIPT_TIMEOUT_SECONDS'}")
         return error_result
     except Exception as e:
         log.warning(f"⚠️ Gemini call failed for {symbol} transcript: {type(e).__name__}: {e}")
+        if _gemini_give_up(symbol, attachment_url, f'{type(e).__name__}'):
+            return no_content_result
         return error_result
     try:
         candidates = data.get('candidates', [])
