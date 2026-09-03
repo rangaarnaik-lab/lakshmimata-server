@@ -171,7 +171,8 @@ __all__ = [
     'time',
     'timedelta',
     'timezone',
-    'upload_snapshot_to_r2'
+    'upload_snapshot_to_r2',
+    'egress_trace_config'
 ]
 
 
@@ -2041,19 +2042,74 @@ async def save_fundamentals_batch_to_db(session: aiohttp.ClientSession, rows: li
     await asyncio.gather(*[upload(c) for c in chunks])
     log.info(f"  💾 Uploaded {uploaded}/{len(rows)} fundamentals rows to Supabase")
 
-def _r2_put_object_sync(key: str, body: bytes, content_type: str, cache_seconds: int):
+# ── Egress metering ────────────────────────────────────────────────────
+# Railway shows only a single total-egress number. This TraceConfig, passed
+# to the service's shared ClientSession, accumulates outbound bytes PER
+# HOST and logs a ranked summary every 15 minutes, so the Railway logs
+# show exactly which endpoint (Gemini? Supabase? R2? Telegram?) is
+# consuming the egress budget. Overhead is one dict update per chunk.
+_egress_bytes: dict = {}
+_EGRESS_LOG_EVERY_SEC = int(os.getenv('EGRESS_LOG_EVERY_SEC', '900'))
+_egress_last_log = [0.0]
+
+def egress_trace_config():
+    import aiohttp  # local import — shared.py is also imported by tools
+    tc = aiohttp.TraceConfig()
+
+    async def _on_start(session, ctx, params):
+        try:
+            ctx._eg_host = params.url.host or 'unknown'
+        except Exception:
+            ctx._eg_host = 'unknown'
+
+    async def _on_chunk_sent(session, ctx, params):
+        try:
+            n = len(params.chunk)
+        except Exception:
+            return
+        host = getattr(ctx, '_eg_host', 'unknown')
+        _egress_bytes[host] = _egress_bytes.get(host, 0) + n
+        now = time.time()
+        if now - _egress_last_log[0] >= _EGRESS_LOG_EVERY_SEC:
+            _egress_last_log[0] = now
+            total = sum(_egress_bytes.values())
+            ranked = sorted(_egress_bytes.items(), key=lambda kv: -kv[1])[:6]
+            log.info("📡 EGRESS (since boot, by host): " + " · ".join(
+                f"{h}={b/1e9:.2f}GB" if b >= 1e9 else f"{h}={b/1e6:.1f}MB"
+                for h, b in ranked) + f" — TOTAL={total/1e9:.2f}GB")
+
+    tc.on_request_start.append(_on_start)
+    tc.on_request_chunk_sent.append(_on_chunk_sent)
+    return tc
+
+def _r2_put_object_sync(key: str, body: bytes, content_type: str, cache_seconds: int,
+                        content_encoding: str | None = None):
     """The actual blocking boto3 call — only ever invoked inside
     asyncio.to_thread() below, never directly on the event loop.
     Moved here from live_scan.py (2026-08-01) so fundamentals_worker.py
     can also upload snapshots (e.g. announcements) to R2, not just
     live_scan.py's stock snapshot."""
+    extra = {}
+    if content_encoding:
+        extra['ContentEncoding'] = content_encoding
     _r2_client.put_object(
         Bucket=R2_BUCKET_NAME,
         Key=key,
         Body=body,
         ContentType=content_type,
         CacheControl=f'public, max-age={cache_seconds}',
+        **extra,
     )
+
+# Last uploaded (gzipped) body per snapshot key — skip-if-unchanged so the
+# scanner/worker stop re-uploading identical JSON every cycle. In-memory is
+# enough: after a restart the first upload always goes through, which is
+# exactly what we want. Bounded by the small number of snapshot keys used.
+_r2_last_bodies: dict = {}
+
+# Egress-saving switch for the R2 snapshot path (gzip + skip-if-unchanged).
+R2_SNAPSHOT_EFFICIENT = (os.getenv('R2_SNAPSHOT_EFFICIENT') or '1').strip().lower() not in (
+    '0', 'false', 'no', 'off')
 
 async def upload_snapshot_to_r2(key: str, data, cache_seconds: int = 60):
     """Uploads a JSON snapshot to R2 for the frontend to read directly
@@ -2069,6 +2125,14 @@ async def upload_snapshot_to_r2(key: str, data, cache_seconds: int = 60):
     missing or stale, so a failed upload here degrades gracefully rather
     than breaking anything.
 
+    Egress reduction (2026-09, R2_SNAPSHOT_EFFICIENT=1 default):
+    1. The body is gzipped before upload (JSON compresses ~10x) and stored
+       with Content-Encoding: gzip — browsers/fetch() transparently
+       decompress, so the frontend needs no changes.
+    2. If the gzipped body is byte-identical to the last upload for this
+       key, the upload is skipped entirely — repeated identical cycles
+       cost zero egress.
+
     Shared (2026-08-01) between live_scan.py (stock snapshots) and
     fundamentals_worker.py (announcement snapshots) - same mechanism,
     different keys."""
@@ -2082,7 +2146,19 @@ async def upload_snapshot_to_r2(key: str, data, cache_seconds: int = 60):
         return
     try:
         body = json.dumps(data, default=str).encode('utf-8')
-        await asyncio.to_thread(_r2_put_object_sync, key, body, 'application/json', cache_seconds)
-        log.info(f"  ☁️ Uploaded {key} to R2 ({len(body)/1024:.1f} KB)")
+        content_encoding = None
+        if R2_SNAPSHOT_EFFICIENT:
+            import gzip as _gzip
+            gz = _gzip.compress(body, compresslevel=6)
+            if gz < len(body) * 0.9:  # only worth it when clearly smaller
+                body = gz
+                content_encoding = 'gzip'
+            if _r2_last_bodies.get(key) == body:
+                return  # unchanged since last cycle — zero egress
+            _r2_last_bodies[key] = body
+        await asyncio.to_thread(_r2_put_object_sync, key, body, 'application/json',
+                                cache_seconds, content_encoding)
+        log.info(f"  ☁️ Uploaded {key} to R2 ({len(body)/1024:.1f} KB"
+                 + (", gzipped" if content_encoding else "") + ")")
     except Exception as e:
         log.warning(f"⚠️ R2 upload failed for {key}: {e}")

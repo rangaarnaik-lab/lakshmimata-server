@@ -76,6 +76,12 @@ _ABOUT_OPTIONAL_COLS_MISSING = False  # set True after PGRST204 on image/sources
 _RESULT_RATING_COLS_MISSING = False  # set True after PGRST204 on result_rating*
 # (symbol, attachment_url) permanently done for Gemini — never re-queue in-process.
 _RESULTS_PDF_NO_RETRY: set[tuple[str, str]] = set()
+# (symbol, attachment_url) that Gemini permanently rejected with 400
+# INVALID_ARGUMENT (corrupt/unsupported PDF or audio). Re-downloading and
+# re-uploading the same file every cycle burned tens of GB of Railway
+# egress for zero chance of success (WEWIN/AARTIPHARM/MODIS/... 2026-09).
+# In-memory: cleared on restart, so each gets exactly one retry per deploy.
+_GEMINI_400_NO_RETRY: set[tuple[str, str]] = set()
 # When Gemini starts failing: retry for ~10 min, then long-pause.
 _ABOUT_GEMINI_UNHEALTHY_SINCE: float | None = None
 # Hard quota / billing 429 — skip short retry, go straight to long cooldown.
@@ -1041,6 +1047,8 @@ async def extract_ppt_summary(session: aiohttp.ClientSession, symbol: str, attac
     usable was found (safe to mark done)."""
     error_result = {'summary': None, 'error': True}
     no_content_result = {'summary': None, 'error': False}
+    if (symbol, attachment_url) in _GEMINI_400_NO_RETRY:
+        return no_content_result  # Gemini permanently rejected this file — do not re-upload
     api_key = _gemini_api_key_next('PPT')
     if not api_key or not attachment_url:
         return error_result
@@ -1061,7 +1069,22 @@ async def extract_ppt_summary(session: aiohttp.ClientSession, symbol: str, attac
     if len(pdf_bytes) > 15_000_000:
         log.warning(f"⚠️ Presentation PDF too large for {symbol} ({len(pdf_bytes)} bytes) - skipping")
         return no_content_result
-    pdf_b64 = base64.b64encode(pdf_bytes).decode('ascii')
+    # ── EGRESS REDUCTION: text-first for PPT decks ────────────────────
+    # Slide text extracts well with pypdf, so send a few KB of text instead
+    # of a multi-MB base64 deck. Fall back to a page-capped PDF only when
+    # text extraction is too thin (scanned/image-only decks).
+    deck_text = await _extract_pdf_text(pdf_bytes, max_pages=20)
+    if deck_text and len(deck_text) >= int(os.getenv('PPT_TEXT_MIN_CHARS', '1500')):
+        pdf_b64 = None
+        log.info(f"  📄 {symbol}: PPT text-first ({len(deck_text)/1024:.0f}KB text instead of "
+                 f"{len(pdf_bytes)/1e6:.1f}MB PDF — egress saving)")
+    else:
+        trimmed = await _trim_pdf_pages(pdf_bytes, int(os.getenv('PPT_PDF_MAX_PAGES', '20')))
+        if trimmed is not None:
+            log.info(f"  ✂️ {symbol}: PPT trimmed to first {os.getenv('PPT_PDF_MAX_PAGES', '20')} pages "
+                     f"({len(pdf_bytes)/1e6:.1f}MB → {len(trimmed)/1e6:.1f}MB)")
+            pdf_bytes = trimmed
+        pdf_b64 = base64.b64encode(pdf_bytes).decode('ascii')
     prompt = (
         "This is an investor/analyst presentation (slide deck) filed by an Indian listed "
         "company with NSE/BSE. Read the full deck - text, tables, and any charts you can "
@@ -1148,12 +1171,20 @@ async def extract_ppt_summary(session: aiohttp.ClientSession, symbol: str, attac
     model = os.getenv('GEMINI_CONCALL_MODEL', 'gemini-3.1-flash-lite')
     gemini_timeout = int(os.getenv('GEMINI_PPT_TIMEOUT_SECONDS', '120'))
     try:
+        # Text-first mode: when the deck's text was extracted locally
+        # (pdf_b64 is None), send the text instead of the full PDF —
+        # same schema, ~100x less egress.
+        if pdf_b64:
+            media_part = {"inline_data": {"mime_type": "application/pdf", "data": pdf_b64}}
+        else:
+            media_part = {"text": "PRESENTATION TEXT (extracted from the deck's slides; "
+                                  "charts/images are not available):\n\n" + deck_text[:12000]}
         status, data, body = await _gemini_generate(
             session,
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
             {
                 "contents": [{"parts": [
-                    {"inline_data": {"mime_type": "application/pdf", "data": pdf_b64}},
+                    media_part,
                     {"text": prompt},
                 ]}],
                 "generationConfig": {"responseMimeType": "application/json", "responseSchema": schema},
@@ -1165,6 +1196,14 @@ async def extract_ppt_summary(session: aiohttp.ClientSession, symbol: str, attac
             if status == 429:
                 log.warning(f"⚠️ Gemini rate-limit hit for {symbol} presentation (429) - backing off")
                 await asyncio.sleep(int(os.getenv('GEMINI_429_BACKOFF_SECONDS', '45')))
+            elif status == 400:
+                # INVALID_ARGUMENT is PERMANENT (corrupt/unsupported PDF).
+                # Mark no-retry — treating it as transient re-downloaded and
+                # re-uploaded the same multi-MB file every cycle, 24/7.
+                _GEMINI_400_NO_RETRY.add((symbol, attachment_url))
+                log.warning(f"⚠️ {symbol}: Gemini permanently rejected presentation (400) "
+                            f"— will not retry this file")
+                return no_content_result
             else:
                 log.warning(f"⚠️ Gemini presentation extraction failed for {symbol} ({status}): {body[:200]}")
             return error_result
@@ -1254,9 +1293,23 @@ async def _gemini_upload_file(session: aiohttp.ClientSession, api_key: str,
     """Upload bytes via Gemini Files API (resumable). Returns file.uri or None.
 
     Required for long concall audio (often >20MB). Files expire ~48h; we only
-    need the URI for the immediate generateContent call."""
+    need the URI for the immediate generateContent call.
+
+    Egress guard: audio uploads are the single largest outbound cost in this
+    worker (a 1-hour call is often 20-60MB, and it ALL counts as Railway
+    egress). GEMINI_MAX_AUDIO_BYTES caps what we're willing to upload —
+    anything bigger is skipped (transient-style: caller can retry a smaller
+    source; the announcement is not marked done). Default 60MB; set 0 to
+    disable the cap."""
     if not api_key or not data:
         return None
+    if (mime_type or '').startswith('audio/'):
+        max_audio = int(os.getenv('GEMINI_MAX_AUDIO_BYTES', str(60_000_000)))
+        if max_audio and len(data) > max_audio:
+            log.warning(f"⚠️ Skipping {display_name}: audio is {len(data)/1e6:.1f}MB "
+                        f"(> GEMINI_MAX_AUDIO_BYTES {max_audio/1e6:.0f}MB) — "
+                        f"too much Railway egress for one call")
+            return None
     start_url = f"https://generativelanguage.googleapis.com/upload/v1beta/files?key={api_key}"
     try:
         async with session.post(
@@ -1315,6 +1368,8 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
     summary=None → nothing to save (safe to mark done)."""
     error_result = {'summary': None, 'error': True}
     no_content_result = {'summary': None, 'error': False}
+    if (symbol, attachment_url) in _GEMINI_400_NO_RETRY:
+        return no_content_result  # Gemini permanently rejected this file — do not re-upload
     api_key = _gemini_api_key_next('TRANSCRIPT')
     if not api_key or not attachment_url:
         return error_result
@@ -1346,6 +1401,16 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
     if (not is_audio) and len(file_bytes) > max_pdf:
         log.warning(f"⚠️ Transcript PDF too large for {symbol} ({len(file_bytes)} bytes) - skipping")
         return no_content_result
+    # Egress reduction: transcripts are text — trim to the first N pages
+    # before the base64 upload (Q&A tails behind the call rarely justify
+    # re-uploading a 10MB file every retry).
+    if not is_audio:
+        _t_pages = int(os.getenv('TRANSCRIPT_PDF_MAX_PAGES', '30'))
+        _t_trim = await _trim_pdf_pages(file_bytes, _t_pages)
+        if _t_trim is not None:
+            log.info(f"  ✂️ {symbol}: transcript PDF trimmed to first {_t_pages} pages "
+                     f"({len(file_bytes)/1e6:.1f}MB → {len(_t_trim)/1e6:.1f}MB — egress saving)")
+            file_bytes = _t_trim
 
     if is_audio:
         media_intro = (
@@ -1499,6 +1564,16 @@ async def extract_transcript_summary(session: aiohttp.ClientSession, symbol: str
             if status == 429:
                 log.warning(f"⚠️ Gemini rate-limit hit for {symbol} transcript (429) - backing off")
                 await asyncio.sleep(int(os.getenv('GEMINI_429_BACKOFF_SECONDS', '45')))
+            elif status == 400:
+                # INVALID_ARGUMENT is PERMANENT (corrupt/unsupported PDF or
+                # audio). Marking no-retry: treating it as transient made the
+                # loop re-download and re-upload the same multi-MB file every
+                # cycle around the clock (AARTIPHARM/MODIS/HMAAGRO/SHARDAMOTR/
+                # SURAKSHA, 2026-09) — tens of GB of wasted Railway egress.
+                _GEMINI_400_NO_RETRY.add((symbol, attachment_url))
+                log.warning(f"⚠️ {symbol}: Gemini permanently rejected transcript (400) "
+                            f"— will not retry this file")
+                return no_content_result
             else:
                 log.warning(f"⚠️ Gemini transcript extraction failed for {symbol} ({status}): {body[:200]}")
             return error_result
@@ -1617,6 +1692,17 @@ async def extract_results_from_pdf(session: aiohttp.ClientSession, symbol: str, 
         return error_result
     # Gemini inline PDF ~20MB request limit; base64 expands ~4/3, so keep
     # raw PDF under ~15MB to avoid 400 INVALID_ARGUMENT loops.
+    # ── EGRESS REDUCTION: page-cap before upload ──────────────────────
+    # Results tables live in the first few pages of the filing; appendix
+    # pages behind them were being uploaded (base64, +33%) for nothing.
+    # First trim to RESULTS_PDF_MAX_PAGES, THEN apply the size limit —
+    # most oversized filings become small once trimmed.
+    trimmed = await _trim_pdf_pages(pdf_bytes, int(os.getenv('RESULTS_PDF_MAX_PAGES', '12')))
+    if trimmed is not None:
+        log.info(f"  ✂️ {symbol}: results PDF trimmed to first "
+                 f"{os.getenv('RESULTS_PDF_MAX_PAGES', '12')} pages "
+                 f"({len(pdf_bytes)/1e6:.1f}MB → {len(trimmed)/1e6:.1f}MB — egress saving)")
+        pdf_bytes = trimmed
     max_pdf = int(os.getenv('RESULTS_PDF_MAX_BYTES', str(15_000_000)))
     if len(pdf_bytes) > max_pdf:
         log.warning(f"⚠️ Results PDF too large for {symbol} ({len(pdf_bytes)} bytes) - skipping "
@@ -7988,7 +8074,9 @@ async def fundamentals_worker_main():
         log.info("  📘 About-company: enabled (will also resume after any 24h Gemini hard stop)")
 
     connector = aiohttp.TCPConnector(limit=20, ssl=False)
-    async with aiohttp.ClientSession(connector=connector) as session:
+    async with aiohttp.ClientSession(
+            connector=connector,
+            trace_configs=[egress_trace_config()]) as session:
         await load_instrument_master(session)  # needed for ISIN lookups (Upstox fundamentals API)
         try:
             await _log_worker_backlog_summary(session, reason='startup')
@@ -8254,6 +8342,119 @@ def rate_announcements_free(rows: list) -> list:
                 r['ai_summary'] = f"₹{val:,.0f} Cr mentioned in filing"
     return rows
 
+_PDF_TEXT_MAX_BYTES = int(os.getenv('GENERIC_ANN_PDF_MAX_BYTES', str(10_000_000)))
+_PDF_TEXT_MAX_CHARS = int(os.getenv('GENERIC_ANN_TEXT_MAX_CHARS', '4000'))
+_PDF_TEXT_MAX_PER_CYCLE = int(os.getenv('GENERIC_ANN_PDF_PER_CYCLE', '8'))
+
+
+def _is_generic_announcement(row: dict) -> bool:
+    """True for generic announcements (order wins, capex, credit rating,
+    partnerships, etc.) whose attachment should be read LOCALLY via pypdf
+    text extraction rather than uploaded to Gemini. Transcript / investor
+    presentation / results filings are deliberately excluded — those keep
+    the full-PDF Gemini path (they need layout + table understanding)."""
+    text = ((row.get('category') or '') + ' ' + (row.get('subject') or '')).lower()
+    if not text.strip():
+        return False
+    # Never double-process the specialised Gemini-PDF pipelines.
+    if _is_transcript_announcement(row) or _is_ppt_announcement(row):
+        return False
+    if any(p in text for p in _RESULTS_ANN_KEYWORDS):
+        return False
+    if any(p in text for p in _RESULTS_ANN_EXCLUDE):
+        return False
+    # Generic / routine corporate news worth enriching with the PDF text.
+    generic_hits = (
+        list(_ORDER_WIN_PATTERNS)
+        + list(_ANN_POSITIVE_PATTERNS)
+        + list(_ANN_NEGATIVE_PATTERNS)
+    )
+    return any(p in text for p in generic_hits)
+
+
+async def _extract_pdf_text(pdf_bytes: bytes, max_pages: int = 8) -> str | None:
+    """Extract plain text from a PDF locally (pypdf, run in a thread —
+    parsing is CPU-bound). Returns up to _PDF_TEXT_MAX_CHARS of text, or
+    None when the PDF yields nothing usable (scanned/image-only filings).
+    This replaces a multi-MB base64 upload to Gemini with a few KB of
+    text — cutting Railway egress by ~100x for generic announcements."""
+    if not pdf_bytes or len(pdf_bytes) > _PDF_TEXT_MAX_BYTES:
+        return None
+    try:
+        import io
+        from pypdf import PdfReader
+        def _parse():
+            reader = PdfReader(io.BytesIO(pdf_bytes))
+            chunks = []
+            total = 0
+            for page in reader.pages[:max_pages]:
+                t = (page.extract_text() or '').strip()
+                if not t:
+                    continue
+                chunks.append(t)
+                total += len(t)
+                if total >= _PDF_TEXT_MAX_CHARS:
+                    break
+            return '\n'.join(chunks)[:_PDF_TEXT_MAX_CHARS]
+        text = await asyncio.to_thread(_parse)
+        return text
+    except Exception as e:
+        log.debug(f"pypdf text extraction failed: {type(e).__name__}: {e}")
+        return None
+
+
+async def _generic_ann_attachment_text(session: aiohttp.ClientSession, row: dict) -> str:
+    """Download a generic announcement's attachment and return a trimmed
+    plain-text excerpt (pypdf, local). Returns '' on any failure — the
+    rating call degrades to subject-only exactly as before."""
+    url = row.get('attachment_url') or ''
+    if not url or _attachment_looks_like_audio(url):
+        return ''
+    try:
+        async with session.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.nseindia.com"},
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as r:
+            if r.status != 200:
+                return ''
+            ctype = (r.headers.get('Content-Type') or '').lower()
+            if ctype and 'pdf' not in ctype and 'octet-stream' not in ctype:
+                return ''
+            pdf_bytes = await r.read()
+    except Exception:
+        return ''
+    text = await _extract_pdf_text(pdf_bytes)
+    return (text or '').strip()
+
+
+async def _trim_pdf_pages(pdf_bytes: bytes, max_pages: int):
+    """Return a PDF containing only the first max_pages pages, or None when
+    no trimming is needed (document already <= max_pages). Runs pypdf in a
+    thread. Used to shrink Gemini uploads: financial tables in results
+    filings live in the first few pages; 100-page appendices behind them
+    were costing multi-MB base64 uploads for zero extraction benefit."""
+    if not pdf_bytes:
+        return None
+    try:
+        import io
+        from pypdf import PdfReader, PdfWriter
+        def _trim():
+            reader = PdfReader(io.BytesIO(pdf_bytes))
+            if len(reader.pages) <= max_pages:
+                return None
+            writer = PdfWriter()
+            for page in reader.pages[:max_pages]:
+                writer.add_page(page)
+            buf = io.BytesIO()
+            writer.write(buf)
+            return buf.getvalue()
+        return await asyncio.to_thread(_trim)
+    except Exception as e:
+        log.debug(f"PDF trim failed ({type(e).__name__}: {e}) — sending original")
+        return None
+
+
 async def rate_announcements_with_ai(session: aiohttp.ClientSession, rows: list) -> list:
     """Tags each announcement with an AI sentiment rating ('positive' /
     'neutral' / 'negative') via one batched Anthropic API call per polling
@@ -8267,9 +8468,26 @@ async def rate_announcements_with_ai(session: aiohttp.ClientSession, rows: list)
         return rows
     if not api_key:
         return rate_announcements_free(rows)
+    # ── Generic-announcement PDF text enrichment (pypdf, local) ──────
+    # Order wins / generic corporate news: read the attachment LOCALLY and
+    # send only a few KB of extracted text — never the raw PDF to Gemini.
+    # Specialised filings (transcripts / PPTs / results) are excluded by
+    # _is_generic_announcement and keep their own full-PDF Gemini paths.
+    # Excerpts are kept in a local dict (NOT on the row dicts) so the
+    # Supabase upsert payload is never polluted with a non-column key.
+    enrich_targets = [(i, r) for i, r in enumerate(rows) if _is_generic_announcement(r)][: _PDF_TEXT_MAX_PER_CYCLE]
+    excerpts_by_idx: dict[int, str] = {}
+    if enrich_targets:
+        excerpts = await asyncio.gather(
+            *[_generic_ann_attachment_text(session, r) for _, r in enrich_targets])
+        excerpts_by_idx = {i: e for (i, _), e in zip(enrich_targets, excerpts) if e}
+        log.info(f"  📄 Generic-announcement PDFs text-extracted: {len(excerpts_by_idx)}/"
+                 f"{len(enrich_targets)} (pypdf local — no Gemini upload)")
     listing = "\n".join(
         f"{i+1}. [{r.get('symbol')}, mcap ₹{int(r['market_cap']) if r.get('market_cap') else '?'} Cr] "
         f"{(r.get('category') or '')}: {(r.get('subject') or '')[:300]}"
+        + (f"\n   ATTACHMENT TEXT: {excerpts_by_idx[i][:1200]}"
+           if i in excerpts_by_idx else '')
         for i, r in enumerate(rows)
     )
     prompt = (
