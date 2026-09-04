@@ -99,6 +99,63 @@ _GEMINI_400_NO_RETRY: set[tuple[str, str]] = set()
 _GEMINI_RETRY_COUNTS: dict[tuple[str, str], int] = {}
 _GEMINI_MAX_FILE_FAILS = int(os.getenv('GEMINI_MAX_FILE_FAILS', '4'))
 
+# Global aiohttp session reference for Gemini fallback (set at startup)
+_gemini_fallback_session: aiohttp.ClientSession | None = None
+
+
+# ── Gemini fundamentals fallback (when Upstox token expires) ────────────
+# When all Upstox calls return 401, use Gemini to extract key metrics from
+# announcements text. Registered into shared._gemini_fallback_fn at startup.
+
+async def _gemini_fundamentals_fallback(sym: str, text: str) -> dict:
+    """Extract key fundamentals from announcements text using Gemini.
+    Called by shared.fetch_gemini_fundamentals when Upstox is unavailable."""
+    model = os.getenv('GEMINI_FALLBACK_MODEL', 'gemini-2.0-flash')
+    prompt = (
+        f"Extract key financial fundamentals for {sym} from the following "
+        f"corporate announcements. Return ONLY a JSON object with these keys "
+        f"(use null if not found): market_cap, pe, roe, eps, debt_eq, promoter, "
+        f"pb, roce, div_yield, industry. Values should be numbers (no units). "
+        f"Example: {{\"pe\": 25.3, \"roe\": 18.2, \"market_cap\": 50000, "
+        f"\"industry\": \"Pharmaceuticals\"}}\n\n"
+        f"Announcements:\n{text[:6000]}"
+    )
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"maxOutputTokens": 500},
+    }
+    try:
+        status, data, _txt, _exhausted, _key = await _gemini_generate_rotating(
+            _gemini_fallback_session,
+            model=model,
+            body=body,
+            timeout_s=60,
+            symbol=sym,
+            label='fundamentals fallback',
+        )
+        if status == 200 and data:
+            # Extract text from Gemini response
+            candidates = data.get('candidates', [])
+            if candidates:
+                parts = candidates[0].get('content', {}).get('parts', [])
+                for part in parts:
+                    txt = part.get('text', '')
+                    if txt:
+                        import re as _re
+                        match = _re.search(r'\{[^}]+\}', txt)
+                        if match:
+                            return json.loads(match.group())
+    except Exception:
+        pass
+    return {}
+
+
+def _register_gemini_fundamentals_fallback():
+    """Register the Gemini fallback function in shared module."""
+    import shared as _shared
+    _shared._gemini_fallback_fn = _gemini_fundamentals_fallback
+    log.info("  🔍 Gemini fundamentals fallback registered (for Upstox 401)")
+
 
 def _gemini_give_up(symbol: str, url: str, reason: str) -> bool:
     """Count a failure for (symbol, url). Returns True once the item has
@@ -8171,6 +8228,11 @@ async def fundamentals_worker_main():
     async with aiohttp.ClientSession(
             connector=connector,
             trace_configs=[egress_trace_config()]) as session:
+        # Store global session reference for Gemini fallback
+        global _gemini_fallback_session
+        _gemini_fallback_session = session
+        # Register Gemini fundamentals fallback (for Upstox 401)
+        _register_gemini_fundamentals_fallback()
         await load_instrument_master(session)  # needed for ISIN lookups (Upstox fundamentals API)
         try:
             await _log_worker_backlog_summary(session, reason='startup')

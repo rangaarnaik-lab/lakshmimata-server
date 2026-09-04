@@ -1525,6 +1525,63 @@ async def fetch_upstox_fundamentals(session: aiohttp.ClientSession, sym: str, is
 
     return result if got_any else None
 
+
+# ── Gemini-based fundamentals fallback ──────────────────────────────────
+# When Upstox token expires (all 401s), use Gemini to extract key metrics
+# from available announcements text. Not as comprehensive as Upstox, but
+# better than leaving fundamentals blank for weeks.
+
+_gemini_fallback_fn = None  # registered by fundamentals_worker at startup
+_gemini_fundamentals_debug_count = 0
+
+async def fetch_gemini_fundamentals(session: aiohttp.ClientSession, sym: str,
+                                     announcements_text: str = "",
+                                     debug: bool = False) -> Optional[dict]:
+    """Extract key fundamentals from announcements text using Gemini.
+    Fallback when Upstox token is expired (401). Returns partial data."""
+    global _gemini_fundamentals_debug_count
+
+    if not announcements_text or not _gemini_fallback_fn:
+        return None
+
+    # Truncate to avoid burning tokens on long texts
+    text = announcements_text[:8000]
+
+    try:
+        data = await _gemini_fallback_fn(sym, text)
+        if not data or not isinstance(data, dict):
+            return None
+
+        result = {
+            'market_cap': data.get('market_cap'), 'pe': data.get('pe'),
+            'roe': data.get('roe'), 'eps': data.get('eps'),
+            'debt_eq': data.get('debt_eq'), 'promoter': data.get('promoter'),
+            'eps_qoq': None, 'eps_yoy': None, 'sales_qoq': None, 'sales_yoy': None,
+            'opm_pct': None, 'opm_trend': None, 'eps_growth_streak': None,
+            'fii_pct': None, 'fii_trend': None, 'dii_pct': None, 'dii_trend': None,
+            'promoter_trend': None, 'peg_ratio': None,
+            'industry': data.get('industry'),
+            'shares_outstanding': None,
+            'pb': data.get('pb'), 'roce': data.get('roce'),
+            'industry_pe': None, 'div_yield': data.get('div_yield'),
+            'cfo': None, 'fcf': None, 'cfo_pat': None,
+            'nim': None, 'gnpa': None, 'nnpa': None, 'car': None, 'casa': None,
+        }
+
+        got_any = any(v is not None for v in result.values())
+        if debug or (_gemini_fundamentals_debug_count < 5 and got_any):
+            _gemini_fundamentals_debug_count += 1
+            log.info(f"  🔍 {sym} Gemini fundamentals: pe={result['pe']}, roe={result['roe']}, "
+                     f"mcap={result['market_cap']}, industry={result['industry']}")
+
+        return result if got_any else None
+
+    except Exception as e:
+        if debug:
+            log.info(f"  🔍 {sym} Gemini fundamentals error: {type(e).__name__}: {e}")
+        return None
+
+
 # Quick-service / restaurant chains — our lookup table tags many as "Hotels";
 # StockEdge groups them under Leisure - Restaurants.
 QSR_INDUSTRY_OVERRIDES = {
@@ -1700,7 +1757,17 @@ async def load_fundamentals_batch(session: aiohttp.ClientSession, symbols: list)
         # Upstox/CSV/other sources fill them.
         if upstox_data is not None:
             return upstox_data
-        return {
+        # Gemini fallback when Upstox token expired (all 401s)
+        if _gemini_fallback_fn:
+            try:
+                ann_text = await _fetch_announcements_text_for_gemini(sym)
+                if ann_text:
+                    gemini_data = await fetch_gemini_fundamentals(session, sym, ann_text, debug=debug)
+                    if gemini_data is not None:
+                        return gemini_data
+            except Exception:
+                pass
+                return {
             'market_cap': None, 'pe': None, 'roe': None, 'eps': None, 'debt_eq': None, 'promoter': None,
             'eps_qoq': None, 'eps_yoy': None, 'sales_qoq': None, 'sales_yoy': None,
             'opm_pct': None, 'opm_trend': None, 'eps_growth_streak': None,
@@ -1711,7 +1778,6 @@ async def load_fundamentals_batch(session: aiohttp.ClientSession, symbols: list)
             'cfo': None, 'fcf': None, 'cfo_pat': None,
             'nim': None, 'gnpa': None, 'nnpa': None, 'car': None, 'casa': None,
         }
-
 
     global _fundamentals_debug_count
     # Confirmed via the error-type summary: BATCH=20 (x2 endpoints per
@@ -1761,6 +1827,27 @@ async def load_fundamentals_batch(session: aiohttp.ClientSession, symbols: list)
     if _fetch_error_counts:
         summary = ', '.join(f"{k}={v}" for k, v in sorted(_fetch_error_counts.items(), key=lambda x: -x[1]))
         log.info(f"  📋 Fetch outcome breakdown: {summary}")
+
+
+async def _fetch_announcements_text_for_gemini(sym: str) -> str:
+    """Fetch recent announcements text from Supabase for Gemini fallback.
+    Returns concatenated text or empty string."""
+    try:
+        if not supabase:
+            return ""
+        resp = supabase.table("announcements") \
+            .select("attchmntText,symbol,an_dt") \
+            .eq("symbol", sym) \
+            .order("an_dt", desc=True) \
+            .limit(10) \
+            .execute()
+        if resp.data:
+            texts = [r.get("attchmntText", "") for r in resp.data if r.get("attchmntText")]
+            return "\n\n".join(texts[:5])  # top 5 recent announcements
+    except Exception:
+        pass
+    return ""
+
 
 async def load_fundamentals_from_supabase(session: aiohttp.ClientSession) -> list:
     """
