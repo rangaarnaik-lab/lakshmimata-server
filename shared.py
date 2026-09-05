@@ -30,6 +30,7 @@ import xml.etree.ElementTree as ET
 from botocore.config import Config as BotoConfig
 from datetime import datetime, timezone, timedelta
 from typing import Optional
+from urllib.parse import quote
 
 # ── Logging ───────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -448,6 +449,135 @@ _fetch_error_counts: dict = {}  # exception-type name -> count, reset per load_f
 # aggregated (not logged per-call) so a systemic failure shows up as one
 # clear summary line instead of thousands of repeated log entries
 
+# ── Yahoo Finance fundamentals fallback ────────────────────────────────
+# Upstox's key-ratios endpoint provides P/E but never market cap, and the
+# old Screener.in fallback that used to fill market cap (and second-chance
+# P/E) was removed because Railway's IP is rate-limited/blocked. Yahoo's
+# v10 quoteSummary carries both trailingPE and marketCap, but requires a
+# cookie+crumb token. All of this is best-effort: any failure just leaves
+# the fields None, no worse than before.
+ENABLE_YAHOO_FUNDAMENTALS = (
+    (os.getenv('ENABLE_YAHOO_FUNDAMENTALS') or '1').strip().lower()
+    not in ('0', 'false', 'off', 'no')
+)
+_yahoo_crumb: Optional[str] = None
+_yahoo_crumb_at: float = 0.0
+_YAHOO_CRUMB_TTL = 3600.0  # refresh the crumb token hourly
+_YAHOO_SUMMARY_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "Accept": "application/json,text/plain,*/*",
+}
+
+
+async def _yahoo_get_crumb(session: aiohttp.ClientSession) -> Optional[str]:
+    """Obtain a Yahoo Finance crumb token for the v10 quoteSummary endpoint.
+
+    First hits fc.yahoo.com so its Set-Cookie lands in the (cookie-aware)
+    aiohttp session jar, then requests the crumb using those cookies.
+    Cached briefly so we don't re-fetch per symbol. Returns None on any
+    failure so callers simply skip the Yahoo fundamentals fallback.
+    """
+    global _yahoo_crumb, _yahoo_crumb_at
+    now = time.time()
+    if _yahoo_crumb and (now - _yahoo_crumb_at) < _YAHOO_CRUMB_TTL:
+        return _yahoo_crumb
+    try:
+        async with session.get(
+            "https://fc.yahoo.com", headers=_YAHOO_SUMMARY_HEADERS,
+            timeout=aiohttp.ClientTimeout(total=8)) as _:
+            pass  # cookies are stored in the session jar
+        async with session.get(
+            "https://query1.finance.yahoo.com/v1/test/getcrumb",
+            headers=_YAHOO_SUMMARY_HEADERS,
+            timeout=aiohttp.ClientTimeout(total=8)) as r:
+            if r.status == 200:
+                c = (await r.text()).strip()
+                if c:
+                    _yahoo_crumb, _yahoo_crumb_at = c, now
+                    return c
+    except Exception as e:
+        key = f'yahoo_crumb_{type(e).__name__}'
+        _fetch_error_counts[key] = _fetch_error_counts.get(key, 0) + 1
+    return None
+
+
+async def fetch_yahoo_fundamentals(session: aiohttp.ClientSession, sym: str,
+                                   debug: bool = False) -> dict:
+    """Best-effort Yahoo fallback that populates P/E + market cap for NSE/BSE
+    symbols where Upstox leaves them None.
+
+    Uses Yahoo's v10 quoteSummary endpoint (requires a crumb token). Tries the
+    .NS ticker then .BO, mirroring fetch_yahoo_full_ohlcv. Returns a partial
+    dict with 'pe', 'market_cap' and 'shares_outstanding' in the SAME units as
+    the rest of the pipeline (market_cap in crore rupees), or {} when Yahoo
+    returns nothing usable.
+    """
+    if not ENABLE_YAHOO_FUNDAMENTALS:
+        return {}
+    crumb = await _yahoo_get_crumb(session)
+    if not crumb:
+        return {}
+
+    def get_raw(mod, key):
+        if not isinstance(mod, dict):
+            return None
+        v = mod.get(key) or {}
+        return v.get('raw')
+
+    for suffix in ('.NS', '.BO'):
+        ticker = f"{sym}{suffix}"
+        url = ("https://query1.finance.yahoo.com/v10/finance/quoteSummary/"
+               f"{quote(ticker)}?modules=price,summaryDetail,defaultKeyStatistics"
+               f"&crumb={quote(crumb)}")
+        try:
+            async with session.get(url, headers=_YAHOO_SUMMARY_HEADERS,
+                                   timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status != 200:
+                    key = f'yahoo_quote_summary_{r.status}'
+                    _fetch_error_counts[key] = _fetch_error_counts.get(key, 0) + 1
+                    continue
+                data = await r.json()
+        except Exception as e:
+            key = f'yahoo_quote_summary_{type(e).__name__}'
+            _fetch_error_counts[key] = _fetch_error_counts.get(key, 0) + 1
+            continue
+
+        result_list = (data.get('quoteSummary') or {}).get('result') or []
+        if not result_list:
+            continue
+        m = result_list[0]
+        price_mod = m.get('price') or {}
+        summary = m.get('summaryDetail') or {}
+        default_ks = m.get('defaultKeyStatistics') or {}
+
+        out = {}
+        mcap = get_raw(price_mod, 'marketCap')
+        if mcap is None:
+            mcap = get_raw(default_ks, 'marketCap')
+        if mcap is None:
+            mcap = get_raw(summary, 'marketCap')
+        price_raw = get_raw(price_mod, 'regularMarketPrice')
+        if mcap:
+            out['market_cap'] = mcap / 10_000_000.0  # raw rupee -> crore
+        pe = get_raw(default_ks, 'trailingPE')
+        if pe is None:
+            pe = get_raw(summary, 'trailingPE')
+        if pe is not None:
+            out['pe'] = float(pe)
+        shares = get_raw(default_ks, 'sharesOutstanding')
+        if shares is None and mcap and price_raw:
+            shares = mcap / price_raw
+        if shares:
+            out['shares_outstanding'] = shares
+
+        if out:
+            if debug:
+                log.info(f"  🔍 {sym} Yahoo fundamentals: pe={out.get('pe')}, "
+                         f"mcap_cr={out.get('market_cap')}, "
+                         f"shares={out.get('shares_outstanding')}")
+            return out
+    return {}
+
 _NSE_ANNOUNCEMENTS_HEADER_SETS = [
     {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -466,6 +596,74 @@ _NSE_ANNOUNCEMENTS_HEADER_SETS = [
     },
 ]
 _nse_announcements_debug_count = 0  # caps raw-response logging while verifying the real field shape
+
+
+async def fetch_nse_quote_fundamentals(session: aiohttp.ClientSession, sym: str,
+                                       debug: bool = False) -> dict:
+    """Official, real-time NSE quote-equity data: P/E + sector/industry.
+
+    Upstox's P/E comes from its key-ratios endpoint (quarterly refresh) and the
+    Upstox industry lookup relies on guessing endpoints; this official NSE call
+    is the more current/authoritative source for BOTH, straight from the
+    exchange. Requires the same cookie-priming used by every other NSE endpoint
+    in this codebase (warm-up hit to a page, then the API call in the same
+    session so the cookie jar reuses it).
+
+    NOTE: NSE quote-equity does NOT expose current market cap or total shares
+    outstanding — those are still filled by the Yahoo fallback (and then kept
+    daily-fresh by run_scan via shares_outstanding × live price). Returns a
+    partial dict with 'pe' and 'industry', or {} when NSE returns nothing usable.
+    """
+    headers = dict(_NSE_ANNOUNCEMENTS_HEADER_SETS[0])
+    headers["Referer"] = f"https://www.nseindia.com/get-quotes/equity?symbol={sym}"
+    out: dict = {}
+    try:
+        # Cookie-priming: visit a page first so NSE sets cookies in the session jar.
+        async with session.get("https://www.nseindia.com/option-chain",
+                               headers=headers,
+                               timeout=aiohttp.ClientTimeout(total=15)) as r0:
+            await r0.read()
+        url = f"https://www.nseindia.com/api/quote-equity?symbol={quote(sym)}"
+        async with session.get(url, headers=headers,
+                               timeout=aiohttp.ClientTimeout(total=15)) as r:
+            if r.status != 200:
+                key = f'nse_quote_equity_{r.status}'
+                _fetch_error_counts[key] = _fetch_error_counts.get(key, 0) + 1
+                if debug:
+                    log.info(f"  🔍 {sym} NSE quote-equity: non-200 status ({r.status})")
+                return {}
+            data = await r.json()
+    except Exception as e:
+        key = f'nse_quote_equity_{type(e).__name__}'
+        _fetch_error_counts[key] = _fetch_error_counts.get(key, 0) + 1
+        if debug:
+            log.info(f"  🔍 {sym} NSE quote-equity exception: {type(e).__name__}: {e}")
+        return {}
+
+    payload = data.get('data') or {}
+    if not isinstance(payload, dict):
+        return {}
+
+    meta = payload.get('metadata') or {}
+    pe = meta.get('pdSymbolPe')
+    if pe is not None:
+        try:
+            out['pe'] = float(pe)
+        except (TypeError, ValueError):
+            pass
+
+    ind = payload.get('industryInfo') or {}
+    industry = (ind.get('basicIndustry') or ind.get('industry')
+                or ind.get('sector') or ind.get('macro'))
+    if industry and isinstance(industry, str):
+        industry = industry.strip()
+        if industry:
+            out['industry'] = industry
+
+    if out and debug:
+        log.info(f"  🔍 {sym} NSE quote-equity: pe={out.get('pe')}, "
+                 f"industry={out.get('industry')}")
+    return out
 
 # ── Supabase client ───────────────────────────────────────────────────
 # Exact set of fields the frontend's transformStockRow() actually reads
@@ -1752,32 +1950,53 @@ async def load_fundamentals_batch(session: aiohttp.ClientSession, symbols: list)
     async def fetch_one_fundamentals(sym, debug):
         isin = isin_for(sym)
         upstox_data = await fetch_upstox_fundamentals(session, sym, isin, debug=debug) if isin else None
-        # Screener.in fallback removed — Railway IP is blocked/rate-limited
-        # and scrapes only produced noise. Missing fields stay None until
-        # Upstox/CSV/other sources fill them.
-        if upstox_data is not None:
-            return upstox_data
-        # Gemini fallback when Upstox token expired (all 401s)
-        if _gemini_fallback_fn:
+        data = upstox_data
+        # Gemini fallback when Upstox token expired (all 401s) — best-effort;
+        # any failure here just falls through to the blank default below.
+        if data is None and _gemini_fallback_fn:
             try:
                 ann_text = await _fetch_announcements_text_for_gemini(sym)
                 if ann_text:
                     gemini_data = await fetch_gemini_fundamentals(session, sym, ann_text, debug=debug)
                     if gemini_data is not None:
-                        return gemini_data
+                        data = gemini_data
             except Exception:
                 pass
-                return {
-            'market_cap': None, 'pe': None, 'roe': None, 'eps': None, 'debt_eq': None, 'promoter': None,
-            'eps_qoq': None, 'eps_yoy': None, 'sales_qoq': None, 'sales_yoy': None,
-            'opm_pct': None, 'opm_trend': None, 'eps_growth_streak': None,
-            'fii_pct': None, 'fii_trend': None, 'dii_pct': None, 'dii_trend': None,
-            'promoter_trend': None, 'peg_ratio': None, 'industry': None,
-            'shares_outstanding': None,
-            'pb': None, 'roce': None, 'industry_pe': None, 'div_yield': None,
-            'cfo': None, 'fcf': None, 'cfo_pat': None,
-            'nim': None, 'gnpa': None, 'nnpa': None, 'car': None, 'casa': None,
-        }
+        if data is None:
+            # Nothing usable from Upstox or the Gemini fallback — return a
+            # blank row. MUST always be a dict (never None): the caller does
+            # `data['fetched_at'] = now`, which raises TypeError on None and
+            # kills the whole fundamentals refresh (=> market cap / P/E empty).
+            data = {
+                'market_cap': None, 'pe': None, 'roe': None, 'eps': None, 'debt_eq': None, 'promoter': None,
+                'eps_qoq': None, 'eps_yoy': None, 'sales_qoq': None, 'sales_yoy': None,
+                'opm_pct': None, 'opm_trend': None, 'eps_growth_streak': None,
+                'fii_pct': None, 'fii_trend': None, 'dii_pct': None, 'dii_trend': None,
+                'promoter_trend': None, 'peg_ratio': None, 'industry': None,
+                'shares_outstanding': None,
+                'pb': None, 'roce': None, 'industry_pe': None, 'div_yield': None,
+                'cfo': None, 'fcf': None, 'cfo_pat': None,
+                'nim': None, 'gnpa': None, 'nnpa': None, 'car': None, 'casa': None,
+            }
+        # NSE official quote-equity — real-time P/E + sector/industry. More
+        # current than Upstox's quarterly key-ratios, and far more reliable than
+        # the Upstox industry path-guessing. NSE does NOT provide market cap /
+        # shares outstanding (see fetch_nse_quote_fundamentals docstring).
+        if data.get('pe') is None or data.get('industry') is None:
+            nse = await fetch_nse_quote_fundamentals(session, sym, debug=debug)
+            for k in ('pe', 'industry'):
+                if data.get(k) is None and nse.get(k) is not None:
+                    data[k] = nse[k]
+        # Screener.in fallback removed (Railway IP blocked/rate-limited), and
+        # Upstox's key-ratios endpoint provides P/E but NEVER market cap — so
+        # fill whichever of pe / market_cap is still missing from Yahoo Finance
+        # (best-effort; failures are already counted and leave the field None).
+        if data.get('pe') is None or data.get('market_cap') is None:
+            yahoo = await fetch_yahoo_fundamentals(session, sym, debug=debug)
+            for k in ('pe', 'market_cap', 'shares_outstanding'):
+                if data.get(k) is None and yahoo.get(k) is not None:
+                    data[k] = yahoo[k]
+        return data
 
     global _fundamentals_debug_count
     # Confirmed via the error-type summary: BATCH=20 (x2 endpoints per
