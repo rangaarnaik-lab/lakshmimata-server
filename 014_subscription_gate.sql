@@ -22,7 +22,10 @@ stable
 security definer
 set search_path = public, pg_temp
 as $$
-  select exists (
+  -- Launch promo: everyone has access until Nov 1 2026, 00:00 IST.
+  -- Remove this clause (or move the date) to end the free period.
+  select (now() < timestamptz '2026-11-01 00:00:00+05:30')
+      or exists (
     select 1
     from public.subscriptions s
     where s.user_id = uid
